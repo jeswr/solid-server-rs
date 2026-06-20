@@ -66,6 +66,19 @@ impl Harness {
         content_type: Option<&str>,
         body: Body,
     ) -> axum::http::Response<Body> {
+        self.request_with(method, path, content_type, &[], body)
+            .await
+    }
+
+    /// An authenticated request with arbitrary extra headers (Slug / If-Match / Range / Accept …).
+    async fn request_with(
+        &self,
+        method: &str,
+        path: &str,
+        content_type: Option<&str>,
+        extra: &[(&str, &str)],
+        body: Body,
+    ) -> axum::http::Response<Body> {
         let (authz, dpop) = self.auth_headers(method, path);
         let mut builder = Request::builder()
             .method(method)
@@ -74,6 +87,9 @@ impl Harness {
             .header("dpop", dpop);
         if let Some(ct) = content_type {
             builder = builder.header("content-type", ct);
+        }
+        for (k, v) in extra {
+            builder = builder.header(*k, *v);
         }
         self.app
             .clone()
@@ -221,4 +237,476 @@ async fn put_with_malformed_turtle_is_400() {
         )
         .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// --- M2: content negotiation -------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_negotiates_jsonld_from_stored_turtle() {
+    let h = Harness::new();
+    h.request(
+        "PUT",
+        "/alice/data",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
+
+    let get = h
+        .request_with(
+            "GET",
+            "/alice/data",
+            None,
+            &[("accept", "application/ld+json")],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(
+        get.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+        "application/ld+json"
+    );
+    let bytes = to_bytes(get.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    // The JSON-LD re-serialisation must contain the subject + the foaf name.
+    assert!(text.contains("alice/data#me"), "JSON-LD body: {text}");
+    assert!(text.contains("Alice"), "JSON-LD body: {text}");
+}
+
+#[tokio::test]
+async fn get_with_unacceptable_accept_is_406() {
+    let h = Harness::new();
+    h.request(
+        "PUT",
+        "/alice/data",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
+    let get = h
+        .request_with(
+            "GET",
+            "/alice/data",
+            None,
+            &[("accept", "image/png")],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(get.status(), StatusCode::NOT_ACCEPTABLE);
+}
+
+// --- M2: Range ---------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_with_a_range_returns_206_partial() {
+    let h = Harness::new();
+    h.request(
+        "PUT",
+        "/alice/data",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
+    let get = h
+        .request_with(
+            "GET",
+            "/alice/data",
+            None,
+            &[("range", "bytes=0-3")],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(get.status(), StatusCode::PARTIAL_CONTENT);
+    let cr = get
+        .headers()
+        .get(axum::http::header::CONTENT_RANGE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(cr.starts_with("bytes 0-3/"), "Content-Range: {cr}");
+    let bytes = to_bytes(get.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(bytes.len(), 4);
+    assert_eq!(&bytes[..], &TURTLE.as_bytes()[0..4]);
+}
+
+#[tokio::test]
+async fn get_with_an_unsatisfiable_range_is_416() {
+    let h = Harness::new();
+    h.request(
+        "PUT",
+        "/alice/data",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
+    let get = h
+        .request_with(
+            "GET",
+            "/alice/data",
+            None,
+            &[("range", "bytes=99999-100000")],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(get.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert!(get
+        .headers()
+        .contains_key(axum::http::header::CONTENT_RANGE));
+}
+
+// --- M2: conditional requests ------------------------------------------------------------------
+
+#[tokio::test]
+async fn put_if_none_match_star_blocks_overwrite() {
+    let h = Harness::new();
+    let first = h
+        .request(
+            "PUT",
+            "/alice/data",
+            Some("text/turtle"),
+            Body::from(TURTLE),
+        )
+        .await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    // A second PUT with If-None-Match: * (create-only) must fail with 412 (it already exists).
+    let second = h
+        .request_with(
+            "PUT",
+            "/alice/data",
+            Some("text/turtle"),
+            &[("if-none-match", "*")],
+            Body::from(TURTLE),
+        )
+        .await;
+    assert_eq!(second.status(), StatusCode::PRECONDITION_FAILED);
+}
+
+#[tokio::test]
+async fn put_if_match_with_wrong_etag_is_412() {
+    let h = Harness::new();
+    h.request(
+        "PUT",
+        "/alice/data",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
+    let resp = h
+        .request_with(
+            "PUT",
+            "/alice/data",
+            Some("text/turtle"),
+            &[("if-match", "\"not-the-real-etag\"")],
+            Body::from(TURTLE),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+}
+
+#[tokio::test]
+async fn put_if_match_with_correct_etag_succeeds() {
+    let h = Harness::new();
+    let first = h
+        .request(
+            "PUT",
+            "/alice/data",
+            Some("text/turtle"),
+            Body::from(TURTLE),
+        )
+        .await;
+    let etag = first
+        .headers()
+        .get(axum::http::header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let resp = h
+        .request_with(
+            "PUT",
+            "/alice/data",
+            Some("text/turtle"),
+            &[("if-match", &etag)],
+            Body::from("<#me> <http://xmlns.com/foaf/0.1/name> \"Updated\" ."),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+// --- M2: POST ----------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn post_creates_a_child_with_slug() {
+    let h = Harness::new();
+    let resp = h
+        .request_with(
+            "POST",
+            "/alice/",
+            Some("text/turtle"),
+            &[("slug", "note1")],
+            Body::from("<#it> <http://xmlns.com/foaf/0.1/name> \"Note\" ."),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let location = resp
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(location, "https://pod.example/alice/note1");
+
+    // The child is readable at its minted Location.
+    let get = h.request("GET", "/alice/note1", None, Body::empty()).await;
+    assert_eq!(get.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn post_mints_a_uri_without_a_slug() {
+    let h = Harness::new();
+    let resp = h
+        .request(
+            "POST",
+            "/alice/",
+            Some("text/turtle"),
+            Body::from("<#it> <http://xmlns.com/foaf/0.1/name> \"X\" ."),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let location = resp
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        location.starts_with("https://pod.example/alice/"),
+        "minted Location: {location}"
+    );
+    assert_ne!(location, "https://pod.example/alice/");
+}
+
+#[tokio::test]
+async fn post_to_a_non_container_is_409() {
+    let h = Harness::new();
+    // The target is a plain resource path (no trailing slash) ⇒ not a container.
+    let resp = h
+        .request(
+            "POST",
+            "/alice/data",
+            Some("text/turtle"),
+            Body::from(TURTLE),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn unauthenticated_post_is_forbidden() {
+    let h = Harness::new();
+    let resp = h
+        .unauth_request("POST", "/alice/", Some("text/turtle"), Body::from(TURTLE))
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+// --- M2: DELETE --------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn delete_removes_a_resource() {
+    let h = Harness::new();
+    h.request(
+        "PUT",
+        "/alice/data",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
+
+    let del = h
+        .request("DELETE", "/alice/data", None, Body::empty())
+        .await;
+    assert_eq!(del.status(), StatusCode::NO_CONTENT);
+
+    // It is gone.
+    let get = h.request("GET", "/alice/data", None, Body::empty()).await;
+    assert_eq!(get.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_a_missing_resource_is_404() {
+    let h = Harness::new();
+    let del = h
+        .request("DELETE", "/alice/gone", None, Body::empty())
+        .await;
+    assert_eq!(del.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_a_non_empty_container_is_409() {
+    let h = Harness::new();
+    // POST a child into the container so it has a member.
+    h.request_with(
+        "POST",
+        "/alice/",
+        Some("text/turtle"),
+        &[("slug", "child")],
+        Body::from("<#it> <http://xmlns.com/foaf/0.1/name> \"C\" ."),
+    )
+    .await;
+    // Make the container itself exist (PUT it as a resource record) so DELETE reaches the
+    // emptiness check rather than a 404.
+    h.request(
+        "PUT",
+        "/alice/",
+        Some("text/turtle"),
+        Body::from("<#c> <http://xmlns.com/foaf/0.1/name> \"Container\" ."),
+    )
+    .await;
+
+    let del = h.request("DELETE", "/alice/", None, Body::empty()).await;
+    assert_eq!(del.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn unauthenticated_delete_is_forbidden() {
+    let h = Harness::new();
+    h.request(
+        "PUT",
+        "/alice/data",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
+    let del = h
+        .unauth_request("DELETE", "/alice/data", None, Body::empty())
+        .await;
+    assert_eq!(del.status(), StatusCode::FORBIDDEN);
+}
+
+// --- M2: PATCH (N3 Patch) ----------------------------------------------------------------------
+
+const N3_PATCH: &str = "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
+@prefix foaf: <http://xmlns.com/foaf/0.1/> .\n\
+_:patch a solid:InsertDeletePatch;\n\
+  solid:deletes { <https://pod.example/alice/data#me> foaf:name \"Alice\" . };\n\
+  solid:inserts { <https://pod.example/alice/data#me> foaf:name \"Alice 2\" . }.\n";
+
+#[tokio::test]
+async fn patch_inserts_and_deletes_triples() {
+    let h = Harness::new();
+    h.request(
+        "PUT",
+        "/alice/data",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
+
+    let patch = h
+        .request(
+            "PATCH",
+            "/alice/data",
+            Some("text/n3"),
+            Body::from(N3_PATCH),
+        )
+        .await;
+    assert_eq!(patch.status(), StatusCode::NO_CONTENT);
+
+    // The resource now carries the new name and not the old one.
+    let get = h.request("GET", "/alice/data", None, Body::empty()).await;
+    let bytes = to_bytes(get.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("Alice 2"), "patched body: {text}");
+    assert!(
+        !text.contains("\"Alice\""),
+        "old value still present: {text}"
+    );
+}
+
+#[tokio::test]
+async fn patch_with_an_unsupported_media_type_is_415() {
+    let h = Harness::new();
+    h.request(
+        "PUT",
+        "/alice/data",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
+    // SPARQL Update is deferred — must be 415, never silently accepted.
+    let resp = h
+        .request(
+            "PATCH",
+            "/alice/data",
+            Some("application/sparql-update"),
+            Body::from("INSERT DATA { <#s> <#p> <#o> }"),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
+async fn patch_deleting_an_absent_triple_is_409() {
+    let h = Harness::new();
+    h.request(
+        "PUT",
+        "/alice/data",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
+    let doc = "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
+@prefix foaf: <http://xmlns.com/foaf/0.1/> .\n\
+_:patch solid:deletes { <https://pod.example/alice/data#me> foaf:name \"NotThere\" . }.\n";
+    let resp = h
+        .request("PATCH", "/alice/data", Some("text/n3"), Body::from(doc))
+        .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn patch_with_a_templated_where_is_422() {
+    let h = Harness::new();
+    h.request(
+        "PUT",
+        "/alice/data",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
+    let doc = "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
+@prefix foaf: <http://xmlns.com/foaf/0.1/> .\n\
+_:patch solid:where { ?s foaf:name ?n . };\n\
+  solid:deletes { ?s foaf:name ?n . }.\n";
+    let resp = h
+        .request("PATCH", "/alice/data", Some("text/n3"), Body::from(doc))
+        .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn unauthenticated_patch_is_forbidden() {
+    let h = Harness::new();
+    h.request(
+        "PUT",
+        "/alice/data",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
+    let resp = h
+        .unauth_request(
+            "PATCH",
+            "/alice/data",
+            Some("text/n3"),
+            Body::from(N3_PATCH),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }

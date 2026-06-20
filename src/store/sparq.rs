@@ -37,9 +37,12 @@ pub enum SparqError {
 
 /// The authoritative RDF index over SPARQ.
 ///
-/// In M1 only the metadata-record operations needed by GET/HEAD/PUT are defined. M2 extends this
-/// with containment membership, the `usage()` quota view, and the WAC/ACP ACL-document graphs that
-/// the (future) access-evaluation step reads.
+/// M1 defined only the metadata-record operations needed by GET/HEAD/PUT. M2 adds DELETE
+/// ([`SparqClient::delete_meta`]) and containment membership ([`SparqClient::add_child`] /
+/// [`remove_child`](SparqClient::remove_child) / [`list_children`](SparqClient::list_children)) —
+/// SPARQ is authoritative for containment, so POST (mint a child) + the empty-container DELETE check
+/// flow through it, never an S3 LIST. M2-next: the `usage()` quota view + the WAC/ACP ACL-document
+/// graphs the (future) access-evaluation step reads.
 #[async_trait]
 pub trait SparqClient: Send + Sync {
     /// Fetch the authoritative metadata for a resource IRI, or [`SparqError::NotFound`].
@@ -50,12 +53,37 @@ pub trait SparqClient: Send + Sync {
 
     /// Whether the resource is indexed (the authoritative existence check — never an S3 HEAD).
     async fn exists(&self, iri: &str) -> Result<bool, SparqError>;
+
+    /// Remove a resource's metadata record. Idempotent: deleting an absent IRI is `Ok(())` (the
+    /// caller's existence check governs the 404, so this is a no-op-on-absent at the index layer).
+    async fn delete_meta(&self, iri: &str) -> Result<(), SparqError>;
+
+    /// Record `child` as contained by `container` (authoritative `ldp:contains` membership).
+    async fn add_child(&self, container: &str, child: &str) -> Result<(), SparqError>;
+
+    /// Remove `child` from `container`'s membership. Idempotent on an absent edge.
+    async fn remove_child(&self, container: &str, child: &str) -> Result<(), SparqError>;
+
+    /// List the IRIs of `container`'s direct children (its `ldp:contains` members).
+    async fn list_children(&self, container: &str) -> Result<Vec<String>, SparqError>;
 }
 
-/// An in-memory [`SparqClient`] for tests and the M1 boot-without-SPARQ path.
+/// An in-memory [`SparqClient`] for tests and the M1/M2 boot-without-SPARQ path.
+///
+/// Holds the metadata records AND the containment edges (container IRI → ordered child IRIs) behind
+/// a single lock, so a POST/DELETE that touches both stays internally consistent under the test
+/// double's coarse locking.
 #[derive(Default)]
 pub struct InMemorySparqClient {
-    inner: Mutex<HashMap<String, ResourceMeta>>,
+    inner: Mutex<Index>,
+}
+
+/// The in-memory index state: metadata records + containment membership.
+#[derive(Default)]
+struct Index {
+    meta: HashMap<String, ResourceMeta>,
+    /// container IRI → its direct children, kept in insertion order (a `Vec`, de-duplicated).
+    children: HashMap<String, Vec<String>>,
 }
 
 impl InMemorySparqClient {
@@ -71,7 +99,7 @@ impl SparqClient for InMemorySparqClient {
             .inner
             .lock()
             .map_err(|_| SparqError::Backend("poisoned".into()))?;
-        guard.get(iri).cloned().ok_or(SparqError::NotFound)
+        guard.meta.get(iri).cloned().ok_or(SparqError::NotFound)
     }
 
     async fn put_meta(&self, iri: &str, meta: ResourceMeta) -> Result<(), SparqError> {
@@ -79,7 +107,7 @@ impl SparqClient for InMemorySparqClient {
             .inner
             .lock()
             .map_err(|_| SparqError::Backend("poisoned".into()))?;
-        guard.insert(iri.to_string(), meta);
+        guard.meta.insert(iri.to_string(), meta);
         Ok(())
     }
 
@@ -88,6 +116,46 @@ impl SparqClient for InMemorySparqClient {
             .inner
             .lock()
             .map_err(|_| SparqError::Backend("poisoned".into()))?;
-        Ok(guard.contains_key(iri))
+        Ok(guard.meta.contains_key(iri))
+    }
+
+    async fn delete_meta(&self, iri: &str) -> Result<(), SparqError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| SparqError::Backend("poisoned".into()))?;
+        guard.meta.remove(iri);
+        Ok(())
+    }
+
+    async fn add_child(&self, container: &str, child: &str) -> Result<(), SparqError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| SparqError::Backend("poisoned".into()))?;
+        let entry = guard.children.entry(container.to_string()).or_default();
+        if !entry.iter().any(|c| c == child) {
+            entry.push(child.to_string());
+        }
+        Ok(())
+    }
+
+    async fn remove_child(&self, container: &str, child: &str) -> Result<(), SparqError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| SparqError::Backend("poisoned".into()))?;
+        if let Some(entry) = guard.children.get_mut(container) {
+            entry.retain(|c| c != child);
+        }
+        Ok(())
+    }
+
+    async fn list_children(&self, container: &str) -> Result<Vec<String>, SparqError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| SparqError::Backend("poisoned".into()))?;
+        Ok(guard.children.get(container).cloned().unwrap_or_default())
     }
 }

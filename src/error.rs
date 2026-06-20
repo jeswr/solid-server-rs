@@ -38,6 +38,29 @@ pub enum ServerError {
     #[error("not found")]
     NotFound,
 
+    /// A request that conflicts with the current state of the target — e.g. POST to a
+    /// non-container, or DELETE of a non-empty container (LDP refuses both).
+    #[error("conflict: {0}")]
+    Conflict(String),
+
+    /// A conditional request's precondition (`If-Match` / `If-None-Match`) was not met (RFC 9110
+    /// §13). A failed `If-None-Match: *` create-guard, or an `If-Match` ETag mismatch, maps here.
+    #[error("precondition failed")]
+    PreconditionFailed,
+
+    /// A `Range` request whose range(s) cannot be satisfied for the resource (RFC 9110 §15.5.17).
+    #[error("range not satisfiable")]
+    RangeNotSatisfiable,
+
+    /// No representation acceptable per the request's `Accept` header (RFC 9110 §15.5.7).
+    #[error("not acceptable")]
+    NotAcceptable,
+
+    /// The PATCH document or media type is unsupported / malformed (RFC 5789 §2.2 → 422 for a
+    /// well-formed but unprocessable patch, 415 for an unsupported media type — see [`Self::status`]).
+    #[error("unprocessable patch: {0}")]
+    UnprocessablePatch(String),
+
     /// An unsupported or unparseable RDF content type.
     #[error("unsupported media type: {0}")]
     UnsupportedMediaType(String),
@@ -57,6 +80,11 @@ impl ServerError {
             }
             ServerError::Forbidden => StatusCode::FORBIDDEN,
             ServerError::NotFound => StatusCode::NOT_FOUND,
+            ServerError::Conflict(_) => StatusCode::CONFLICT,
+            ServerError::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
+            ServerError::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
+            ServerError::NotAcceptable => StatusCode::NOT_ACCEPTABLE,
+            ServerError::UnprocessablePatch(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ServerError::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             ServerError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -84,6 +112,11 @@ impl IntoResponse for ServerError {
             StatusCode::INTERNAL_SERVER_ERROR => "internal server error",
             StatusCode::NOT_FOUND => "not found",
             StatusCode::FORBIDDEN => "forbidden",
+            StatusCode::CONFLICT => "conflict",
+            StatusCode::PRECONDITION_FAILED => "precondition failed",
+            StatusCode::RANGE_NOT_SATISFIABLE => "range not satisfiable",
+            StatusCode::NOT_ACCEPTABLE => "not acceptable",
+            StatusCode::UNPROCESSABLE_ENTITY => "unprocessable entity",
             StatusCode::UNSUPPORTED_MEDIA_TYPE => "unsupported media type",
             _ => "bad request",
         };

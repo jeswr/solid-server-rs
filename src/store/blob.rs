@@ -35,6 +35,10 @@ pub trait BlobStore: Send + Sync {
 
     /// Whether a key exists.
     async fn exists(&self, key: &str) -> Result<bool, BlobError>;
+
+    /// Remove the bytes for a storage key. Idempotent: deleting an absent key is `Ok(())` (the
+    /// authoritative existence decision lives in the index, not here).
+    async fn delete(&self, key: &str) -> Result<(), BlobError>;
 }
 
 /// An in-memory [`BlobStore`] for tests and the M1 boot-without-S3 path.
@@ -74,5 +78,14 @@ impl BlobStore for InMemoryBlobStore {
             .lock()
             .map_err(|_| BlobError::Backend("poisoned".into()))?;
         Ok(guard.contains_key(key))
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), BlobError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| BlobError::Backend("poisoned".into()))?;
+        guard.remove(key);
+        Ok(())
     }
 }

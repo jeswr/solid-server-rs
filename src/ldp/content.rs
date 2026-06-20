@@ -7,12 +7,14 @@
 //! count (proof the body is well-formed RDF) without retaining the graph — the slice stores bytes
 //! verbatim and lets SPARQ be authoritative for the triples.
 //!
-//! M2: full content negotiation (an `Accept`-driven serialisation choice), N-Triples/N-Quads/N3,
-//! and the JSON-LD `noRemoteContextLoader` SSRF posture (oxjsonld is local-only by construction, so
-//! that posture ports favourably).
+//! M2: content negotiation (an `Accept`-driven serialisation choice) + re-serialisation between the
+//! two RDF formats now land here ([`negotiate_accept`] + [`serialize_triples`]). The JSON-LD
+//! `noRemoteContextLoader` SSRF posture (oxjsonld is local-only by construction) ports favourably.
+//! Still M2-next: N-Triples/N-Quads/N3 read formats.
 
-use oxjsonld::JsonLdParser;
-use oxttl::TurtleParser;
+use oxjsonld::{JsonLdParser, JsonLdSerializer};
+use oxrdf::{GraphNameRef, QuadRef, Triple};
+use oxttl::{TurtleParser, TurtleSerializer};
 
 use crate::error::ServerError;
 
@@ -60,17 +62,34 @@ pub fn classify(content_type: Option<&str>) -> Result<RdfFormat, ServerError> {
 /// This proves the body is well-formed RDF before the slice stores it. The parsed graph is NOT
 /// retained — SPARQ is the authoritative triple store; the blob store keeps the bytes verbatim.
 pub fn validate_rdf(format: RdfFormat, body: &[u8], base_iri: &str) -> Result<usize, ServerError> {
+    Ok(parse_to_triples(format, body, base_iri)?.len())
+}
+
+/// Parse `body` (in `format`) into its default-graph triples, resolving relative IRIs against
+/// `base_iri`.
+///
+/// Both source formats are reduced to a flat `Vec<Triple>`: the Turtle parser already yields the
+/// default graph; the JSON-LD parser yields quads, of which only the default graph is retained (a
+/// Solid RDF *resource* is a single graph — named graphs in a submitted JSON-LD document are not
+/// part of the resource's triples). This is the shared parse step behind both validation and content
+/// negotiation, so an unparseable body is rejected (a 400) before any storage or re-serialisation.
+pub fn parse_to_triples(
+    format: RdfFormat,
+    body: &[u8],
+    base_iri: &str,
+) -> Result<Vec<Triple>, ServerError> {
     match format {
         RdfFormat::Turtle => {
             let parser = TurtleParser::new()
                 .with_base_iri(base_iri)
                 .map_err(|e| ServerError::BadRequest(format!("invalid base IRI: {e}")))?;
-            let mut count = 0usize;
+            let mut triples = Vec::new();
             for triple in parser.for_slice(body) {
-                triple.map_err(|e| ServerError::BadRequest(format!("invalid Turtle: {e}")))?;
-                count += 1;
+                let t =
+                    triple.map_err(|e| ServerError::BadRequest(format!("invalid Turtle: {e}")))?;
+                triples.push(t);
             }
-            Ok(count)
+            Ok(triples)
         }
         RdfFormat::JsonLd => {
             // oxjsonld is local-only by construction (no remote context loader) — the SSRF-safe
@@ -78,12 +97,206 @@ pub fn validate_rdf(format: RdfFormat, body: &[u8], base_iri: &str) -> Result<us
             let parser = JsonLdParser::new()
                 .with_base_iri(base_iri)
                 .map_err(|e| ServerError::BadRequest(format!("invalid base IRI: {e}")))?;
-            let mut count = 0usize;
+            let mut triples = Vec::new();
             for quad in parser.for_slice(body) {
-                quad.map_err(|e| ServerError::BadRequest(format!("invalid JSON-LD: {e}")))?;
-                count += 1;
+                let q =
+                    quad.map_err(|e| ServerError::BadRequest(format!("invalid JSON-LD: {e}")))?;
+                // A resource is a single (default) graph; ignore any named-graph quads.
+                if q.graph_name == oxrdf::GraphName::DefaultGraph {
+                    triples.push(Triple::new(q.subject, q.predicate, q.object));
+                }
             }
-            Ok(count)
+            Ok(triples)
         }
+    }
+}
+
+/// Serialise a triple set into `format`, returning the bytes.
+///
+/// The serialisation is unconditioned (no base-IRI abbreviation) so the output is self-contained and
+/// stable. Used by content negotiation on read (re-render the stored Turtle as JSON-LD or vice
+/// versa) and after a PATCH (re-serialise the patched graph for storage).
+pub fn serialize_triples(format: RdfFormat, triples: &[Triple]) -> Result<Vec<u8>, ServerError> {
+    match format {
+        RdfFormat::Turtle => {
+            let mut ser = TurtleSerializer::new().for_writer(Vec::new());
+            for t in triples {
+                ser.serialize_triple(t)
+                    .map_err(|e| ServerError::Storage(format!("turtle serialise: {e}")))?;
+            }
+            ser.finish()
+                .map_err(|e| ServerError::Storage(format!("turtle serialise: {e}")))
+        }
+        RdfFormat::JsonLd => {
+            let mut ser = JsonLdSerializer::new().for_writer(Vec::new());
+            for t in triples {
+                let q = QuadRef::new(
+                    t.subject.as_ref(),
+                    t.predicate.as_ref(),
+                    t.object.as_ref(),
+                    GraphNameRef::DefaultGraph,
+                );
+                ser.serialize_quad(q)
+                    .map_err(|e| ServerError::Storage(format!("json-ld serialise: {e}")))?;
+            }
+            ser.finish()
+                .map_err(|e| ServerError::Storage(format!("json-ld serialise: {e}")))
+        }
+    }
+}
+
+/// Negotiate the response RDF format from an `Accept` header against the formats this server can
+/// produce (Turtle + JSON-LD).
+///
+/// Returns the best acceptable [`RdfFormat`], or `None` when the client explicitly accepts neither
+/// (the caller then responds 406). An ABSENT or `*/*` Accept defaults to the resource's stored
+/// format (`stored`) — the most faithful, zero-cost response. Quality values (`q=`) are honoured:
+/// the highest-q acceptable type wins, ties broken in the header's order.
+///
+/// This is a deliberately small, dependency-free `Accept` parser sufficient for the two RDF media
+/// types the server serves; it is NOT a general RFC 7231 content-negotiation engine.
+pub fn negotiate_accept(accept: Option<&str>, stored: RdfFormat) -> Option<RdfFormat> {
+    let raw = match accept {
+        None => return Some(stored),
+        Some(s) if s.trim().is_empty() => return Some(stored),
+        Some(s) => s,
+    };
+
+    // Track the best q for each producible type, plus whether a wildcard was offered.
+    let mut q_turtle: Option<f32> = None;
+    let mut q_jsonld: Option<f32> = None;
+    let mut q_wildcard: Option<f32> = None;
+
+    for part in raw.split(',') {
+        let mut it = part.split(';');
+        let media = it.next().unwrap_or("").trim().to_ascii_lowercase();
+        // Parse an optional q-value; default 1.0; clamp to [0,1]; a malformed q is treated as 0
+        // (RFC 7231 §5.3.1 — an unparseable weight is not "accepted").
+        let mut q: f32 = 1.0;
+        for param in it {
+            let p = param.trim();
+            if let Some(v) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
+                q = v.trim().parse::<f32>().unwrap_or(0.0).clamp(0.0, 1.0);
+            }
+        }
+        match media.as_str() {
+            "text/turtle" => q_turtle = Some(q_turtle.unwrap_or(0.0).max(q)),
+            "application/ld+json" => q_jsonld = Some(q_jsonld.unwrap_or(0.0).max(q)),
+            "*/*" | "application/*" | "text/*" => {
+                // A type-wildcard only counts if it could cover one of our concrete types; we keep
+                // the broadest (`*/*`-style) wildcard q and apply it to whichever concrete type the
+                // client did not name explicitly. The common `text/*`/`application/*` cases also map
+                // onto our two types, so treat them all as a generic fallback weight.
+                q_wildcard = Some(q_wildcard.unwrap_or(0.0).max(q));
+            }
+            _ => {}
+        }
+    }
+
+    // Apply any wildcard weight to types not explicitly listed.
+    let turtle = q_turtle.or(q_wildcard).unwrap_or(0.0);
+    let jsonld = q_jsonld.or(q_wildcard).unwrap_or(0.0);
+
+    if turtle <= 0.0 && jsonld <= 0.0 {
+        return None; // 406 — the client accepts neither producible type.
+    }
+    // Highest q wins; on a tie prefer the resource's stored format (cheapest, most faithful).
+    Some(match stored {
+        RdfFormat::Turtle if turtle >= jsonld => RdfFormat::Turtle,
+        RdfFormat::JsonLd if jsonld >= turtle => RdfFormat::JsonLd,
+        _ if turtle >= jsonld => RdfFormat::Turtle,
+        _ => RdfFormat::JsonLd,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const IRI: &str = "https://pod.example/alice/data";
+    const TURTLE: &str =
+        "<https://pod.example/alice/data#me> <http://xmlns.com/foaf/0.1/name> \"Alice\" .";
+
+    #[test]
+    fn absent_or_wildcard_accept_keeps_stored_format() {
+        assert_eq!(
+            negotiate_accept(None, RdfFormat::Turtle),
+            Some(RdfFormat::Turtle)
+        );
+        assert_eq!(
+            negotiate_accept(Some(""), RdfFormat::JsonLd),
+            Some(RdfFormat::JsonLd)
+        );
+        assert_eq!(
+            negotiate_accept(Some("*/*"), RdfFormat::Turtle),
+            Some(RdfFormat::Turtle)
+        );
+    }
+
+    #[test]
+    fn explicit_jsonld_wins_over_stored_turtle() {
+        assert_eq!(
+            negotiate_accept(Some("application/ld+json"), RdfFormat::Turtle),
+            Some(RdfFormat::JsonLd)
+        );
+    }
+
+    #[test]
+    fn explicit_turtle_wins_over_stored_jsonld() {
+        assert_eq!(
+            negotiate_accept(Some("text/turtle"), RdfFormat::JsonLd),
+            Some(RdfFormat::Turtle)
+        );
+    }
+
+    #[test]
+    fn q_values_are_honoured() {
+        // JSON-LD preferred by weight even though Turtle is listed first.
+        assert_eq!(
+            negotiate_accept(
+                Some("text/turtle;q=0.5, application/ld+json;q=0.9"),
+                RdfFormat::Turtle
+            ),
+            Some(RdfFormat::JsonLd)
+        );
+    }
+
+    #[test]
+    fn q_zero_excludes_a_type() {
+        // Turtle explicitly refused (q=0); JSON-LD acceptable ⇒ JSON-LD.
+        assert_eq!(
+            negotiate_accept(
+                Some("text/turtle;q=0, application/ld+json"),
+                RdfFormat::Turtle
+            ),
+            Some(RdfFormat::JsonLd)
+        );
+    }
+
+    #[test]
+    fn unacceptable_accept_is_none_406() {
+        assert_eq!(
+            negotiate_accept(Some("application/xml"), RdfFormat::Turtle),
+            None
+        );
+        assert_eq!(negotiate_accept(Some("text/html"), RdfFormat::JsonLd), None);
+    }
+
+    #[test]
+    fn turtle_round_trips_through_jsonld_and_back() {
+        // Parse Turtle → serialise JSON-LD → parse JSON-LD → same single triple.
+        let triples = parse_to_triples(RdfFormat::Turtle, TURTLE.as_bytes(), IRI).unwrap();
+        assert_eq!(triples.len(), 1);
+        let jsonld = serialize_triples(RdfFormat::JsonLd, &triples).unwrap();
+        let reparsed = parse_to_triples(RdfFormat::JsonLd, &jsonld, IRI).unwrap();
+        assert_eq!(reparsed, triples);
+    }
+
+    #[test]
+    fn serialise_to_turtle_is_reparseable() {
+        let triples = parse_to_triples(RdfFormat::Turtle, TURTLE.as_bytes(), IRI).unwrap();
+        let ttl = serialize_triples(RdfFormat::Turtle, &triples).unwrap();
+        let reparsed = parse_to_triples(RdfFormat::Turtle, &ttl, IRI).unwrap();
+        assert_eq!(reparsed, triples);
     }
 }

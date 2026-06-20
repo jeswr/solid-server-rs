@@ -23,7 +23,7 @@ client (DPoP) → axum (rustls/aws-lc-rs)
    auth middleware ── delegates to ──▶ solid-oidc-verifier  (DPoP/Solid-OIDC; NOT reimplemented)
                  │                      (git dependency; verifies at+jwt + DPoP proof, fail-closed)
                  ▼
-   LDP handlers (GET / HEAD / PUT)
+   LDP handlers (GET / HEAD / PUT / POST / DELETE / PATCH)
                  │
                  ▼
    Store trait ──┬──▶ SparqClient   ── SPARQ is AUTHORITATIVE for RDF data + metadata + (M2) ACL
@@ -42,32 +42,48 @@ Auth is **not reimplemented here**: token + DPoP-proof verification is delegated
 `solid-oidc-verifier` (consumed as a `git` dependency), using its `JwksProvider` / `ReplayStore`
 trait seams. This crate only adapts HTTP requests to/from the verifier.
 
-## What's in this slice (M1)
+## What's in this slice
 
 A coherent, compiling vertical slice with clean trait seams and unit tests:
 
 - An **axum server skeleton** ([`src/main.rs`](src/main.rs), [`src/app.rs`](src/app.rs)) that boots
-  (rustls/aws-lc-rs crypto provider installed; plain-TCP listener in M1, TLS termination is M2).
+  (rustls/aws-lc-rs crypto provider installed; plain-TCP listener for now, TLS termination is later).
 - **DPoP-bound auth middleware** ([`src/auth.rs`](src/auth.rs)) that calls the verifier on every
   request and either injects the verified caller identity or returns the verifier's own 401/503 +
   `WWW-Authenticate` challenge unchanged.
-- A **minimal LDP path** — GET / HEAD / PUT on a single resource ([`src/ldp/`](src/ldp/)) over a
-  [`Store`](src/store/mod.rs) trait whose composite impl reads/writes metadata via SPARQ
-  (authoritative) and bytes via `object_store` (backup). Each seam has an **in-memory test double**,
-  so the whole stack runs without a SPARQ / S3 / IdP. **Writes fail closed**: with no ACL engine yet
-  (M2), a PUT from a public/unauthenticated caller is rejected (403) rather than allowed.
+- **The LDP verb surface** ([`src/ldp/`](src/ldp/)) over a [`Store`](src/store/mod.rs) trait whose
+  composite impl reads/writes metadata via SPARQ (authoritative) and bytes via `object_store`
+  (backup). Each seam has an **in-memory test double**, so the whole stack runs without a SPARQ / S3
+  / IdP:
+  - **GET / HEAD** with `Accept`-driven **content negotiation** (Turtle ↔ JSON-LD re-serialisation)
+    and single-range **`Range: bytes=…`** support (206 + `Content-Range`, 416 when unsatisfiable).
+  - **PUT** (create-or-replace) and **POST** (create a child in a container — honours `Slug`, mints
+    a server URI otherwise, 201 + `Location`; 409 on POST to a non-container).
+  - **DELETE** (404 on a missing target; 409 refusal for a non-empty container).
+  - **PATCH** — the Solid **N3 Patch** engine (`text/n3`, [`src/ldp/patch.rs`](src/ldp/patch.rs)):
+    the `solid:inserts` + `solid:deletes` subset; a templated `solid:where`/variable patch is an
+    explicit 422 (never silently ignored); a non-`text/n3` PATCH is a 415.
+  - **Conditional requests** — strong `ETag` on responses; `If-Match` / `If-None-Match` honoured on
+    PUT/PATCH/DELETE (412 on mismatch; `If-None-Match: *` create-guard) —
+    [`src/ldp/conditional.rs`](src/ldp/conditional.rs).
+  - **Writes fail closed**: with no ACL engine yet, a mutation from a public/unauthenticated caller
+    is rejected (403) rather than allowed — the WAC decision plugs into that seam.
 - **LDP target/URL parsing** ([`src/ldp/target.rs`](src/ldp/target.rs)) and **Turtle / JSON-LD**
-  content-type handling + RDF validation via `oxttl` / `oxjsonld` ([`src/ldp/content.rs`](src/ldp/content.rs)).
+  content handling, validation, re-serialisation + `Accept` negotiation via `oxttl` / `oxjsonld`
+  ([`src/ldp/content.rs`](src/ldp/content.rs)).
 - **Unit + end-to-end tests** for the auth middleware (valid / invalid / missing / replayed token
-  via the verifier), LDP target parsing, the Store trait against the in-memory impl, content-type
-  handling, and the full PUT→GET HTTP path.
+  via the verifier), LDP target parsing, the Store trait against the in-memory impl, content
+  handling + negotiation, range + conditional logic, the N3-Patch engine, and the full HTTP path for
+  every verb (happy + error cases).
 
-### Deferred to later slices (`// M2:`-marked seams in the code)
+### Deferred to later slices (`// M2-next:`-marked seams in the code)
 
-Full WAC evaluation, the rest of the LDP verb set (POST / DELETE / PATCH / Range / conditional /
-full conneg), notifications (WebSocketChannel2023), the reconciler, TLS termination, the
+Full **WAC authorization** evaluation (needs the SPARQ access-control design — a separate slice), the
+N3-Patch **`solid:where` variable solver**, **multipart Range**, **SPARQL-Update PATCH**, recursive
+container delete, notifications (WebSocketChannel2023), the reconciler, TLS termination, the
 **live SPARQ HTTP client** (needs a running SPARQ instance — an integration test), and **live JWKS**
-(needs the verifier's M2 network adapters). The code carries `M2:` seam comments where each plugs in.
+(needs the verifier's network adapters). The code carries `M2-next:` seam comments where each plugs
+in.
 
 ## Build & run
 
@@ -85,9 +101,9 @@ SOLID_SERVER_TRUSTED_ISSUER=https://idp.example/realms/solid \
   cargo run
 ```
 
-The M1 server boots with in-memory storage and a static (empty) JWKS, so an authenticated request
-needs a token whose issuer key is registered in the JWKS provider — see the tests
-([`tests/`](tests/)) for how tokens + DPoP proofs are minted and verified end-to-end.
+The server boots with in-memory storage and a static (empty) JWKS, so an authenticated request needs
+a token whose issuer key is registered in the JWKS provider — see the tests ([`tests/`](tests/)) for
+how tokens + DPoP proofs are minted and verified end-to-end.
 
 ## Gate
 

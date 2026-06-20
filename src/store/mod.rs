@@ -26,12 +26,21 @@ pub struct Resource {
 
 /// The composite storage seam used by the LDP handlers.
 ///
-/// M1 covers the single-resource GET/HEAD/PUT path. M2 extends it with containers/containment,
-/// DELETE, conditional writes (the ETag CAS), and the reconciler that GCs orphaned bytes/index rows.
+/// M1 covered the single-resource GET/HEAD/PUT path. M2 adds DELETE, containment (POST mints a child
+/// + records membership; an empty-container check governs DELETE), and the metadata needed for the
+/// conditional-write ETag CAS (the [`ResourceMeta::etag`] the handler compares).
+///
+/// M2-next: the reconciler that GCs orphaned bytes/index rows after a crash between the byte and
+/// index writes, and recursive container delete.
 #[async_trait]
 pub trait Store: Send + Sync {
     /// Read a resource by IRI: its authoritative metadata (SPARQ) + its bytes (blob store).
     async fn read(&self, iri: &str) -> ServerResult<Resource>;
+
+    /// Fetch just the authoritative metadata for a resource IRI (no bytes), or `None` if absent.
+    ///
+    /// Used by the conditional-request path to learn the current ETag without paying for the body.
+    async fn meta(&self, iri: &str) -> ServerResult<Option<ResourceMeta>>;
 
     /// Whether a resource exists (the authoritative SPARQ existence check — never an S3 HEAD).
     async fn exists(&self, iri: &str) -> ServerResult<bool>;
@@ -39,6 +48,25 @@ pub trait Store: Send + Sync {
     /// Create-or-replace a resource: write the bytes, then the authoritative metadata.
     async fn write(&self, iri: &str, body: Bytes, content_type: &str)
         -> ServerResult<ResourceMeta>;
+
+    /// Create a resource AND record it as a child of `container` (the POST containment path). The
+    /// `child` IRI is the server-minted target. Returns the new resource's metadata.
+    async fn create_in_container(
+        &self,
+        container: &str,
+        child: &str,
+        body: Bytes,
+        content_type: &str,
+    ) -> ServerResult<ResourceMeta>;
+
+    /// Delete a resource: remove its index record + its bytes, and detach it from `parent`'s
+    /// containment (if `parent` is given). The caller is responsible for the existence (404) and
+    /// empty-container (409) decisions; this performs the removal.
+    async fn delete(&self, iri: &str, parent: Option<&str>) -> ServerResult<()>;
+
+    /// List the direct children (their IRIs) of a container — the authoritative `ldp:contains`
+    /// membership. Used for the empty-container DELETE refusal.
+    async fn list_children(&self, container: &str) -> ServerResult<Vec<String>>;
 }
 
 /// The default [`Store`]: SPARQ (authoritative metadata) + a blob store (backup bytes).
@@ -87,6 +115,14 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
         Ok(Resource { body, meta })
     }
 
+    async fn meta(&self, iri: &str) -> ServerResult<Option<ResourceMeta>> {
+        match self.sparq.get_meta(iri).await {
+            Ok(m) => Ok(Some(m)),
+            Err(SparqError::NotFound) => Ok(None),
+            Err(SparqError::Backend(e)) => Err(ServerError::Storage(e)),
+        }
+    }
+
     async fn exists(&self, iri: &str) -> ServerResult<bool> {
         self.sparq
             .exists(iri)
@@ -118,6 +154,61 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
             .await
             .map_err(|e| ServerError::Storage(format!("{e}")))?;
         Ok(meta)
+    }
+
+    async fn create_in_container(
+        &self,
+        container: &str,
+        child: &str,
+        body: Bytes,
+        content_type: &str,
+    ) -> ServerResult<ResourceMeta> {
+        // Write the resource exactly as a PUT would, then record the containment edge. Membership is
+        // recorded LAST so a failed write leaves no dangling member (the same byte-then-index, then
+        // membership ordering the production server uses; the reconciler is M2-next).
+        let meta = self.write(child, body, content_type).await?;
+        self.sparq
+            .add_child(container, child)
+            .await
+            .map_err(|e| ServerError::Storage(format!("{e}")))?;
+        Ok(meta)
+    }
+
+    async fn delete(&self, iri: &str, parent: Option<&str>) -> ServerResult<()> {
+        // Look up the byte-pointer from the authoritative index so we delete the right blob.
+        let blob_key = match self.sparq.get_meta(iri).await {
+            Ok(m) => Some(m.blob_key),
+            Err(SparqError::NotFound) => None,
+            Err(SparqError::Backend(e)) => return Err(ServerError::Storage(e)),
+        };
+        // Detach from the parent's containment first, then drop the index record, then the bytes.
+        // Index-before-bytes keeps the invariant "if it's indexed, its bytes exist" — a crash after
+        // the index delete leaves orphaned bytes (the reconciler GCs them — M2-next), never an index
+        // row pointing at missing bytes.
+        if let Some(p) = parent {
+            self.sparq
+                .remove_child(p, iri)
+                .await
+                .map_err(|e| ServerError::Storage(format!("{e}")))?;
+        }
+        self.sparq
+            .delete_meta(iri)
+            .await
+            .map_err(|e| ServerError::Storage(format!("{e}")))?;
+        if let Some(key) = blob_key {
+            self.blob
+                .delete(&key)
+                .await
+                .map_err(|e| ServerError::Storage(format!("{e}")))?;
+        }
+        Ok(())
+    }
+
+    async fn list_children(&self, container: &str) -> ServerResult<Vec<String>> {
+        self.sparq
+            .list_children(container)
+            .await
+            .map_err(|e| ServerError::Storage(format!("{e}")))
     }
 }
 

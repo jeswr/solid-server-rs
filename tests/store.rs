@@ -76,6 +76,87 @@ async fn different_bytes_yield_a_different_etag() {
     );
 }
 
+// --- M2: delete + containment ---
+
+#[tokio::test]
+async fn delete_removes_metadata_and_bytes() {
+    let s = store();
+    s.write(IRI, Bytes::from_static(TURTLE.as_bytes()), "text/turtle")
+        .await
+        .unwrap();
+    assert!(s.exists(IRI).await.unwrap());
+
+    s.delete(IRI, None).await.unwrap();
+    assert!(!s.exists(IRI).await.unwrap());
+    assert!(matches!(
+        s.read(IRI).await.unwrap_err(),
+        ServerError::NotFound
+    ));
+}
+
+#[tokio::test]
+async fn delete_is_idempotent_on_absent() {
+    let s = store();
+    // Deleting a never-written resource is not an error at the store layer.
+    s.delete(IRI, None).await.unwrap();
+}
+
+#[tokio::test]
+async fn create_in_container_records_membership() {
+    let s = store();
+    let container = "https://pod.example/alice/";
+    let child = "https://pod.example/alice/note1";
+    s.create_in_container(
+        container,
+        child,
+        Bytes::from_static(b"<#it> <#p> \"x\" ."),
+        "text/turtle",
+    )
+    .await
+    .unwrap();
+
+    let children = s.list_children(container).await.unwrap();
+    assert_eq!(children, vec![child.to_string()]);
+    assert!(s.exists(child).await.unwrap());
+}
+
+#[tokio::test]
+async fn delete_detaches_from_parent_container() {
+    let s = store();
+    let container = "https://pod.example/alice/";
+    let child = "https://pod.example/alice/note1";
+    s.create_in_container(
+        container,
+        child,
+        Bytes::from_static(b"<#it> <#p> \"x\" ."),
+        "text/turtle",
+    )
+    .await
+    .unwrap();
+    assert_eq!(s.list_children(container).await.unwrap().len(), 1);
+
+    s.delete(child, Some(container)).await.unwrap();
+    assert!(s.list_children(container).await.unwrap().is_empty());
+    assert!(!s.exists(child).await.unwrap());
+}
+
+#[tokio::test]
+async fn meta_returns_etag_without_bytes() {
+    let s = store();
+    let written = s
+        .write(IRI, Bytes::from_static(TURTLE.as_bytes()), "text/turtle")
+        .await
+        .unwrap();
+    let meta = s
+        .meta(IRI)
+        .await
+        .unwrap()
+        .expect("meta present after write");
+    assert_eq!(meta.etag, written.etag);
+    // Absent resource ⇒ None.
+    assert!(s.meta("https://pod.example/nope").await.unwrap().is_none());
+}
+
 // --- content-type classification + RDF validation ---
 
 #[test]

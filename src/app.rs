@@ -17,7 +17,9 @@ use solid_oidc_verifier::config::JwksProvider;
 use solid_oidc_verifier::replay::ReplayStore;
 
 use crate::auth::{auth_middleware, AuthContext};
-use crate::ldp::handler::{get_handler, head_handler, put_handler, LdpState};
+use crate::ldp::handler::{
+    delete_handler, get_handler, head_handler, patch_handler, post_handler, put_handler, LdpState,
+};
 use crate::store::Store;
 
 /// The assembled application state — the auth context + the LDP state, each behind an [`Arc`].
@@ -40,7 +42,7 @@ where
     }
 }
 
-/// Build the axum router: the LDP single-resource routes (GET/HEAD/PUT), wrapped by the DPoP auth
+/// Build the axum router: the LDP routes (GET/HEAD/PUT/POST/DELETE/PATCH), wrapped by the DPoP auth
 /// middleware. A wildcard path captures the resource target; the handler re-parses it against the
 /// base URL.
 pub fn build_router<J, R, S>(state: AppState<J, R, S>) -> Router
@@ -57,7 +59,10 @@ where
             "/{*path}",
             get(get_handler::<S>)
                 .head(head_handler::<S>)
-                .put(put_handler::<S>),
+                .put(put_handler::<S>)
+                .post(post_handler::<S>)
+                .delete(delete_handler::<S>)
+                .patch(patch_handler::<S>),
         )
         // The auth middleware carries the AuthContext as ITS state; it runs before the handler and
         // injects the VerifiedToken into request extensions.

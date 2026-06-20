@@ -15,16 +15,20 @@
 //!   [`solid-oidc-verifier`](https://github.com/jeswr/solid-oidc-verifier) crate (a git dependency).
 //!   Auth is **not** reimplemented here. See [`auth`].
 //!
-//! ## M1 vertical slice (this crate)
+//! ## Vertical slice (this crate)
 //! A coherent, compiling slice with clean trait seams + tests:
 //! - an axum server skeleton ([`app`]) that boots,
 //! - DPoP-bound auth middleware ([`auth`]) over the verifier,
-//! - GET/HEAD/PUT on a single resource ([`ldp`]) through a [`store::Store`] trait,
-//! - LDP target/URL parsing + Turtle/JSON-LD content-type handling ([`ldp::target`], [`ldp::content`]).
+//! - the LDP verb surface ([`ldp`]) through a [`store::Store`] trait: GET/HEAD (with `Accept`
+//!   content negotiation + `Range`), PUT/POST/DELETE/PATCH (conditional `If-Match`/`If-None-Match`),
+//!   POST `Slug`-honouring child creation, the empty-container DELETE refusal, and the Solid N3-Patch
+//!   engine (`text/n3`, the insert/delete subset),
+//! - LDP target/URL parsing + Turtle/JSON-LD content handling ([`ldp::target`], [`ldp::content`]).
 //!
-//! Everything network-facing (the live SPARQ HTTP client, live JWKS) and the rest of the Solid
-//! surface (full WAC, the full LDP verb set, notifications, reconciliation) is a clearly-marked
-//! `M2:` seam, not implemented. The default impls used in M1 are in-memory test doubles.
+//! Everything network-facing (the live SPARQ HTTP client, live JWKS) and the parts of the Solid
+//! surface that need designs not yet written (full WAC authorization, notifications, the reconciler,
+//! the N3-Patch `solid:where` variable solver, multipart Range, SPARQL-Update PATCH) are clearly
+//! marked `M2-next:` seams, not implemented. The default impls used here are in-memory test doubles.
 
 pub mod app;
 pub mod auth;
