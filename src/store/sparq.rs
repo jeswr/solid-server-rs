@@ -58,25 +58,26 @@ pub trait SparqClient: Send + Sync {
     /// caller's existence check governs the 404, so this is a no-op-on-absent at the index layer).
     async fn delete_meta(&self, iri: &str) -> Result<(), SparqError>;
 
-    /// Record `child` as contained by `container` (authoritative `ldp:contains` membership),
-    /// enforcing the parent-exists invariant ATOMICALLY: if `container` is not indexed at insert
-    /// time, this returns [`SparqError::NotFound`] WITHOUT recording the edge. This closes the
-    /// check-then-act race in the POST path — a concurrent DELETE of the container between the
-    /// handler's existence check and this insert cannot leave a member under a missing container,
-    /// because the existence test and the edge write happen under the index's own atomicity. The
-    /// edge insert is idempotent (recording an existing membership is a no-op).
-    async fn add_child(&self, container: &str, child: &str) -> Result<(), SparqError>;
+    /// ATOMICALLY create a child resource record: in a SINGLE index operation, verify `container` is
+    /// indexed (else [`SparqError::NotFound`]) and commit BOTH `child`'s metadata record AND the
+    /// `container`→`child` containment edge together.
+    ///
+    /// Committing the metadata and the membership in one atomic step is what makes the POST path
+    /// race-free: there is NO window in which the edge exists without the child's metadata (or vice
+    /// versa), so no removal-based compensation is needed and a concurrent same-IRI creator cannot
+    /// observe — or have removed — a half-built containment. (The live impl is one SPARQL UPDATE with
+    /// a `container`-EXISTS guard that inserts both triples.) The blob bytes are written by the caller
+    /// BEFORE this call; if this fails (missing container), those bytes are orphaned and GC'd by the
+    /// reconciler — the same crash-consistency model as [`SparqClient::put_meta`].
+    async fn create_child(
+        &self,
+        container: &str,
+        child: &str,
+        meta: ResourceMeta,
+    ) -> Result<(), SparqError>;
 
     /// Remove `child` from `container`'s membership. Idempotent on an absent edge.
     async fn remove_child(&self, container: &str, child: &str) -> Result<(), SparqError>;
-
-    /// ATOMICALLY remove `child` from `container`'s membership ONLY IF `child` has no metadata
-    /// record (it is an orphaned edge with no backing resource). The existence test and the edge
-    /// removal happen under the index's own atomicity, so a concurrent creator that successfully
-    /// writes `child`'s metadata between a separate check and delete cannot have its membership torn
-    /// down. This is the compensating action for a failed `create_in_container` — it removes the edge
-    /// precisely when no create (this request's or a concurrent one's) backs it.
-    async fn remove_child_if_orphan(&self, container: &str, child: &str) -> Result<(), SparqError>;
 
     /// List the IRIs of `container`'s direct children (its `ldp:contains` members).
     async fn list_children(&self, container: &str) -> Result<Vec<String>, SparqError>;
@@ -142,16 +143,23 @@ impl SparqClient for InMemorySparqClient {
         Ok(())
     }
 
-    async fn add_child(&self, container: &str, child: &str) -> Result<(), SparqError> {
+    async fn create_child(
+        &self,
+        container: &str,
+        child: &str,
+        meta: ResourceMeta,
+    ) -> Result<(), SparqError> {
         let mut guard = self
             .inner
             .lock()
             .map_err(|_| SparqError::Backend("poisoned".into()))?;
-        // Atomic parent-exists check: the container's metadata + the membership edge live under the
-        // SAME lock, so a child can never be attached to a container that is not currently indexed.
+        // ONE atomic step under the single lock: verify the container exists, then commit BOTH the
+        // child's metadata AND the containment edge together. No window separates them, so there is
+        // nothing for a concurrent creator (or a failed-request compensation) to observe half-built.
         if !guard.meta.contains_key(container) {
             return Err(SparqError::NotFound);
         }
+        guard.meta.insert(child.to_string(), meta);
         let entry = guard.children.entry(container.to_string()).or_default();
         if !entry.iter().any(|c| c == child) {
             entry.push(child.to_string());
@@ -164,23 +172,6 @@ impl SparqClient for InMemorySparqClient {
             .inner
             .lock()
             .map_err(|_| SparqError::Backend("poisoned".into()))?;
-        if let Some(entry) = guard.children.get_mut(container) {
-            entry.retain(|c| c != child);
-        }
-        Ok(())
-    }
-
-    async fn remove_child_if_orphan(&self, container: &str, child: &str) -> Result<(), SparqError> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| SparqError::Backend("poisoned".into()))?;
-        // The metadata check + the edge removal are under ONE lock, so a concurrent creator that
-        // writes the child's metadata cannot interleave between them — its membership survives. We
-        // remove the edge only when the child has no backing index record (a true orphan).
-        if guard.meta.contains_key(child) {
-            return Ok(());
-        }
         if let Some(entry) = guard.children.get_mut(container) {
             entry.retain(|c| c != child);
         }

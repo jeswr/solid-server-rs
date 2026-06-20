@@ -163,30 +163,32 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
         body: Bytes,
         content_type: &str,
     ) -> ServerResult<ResourceMeta> {
-        // Record the containment edge FIRST: `add_child` enforces the parent-exists invariant
-        // atomically (it returns NotFound if the container is not indexed at insert time), so this
-        // closes the check-then-act race — a concurrent DELETE of the container is caught here rather
-        // than producing a child under a missing container. A missing container ⇒ 404 with nothing
-        // written.
-        match self.sparq.add_child(container, child).await {
-            Ok(_) => {}
-            Err(SparqError::NotFound) => return Err(ServerError::NotFound),
-            Err(SparqError::Backend(e)) => return Err(ServerError::Storage(e)),
-        }
-        // Now write the resource bytes + index record. On a write failure, compensate with the
-        // ATOMIC `remove_child_if_orphan`: it removes the containment edge under the index's own lock
-        // ONLY if the child has no metadata record. This is robust against every concurrent-same-IRI
-        // interleaving — the existence test and the edge removal cannot be split, so a concurrent
-        // creator that successfully wrote the child's metadata never has its membership torn down; the
-        // edge is removed precisely when no create (this request's or a concurrent one's) backs it.
-        // The membership↔metadata consistency is the durable invariant; the reconciler (M2-next) is
-        // the backstop for a crash between the two index writes.
-        match self.write(child, body, content_type).await {
-            Ok(meta) => Ok(meta),
-            Err(e) => {
-                let _ = self.sparq.remove_child_if_orphan(container, child).await;
-                Err(e)
-            }
+        // Write the bytes FIRST (content-addressed by key; idempotent), then commit the child's
+        // metadata AND its containment edge in ONE atomic index operation (`create_child`). Because
+        // the metadata + the edge commit together, there is no window in which the edge exists
+        // without backing metadata — so the POST path needs NO removal-based compensation and a
+        // concurrent same-IRI creator can never observe or tear down a half-built containment. A
+        // missing container ⇒ 404; the bytes written above are then orphaned and GC'd by the
+        // reconciler (M2-next) — the same crash-consistency model `write` documents.
+        let blob_key = Self::blob_key_for(child);
+        let etag = Self::etag_for(&body);
+        self.blob
+            .put(&blob_key, body)
+            .await
+            .map_err(|e| ServerError::Storage(format!("{e}")))?;
+        let meta = ResourceMeta {
+            content_type: content_type.to_string(),
+            blob_key,
+            etag,
+        };
+        match self
+            .sparq
+            .create_child(container, child, meta.clone())
+            .await
+        {
+            Ok(()) => Ok(meta),
+            Err(SparqError::NotFound) => Err(ServerError::NotFound),
+            Err(SparqError::Backend(e)) => Err(ServerError::Storage(e)),
         }
     }
 

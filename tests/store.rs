@@ -6,7 +6,8 @@ use axum::body::Bytes;
 use solid_server_rs::error::ServerError;
 use solid_server_rs::ldp::content::{classify, validate_rdf, RdfFormat};
 use solid_server_rs::store::{
-    CompositeStore, InMemoryBlobStore, InMemorySparqClient, ResourceMeta, SparqClient, Store,
+    CompositeStore, InMemoryBlobStore, InMemorySparqClient, ResourceMeta, SparqClient, SparqError,
+    Store,
 };
 
 const IRI: &str = "https://pod.example/alice/data";
@@ -179,8 +180,9 @@ async fn create_in_container_twice_keeps_a_single_membership() {
 }
 
 #[tokio::test]
-async fn remove_child_if_orphan_only_removes_unbacked_edges() {
-    // Directly exercise the atomic compensating action on the SparqClient.
+async fn create_child_commits_metadata_and_membership_atomically() {
+    // Directly exercise the atomic create on the SparqClient: both the child metadata and the edge
+    // appear together, and a missing container is refused with nothing written.
     let sparq = InMemorySparqClient::new();
     let container = "https://pod.example/alice/";
     let child = "https://pod.example/alice/note1";
@@ -189,23 +191,20 @@ async fn remove_child_if_orphan_only_removes_unbacked_edges() {
         blob_key: "k".into(),
         etag: "\"e\"".into(),
     };
-    sparq.put_meta(container, meta.clone()).await.unwrap();
-    sparq.add_child(container, child).await.unwrap();
 
-    // Orphan edge (child has no metadata) ⇒ removed.
-    sparq
-        .remove_child_if_orphan(container, child)
+    // Missing container ⇒ NotFound, no metadata + no edge written.
+    let err = sparq
+        .create_child(container, child, meta.clone())
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(matches!(err, SparqError::NotFound));
+    assert!(!sparq.exists(child).await.unwrap());
     assert!(sparq.list_children(container).await.unwrap().is_empty());
 
-    // Backed edge (child HAS metadata, e.g. a concurrent successful create) ⇒ preserved.
-    sparq.add_child(container, child).await.unwrap();
-    sparq.put_meta(child, meta).await.unwrap();
-    sparq
-        .remove_child_if_orphan(container, child)
-        .await
-        .unwrap();
+    // With the container indexed, create_child commits the child meta AND the edge together.
+    sparq.put_meta(container, meta.clone()).await.unwrap();
+    sparq.create_child(container, child, meta).await.unwrap();
+    assert!(sparq.exists(child).await.unwrap());
     assert_eq!(
         sparq.list_children(container).await.unwrap(),
         vec![child.to_string()]
