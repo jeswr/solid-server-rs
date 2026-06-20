@@ -35,6 +35,14 @@ pub enum SparqError {
     Backend(String),
 }
 
+/// A query-build failure (an IRIREF-invalid untrusted IRI) is a FATAL backend error — fail-closed,
+/// never silently escaped/aliased.
+impl From<super::sparql::BuildError> for SparqError {
+    fn from(e: super::sparql::BuildError) -> Self {
+        SparqError::Backend(format!("fatal: {e}"))
+    }
+}
+
 /// The authoritative RDF index over SPARQ.
 ///
 /// M1 defined only the metadata-record operations needed by GET/HEAD/PUT. M2 adds DELETE

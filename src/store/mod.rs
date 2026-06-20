@@ -2,18 +2,22 @@
 //! The composite [`Store`] — the LDP handler's single view of storage.
 //!
 //! A [`Store`] reads/writes RDF + metadata via [`SparqClient`] (authoritative) and bytes via
-//! [`BlobStore`] (backup), mirroring the production server's S3+index composite. The default impl,
+//! [`BlobStore`] (backup), mirroring prod-solid-server's S3+index composite. The default impl,
 //! [`CompositeStore`], wires the two seams together; both seams have in-memory test doubles so the
 //! whole stack is testable without a running SPARQ or S3.
 
 pub mod blob;
+pub mod http;
 pub mod sparq;
+pub mod sparql;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 
 pub use blob::{BlobError, BlobStore, InMemoryBlobStore};
+pub use http::{HttpSparqClient, SparqHttpError};
 pub use sparq::{InMemorySparqClient, ResourceMeta, SparqClient, SparqError};
+pub use sparql::{BodyObject, BuildError};
 
 use crate::error::{ServerError, ServerResult};
 
@@ -82,7 +86,7 @@ impl<S: SparqClient, B: BlobStore> CompositeStore<S, B> {
 
     /// Derive the opaque blob-store key for an IRI.
     ///
-    /// M2: this is the production server's `KeyMapper` — a stable, collision-free,
+    /// M2: this is prod-solid-server's `KeyMapper` — a stable, collision-free,
     /// directory-traversal-safe mapping. The M1 placeholder is a simple percent-flattening that is
     /// deterministic and reversible enough for the slice's tests.
     fn blob_key_for(iri: &str) -> String {
@@ -137,7 +141,7 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
         content_type: &str,
     ) -> ServerResult<ResourceMeta> {
         // Crash-consistency: bytes FIRST, then the authoritative index (spike §6). On an index-write
-        // failure the production server issues a compensating delete; M2 ports that + the reconciler.
+        // failure prod-solid-server issues a compensating delete; M2 ports that + the reconciler.
         let blob_key = Self::blob_key_for(iri);
         let etag = Self::etag_for(&body);
         self.blob

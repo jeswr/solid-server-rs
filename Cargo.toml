@@ -3,7 +3,7 @@ name = "solid-server-rs"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.81"
-description = "EXPERIMENTAL parallel-track Rust reimplementation of a Solid/LDP server. SPARQ-authoritative for RDF + access-control; object_store/S3 backup-only for bytes. Does NOT replace the production TypeScript prod-solid-server."
+description = "EXPERIMENTAL parallel-track Rust reimplementation of a Solid/LDP server. SPARQ-authoritative for RDF + access-control; object_store/S3 backup-only for bytes. Does NOT replace the TypeScript prod-solid-server."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/jeswr/solid-server-rs"
 homepage = "https://github.com/jeswr/solid-server-rs"
@@ -16,7 +16,9 @@ publish = false
 # HTTP framework: axum on hyper 1.x + tokio (spike §4). The closest structural analogue to the
 # framework-agnostic LDP handler seam in prod-solid-server.
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+# `time` is required by the M3 HttpSparqClient's per-request `tokio::time::timeout` (do NOT rely on
+# a transitive enable — that's fragile under feature-unification changes).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 # tower-http middleware layer set (spike §4). M2 wires in CORS/security-headers/trace/body-limit.
 tower = "0.5"
 tower-http = { version = "0.7", features = ["trace"] }
@@ -38,6 +40,13 @@ object_store = "0.13"
 async-trait = "0.1"
 bytes = "1"
 http = "1"
+# Live SPARQ HTTP client (M3): a SPARQL 1.1 Protocol client over the SPARQ /sparql endpoint. Built
+# on the hyper 1.x client + hyper-util's legacy pooled Client — both ALREADY in the tree (axum +
+# the verifier pull them in), so this adds NO new crates, only enables already-resolved client
+# features. Plain HTTP to a trusted internal endpoint; TLS is an M3-next adapter behind the same type.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -50,7 +59,11 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 base64 = "0.22"
 sha2 = "0.10"
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "macros"] }
+# The HttpSparqClient unit tests run against an in-process mock SPARQL endpoint (an axum server on a
+# tokio listener) — no live SPARQ. `net` for the listener, `rt-multi-thread` so the client + server
+# run on the same multi-threaded runtime, `time` for the timeout test.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time"] }
+http-body-util = "0.1"
 
 [features]
 default = []
