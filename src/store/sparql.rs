@@ -465,16 +465,27 @@ fn render_bnode(label: &str) -> String {
     out
 }
 
-/// VALIDATE a language tag against the SPARQL `LANGTAG` grammar subset (a non-empty sequence of
-/// `[A-Za-z0-9-]` — the BCP-47 ASCII alphanumeric + hyphen shape) and return it unchanged, or
-/// [`BuildError::InvalidLangTag`] if it is empty or carries any other character.
+/// VALIDATE a language tag against the SPARQL `LANGTAG` grammar
+/// (`'@' [a-zA-Z]+ ('-' [a-zA-Z0-9]+)*`) and return it unchanged, or [`BuildError::InvalidLangTag`].
 ///
-/// This is fail-CLOSED: a malformed tag is REJECTED, never silently rewritten (the round-6 finding —
-/// stripping `en> } DROP` to `enDROP` mutated the data, and an all-stripped tag produced invalid
-/// `"x"@`). A crafted tag therefore can neither inject (it is refused) nor be silently corrupted.
+/// The shape (NOT merely "alphanumeric + hyphen"): an ALPHABETIC primary subtag of length ≥ 1,
+/// followed by zero or more `-`-separated subtags each of length ≥ 1 and alphanumeric. So `en`,
+/// `en-US`, `zh-Hans-CN` pass; `1`/`1x` (non-alpha primary), `en-` (empty trailing subtag),
+/// `en--US` (empty interior subtag), `` (empty) are REJECTED. Fail-CLOSED: a malformed tag is
+/// refused, never silently rewritten (the round-6 finding) and never emits invalid query text.
 fn validate_lang(lang: &str) -> Result<&str, BuildError> {
-    if lang.is_empty() || !lang.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        return Err(BuildError::InvalidLangTag);
+    let mut subtags = lang.split('-');
+    // Primary subtag: alphabetic, non-empty.
+    match subtags.next() {
+        Some(primary)
+            if !primary.is_empty() && primary.chars().all(|c| c.is_ascii_alphabetic()) => {}
+        _ => return Err(BuildError::InvalidLangTag),
+    }
+    // Each remaining subtag: alphanumeric, non-empty.
+    for sub in subtags {
+        if sub.is_empty() || !sub.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(BuildError::InvalidLangTag);
+        }
     }
     Ok(lang)
 }
@@ -772,10 +783,19 @@ mod tests {
 
     #[test]
     fn lang_tag_is_validated_fail_closed() {
-        assert_eq!(validate_lang("en-US"), Ok("en-US"));
+        // Valid per the SPARQL LANGTAG grammar.
         assert_eq!(validate_lang("en"), Ok("en"));
+        assert_eq!(validate_lang("en-US"), Ok("en-US"));
+        assert_eq!(validate_lang("zh-Hans-CN"), Ok("zh-Hans-CN"));
+        // Invalid: empty, whitespace/forbidden char, non-alpha primary, empty trailing/interior
+        // subtag — all rejected fail-closed (round-7 finding).
         assert_eq!(validate_lang(""), Err(BuildError::InvalidLangTag));
         assert_eq!(validate_lang("en US"), Err(BuildError::InvalidLangTag));
         assert_eq!(validate_lang("en>"), Err(BuildError::InvalidLangTag));
+        assert_eq!(validate_lang("1"), Err(BuildError::InvalidLangTag));
+        assert_eq!(validate_lang("1x"), Err(BuildError::InvalidLangTag));
+        assert_eq!(validate_lang("en-"), Err(BuildError::InvalidLangTag));
+        assert_eq!(validate_lang("en--US"), Err(BuildError::InvalidLangTag));
+        assert_eq!(validate_lang("-en"), Err(BuildError::InvalidLangTag));
     }
 }
