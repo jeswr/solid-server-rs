@@ -96,8 +96,12 @@ async fn serve_read<S: Store>(
     )?;
 
     let total_len = body.len() as u64;
-    let range_header = header_str(req_headers, header::RANGE);
-    let outcome = range::evaluate(range_header, total_len);
+    // `Range` is defined for GET (RFC 9110 §14.2); ignore it for HEAD so a HEAD never returns 206.
+    let outcome = if with_body {
+        range::evaluate(header_str(req_headers, header::RANGE), total_len)
+    } else {
+        RangeOutcome::Full
+    };
 
     let mut out = HeaderMap::new();
     set_str(&mut out, header::CONTENT_TYPE, &content_type);
@@ -189,7 +193,8 @@ pub async fn put_handler<S: Store>(
 /// `POST /{path}` — create a child resource inside a container.
 ///
 /// Honours the `Slug` header (sanitised) and mints a server URI when absent or colliding. POST to a
-/// non-container is a 409 Conflict. Returns 201 + `Location`. Fail-closed (public ⇒ 403).
+/// non-container is a 409 Conflict; POST to a container that does not exist is a 404. Returns 201 +
+/// `Location`. Fail-closed (public ⇒ 403).
 pub async fn post_handler<S: Store>(
     State(state): State<Arc<LdpState<S>>>,
     Extension(token): Extension<VerifiedToken>,
@@ -200,12 +205,17 @@ pub async fn post_handler<S: Store>(
     require_authenticated(&token)?;
     let container = parse_target(&state.base_url, uri.path())?;
 
-    // POST creates a CHILD in a CONTAINER — the target must be a container (trailing-slash path) and
-    // must exist (or be the conventional root). A POST to a plain resource is a 409.
+    // POST creates a CHILD in a CONTAINER — the target must be a container (trailing-slash path).
+    // A POST to a plain resource is a 409.
     if !container.is_container {
         return Err(ServerError::Conflict(
             "POST target is not a container".into(),
         ));
+    }
+    // The container must exist (the authoritative index check) — never create a child + a containment
+    // edge under a missing container. A missing container is a 404.
+    if !state.store.exists(&container.iri).await? {
+        return Err(ServerError::NotFound);
     }
 
     let content_type = header_str(&headers, header::CONTENT_TYPE);

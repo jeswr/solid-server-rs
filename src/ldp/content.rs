@@ -162,10 +162,19 @@ pub fn negotiate_accept(accept: Option<&str>, stored: RdfFormat) -> Option<RdfFo
         Some(s) => s,
     };
 
-    // Track the best q for each producible type, plus whether a wildcard was offered.
+    // Track the best q for each producible type, plus the matching type-range wildcards. A `text/*`
+    // range can only cover Turtle (`text/turtle`); an `application/*` range only JSON-LD
+    // (`application/ld+json`); `*/*` covers both. Each is kept separately so a `text/*` request never
+    // yields JSON-LD (the bug roborev flagged).
     let mut q_turtle: Option<f32> = None;
     let mut q_jsonld: Option<f32> = None;
-    let mut q_wildcard: Option<f32> = None;
+    let mut q_text_star: Option<f32> = None; // covers Turtle only
+    let mut q_app_star: Option<f32> = None; // covers JSON-LD only
+    let mut q_any: Option<f32> = None; // covers both
+
+    fn bump(slot: &mut Option<f32>, q: f32) {
+        *slot = Some(slot.unwrap_or(0.0).max(q));
+    }
 
     for part in raw.split(',') {
         let mut it = part.split(';');
@@ -180,22 +189,19 @@ pub fn negotiate_accept(accept: Option<&str>, stored: RdfFormat) -> Option<RdfFo
             }
         }
         match media.as_str() {
-            "text/turtle" => q_turtle = Some(q_turtle.unwrap_or(0.0).max(q)),
-            "application/ld+json" => q_jsonld = Some(q_jsonld.unwrap_or(0.0).max(q)),
-            "*/*" | "application/*" | "text/*" => {
-                // A type-wildcard only counts if it could cover one of our concrete types; we keep
-                // the broadest (`*/*`-style) wildcard q and apply it to whichever concrete type the
-                // client did not name explicitly. The common `text/*`/`application/*` cases also map
-                // onto our two types, so treat them all as a generic fallback weight.
-                q_wildcard = Some(q_wildcard.unwrap_or(0.0).max(q));
-            }
+            "text/turtle" => bump(&mut q_turtle, q),
+            "application/ld+json" => bump(&mut q_jsonld, q),
+            "text/*" => bump(&mut q_text_star, q),
+            "application/*" => bump(&mut q_app_star, q),
+            "*/*" => bump(&mut q_any, q),
             _ => {}
         }
     }
 
-    // Apply any wildcard weight to types not explicitly listed.
-    let turtle = q_turtle.or(q_wildcard).unwrap_or(0.0);
-    let jsonld = q_jsonld.or(q_wildcard).unwrap_or(0.0);
+    // Resolve each concrete type's effective weight: an explicit q wins; else the most specific
+    // applicable wildcard (`type/*`), else `*/*`. A type with no applicable range is not accepted.
+    let turtle = q_turtle.or(q_text_star).or(q_any).unwrap_or(0.0);
+    let jsonld = q_jsonld.or(q_app_star).or(q_any).unwrap_or(0.0);
 
     if turtle <= 0.0 && jsonld <= 0.0 {
         return None; // 406 — the client accepts neither producible type.
@@ -280,6 +286,56 @@ mod tests {
             None
         );
         assert_eq!(negotiate_accept(Some("text/html"), RdfFormat::JsonLd), None);
+    }
+
+    #[test]
+    fn text_star_covers_only_turtle() {
+        // `text/*` maps to Turtle, never JSON-LD — even when the stored format is JSON-LD.
+        assert_eq!(
+            negotiate_accept(Some("text/*"), RdfFormat::JsonLd),
+            Some(RdfFormat::Turtle)
+        );
+        assert_eq!(
+            negotiate_accept(Some("text/*"), RdfFormat::Turtle),
+            Some(RdfFormat::Turtle)
+        );
+    }
+
+    #[test]
+    fn application_star_covers_only_jsonld() {
+        // `application/*` maps to JSON-LD, never Turtle — even when the stored format is Turtle.
+        assert_eq!(
+            negotiate_accept(Some("application/*"), RdfFormat::Turtle),
+            Some(RdfFormat::JsonLd)
+        );
+        assert_eq!(
+            negotiate_accept(Some("application/*"), RdfFormat::JsonLd),
+            Some(RdfFormat::JsonLd)
+        );
+    }
+
+    #[test]
+    fn any_wildcard_covers_both_and_keeps_stored() {
+        assert_eq!(
+            negotiate_accept(Some("*/*"), RdfFormat::Turtle),
+            Some(RdfFormat::Turtle)
+        );
+        assert_eq!(
+            negotiate_accept(Some("*/*"), RdfFormat::JsonLd),
+            Some(RdfFormat::JsonLd)
+        );
+    }
+
+    #[test]
+    fn explicit_beats_wildcard() {
+        // An explicit application/ld+json at higher q wins over a text/* range.
+        assert_eq!(
+            negotiate_accept(
+                Some("text/*;q=0.3, application/ld+json;q=0.9"),
+                RdfFormat::Turtle
+            ),
+            Some(RdfFormat::JsonLd)
+        );
     }
 
     #[test]

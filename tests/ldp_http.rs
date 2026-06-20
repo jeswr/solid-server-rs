@@ -98,6 +98,19 @@ impl Harness {
             .unwrap()
     }
 
+    /// Create the container at `path` (a trailing-slash path) so a subsequent POST can target it.
+    async fn make_container(&self, path: &str) {
+        let resp = self
+            .request(
+                "PUT",
+                path,
+                Some("text/turtle"),
+                Body::from("<#c> <http://xmlns.com/foaf/0.1/name> \"Container\" ."),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
     /// An UNAUTHENTICATED request (no Authorization / DPoP).
     async fn unauth_request(
         &self,
@@ -331,6 +344,29 @@ async fn get_with_a_range_returns_206_partial() {
 }
 
 #[tokio::test]
+async fn head_with_a_range_is_200_not_206() {
+    // Range is defined for GET; a HEAD with Range must NOT return 206.
+    let h = Harness::new();
+    h.request(
+        "PUT",
+        "/alice/data",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
+    let head = h
+        .request_with(
+            "HEAD",
+            "/alice/data",
+            None,
+            &[("range", "bytes=0-3")],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(head.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn get_with_an_unsatisfiable_range_is_416() {
     let h = Harness::new();
     h.request(
@@ -441,6 +477,7 @@ async fn put_if_match_with_correct_etag_succeeds() {
 #[tokio::test]
 async fn post_creates_a_child_with_slug() {
     let h = Harness::new();
+    h.make_container("/alice/").await;
     let resp = h
         .request_with(
             "POST",
@@ -468,6 +505,7 @@ async fn post_creates_a_child_with_slug() {
 #[tokio::test]
 async fn post_mints_a_uri_without_a_slug() {
     let h = Harness::new();
+    h.make_container("/alice/").await;
     let resp = h
         .request(
             "POST",
@@ -504,6 +542,21 @@ async fn post_to_a_non_container_is_409() {
         )
         .await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn post_to_a_missing_container_is_404() {
+    let h = Harness::new();
+    // The container path is well-formed but was never created — must not create a child under it.
+    let resp = h
+        .request(
+            "POST",
+            "/missing/",
+            Some("text/turtle"),
+            Body::from("<#it> <http://xmlns.com/foaf/0.1/name> \"X\" ."),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -550,6 +603,8 @@ async fn delete_a_missing_resource_is_404() {
 #[tokio::test]
 async fn delete_a_non_empty_container_is_409() {
     let h = Harness::new();
+    // The container must exist before a child can be POSTed into it.
+    h.make_container("/alice/").await;
     // POST a child into the container so it has a member.
     h.request_with(
         "POST",
@@ -557,15 +612,6 @@ async fn delete_a_non_empty_container_is_409() {
         Some("text/turtle"),
         &[("slug", "child")],
         Body::from("<#it> <http://xmlns.com/foaf/0.1/name> \"C\" ."),
-    )
-    .await;
-    // Make the container itself exist (PUT it as a resource record) so DELETE reaches the
-    // emptiness check rather than a 404.
-    h.request(
-        "PUT",
-        "/alice/",
-        Some("text/turtle"),
-        Body::from("<#c> <http://xmlns.com/foaf/0.1/name> \"Container\" ."),
     )
     .await;
 

@@ -6,11 +6,12 @@
 //! request may proceed (RFC 9110 §13.1–§13.2). The handler holds the I/O; this module holds the
 //! exact comparison rules so they are exhaustively unit-testable.
 //!
-//! The server emits only **strong** ETags (`"…"`), so weak comparison (`W/…`) does not arise on the
-//! produce side; on the *consume* side an inbound `W/`-prefixed validator is compared by its opaque
-//! tag, which for our strong tags is exactly the strong comparison. The wildcard `*` is handled per
-//! spec: `If-None-Match: *` ⇒ "only if it does NOT exist" (the create guard); `If-Match: *` ⇒ "only
-//! if it DOES exist".
+//! The server emits only **strong** ETags (`"…"`). Validator strength is honoured per RFC 9110:
+//! `If-Match` uses **strong comparison** (§13.1.1 — "the server MUST NOT … weak"), so an inbound
+//! weak validator (`W/"…"`) can NEVER satisfy `If-Match` and the request fails; `If-None-Match` uses
+//! **weak comparison** (§13.1.2), so a `W/`-prefixed validator matches by its opaque tag. The
+//! wildcard `*` is handled per spec: `If-None-Match: *` ⇒ "only if it does NOT exist" (the create
+//! guard); `If-Match: *` ⇒ "only if it DOES exist".
 
 use crate::error::ServerError;
 
@@ -41,12 +42,13 @@ pub fn evaluate(
     if_none_match: Option<&str>,
     current: Option<&str>,
 ) -> Precondition {
-    // --- If-Match: proceed only if the current representation matches one of the listed tags.
+    // --- If-Match: proceed only if the current representation matches one of the listed tags, by
+    // STRONG comparison (RFC 9110 §13.1.1) — a weak (`W/`) validator never satisfies If-Match.
     if let Some(im) = if_match {
         let ok = match current {
             // `If-Match: *` ⇒ the resource must exist.
             _ if is_wildcard(im) => current.is_some(),
-            Some(cur) => tag_list(im).any(|t| strong_eq(t, cur)),
+            Some(cur) => tag_list(im).any(|t| t.matches_strong(cur)),
             // No current representation can match a concrete tag list.
             None => false,
         };
@@ -56,11 +58,12 @@ pub fn evaluate(
     }
 
     // --- If-None-Match: proceed only if NONE of the listed tags match (the create / no-overwrite
-    // guard). `If-None-Match: *` ⇒ the resource must NOT exist.
+    // guard), by WEAK comparison (RFC 9110 §13.1.2). `If-None-Match: *` ⇒ the resource must NOT
+    // exist.
     if let Some(inm) = if_none_match {
         let matched = match current {
             _ if is_wildcard(inm) => current.is_some(),
-            Some(cur) => tag_list(inm).any(|t| strong_eq(t, cur)),
+            Some(cur) => tag_list(inm).any(|t| t.matches_weak(cur)),
             None => false,
         };
         if matched {
@@ -84,21 +87,46 @@ fn is_wildcard(header: &str) -> bool {
     header.trim() == "*"
 }
 
-/// Iterate the entity-tags in a comma-separated `If-(None-)Match` header value, trimming whitespace
-/// and a leading weak-validator marker (`W/`). An empty/blank entry is skipped.
-fn tag_list(header: &str) -> impl Iterator<Item = &str> {
+/// An inbound entity-tag with its validator strength preserved (RFC 9110 §8.8.3).
+struct InboundTag<'a> {
+    /// The opaque quoted tag value (e.g. `"abc"`), with any `W/` prefix removed.
+    opaque: &'a str,
+    /// Whether the inbound validator was weak (`W/`-prefixed).
+    weak: bool,
+}
+
+impl InboundTag<'_> {
+    /// STRONG comparison (for `If-Match`): both validators must be strong and the opaque tags equal.
+    /// The server's stored tag is always strong, so a weak inbound tag never matches strongly.
+    fn matches_strong(&self, current_strong: &str) -> bool {
+        !self.weak && self.opaque == current_strong
+    }
+
+    /// WEAK comparison (for `If-None-Match`): the opaque tags are equal regardless of strength.
+    fn matches_weak(&self, current_strong: &str) -> bool {
+        self.opaque == current_strong
+    }
+}
+
+/// Iterate the entity-tags in a comma-separated `If-(None-)Match` header value, preserving each
+/// tag's validator STRENGTH (so `If-Match` can correctly reject a weak validator). Whitespace is
+/// trimmed and an empty/blank entry is skipped.
+fn tag_list(header: &str) -> impl Iterator<Item = InboundTag<'_>> {
     header
         .split(',')
         .map(|t| t.trim())
-        .map(|t| t.strip_prefix("W/").unwrap_or(t))
         .filter(|t| !t.is_empty())
-}
-
-/// Strong comparison of two opaque entity-tags (RFC 9110 §8.8.3.2): byte-equal, both strong. The
-/// stored tag is always strong; a `W/` prefix on either side was already stripped by [`tag_list`],
-/// so this is a plain equality of the quoted opaque values.
-fn strong_eq(a: &str, b: &str) -> bool {
-    a == b
+        .map(|t| match t.strip_prefix("W/") {
+            Some(rest) => InboundTag {
+                opaque: rest.trim(),
+                weak: true,
+            },
+            None => InboundTag {
+                opaque: t,
+                weak: false,
+            },
+        })
+        .filter(|t| !t.opaque.is_empty())
 }
 
 #[cfg(test)]
@@ -148,13 +176,32 @@ mod tests {
     }
 
     #[test]
-    fn if_match_list_and_weak_prefix() {
-        let list = format!("{OTHER}, W/{TAG}");
-        // The current tag appears (weak-prefixed) in the list ⇒ If-Match proceeds.
+    fn if_match_list_matches_a_strong_member() {
+        // A strong member of the list matches ⇒ If-Match proceeds (strong comparison).
+        let list = format!("{OTHER}, {TAG}");
         assert_eq!(
             evaluate(Some(&list), None, Some(TAG)),
             Precondition::Proceed
         );
+    }
+
+    #[test]
+    fn if_match_rejects_a_weak_validator() {
+        // RFC 9110 §13.1.1: a weak (`W/`) validator must NOT satisfy If-Match — even with the same
+        // opaque tag, so this must FAIL (the bug roborev flagged).
+        let weak = format!("W/{TAG}");
+        assert_eq!(evaluate(Some(&weak), None, Some(TAG)), Precondition::Failed);
+        // …and a list whose only matching tag is weak still fails.
+        let list = format!("{OTHER}, W/{TAG}");
+        assert_eq!(evaluate(Some(&list), None, Some(TAG)), Precondition::Failed);
+    }
+
+    #[test]
+    fn if_none_match_accepts_a_weak_validator() {
+        // RFC 9110 §13.1.2: If-None-Match uses WEAK comparison — a `W/`-prefixed tag with the same
+        // opaque value DOES match (so "none match" fails ⇒ 412 on a mutation).
+        let weak = format!("W/{TAG}");
+        assert_eq!(evaluate(None, Some(&weak), Some(TAG)), Precondition::Failed);
     }
 
     #[test]
