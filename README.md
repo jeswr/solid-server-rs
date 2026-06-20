@@ -61,8 +61,11 @@ A coherent, compiling vertical slice with clean trait seams and unit tests:
     a server URI otherwise, 201 + `Location`; 409 on POST to a non-container).
   - **DELETE** (404 on a missing target; 409 refusal for a non-empty container).
   - **PATCH** — the Solid **N3 Patch** engine (`text/n3`, [`src/ldp/patch.rs`](src/ldp/patch.rs)):
-    the `solid:inserts` + `solid:deletes` subset; a templated `solid:where`/variable patch is an
-    explicit 422 (never silently ignored); a non-`text/n3` PATCH is a 415.
+    `solid:inserts` + `solid:deletes` plus the **`solid:where` variable solver** — a basic-graph-pattern
+    matcher (conjunctive variable unification) over the target graph whose single binding instantiates
+    the templates. Spec-faithful: a non-empty `where` MUST have exactly one solution (zero or multiple ⇒
+    409), template variables MUST occur in `where` and templates MUST NOT contain blank nodes (422). A
+    non-`text/n3` PATCH is a 415.
   - **Conditional requests** — strong `ETag` on responses; `If-Match` / `If-None-Match` honoured on
     PUT/PATCH/DELETE (412 on mismatch; `If-None-Match: *` create-guard) —
     [`src/ldp/conditional.rs`](src/ldp/conditional.rs).
@@ -78,8 +81,8 @@ A coherent, compiling vertical slice with clean trait seams and unit tests:
 
 ### Deferred to later slices (`// M2-next:`-marked seams in the code)
 
-Full **WAC authorization** evaluation (needs the SPARQ access-control design — a separate slice), the
-N3-Patch **`solid:where` variable solver**, **multipart Range**, **SPARQL-Update PATCH**, recursive
+Full **WAC authorization** evaluation (needs the SPARQ access-control design — a separate slice),
+**multipart Range**, **SPARQL-Update PATCH**, recursive
 container delete, notifications (WebSocketChannel2023), the reconciler, TLS termination, the
 **live SPARQ HTTP client** (needs a running SPARQ instance — an integration test), and **live JWKS**
 (needs the verifier's network adapters). The code carries `M2-next:` seam comments where each plugs

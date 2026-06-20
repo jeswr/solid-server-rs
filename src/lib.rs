@@ -22,12 +22,12 @@
 //! - the LDP verb surface ([`ldp`]) through a [`store::Store`] trait: GET/HEAD (with `Accept`
 //!   content negotiation + `Range`), PUT/POST/DELETE/PATCH (conditional `If-Match`/`If-None-Match`),
 //!   POST `Slug`-honouring child creation, the empty-container DELETE refusal, and the Solid N3-Patch
-//!   engine (`text/n3`, the insert/delete subset),
+//!   engine (`text/n3`, insert/delete plus the `solid:where` variable solver),
 //! - LDP target/URL parsing + Turtle/JSON-LD content handling ([`ldp::target`], [`ldp::content`]).
 //!
 //! Everything network-facing (the live SPARQ HTTP client, live JWKS) and the parts of the Solid
 //! surface that need designs not yet written (full WAC authorization, notifications, the reconciler,
-//! the N3-Patch `solid:where` variable solver, multipart Range, SPARQL-Update PATCH) are clearly
+//! multipart Range, SPARQL-Update PATCH) are clearly
 //! marked `M2-next:` seams, not implemented. The default impls used here are in-memory test doubles.
 
 pub mod app;

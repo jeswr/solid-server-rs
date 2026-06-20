@@ -6,13 +6,13 @@
 //!   content negotiation.
 //! - [`conditional`] — `If-Match` / `If-None-Match` precondition evaluation over the strong ETag.
 //! - [`range`] — single `Range: bytes=…` request handling (206 / 416).
-//! - [`patch`] — the Solid N3-Patch engine (`text/n3`, the insert/delete subset).
+//! - [`patch`] — the Solid N3-Patch engine (`text/n3`): insert/delete plus the `solid:where`
+//!   variable solver (basic-graph-pattern matching with the spec's exactly-one-solution rule).
 //! - [`handler`] — the GET / HEAD / PUT / POST / DELETE / PATCH axum handlers over the
 //!   [`crate::store::Store`] seam.
 //!
 //! M2-next (clearly seamed, not implemented): full WAC authorization (needs the SPARQ access-control
-//! design), the `solid:where` patch variable solver, multipart Range, and `application/sparql-update`
-//! PATCH.
+//! design), multipart Range, and `application/sparql-update` PATCH.
 
 pub mod conditional;
 pub mod content;

@@ -716,8 +716,11 @@ _:patch solid:deletes { <https://pod.example/alice/data#me> foaf:name \"NotThere
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
+/// A templated `solid:where` patch end-to-end: bind the current name, delete it, insert a new one
+/// (the canonical "rename" patch). The single solution drives the templates and the body reads back
+/// with the new value.
 #[tokio::test]
-async fn patch_with_a_templated_where_is_422() {
+async fn patch_with_a_templated_where_renames() {
     let h = Harness::new();
     h.request(
         "PUT",
@@ -728,12 +731,48 @@ async fn patch_with_a_templated_where_is_422() {
     .await;
     let doc = "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
 @prefix foaf: <http://xmlns.com/foaf/0.1/> .\n\
-_:patch solid:where { ?s foaf:name ?n . };\n\
-  solid:deletes { ?s foaf:name ?n . }.\n";
+_:patch solid:where   { <https://pod.example/alice/data#me> foaf:name ?n . };\n\
+  solid:deletes { <https://pod.example/alice/data#me> foaf:name ?n . };\n\
+  solid:inserts { <https://pod.example/alice/data#me> foaf:name \"Renamed\" . }.\n";
     let resp = h
         .request("PATCH", "/alice/data", Some("text/n3"), Body::from(doc))
         .await;
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let get = h.request("GET", "/alice/data", None, Body::empty()).await;
+    let bytes = to_bytes(get.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("Renamed"), "patched body: {text}");
+    assert!(
+        !text.contains("\"Alice\""),
+        "old value still present: {text}"
+    );
+}
+
+/// Spec: a non-empty `solid:where` with MULTIPLE solutions is a 409 (the Solid N3 Patch requires
+/// exactly one mapping — it does not fan out per solution).
+#[tokio::test]
+async fn patch_with_a_multi_solution_where_is_409() {
+    let h = Harness::new();
+    // Two foaf:name triples on the same subject ⇒ the where binds ?n two ways ⇒ multiple solutions.
+    let turtle =
+        "<https://pod.example/alice/data#me> <http://xmlns.com/foaf/0.1/name> \"Alice\" .\n\
+<https://pod.example/alice/data#me> <http://xmlns.com/foaf/0.1/name> \"Alicia\" .";
+    h.request(
+        "PUT",
+        "/alice/data",
+        Some("text/turtle"),
+        Body::from(turtle),
+    )
+    .await;
+    let doc = "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
+@prefix foaf: <http://xmlns.com/foaf/0.1/> .\n\
+_:patch solid:where { <https://pod.example/alice/data#me> foaf:name ?n . };\n\
+  solid:deletes { <https://pod.example/alice/data#me> foaf:name ?n . }.\n";
+    let resp = h
+        .request("PATCH", "/alice/data", Some("text/n3"), Body::from(doc))
+        .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]

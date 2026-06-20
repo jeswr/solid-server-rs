@@ -281,11 +281,12 @@ pub async fn delete_handler<S: Store>(
 
 /// `PATCH /{path}` — apply a Solid N3 Patch (`text/n3`).
 ///
-/// The patch is parsed (insert/delete subset; a templated `where`/variable patch is a clear 422 —
-/// see [`patch_handler`]), applied to the target's existing graph (a missing `deletes` triple ⇒ 409), and
-/// the result re-serialised in the resource's stored format. PATCH on a missing resource that only
-/// inserts creates it (the LDP "create on PATCH" convention); a PATCH with deletes on a missing
-/// resource is a 409. `If-Match` is honoured. Fail-closed (public ⇒ 403).
+/// The patch is parsed (insert/delete plus the `solid:where` variable solver — see
+/// [`crate::ldp::patch`] for the BGP-matching + exactly-one-solution semantics), applied to the
+/// target's existing graph (a missing `deletes` triple ⇒ 409; a non-empty `where` with zero or
+/// multiple solutions ⇒ 409), and the result re-serialised in the resource's stored format. PATCH on
+/// a missing resource that only inserts creates it (the LDP "create on PATCH" convention); a PATCH
+/// with deletes on a missing resource is a 409. `If-Match` is honoured. Fail-closed (public ⇒ 403).
 pub async fn patch_handler<S: Store>(
     State(state): State<Arc<LdpState<S>>>,
     Extension(token): Extension<VerifiedToken>,
