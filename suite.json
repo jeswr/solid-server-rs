@@ -1,0 +1,27 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jeswr/full-solid-ecosystem/main/tracking/schema/suite.schema.json",
+  "id": "solid-server-rs",
+  "kind": "service",
+  "name": "Solid Server (Rust, EXPERIMENTAL)",
+  "repo": "https://github.com/jeswr/solid-server-rs",
+  "category": "infrastructure",
+  "maturity": "prototype",
+  "visibility": "public",
+  "stack": {
+    "lang": "Rust (edition 2021)",
+    "http": "axum 0.8 (hyper 1.x + tokio)",
+    "tls": "rustls 0.23 (aws-lc-rs)",
+    "auth": "solid-oidc-verifier (git dependency — DPoP/Solid-OIDC, not reimplemented)",
+    "rdf": "oxttl + oxjsonld + oxrdf (Oxigraph)",
+    "storage": "object_store (S3/Local) — backup-only for bytes; SPARQ authoritative for RDF",
+    "test": "cargo test",
+    "lint": "clippy -D warnings + rustfmt --check",
+    "supplyChain": "cargo-deny (deny.toml)"
+  },
+  "dependsOn": ["prod-solid-server", "solid-oidc-verifier", "sparq"],
+  "roadmap": {
+    "doc": "https://github.com/jeswr/solid-server-rs#readme",
+    "milestone": "M1 — coherent compiling vertical slice (axum boot + DPoP auth middleware via solid-oidc-verifier + GET/HEAD/PUT over a Store trait, SPARQ-authoritative / object_store-backup seams, Turtle/JSON-LD parsing, unit tests)",
+    "note": "EXPERIMENTAL parallel track — does NOT replace and must NEVER touch the production TypeScript prod-solid-server (the live, supported server). Architecture per the maintainer's directive + the Rust-migration spike: SPARQ is the AUTHORITATIVE source for RDF data AND access-control evaluation (queried over its HTTP API); object_store/S3 is BACKUP-ONLY for resource bytes. DPoP/Solid-OIDC verification is delegated to the standalone solid-oidc-verifier crate (consumed as a git dependency) — auth is NOT reimplemented here. M1 ships the vertical slice with clean trait seams (Store / SparqClient / BlobStore, each with an in-memory test impl) + unit tests; the verifier is consumed at its M1 (StaticJwksProvider + InMemoryReplayStore test seams). DEFERRED to later slices: full WAC evaluation, the full LDP verb set (POST/DELETE/PATCH/Range/conditional/conneg negotiation beyond Turtle/JSON-LD), notifications (WebSocketChannel2023), reconciliation, the live SPARQ HTTP client (needs a running SPARQ), and live JWKS (needs the verifier's M2 network adapters). Code-level `M2:`-marked seam comments flag where the next slice plugs in."
+  }
+}

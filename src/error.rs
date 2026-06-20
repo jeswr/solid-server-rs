@@ -1,0 +1,92 @@
+// AUTHORED-BY Claude Opus 4.8
+//! The server's error type and its mapping onto HTTP status codes.
+//!
+//! Auth failures carry the verifier's own status + `WWW-Authenticate` challenge through unchanged
+//! (the verifier owns the auth error contract — RFC 6750/9449); the rest are the LDP/store errors.
+
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+
+/// The crate-wide result alias.
+pub type ServerResult<T> = Result<T, ServerError>;
+
+/// A server error, mapped to an HTTP status in [`IntoResponse`].
+#[derive(Debug, thiserror::Error)]
+pub enum ServerError {
+    /// The target URL could not be parsed / is not a valid LDP target.
+    #[error("bad request: {0}")]
+    BadRequest(String),
+
+    /// An authentication failure surfaced from the verifier. Carries the exact status the verifier
+    /// chose (401 / 503) and the `WWW-Authenticate` challenge value, so the auth error contract is
+    /// owned by the verifier, not re-derived here.
+    #[error("unauthorized: {message}")]
+    Unauthorized {
+        status: u16,
+        message: String,
+        www_authenticate: String,
+    },
+
+    /// The caller is authenticated but not permitted.
+    ///
+    /// M2: this is produced by the full WAC engine once it lands; the M1 slice never authorizes
+    /// beyond authentication, so this is here for the seam, not yet emitted on a real ACL decision.
+    #[error("forbidden")]
+    Forbidden,
+
+    /// The requested resource does not exist (per SPARQ, the authoritative index).
+    #[error("not found")]
+    NotFound,
+
+    /// An unsupported or unparseable RDF content type.
+    #[error("unsupported media type: {0}")]
+    UnsupportedMediaType(String),
+
+    /// A failure in the storage layer (SPARQ index or blob store).
+    #[error("storage error: {0}")]
+    Storage(String),
+}
+
+impl ServerError {
+    /// The HTTP status this error maps to.
+    pub fn status(&self) -> StatusCode {
+        match self {
+            ServerError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ServerError::Unauthorized { status, .. } => {
+                StatusCode::from_u16(*status).unwrap_or(StatusCode::UNAUTHORIZED)
+            }
+            ServerError::Forbidden => StatusCode::FORBIDDEN,
+            ServerError::NotFound => StatusCode::NOT_FOUND,
+            ServerError::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ServerError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+impl IntoResponse for ServerError {
+    fn into_response(self) -> Response {
+        let status = self.status();
+        // Preserve the verifier's WWW-Authenticate challenge on auth failures (RFC 6750 §3).
+        if let ServerError::Unauthorized {
+            ref www_authenticate,
+            ..
+        } = self
+        {
+            let mut resp = (status, "unauthorized").into_response();
+            if let Ok(value) = www_authenticate.parse() {
+                resp.headers_mut()
+                    .insert(axum::http::header::WWW_AUTHENTICATE, value);
+            }
+            return resp;
+        }
+        // Non-leaky bodies: never echo internal detail to the client (spike §8 — non-leaky errors).
+        let public_body = match status {
+            StatusCode::INTERNAL_SERVER_ERROR => "internal server error",
+            StatusCode::NOT_FOUND => "not found",
+            StatusCode::FORBIDDEN => "forbidden",
+            StatusCode::UNSUPPORTED_MEDIA_TYPE => "unsupported media type",
+            _ => "bad request",
+        };
+        (status, public_body).into_response()
+    }
+}

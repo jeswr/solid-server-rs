@@ -1,0 +1,2 @@
+# Defaults are fine for this crate. Pinned explicitly so `cargo fmt --check` is stable in CI.
+edition = "2021"

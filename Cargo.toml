@@ -1,0 +1,54 @@
+[package]
+name = "solid-server-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+description = "EXPERIMENTAL parallel-track Rust reimplementation of a Solid/LDP server. SPARQ-authoritative for RDF + access-control; object_store/S3 backup-only for bytes. Does NOT replace the production TypeScript prod-solid-server."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jeswr/solid-server-rs"
+homepage = "https://github.com/jeswr/solid-server-rs"
+keywords = ["solid", "ldp", "rdf", "sparq", "server"]
+categories = ["web-programming::http-server"]
+readme = "README.md"
+publish = false
+
+[dependencies]
+# HTTP framework: axum on hyper 1.x + tokio (spike §4). The closest structural analogue to the
+# framework-agnostic LDP handler seam in prod-solid-server.
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+# tower-http middleware layer set (spike §4). M2 wires in CORS/security-headers/trace/body-limit.
+tower = "0.5"
+tower-http = { version = "0.7", features = ["trace"] }
+# TLS: rustls + aws-lc-rs (spike §4 — the house rule, FIPS-capable backend).
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
+# Auth: consume the standalone DPoP/Solid-OIDC verifier as a git dependency — do NOT reimplement.
+# At M1 (network adapters land in its M2); we use its StaticJwksProvider + InMemoryReplayStore seams.
+solid-oidc-verifier = { git = "https://github.com/jeswr/solid-oidc-verifier" }
+# RDF parse/serialise: oxttl (Turtle/N-Triples) + oxjsonld (JSON-LD ↔ RDF), via oxrdf model (spike §4).
+# oxttl 0.2 + oxjsonld 0.2 both pin `oxrdf =0.3.3`, so this is a coherent Oxigraph set.
+oxrdf = "0.3"
+oxttl = "0.2"
+oxjsonld = "0.2"
+# Blob storage seam: object_store gives one trait over S3/GCS/Azure/Local (spike §4).
+object_store = "0.13"
+# Async trait support for the Store / SparqClient / BlobStore seams.
+async-trait = "0.1"
+bytes = "1"
+http = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Mint test JWS access tokens + DPoP proofs for the auth-middleware unit tests (mirrors the
+# verifier crate's own test helpers — ES256 keys + RFC 7638 thumbprint).
+p256 = { version = "0.13", features = ["ecdsa", "jwk", "pem", "std"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+base64 = "0.22"
+sha2 = "0.10"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[features]
+default = []
