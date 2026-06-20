@@ -121,7 +121,7 @@ pub enum SparqHttpError {
     /// The server returned a 4xx — fatal (a malformed query / rejected request; retrying won't help).
     #[error("client error (HTTP {status})")]
     ClientStatus { status: u16 },
-    /// The response body exceeded [`MAX_RESPONSE_BYTES`] or could not be read — fatal.
+    /// The response body exceeded `MAX_RESPONSE_BYTES` or could not be read — fatal.
     #[error("response too large or unreadable")]
     Body,
     /// The response was not the expected shape (e.g. not valid sparql-results JSON) — fatal.
@@ -490,7 +490,7 @@ impl HttpSparqClient {
     /// `INSERT DATA`. Each term flows through the injection-safe builders. An empty triple set is a
     /// no-op (no request issued).
     ///
-    /// This is the write companion to [`construct_resource_ntriples`]: together they are a real
+    /// This is the write companion to [`HttpSparqClient::construct_resource_ntriples`]: together they are a real
     /// SPARQ-native body round-trip (insert → construct), exercising the [`sparql::insert_body_data`]
     /// builder end-to-end. The composite store still keeps resource BYTES in the blob store today, so
     /// the trait does not yet route writes through here; this is the seam a future SPARQ-native body

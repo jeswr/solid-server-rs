@@ -3,8 +3,8 @@
 //!
 //! [`build_router`] is generic over the verifier seams and the store seam so the same wiring serves
 //! both the M1 in-memory test stack and (M2) the network-backed production stack. The auth layer
-//! runs OUTERMOST on the protected routes: a request is authenticated (injecting a [`VerifiedToken`])
-//! before it reaches an LDP handler.
+//! runs OUTERMOST on the protected routes: a request is authenticated (injecting a
+//! [`VerifiedToken`](crate::auth::VerifiedToken)) before it reaches an LDP handler.
 //!
 //! M2 adds the tower-http middleware stack (CORS, security headers, request-id, trace, body-limit,
 //! timeout, rate-limit, load-shed — spike §4) around this, plus the discovery + notification routes.

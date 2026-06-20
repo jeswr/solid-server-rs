@@ -110,6 +110,7 @@ how tokens + DPoP proofs are minted and verified end-to-end.
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps   # rustdoc, deny warnings
 cargo test
 cargo build
 ```

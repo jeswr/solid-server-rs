@@ -14,7 +14,7 @@
 //! **mutations (PUT/POST/DELETE/PATCH) require an authenticated caller and are otherwise rejected
 //! (403)** — the conservative fail-closed posture (never fail open on a write). The `token` argument
 //! on each mutating handler is the seam where the per-resource WAC `write`/`append`/`control`
-//! decision plugs in. See [`require_authenticated`].
+//! decision plugs in. See `require_authenticated`.
 
 use std::sync::Arc;
 
@@ -282,7 +282,7 @@ pub async fn delete_handler<S: Store>(
 /// `PATCH /{path}` — apply a Solid N3 Patch (`text/n3`).
 ///
 /// The patch is parsed (insert/delete subset; a templated `where`/variable patch is a clear 422 —
-/// see [`patch`]), applied to the target's existing graph (a missing `deletes` triple ⇒ 409), and
+/// see [`patch_handler`]), applied to the target's existing graph (a missing `deletes` triple ⇒ 409), and
 /// the result re-serialised in the resource's stored format. PATCH on a missing resource that only
 /// inserts creates it (the LDP "create on PATCH" convention); a PATCH with deletes on a missing
 /// resource is a 409. `If-Match` is honoured. Fail-closed (public ⇒ 403).

@@ -46,7 +46,7 @@ impl From<super::sparql::BuildError> for SparqError {
 /// The authoritative RDF index over SPARQ.
 ///
 /// M1 defined only the metadata-record operations needed by GET/HEAD/PUT. M2 adds DELETE
-/// ([`SparqClient::delete_meta`]) and containment membership ([`SparqClient::add_child`] /
+/// ([`SparqClient::delete_meta`]) and containment membership ([`SparqClient::create_child`] /
 /// [`remove_child`](SparqClient::remove_child) / [`list_children`](SparqClient::list_children)) —
 /// SPARQ is authoritative for containment, so POST (mint a child) + the empty-container DELETE check
 /// flow through it, never an S3 LIST. M2-next: the `usage()` quota view + the WAC/ACP ACL-document
