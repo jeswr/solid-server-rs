@@ -167,20 +167,28 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
         // atomically (it returns NotFound if the container is not indexed at insert time), so this
         // closes the check-then-act race — a concurrent DELETE of the container is caught here rather
         // than producing a child under a missing container. A missing container ⇒ 404 with nothing
-        // written. `inserted` is true only if THIS call created the edge.
-        let inserted = match self.sparq.add_child(container, child).await {
-            Ok(inserted) => inserted,
+        // written.
+        match self.sparq.add_child(container, child).await {
+            Ok(_) => {}
             Err(SparqError::NotFound) => return Err(ServerError::NotFound),
             Err(SparqError::Backend(e)) => return Err(ServerError::Storage(e)),
-        };
+        }
         // Now write the resource bytes + index record. On a write failure, compensate by removing the
-        // containment edge — but ONLY the edge WE inserted, never a concurrent request's identical
-        // membership (the production server's compensating-action ordering; the reconciler is
-        // M2-next).
+        // containment edge — but ONLY if the child has NO successful index record. This is robust
+        // against every concurrent-same-IRI interleaving: the edge backs a child iff some create
+        // succeeded, so we tear it down precisely when none has. (If a concurrent request already
+        // wrote the child's metadata, its successful create still depends on the edge, so we leave
+        // it.) The membership↔metadata consistency is the durable invariant; the reconciler (M2-next)
+        // is the backstop for a crash between the two index writes.
         match self.write(child, body, content_type).await {
             Ok(meta) => Ok(meta),
             Err(e) => {
-                if inserted {
+                let child_has_record = self
+                    .sparq
+                    .exists(child)
+                    .await
+                    .map_err(|se| ServerError::Storage(format!("{se}")))?;
+                if !child_has_record {
                     let _ = self.sparq.remove_child(container, child).await;
                 }
                 Err(e)
