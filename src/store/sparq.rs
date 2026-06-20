@@ -58,7 +58,12 @@ pub trait SparqClient: Send + Sync {
     /// caller's existence check governs the 404, so this is a no-op-on-absent at the index layer).
     async fn delete_meta(&self, iri: &str) -> Result<(), SparqError>;
 
-    /// Record `child` as contained by `container` (authoritative `ldp:contains` membership).
+    /// Record `child` as contained by `container` (authoritative `ldp:contains` membership),
+    /// enforcing the parent-exists invariant ATOMICALLY: if `container` is not indexed at insert
+    /// time, this returns [`SparqError::NotFound`] WITHOUT recording the edge. This closes the
+    /// check-then-act race in the POST path — a concurrent DELETE of the container between the
+    /// handler's existence check and this insert cannot leave a member under a missing container,
+    /// because the existence test and the edge write happen under the index's own atomicity.
     async fn add_child(&self, container: &str, child: &str) -> Result<(), SparqError>;
 
     /// Remove `child` from `container`'s membership. Idempotent on an absent edge.
@@ -133,6 +138,11 @@ impl SparqClient for InMemorySparqClient {
             .inner
             .lock()
             .map_err(|_| SparqError::Backend("poisoned".into()))?;
+        // Atomic parent-exists check: the container's metadata + the membership edge live under the
+        // SAME lock, so a child can never be attached to a container that is not currently indexed.
+        if !guard.meta.contains_key(container) {
+            return Err(SparqError::NotFound);
+        }
         let entry = guard.children.entry(container.to_string()).or_default();
         if !entry.iter().any(|c| c == child) {
             entry.push(child.to_string());

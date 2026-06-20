@@ -163,15 +163,26 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
         body: Bytes,
         content_type: &str,
     ) -> ServerResult<ResourceMeta> {
-        // Write the resource exactly as a PUT would, then record the containment edge. Membership is
-        // recorded LAST so a failed write leaves no dangling member (the same byte-then-index, then
-        // membership ordering the production server uses; the reconciler is M2-next).
-        let meta = self.write(child, body, content_type).await?;
-        self.sparq
-            .add_child(container, child)
-            .await
-            .map_err(|e| ServerError::Storage(format!("{e}")))?;
-        Ok(meta)
+        // Record the containment edge FIRST: `add_child` enforces the parent-exists invariant
+        // atomically (it returns NotFound if the container is not indexed at insert time), so this
+        // closes the check-then-act race — a concurrent DELETE of the container is caught here rather
+        // than producing a child under a missing container. A missing container ⇒ 404 with nothing
+        // written.
+        match self.sparq.add_child(container, child).await {
+            Ok(()) => {}
+            Err(SparqError::NotFound) => return Err(ServerError::NotFound),
+            Err(SparqError::Backend(e)) => return Err(ServerError::Storage(e)),
+        }
+        // Now write the resource bytes + index record. On a write failure, compensate by removing the
+        // containment edge so no membership points at a non-existent child (the production server's
+        // compensating-action ordering; the reconciler is M2-next).
+        match self.write(child, body, content_type).await {
+            Ok(meta) => Ok(meta),
+            Err(e) => {
+                let _ = self.sparq.remove_child(container, child).await;
+                Err(e)
+            }
+        }
     }
 
     async fn delete(&self, iri: &str, parent: Option<&str>) -> ServerResult<()> {

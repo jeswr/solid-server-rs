@@ -106,6 +106,14 @@ async fn create_in_container_records_membership() {
     let s = store();
     let container = "https://pod.example/alice/";
     let child = "https://pod.example/alice/note1";
+    // The container must exist before a child can be attached (atomic parent-exists invariant).
+    s.write(
+        container,
+        Bytes::from_static(b"<#c> <#p> \"C\" ."),
+        "text/turtle",
+    )
+    .await
+    .unwrap();
     s.create_in_container(
         container,
         child,
@@ -121,10 +129,35 @@ async fn create_in_container_records_membership() {
 }
 
 #[tokio::test]
+async fn create_in_a_missing_container_is_not_found() {
+    let s = store();
+    // The container was never created — create_in_container must refuse + write nothing.
+    let err = s
+        .create_in_container(
+            "https://pod.example/missing/",
+            "https://pod.example/missing/child",
+            Bytes::from_static(b"<#it> <#p> \"x\" ."),
+            "text/turtle",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ServerError::NotFound));
+    // Nothing was written under the missing container.
+    assert!(!s.exists("https://pod.example/missing/child").await.unwrap());
+}
+
+#[tokio::test]
 async fn delete_detaches_from_parent_container() {
     let s = store();
     let container = "https://pod.example/alice/";
     let child = "https://pod.example/alice/note1";
+    s.write(
+        container,
+        Bytes::from_static(b"<#c> <#p> \"C\" ."),
+        "text/turtle",
+    )
+    .await
+    .unwrap();
     s.create_in_container(
         container,
         child,
