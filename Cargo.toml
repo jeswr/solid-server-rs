@@ -24,7 +24,9 @@ tower-http = { version = "0.7", features = ["trace"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
 # Auth: consume the standalone DPoP/Solid-OIDC verifier as a git dependency — do NOT reimplement.
 # At M1 (network adapters land in its M2); we use its StaticJwksProvider + InMemoryReplayStore seams.
-solid-oidc-verifier = { git = "https://github.com/jeswr/solid-oidc-verifier" }
+# Pinned to an exact rev (not the floating default branch) for reproducible, security-reviewable
+# builds; Cargo.lock is committed. M2: re-pin to a tagged release once the verifier cuts one.
+solid-oidc-verifier = { git = "https://github.com/jeswr/solid-oidc-verifier", rev = "c3224652daab67aed9986309b6aa7a8449b58658" }
 # RDF parse/serialise: oxttl (Turtle/N-Triples) + oxjsonld (JSON-LD ↔ RDF), via oxrdf model (spike §4).
 # oxttl 0.2 + oxjsonld 0.2 both pin `oxrdf =0.3.3`, so this is a coherent Oxigraph set.
 oxrdf = "0.3"

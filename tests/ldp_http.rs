@@ -81,6 +81,25 @@ impl Harness {
             .await
             .unwrap()
     }
+
+    /// An UNAUTHENTICATED request (no Authorization / DPoP).
+    async fn unauth_request(
+        &self,
+        method: &str,
+        path: &str,
+        content_type: Option<&str>,
+        body: Body,
+    ) -> axum::http::Response<Body> {
+        let mut builder = Request::builder().method(method).uri(path);
+        if let Some(ct) = content_type {
+            builder = builder.header("content-type", ct);
+        }
+        self.app
+            .clone()
+            .oneshot(builder.body(body).unwrap())
+            .await
+            .unwrap()
+    }
 }
 
 #[tokio::test]
@@ -168,6 +187,26 @@ async fn put_with_an_unsupported_content_type_is_415() {
         )
         .await;
     assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
+async fn unauthenticated_put_is_forbidden_fail_closed() {
+    // A write from a public/unauthenticated caller must be rejected (403), not allowed — the slice
+    // has no ACLs yet, so it fails closed on writes rather than fail open.
+    let h = Harness::new();
+    let resp = h
+        .unauth_request(
+            "PUT",
+            "/alice/data",
+            Some("text/turtle"),
+            Body::from(TURTLE),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // And nothing was written — a subsequent (authenticated) GET still 404s.
+    let get = h.request("GET", "/alice/data", None, Body::empty()).await;
+    assert_eq!(get.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

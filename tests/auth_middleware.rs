@@ -207,6 +207,31 @@ async fn http_get_with_a_bad_token_is_401_with_www_authenticate() {
     );
 }
 
+#[tokio::test]
+async fn http_get_with_a_non_utf8_authorization_header_is_400_not_public() {
+    // A present-but-unparseable Authorization header must NOT be silently downgraded to public
+    // access (a fail-open). It is a 400, distinct from an absent header (which is public → 404 here).
+    let issuer_key = KeyKit::generate();
+    let app = test_app(&issuer_key);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/alice/data")
+                // 0xFF is not valid UTF-8 → HeaderValue present but not str-convertible.
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    axum::http::HeaderValue::from_bytes(b"DPoP \xFF").unwrap(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 /// Assemble the full app over the in-memory store + a verifier trusting `issuer_key`.
 fn test_app(issuer_key: &KeyKit) -> axum::Router {
     let ctx = auth_context(issuer_key);

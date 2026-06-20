@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use axum::extract::{Request, State};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use solid_oidc_verifier::config::JwksProvider;
 use solid_oidc_verifier::replay::ReplayStore;
 use solid_oidc_verifier::verifier::{AuthRequest, Verifier};
@@ -89,26 +89,36 @@ where
 {
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
-    let authorization = header_string(&req, axum::http::header::AUTHORIZATION);
+
+    // Distinguish an ABSENT auth header (⇒ public) from one that is PRESENT but unparseable
+    // (non-UTF-8 bytes). A present-but-invalid credential must NOT be silently downgraded to public
+    // access — that is a fail-open. Reject it as a 400.
+    let authorization = match header_string(&req, axum::http::header::AUTHORIZATION) {
+        Ok(v) => v,
+        Err(()) => {
+            return ServerError::BadRequest("malformed Authorization header".into()).into_response()
+        }
+    };
     // DPoP is a custom header; look it up by its lowercase name.
-    let dpop = req
-        .headers()
-        .get("dpop")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+    let dpop = match header_string(&req, axum::http::HeaderName::from_static("dpop")) {
+        Ok(v) => v,
+        Err(()) => return ServerError::BadRequest("malformed DPoP header".into()).into_response(),
+    };
 
     match ctx.authenticate(authorization, dpop, &method, &path) {
         Ok(token) => {
             req.extensions_mut().insert(token);
             next.run(req).await
         }
-        Err(e) => axum::response::IntoResponse::into_response(e),
+        Err(e) => e.into_response(),
     }
 }
 
-fn header_string(req: &Request, name: axum::http::HeaderName) -> Option<String> {
-    req.headers()
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
+/// Read a header as a `String`. `Ok(None)` = absent; `Ok(Some(_))` = a valid value; `Err(())` =
+/// present but not valid UTF-8 (a malformed value that must be rejected, never treated as absent).
+fn header_string(req: &Request, name: axum::http::HeaderName) -> Result<Option<String>, ()> {
+    match req.headers().get(&name) {
+        None => Ok(None),
+        Some(value) => value.to_str().map(|s| Some(s.to_string())).map_err(|_| ()),
+    }
 }

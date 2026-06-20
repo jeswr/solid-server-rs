@@ -54,7 +54,8 @@ A coherent, compiling vertical slice with clean trait seams and unit tests:
 - A **minimal LDP path** — GET / HEAD / PUT on a single resource ([`src/ldp/`](src/ldp/)) over a
   [`Store`](src/store/mod.rs) trait whose composite impl reads/writes metadata via SPARQ
   (authoritative) and bytes via `object_store` (backup). Each seam has an **in-memory test double**,
-  so the whole stack runs without a SPARQ / S3 / IdP.
+  so the whole stack runs without a SPARQ / S3 / IdP. **Writes fail closed**: with no ACL engine yet
+  (M2), a PUT from a public/unauthenticated caller is rejected (403) rather than allowed.
 - **LDP target/URL parsing** ([`src/ldp/target.rs`](src/ldp/target.rs)) and **Turtle / JSON-LD**
   content-type handling + RDF validation via `oxttl` / `oxjsonld` ([`src/ldp/content.rs`](src/ldp/content.rs)).
 - **Unit + end-to-end tests** for the auth middleware (valid / invalid / missing / replayed token

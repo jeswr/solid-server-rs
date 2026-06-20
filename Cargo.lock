@@ -1357,7 +1357,7 @@ dependencies = [
 [[package]]
 name = "solid-oidc-verifier"
 version = "0.1.0"
-source = "git+https://github.com/jeswr/solid-oidc-verifier#c3224652daab67aed9986309b6aa7a8449b58658"
+source = "git+https://github.com/jeswr/solid-oidc-verifier?rev=c3224652daab67aed9986309b6aa7a8449b58658#c3224652daab67aed9986309b6aa7a8449b58658"
 dependencies = [
  "base64",
  "jsonwebtoken",

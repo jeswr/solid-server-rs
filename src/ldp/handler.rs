@@ -88,13 +88,22 @@ pub async fn head_handler<S: Store>(
 /// The body is validated as well-formed RDF in the declared content type before storage; an
 /// unsupported type is 415, a malformed body is 400. M2 adds the conditional-write CAS
 /// (If-None-Match/If-Match) + non-RDF binary resources.
+///
+/// **Fail-closed for writes.** Until the full WAC engine lands (M2), this slice does not consult
+/// ACLs — so a mutating request from a public/unauthenticated caller is **rejected** (a 403) rather
+/// than allowed. This is the conservative posture: never fail open on a write. M2 replaces this
+/// blanket check with the per-resource WAC `write`/`append` decision.
 pub async fn put_handler<S: Store>(
     State(state): State<Arc<LdpState<S>>>,
-    Extension(_token): Extension<VerifiedToken>,
+    Extension(token): Extension<VerifiedToken>,
     uri: axum::http::Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ServerError> {
+    // A write requires an authenticated caller (fail-closed; no ACLs in M1). M2: WAC decision here.
+    if token.is_public() {
+        return Err(ServerError::Forbidden);
+    }
     let target = parse_target(&state.base_url, uri.path())?;
     let content_type = headers
         .get(header::CONTENT_TYPE)
