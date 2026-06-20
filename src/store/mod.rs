@@ -167,19 +167,22 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
         // atomically (it returns NotFound if the container is not indexed at insert time), so this
         // closes the check-then-act race — a concurrent DELETE of the container is caught here rather
         // than producing a child under a missing container. A missing container ⇒ 404 with nothing
-        // written.
-        match self.sparq.add_child(container, child).await {
-            Ok(()) => {}
+        // written. `inserted` is true only if THIS call created the edge.
+        let inserted = match self.sparq.add_child(container, child).await {
+            Ok(inserted) => inserted,
             Err(SparqError::NotFound) => return Err(ServerError::NotFound),
             Err(SparqError::Backend(e)) => return Err(ServerError::Storage(e)),
-        }
+        };
         // Now write the resource bytes + index record. On a write failure, compensate by removing the
-        // containment edge so no membership points at a non-existent child (the production server's
-        // compensating-action ordering; the reconciler is M2-next).
+        // containment edge — but ONLY the edge WE inserted, never a concurrent request's identical
+        // membership (the production server's compensating-action ordering; the reconciler is
+        // M2-next).
         match self.write(child, body, content_type).await {
             Ok(meta) => Ok(meta),
             Err(e) => {
-                let _ = self.sparq.remove_child(container, child).await;
+                if inserted {
+                    let _ = self.sparq.remove_child(container, child).await;
+                }
                 Err(e)
             }
         }

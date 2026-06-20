@@ -147,6 +147,36 @@ async fn create_in_a_missing_container_is_not_found() {
 }
 
 #[tokio::test]
+async fn create_in_container_twice_keeps_a_single_membership() {
+    // Re-creating the same child IRI in a container must not duplicate the membership edge (the
+    // `inserted == false` idempotent path that the ownership-aware compensation relies on).
+    let s = store();
+    let container = "https://pod.example/alice/";
+    let child = "https://pod.example/alice/note1";
+    s.write(
+        container,
+        Bytes::from_static(b"<#c> <#p> \"C\" ."),
+        "text/turtle",
+    )
+    .await
+    .unwrap();
+    for _ in 0..2 {
+        s.create_in_container(
+            container,
+            child,
+            Bytes::from_static(b"<#it> <#p> \"x\" ."),
+            "text/turtle",
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        s.list_children(container).await.unwrap(),
+        vec![child.to_string()]
+    );
+}
+
+#[tokio::test]
 async fn delete_detaches_from_parent_container() {
     let s = store();
     let container = "https://pod.example/alice/";

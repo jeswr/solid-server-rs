@@ -64,7 +64,11 @@ pub trait SparqClient: Send + Sync {
     /// check-then-act race in the POST path — a concurrent DELETE of the container between the
     /// handler's existence check and this insert cannot leave a member under a missing container,
     /// because the existence test and the edge write happen under the index's own atomicity.
-    async fn add_child(&self, container: &str, child: &str) -> Result<(), SparqError>;
+    ///
+    /// Returns `Ok(true)` if THIS call inserted the edge, `Ok(false)` if it already existed. The
+    /// caller uses this to compensate (remove the edge on a later failure) ONLY for an edge it
+    /// actually inserted — never tearing down a concurrent request's identical membership.
+    async fn add_child(&self, container: &str, child: &str) -> Result<bool, SparqError>;
 
     /// Remove `child` from `container`'s membership. Idempotent on an absent edge.
     async fn remove_child(&self, container: &str, child: &str) -> Result<(), SparqError>;
@@ -133,7 +137,7 @@ impl SparqClient for InMemorySparqClient {
         Ok(())
     }
 
-    async fn add_child(&self, container: &str, child: &str) -> Result<(), SparqError> {
+    async fn add_child(&self, container: &str, child: &str) -> Result<bool, SparqError> {
         let mut guard = self
             .inner
             .lock()
@@ -144,10 +148,14 @@ impl SparqClient for InMemorySparqClient {
             return Err(SparqError::NotFound);
         }
         let entry = guard.children.entry(container.to_string()).or_default();
-        if !entry.iter().any(|c| c == child) {
+        if entry.iter().any(|c| c == child) {
+            // The edge already existed (e.g. a concurrent POST minted the same IRI) — report that we
+            // did NOT insert it, so the caller does not compensate away another request's membership.
+            Ok(false)
+        } else {
             entry.push(child.to_string());
+            Ok(true)
         }
-        Ok(())
     }
 
     async fn remove_child(&self, container: &str, child: &str) -> Result<(), SparqError> {
