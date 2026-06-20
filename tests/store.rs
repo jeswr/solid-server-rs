@@ -5,7 +5,9 @@
 use axum::body::Bytes;
 use solid_server_rs::error::ServerError;
 use solid_server_rs::ldp::content::{classify, validate_rdf, RdfFormat};
-use solid_server_rs::store::{CompositeStore, InMemoryBlobStore, InMemorySparqClient, Store};
+use solid_server_rs::store::{
+    CompositeStore, InMemoryBlobStore, InMemorySparqClient, ResourceMeta, SparqClient, Store,
+};
 
 const IRI: &str = "https://pod.example/alice/data";
 const TURTLE: &str =
@@ -148,8 +150,8 @@ async fn create_in_a_missing_container_is_not_found() {
 
 #[tokio::test]
 async fn create_in_container_twice_keeps_a_single_membership() {
-    // Re-creating the same child IRI in a container must not duplicate the membership edge (the
-    // `inserted == false` idempotent path that the ownership-aware compensation relies on).
+    // Re-creating the same child IRI in a container must not duplicate the membership edge
+    // (add_child is idempotent).
     let s = store();
     let container = "https://pod.example/alice/";
     let child = "https://pod.example/alice/note1";
@@ -172,6 +174,40 @@ async fn create_in_container_twice_keeps_a_single_membership() {
     }
     assert_eq!(
         s.list_children(container).await.unwrap(),
+        vec![child.to_string()]
+    );
+}
+
+#[tokio::test]
+async fn remove_child_if_orphan_only_removes_unbacked_edges() {
+    // Directly exercise the atomic compensating action on the SparqClient.
+    let sparq = InMemorySparqClient::new();
+    let container = "https://pod.example/alice/";
+    let child = "https://pod.example/alice/note1";
+    let meta = ResourceMeta {
+        content_type: "text/turtle".into(),
+        blob_key: "k".into(),
+        etag: "\"e\"".into(),
+    };
+    sparq.put_meta(container, meta.clone()).await.unwrap();
+    sparq.add_child(container, child).await.unwrap();
+
+    // Orphan edge (child has no metadata) ⇒ removed.
+    sparq
+        .remove_child_if_orphan(container, child)
+        .await
+        .unwrap();
+    assert!(sparq.list_children(container).await.unwrap().is_empty());
+
+    // Backed edge (child HAS metadata, e.g. a concurrent successful create) ⇒ preserved.
+    sparq.add_child(container, child).await.unwrap();
+    sparq.put_meta(child, meta).await.unwrap();
+    sparq
+        .remove_child_if_orphan(container, child)
+        .await
+        .unwrap();
+    assert_eq!(
+        sparq.list_children(container).await.unwrap(),
         vec![child.to_string()]
     );
 }

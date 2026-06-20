@@ -173,24 +173,18 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
             Err(SparqError::NotFound) => return Err(ServerError::NotFound),
             Err(SparqError::Backend(e)) => return Err(ServerError::Storage(e)),
         }
-        // Now write the resource bytes + index record. On a write failure, compensate by removing the
-        // containment edge — but ONLY if the child has NO successful index record. This is robust
-        // against every concurrent-same-IRI interleaving: the edge backs a child iff some create
-        // succeeded, so we tear it down precisely when none has. (If a concurrent request already
-        // wrote the child's metadata, its successful create still depends on the edge, so we leave
-        // it.) The membership↔metadata consistency is the durable invariant; the reconciler (M2-next)
-        // is the backstop for a crash between the two index writes.
+        // Now write the resource bytes + index record. On a write failure, compensate with the
+        // ATOMIC `remove_child_if_orphan`: it removes the containment edge under the index's own lock
+        // ONLY if the child has no metadata record. This is robust against every concurrent-same-IRI
+        // interleaving — the existence test and the edge removal cannot be split, so a concurrent
+        // creator that successfully wrote the child's metadata never has its membership torn down; the
+        // edge is removed precisely when no create (this request's or a concurrent one's) backs it.
+        // The membership↔metadata consistency is the durable invariant; the reconciler (M2-next) is
+        // the backstop for a crash between the two index writes.
         match self.write(child, body, content_type).await {
             Ok(meta) => Ok(meta),
             Err(e) => {
-                let child_has_record = self
-                    .sparq
-                    .exists(child)
-                    .await
-                    .map_err(|se| ServerError::Storage(format!("{se}")))?;
-                if !child_has_record {
-                    let _ = self.sparq.remove_child(container, child).await;
-                }
+                let _ = self.sparq.remove_child_if_orphan(container, child).await;
                 Err(e)
             }
         }

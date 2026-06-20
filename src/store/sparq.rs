@@ -70,6 +70,14 @@ pub trait SparqClient: Send + Sync {
     /// Remove `child` from `container`'s membership. Idempotent on an absent edge.
     async fn remove_child(&self, container: &str, child: &str) -> Result<(), SparqError>;
 
+    /// ATOMICALLY remove `child` from `container`'s membership ONLY IF `child` has no metadata
+    /// record (it is an orphaned edge with no backing resource). The existence test and the edge
+    /// removal happen under the index's own atomicity, so a concurrent creator that successfully
+    /// writes `child`'s metadata between a separate check and delete cannot have its membership torn
+    /// down. This is the compensating action for a failed `create_in_container` — it removes the edge
+    /// precisely when no create (this request's or a concurrent one's) backs it.
+    async fn remove_child_if_orphan(&self, container: &str, child: &str) -> Result<(), SparqError>;
+
     /// List the IRIs of `container`'s direct children (its `ldp:contains` members).
     async fn list_children(&self, container: &str) -> Result<Vec<String>, SparqError>;
 }
@@ -156,6 +164,23 @@ impl SparqClient for InMemorySparqClient {
             .inner
             .lock()
             .map_err(|_| SparqError::Backend("poisoned".into()))?;
+        if let Some(entry) = guard.children.get_mut(container) {
+            entry.retain(|c| c != child);
+        }
+        Ok(())
+    }
+
+    async fn remove_child_if_orphan(&self, container: &str, child: &str) -> Result<(), SparqError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| SparqError::Backend("poisoned".into()))?;
+        // The metadata check + the edge removal are under ONE lock, so a concurrent creator that
+        // writes the child's metadata cannot interleave between them — its membership survives. We
+        // remove the edge only when the child has no backing index record (a true orphan).
+        if guard.meta.contains_key(child) {
+            return Ok(());
+        }
         if let Some(entry) = guard.children.get_mut(container) {
             entry.retain(|c| c != child);
         }
