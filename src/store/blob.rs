@@ -92,6 +92,44 @@ pub trait BlobStore: Send + Sync {
     async fn stat(&self, key: &str) -> Result<Option<BlobEntry>, BlobError> {
         Ok(self.list().await?.into_iter().find(|e| e.key == key))
     }
+
+    /// ATOMIC compare-and-delete: remove `key` **iff** its current `last_modified` still equals
+    /// `expected_last_modified`. Returns `Ok(true)` if it deleted, `Ok(false)` if the witness no longer
+    /// matched (the bytes changed / the key vanished / its stamp moved) — in which case NOTHING was
+    /// removed. The single race-closing primitive the reconciler's final delete uses.
+    ///
+    /// # Why a CAS (the Finding-1 fix — the residual stat→delete TOCTOU)
+    /// With today's deterministic per-IRI blob keys an overwrite REUSES the same key. The reconciler
+    /// re-stats a candidate just before deleting it, but a recreate that rewrites the bytes in the gap
+    /// between that fresh stat and a plain `delete()` would have its NEW live bytes clobbered by the GC.
+    /// A separate `stat()` then `delete()` cannot close that window — there is always a gap between the
+    /// two calls. This method collapses the compare and the delete into ONE atomic step, so a concurrent
+    /// rewrite either lands BEFORE it (a newer stamp ⇒ witness mismatch ⇒ `Ok(false)`, not deleted) or
+    /// AFTER it (the old bytes are already gone) — there is no clobber window. The witness is the
+    /// fresh-stat's observed `last_modified`: a [`SystemTime`] (not the whole [`BlobEntry`]) because the
+    /// `last_modified` IS the only mutable property a same-key overwrite changes, so it is the complete
+    /// CAS witness — the cleanest shape.
+    ///
+    /// # Atomicity contract (load-bearing — an impl MUST honour it)
+    /// The comparison AND the removal MUST happen under a single, uninterrupted critical section with no
+    /// suspension point (no `await`, no lock release) between them. The in-memory double does the compare
+    /// + remove under ONE `Mutex` lock acquisition, which is genuinely race-free.
+    ///
+    /// No trait DEFAULT is provided: a default built on `stat()`-then-`delete()` would NOT be atomic and
+    /// would reintroduce exactly the TOCTOU this method exists to close — a non-atomic "default" would be
+    /// a silent footgun. So every impl MUST provide a genuinely atomic implementation.
+    ///
+    /// M2-next (the `object_store` adapter): implement with a backend-native conditional/versioned delete
+    /// — `object_store` `PutMode`/delete with an `if_match`/version precondition on the backends that
+    /// support it (S3 conditional writes / object versioning). On a backend WITHOUT a conditional delete,
+    /// the only safe option is **unique-per-write blob keys** (an overwrite never reuses a candidate's
+    /// key, so the reconciler can never target live bytes and the delete can be unconditional) — that
+    /// unique-key migration is an orthogonal beaded slice, NOT built here.
+    async fn delete_if_unchanged(
+        &self,
+        key: &str,
+        expected_last_modified: SystemTime,
+    ) -> Result<bool, BlobError>;
 }
 
 /// A stored blob in the in-memory double: the bytes + the insert/overwrite time (for the grace check).
@@ -201,5 +239,32 @@ impl BlobStore for InMemoryBlobStore {
             key: key.to_string(),
             last_modified: Some(blob.last_modified),
         }))
+    }
+
+    /// ATOMIC compare-and-delete: the compare AND the remove happen under a SINGLE `Mutex` lock
+    /// acquisition with NO `await`/lock release between them, so it is genuinely race-free. A concurrent
+    /// `put`/`put_with_time` (a same-key overwrite) cannot interleave: it either ran before this lock was
+    /// taken (so the stamp no longer equals `expected` ⇒ we DON'T remove, returning `false`) or it runs
+    /// after we release (the old entry is already gone). Either way the overwrite's live bytes are never
+    /// clobbered — there is no TOCTOU window. Returns whether a row was actually removed.
+    async fn delete_if_unchanged(
+        &self,
+        key: &str,
+        expected_last_modified: SystemTime,
+    ) -> Result<bool, BlobError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| BlobError::Backend("poisoned".into()))?;
+        // Compare the CURRENT stamp to the witness, then remove, all while still holding the lock.
+        match guard.get(key) {
+            Some(blob) if blob.last_modified == expected_last_modified => {
+                guard.remove(key);
+                Ok(true)
+            }
+            // Key gone, or its stamp moved since the witness was observed (a rewrite landed) ⇒ do NOT
+            // delete. The bytes under this key are no longer the ones the reconciler decided to GC.
+            _ => Ok(false),
+        }
     }
 }

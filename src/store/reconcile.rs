@@ -18,21 +18,33 @@
 //! 2. lists the physically-stored blobs ([`BlobStore::list`]) — the START-OF-SWEEP snapshot,
 //! 3. classifies each stored blob against that snapshot (referenced / too-young / undated / a
 //!    delete candidate),
-//! 4. re-fetches the referenced set ONCE more, then for each delete candidate RE-CHECKS it against that
-//!    fresh set AND RE-STATS its current `last_modified` ([`BlobStore::stat`]) immediately before
-//!    deleting — see the snapshot-staleness race below,
+//! 4. if there ARE delete candidates, re-fetches the referenced set ONCE more (skipped entirely when
+//!    there are none — see Finding 2), then for each delete candidate RE-CHECKS it against that fresh
+//!    set AND RE-STATS its current `last_modified` ([`BlobStore::stat`]) — see the snapshot-staleness
+//!    race below,
 //! 5. deletes a candidate **iff** it is STILL unreferenced (fresh index) AND STILL old enough (fresh
-//!    stat, not rewritten).
+//!    stat, not rewritten), via an ATOMIC compare-and-delete ([`BlobStore::delete_if_unchanged`]) that
+//!    removes the key only while its `last_modified` still equals the fresh-stat witness.
 //!
-//! ### The snapshot-staleness race (Finding 1 — why the re-check + re-stat exist)
+//! ### The snapshot-staleness race (Finding 1 — why the re-check + the ATOMIC CAS-delete exist)
 //! The blob list in step 2 is a SNAPSHOT; by the time the delete loop reaches a key, a resource may have
 //! been recreated/overwritten at the SAME blob key. Blob keys are TODAY deterministic per IRI, so an
 //! overwrite REUSES the key before — or as — its index row commits. A recreate landing between the
-//! snapshot and the `delete()` would otherwise make the GC clobber newly-written LIVE bytes. The
-//! re-check (fresh referenced set) + re-stat (fresh `last_modified`) narrow that window to the tiny
-//! (fresh-check → delete) gap. The DEFINITIVE race-free fix is **unique-per-write blob keys** (an
-//! overwrite never reuses a candidate's key, so the reconciler can never target live bytes) — that is a
-//! SEPARATE beaded slice; this reconciler only makes the sweep SAFE given today's deterministic keys.
+//! snapshot and the delete would otherwise make the GC clobber newly-written LIVE bytes. The defence is
+//! two-layered: (a) the fresh referenced-set re-check skips any candidate a recreate has re-referenced;
+//! and (b) the final delete is an ATOMIC compare-and-delete — [`BlobStore::delete_if_unchanged`] removes
+//! the key ONLY while its current `last_modified` still equals the witness the fresh stat observed, with
+//! the compare + remove under a single critical section (no suspension point between them). That CLOSES
+//! the race for a [`BlobStore`] with an atomic `delete_if_unchanged` (the in-memory store, the only real
+//! impl): a concurrent rewrite either lands before the CAS (newer stamp ⇒ CAS returns `false` ⇒ not
+//! deleted, recorded `skipped_revalidated`) or after it (the old bytes are already gone) — there is NO
+//! clobber window. A plain `stat()`-then-`delete()` could not close it (a gap always exists between the
+//! two calls); the atomic CAS can.
+//!
+//! The broader **unique-per-write blob keys** migration (an overwrite never reuses a candidate's key, so
+//! the delete could be unconditional) remains an orthogonal improvement on a SEPARATE beaded slice — but
+//! it is **no longer REQUIRED for reconciler correctness**: the atomic CAS already makes the sweep
+//! race-free for an atomic-`delete_if_unchanged` store.
 //!
 //! The grace period is the safety crux. There is an inverse race to the delete-orphan case: a *write
 //! in progress* PUTs its bytes and has NOT YET committed its index row — for that instant the blob is
@@ -51,6 +63,10 @@
 //! - **Fail-closed on the referenced set.** If [`SparqClient::referenced_blob_keys`] errors, the whole
 //!   sweep aborts with that error — it NEVER treats a failed query as "nothing is referenced" (which
 //!   would delete every blob in the pod). The referenced set is fetched BEFORE any delete.
+//! - **No work ⇒ no second query (Finding 2).** The pre-delete fresh referenced-set re-fetch runs ONLY
+//!   when there is at least one delete candidate. A sweep that finds nothing deletable (every blob
+//!   referenced / too-young / undated) returns its report WITHOUT the second query, so a transient SPARQ
+//!   error on that re-fetch can never fail a sweep that had nothing unsafe to do anyway.
 //! - **Idempotent + safe to re-run.** A second run over the same state finds the just-deleted orphans
 //!   gone, so it deletes nothing. Concurrent writes are protected by the grace window. The order
 //!   (referenced-set THEN list) means a blob created+committed between the two steps is simply seen as
@@ -219,13 +235,23 @@ pub async fn reconcile_orphans<S: SparqClient + ?Sized, B: BlobStore + ?Sized>(
         }
     }
 
+    // FINDING 2: short-circuit when there is NOTHING to delete. The pre-delete fresh referenced-set
+    // re-fetch (and the whole second pass) only exists to RE-VALIDATE delete candidates; with zero
+    // candidates there is nothing to re-validate and nothing unsafe to do, so we MUST NOT run a second
+    // SPARQ query that could fail a sweep that had no work. Return the report (already fully partitioned
+    // by the first pass — everything was referenced / too-young / undated) BEFORE the re-check.
+    if candidates.is_empty() {
+        return Ok(report);
+    }
+
     // RE-CHECK against the INDEX once, just before the delete pass (Finding 1, part a). The
     // start-of-sweep `referenced` set can be stale: with today's deterministic per-IRI blob keys an
     // overwrite/recreate REUSES the same key, so a resource recreated between the snapshot and now would
     // have committed a FRESH index row pointing at a candidate key — deleting it would clobber live
     // bytes. Re-fetching the referenced set ONCE here (not per-key) and skipping any candidate now in it
-    // closes that window down to the (this fetch → the per-key delete) gap. Fail-closed: if it errors we
-    // ABORT and delete nothing (a failed query is NEVER "nothing is referenced").
+    // is the first defence; the atomic CAS-delete below is the second. Fail-closed: if it errors we ABORT
+    // and delete nothing (a failed query is NEVER "nothing is referenced"). Reached only when there is at
+    // least one candidate (Finding 2).
     let referenced_fresh: HashSet<String> = sparq
         .referenced_blob_keys()
         .await
@@ -240,10 +266,11 @@ pub async fn reconcile_orphans<S: SparqClient + ?Sized, B: BlobStore + ?Sized>(
             continue;
         }
 
-        // (b) Re-STAT the key's CURRENT last_modified: a rewrite reuses the same key (deterministic
-        // keying), so if the bytes are now newer than the snapshot saw — or now young enough to be inside
-        // the grace window — the blob was overwritten and must NOT be deleted. A stat failure is treated
-        // fail-closed (skip, count under delete_errors) rather than blindly deleting on incomplete info.
+        // (b) Re-STAT the key's CURRENT last_modified to decide the disposition AND derive the CAS
+        // witness. A rewrite reuses the same key (deterministic keying), so if the bytes are now newer
+        // than the snapshot saw — or now young enough to be inside the grace window — the blob was
+        // overwritten and must NOT be deleted. A stat failure is treated fail-closed (skip, count under
+        // delete_errors) rather than blindly deleting on incomplete info.
         let current = match blob.stat(&key).await {
             Ok(Some(entry)) => entry,
             // The key is already gone (a concurrent delete / it never existed by delete-time) — nothing
@@ -258,19 +285,24 @@ pub async fn reconcile_orphans<S: SparqClient + ?Sized, B: BlobStore + ?Sized>(
                 continue;
             }
         };
-        let rewritten = match current.last_modified {
-            // The fresh stat reports no age ⇒ unknowable ⇒ fail-closed, do NOT delete.
-            None => true,
+        // The witness for the atomic CAS-delete: the `last_modified` the FRESH stat observed. An undated
+        // fresh stat (`None`) is unknowable ⇒ fail-closed, no witness ⇒ do NOT delete.
+        let witness = match current.last_modified {
+            None => {
+                report.skipped_revalidated += 1;
+                continue;
+            }
             Some(ts) => {
                 // Newer than the snapshot (overwritten), or now inside the grace window (a fresh write
-                // whose index row may not have committed yet). Either way, not safe to GC.
-                ts > snapshot_ts || now.duration_since(ts).unwrap_or(Duration::ZERO) < opts.grace
+                // whose index row may not have committed yet) ⇒ not safe to GC.
+                if ts > snapshot_ts || now.duration_since(ts).unwrap_or(Duration::ZERO) < opts.grace
+                {
+                    report.skipped_revalidated += 1;
+                    continue;
+                }
+                ts
             }
         };
-        if rewritten {
-            report.skipped_revalidated += 1;
-            continue;
-        }
 
         if opts.dry_run {
             // Deletable, but a dry run touches nothing — counted under `would_delete`, not `deleted`, so
@@ -280,17 +312,18 @@ pub async fn reconcile_orphans<S: SparqClient + ?Sized, B: BlobStore + ?Sized>(
         }
 
         // Still old enough + still unreferenced (fresh index) + not rewritten (fresh stat) + not a dry
-        // run ⇒ reclaim it. A per-key failure is recorded and the sweep CONTINUES (one bad key never
-        // aborts the whole GC).
-        //
-        // RESIDUAL RACE (documented): the two fresh checks above narrow the clobber window to the gap
-        // between this re-check/re-stat and the `delete()` below — a recreate that commits its index row
-        // AND rewrites the bytes in that sub-millisecond gap could still be lost. The DEFINITIVE
-        // race-free fix is unique-per-write blob keys (so an overwrite never reuses a candidate's key and
-        // the reconciler can never target live bytes); that is a SEPARATE beaded slice — this branch
-        // only makes the reconciler SAFE given today's deterministic keys.
-        match blob.delete(&key).await {
-            Ok(()) => report.deleted += 1,
+        // run ⇒ reclaim it via an ATOMIC compare-and-delete. `delete_if_unchanged` removes the key ONLY
+        // while its current `last_modified` still equals `witness` (the value the fresh stat just saw),
+        // with the compare + remove in ONE critical section. This CLOSES the residual stat→delete TOCTOU
+        // (Finding 1): a recreate that rewrites the bytes after our fresh stat moves the stamp, so the CAS
+        // sees the mismatch and returns `false` (recorded `skipped_revalidated`, NOT deleted, NOT an
+        // error) — the new live bytes are never clobbered. A genuine backend failure is recorded under
+        // `delete_errors` and the sweep CONTINUES (one bad key never aborts the whole GC).
+        match blob.delete_if_unchanged(&key, witness).await {
+            Ok(true) => report.deleted += 1,
+            // The bytes changed between the fresh stat and the CAS (a rewrite landed) ⇒ the CAS refused
+            // to delete. Not an orphan any more — record as revalidated, no clobber.
+            Ok(false) => report.skipped_revalidated += 1,
             Err(_) => report.delete_errors += 1,
         }
     }
@@ -615,6 +648,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn candidate_rewritten_in_the_atomic_cas_window_is_not_clobbered() {
+        // FINDING 1 (the residual stat→delete TOCTOU) regression, exercised through the ATOMIC path: a
+        // candidate that passes BOTH the fresh referenced re-check AND the fresh re-stat (so the
+        // un-CAS'd logic would `delete()` it) but whose bytes are rewritten in the gap before the delete.
+        // `CasMismatchBlobStore::stat()` reports the SNAPSHOT stamp (⇒ classified deletable, witness =
+        // snapshot stamp), but its `delete_if_unchanged()` sees a DIFFERENT current stamp ⇒ the CAS
+        // refuses ⇒ NOT deleted. The mutation-check: the atomic stamp comparison inside
+        // `delete_if_unchanged` is what flips the outcome to kept — remove that guard and the blob is
+        // deleted, failing this test.
+        let sparq = InMemorySparqClient::new();
+        let blob = CasMismatchBlobStore::new(
+            "rewritten-in-cas-window",
+            ago(3600), // what list() AND stat() report ⇒ passes re-stat ⇒ deletable, witness = this
+        );
+
+        let report = reconcile_orphans(&sparq, &blob, &opts()).await.unwrap();
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.orphaned, 1);
+        // The atomic CAS saw the stamp had moved ⇒ revalidated, NOT deleted.
+        assert_eq!(report.skipped_revalidated, 1);
+        assert_eq!(report.deleted, 0);
+        assert!(
+            !blob.removed(),
+            "the atomic CAS must REFUSE to delete when the witness no longer matches (the residual \
+             stat→delete TOCTOU): live bytes rewritten in the CAS window must NOT be clobbered"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_candidates_sweep_succeeds_even_if_second_referenced_query_errors() {
+        // FINDING 2: a sweep with NO delete candidates (everything referenced / too-young / undated) must
+        // return its report WITHOUT running the pre-delete fresh referenced-set re-fetch — so a transient
+        // SPARQ error on that 2nd query can never fail a sweep that had nothing unsafe to do.
+        //
+        // `SecondCallFailsSparq` returns {} on the FIRST `referenced_blob_keys()` (the snapshot) and
+        // ERRORS on every later call. The only blob is too-young ⇒ zero candidates ⇒ the 2nd query must
+        // never run. If the empty-candidates short-circuit were removed, the 2nd query would fire and the
+        // sweep would abort with ReferencedSet — the mutation-check.
+        let sparq = SecondCallFailsSparq::new();
+        let blob = InMemoryBlobStore::new();
+        blob.put_with_time("young-orphan", Bytes::from_static(b"x"), ago(1)); // < 60s grace ⇒ too-young
+
+        let report = reconcile_orphans(&sparq, &blob, &opts())
+            .await
+            .expect("zero-candidate sweep must not run (or fail on) the 2nd referenced query");
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.orphaned, 1);
+        assert_eq!(report.too_young, 1);
+        assert_eq!(report.deleted, 0);
+        // The 2nd referenced query was never made (only the snapshot call).
+        assert_eq!(
+            sparq.calls(),
+            1,
+            "the pre-delete fresh referenced-set re-fetch must be skipped when there are no candidates"
+        );
+    }
+
+    #[tokio::test]
     async fn referenced_set_error_aborts_and_deletes_nothing() {
         // Fail-closed: if the referenced-set query fails we must NOT delete (a failed query is NOT
         // "nothing is referenced"). The blob list is never even consulted.
@@ -743,6 +834,150 @@ mod tests {
                 last_modified: Some(self.stat_stamp),
             }))
         }
+        async fn delete_if_unchanged(
+            &self,
+            key: &str,
+            _expected: SystemTime,
+        ) -> Result<bool, BlobError> {
+            // The rewritten candidate is caught by the re-stat (newer than snapshot) BEFORE the CAS, so
+            // this is not reached in the rewrite test; record any call so we can assert it was never hit.
+            self.deleted.lock().expect("poisoned").push(key.to_string());
+            Ok(true)
+        }
+    }
+
+    /// A blob store that passes the reconciler's snapshot+re-stat checks (so the candidate is classified
+    /// deletable with a known witness) but whose ATOMIC `delete_if_unchanged` reports the witness has
+    /// CHANGED — modelling a same-key rewrite landing in the residual gap between the fresh stat and the
+    /// CAS. `list()` and `stat()` both report `stamp` (⇒ deletable, witness = `stamp`); but
+    /// `delete_if_unchanged` returns `Ok(false)` (the stamp moved) and records NOTHING removed. The CAS
+    /// stamp comparison is the load-bearing guard: a `delete_if_unchanged` that ignored the witness and
+    /// always removed would delete the blob, failing the regression test.
+    struct CasMismatchBlobStore {
+        key: String,
+        stamp: SystemTime,
+        removed: Mutex<bool>,
+    }
+    impl CasMismatchBlobStore {
+        fn new(key: &str, stamp: SystemTime) -> Self {
+            Self {
+                key: key.to_string(),
+                stamp,
+                removed: Mutex::new(false),
+            }
+        }
+        fn removed(&self) -> bool {
+            *self.removed.lock().expect("poisoned")
+        }
+    }
+    #[async_trait::async_trait]
+    impl BlobStore for CasMismatchBlobStore {
+        async fn get(&self, _: &str) -> Result<Bytes, BlobError> {
+            Ok(Bytes::from_static(b"x"))
+        }
+        async fn put(&self, _: &str, _: Bytes) -> Result<(), BlobError> {
+            Ok(())
+        }
+        async fn exists(&self, key: &str) -> Result<bool, BlobError> {
+            Ok(key == self.key)
+        }
+        async fn delete(&self, key: &str) -> Result<(), BlobError> {
+            // Unconditional delete: should NOT be reached by the reconciler (it uses the CAS path).
+            if key == self.key {
+                *self.removed.lock().expect("poisoned") = true;
+            }
+            Ok(())
+        }
+        async fn list(&self) -> Result<Vec<super::super::blob::BlobEntry>, BlobError> {
+            Ok(vec![super::super::blob::BlobEntry {
+                key: self.key.clone(),
+                last_modified: Some(self.stamp),
+            }])
+        }
+        async fn stat(
+            &self,
+            key: &str,
+        ) -> Result<Option<super::super::blob::BlobEntry>, BlobError> {
+            // Same stamp as list() ⇒ NOT classified rewritten ⇒ passes the re-stat ⇒ witness = stamp.
+            Ok((key == self.key).then(|| super::super::blob::BlobEntry {
+                key: self.key.clone(),
+                last_modified: Some(self.stamp),
+            }))
+        }
+        async fn delete_if_unchanged(
+            &self,
+            _key: &str,
+            expected: SystemTime,
+        ) -> Result<bool, BlobError> {
+            // The CAS witness comparison: the current stamp has moved (rewrite landed in the gap), so the
+            // observed value differs from `expected` ⇒ refuse to delete. The +1s models the newer stamp.
+            let current = self.stamp + Duration::from_secs(1);
+            if current == expected {
+                *self.removed.lock().expect("poisoned") = true;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+    }
+
+    /// A SPARQ client whose `referenced_blob_keys` returns the EMPTY set on the FIRST call (the
+    /// start-of-sweep snapshot) and ERRORS on every later call — to prove the pre-delete fresh re-fetch
+    /// is SKIPPED when there are no delete candidates (Finding 2). Only `referenced_blob_keys` is
+    /// reachable; the rest panic.
+    struct SecondCallFailsSparq {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl SecondCallFailsSparq {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    #[async_trait::async_trait]
+    impl SparqClient for SecondCallFailsSparq {
+        async fn get_meta(&self, _: &str) -> Result<ResourceMeta, SparqError> {
+            unreachable!()
+        }
+        async fn put_meta(&self, _: &str, _: ResourceMeta) -> Result<(), SparqError> {
+            unreachable!()
+        }
+        async fn exists(&self, _: &str) -> Result<bool, SparqError> {
+            unreachable!()
+        }
+        async fn delete_meta(&self, _: &str) -> Result<(), SparqError> {
+            unreachable!()
+        }
+        async fn delete_meta_if_empty(
+            &self,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<super::super::sparq::DeleteOutcome, SparqError> {
+            unreachable!()
+        }
+        async fn create_child(&self, _: &str, _: &str, _: ResourceMeta) -> Result<(), SparqError> {
+            unreachable!()
+        }
+        async fn remove_child(&self, _: &str, _: &str) -> Result<(), SparqError> {
+            unreachable!()
+        }
+        async fn list_children(&self, _: &str) -> Result<Vec<String>, SparqError> {
+            unreachable!()
+        }
+        async fn referenced_blob_keys(&self) -> Result<HashSet<String>, SparqError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                Ok(HashSet::new())
+            } else {
+                Err(SparqError::Backend(
+                    "second referenced-set query must not run with zero candidates".into(),
+                ))
+            }
+        }
     }
 
     /// A blob store whose `list` reports keys with NO last_modified (the unknown-age path).
@@ -779,6 +1014,13 @@ mod tests {
                 key: self.key.clone(),
                 last_modified: None,
             }])
+        }
+        async fn delete_if_unchanged(
+            &self,
+            key: &str,
+            expected: SystemTime,
+        ) -> Result<bool, BlobError> {
+            self.inner.delete_if_unchanged(key, expected).await
         }
     }
 

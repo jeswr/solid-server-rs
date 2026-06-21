@@ -556,6 +556,16 @@ impl BlobStore for CountingBlob {
     async fn list(&self) -> Result<Vec<solid_server_rs::store::BlobEntry>, BlobError> {
         self.inner.list().await
     }
+
+    async fn delete_if_unchanged(
+        &self,
+        key: &str,
+        expected: std::time::SystemTime,
+    ) -> Result<bool, BlobError> {
+        // Delegate to the inner atomic CAS. This is the reconciler's delete path, not the inline
+        // post-index-delete `delete` this test counts — so it deliberately does NOT bump `deletes_seen`.
+        self.inner.delete_if_unchanged(key, expected).await
+    }
 }
 
 #[tokio::test]
