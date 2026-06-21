@@ -16,9 +16,10 @@ publish = false
 # HTTP framework: axum on hyper 1.x + tokio (spike §4). The closest structural analogue to the
 # framework-agnostic LDP handler seam in prod-solid-server.
 axum = "0.8"
-# `time` is required by the M3 HttpSparqClient's per-request `tokio::time::timeout` (do NOT rely on
-# a transitive enable — that's fragile under feature-unification changes).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+# `time` is required by the M3 HttpSparqClient's per-request `tokio::time::timeout`; `fs` is required
+# by `tls::read_pem`'s `tokio::fs::read`. Declare both directly — do NOT rely on a transitive enable,
+# which is fragile under feature-unification changes.
+tokio = { version = "1", features = ["fs", "rt-multi-thread", "macros", "net", "signal", "time"] }
 # tower-http middleware layer set (spike §4). M2 wires in CORS/security-headers/trace/body-limit.
 tower = "0.5"
 tower-http = { version = "0.7", features = ["trace"] }

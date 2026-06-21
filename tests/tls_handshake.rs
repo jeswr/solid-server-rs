@@ -122,3 +122,105 @@ async fn tls_handshake_serves_https() {
 
     server_task.abort();
 }
+
+/// BIND-ADDR PARITY (finding 3), always-run: the TLS serve path now resolves `SOLID_SERVER_BIND` via
+/// `tokio::net::TcpListener::bind` (the same call the plain-HTTP path uses), which accepts a
+/// `hostname:port` string — whereas the OLD TLS path parsed `SocketAddr`, which REJECTS a hostname.
+/// This pins both halves of the regression: the hostname binds through the new path, and would have
+/// failed through the old `SocketAddr::parse` path.
+#[tokio::test]
+async fn tls_bind_resolves_hostname_like_plain_path() {
+    let bind = "localhost:0";
+
+    // OLD TLS behaviour: `SocketAddr::parse` rejects a hostname — this is the regression the fix
+    // removes. (Asserting it documents WHY the plain path and the old TLS path diverged.)
+    assert!(
+        bind.parse::<std::net::SocketAddr>().is_err(),
+        "a hostname:port must NOT parse as a numeric SocketAddr (else this test proves nothing)"
+    );
+
+    // NEW TLS behaviour == plain-path behaviour: resolve through tokio's bind, which honours the
+    // hostname. A successful bind proves TLS mode now accepts the same address strings as plain mode.
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .expect("tokio bind must accept a hostname:port (parity with the plain-HTTP path)");
+    let addr = listener.local_addr().expect("local addr");
+    assert!(addr.port() != 0, "an ephemeral port should be assigned");
+    assert!(
+        addr.ip().is_loopback(),
+        "localhost should resolve to loopback"
+    );
+
+    // And the listener converts to the blocking std listener that `from_tcp_rustls` consumes — the
+    // exact hand-off the TLS serve arm performs.
+    let std_listener = listener.into_std().expect("into_std");
+    std_listener.set_nonblocking(true).expect("set_nonblocking");
+}
+
+/// GRACEFUL-SHUTDOWN PARITY (finding 2) + the `from_tcp_rustls`/`Handle` wiring (findings 2 & 3),
+/// `#[ignore]`d like the handshake test (real socket I/O + fixture cert). Drives the EXACT serve
+/// construction the binary now uses — `from_tcp_rustls(std_listener, cfg).handle(handle).serve(..)`
+/// over a HOSTNAME-resolved listener — completes a real TLS handshake, then triggers
+/// `handle.graceful_shutdown(Some(..))` and asserts the server task RETURNS (drains and exits) rather
+/// than being force-aborted. The old TLS path had no handle, so Ctrl-C could not drain it.
+#[tokio::test]
+#[ignore = "needs the fixture test cert + real socket I/O; run with --ignored"]
+async fn tls_graceful_shutdown_drains_via_handle() {
+    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let mode = TlsMode::Tls {
+        cert_path: CERT_PATH.into(),
+        key_path: KEY_PATH.into(),
+    };
+    let rustls_config = build_rustls_config(&mode)
+        .await
+        .expect("build rustls config")
+        .expect("TLS mode yields a config");
+
+    let app = Router::new().route("/healthz", get(|| async { "ok" }));
+
+    // Hostname bind (parity) → blocking std listener → from_tcp_rustls + Handle (the binary's path).
+    let tokio_listener = tokio::net::TcpListener::bind("localhost:0")
+        .await
+        .expect("hostname bind");
+    let addr = tokio_listener.local_addr().expect("local addr");
+    let std_listener = tokio_listener.into_std().expect("into_std");
+    std_listener.set_nonblocking(true).expect("set_nonblocking");
+
+    let handle = axum_server::Handle::new();
+    let server_handle = handle.clone();
+    let server_task = tokio::spawn(async move {
+        axum_server::from_tcp_rustls(std_listener, rustls_config)
+            .expect("from_tcp_rustls")
+            .handle(server_handle)
+            .serve(app.into_make_service())
+            .await
+    });
+
+    // Complete a real handshake first (proves the listener is serving TLS), then drain.
+    let connector = TlsConnector::from(Arc::new(client_config()));
+    let dns_name = ServerName::try_from("localhost").expect("server name");
+    let mut connected = false;
+    for _ in 0..50 {
+        if let Ok(tcp) = tokio::net::TcpStream::connect(addr).await {
+            if connector.connect(dns_name.clone(), tcp).await.is_ok() {
+                connected = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(connected, "could not complete a handshake before shutdown");
+
+    // Trigger graceful shutdown with a drain timeout (the binary uses 10s; the test uses a short one
+    // so it is fast). With no in-flight requests the server should return promptly.
+    handle.graceful_shutdown(Some(std::time::Duration::from_secs(2)));
+
+    // The server task must RETURN on its own (graceful) — NOT hang. If the handle were not wired,
+    // `serve(..)` would run forever and this `timeout` would elapse.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), server_task)
+        .await
+        .expect("server did not shut down within timeout — graceful_shutdown not wired")
+        .expect("server task panicked");
+    result.expect("serve returned an error");
+}

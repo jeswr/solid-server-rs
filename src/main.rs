@@ -23,6 +23,8 @@
 //! terminates HTTPS in-process via `axum-server` over the house rustls/aws-lc-rs stack; when NEITHER
 //! is set it keeps the plain-TCP listener (terminate TLS at a reverse proxy). See [`solid_server_rs::tls`]
 //! for the config-shape decision (PEM paths, both-or-neither validation, ACME noted as a future seam).
+//! Both serve paths share the same `SOLID_SERVER_BIND` resolution (hostname:port accepted, not only a
+//! numeric `SocketAddr`) and the same Ctrl-C graceful-drain behaviour.
 //!
 //! ## Still seamed (not in this slice)
 //! - The live SPARQ HTTP client + the `object_store`-backed blob store (the binary still boots the
@@ -154,13 +156,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("WARNING: experimental parallel track — NOT the production prod-solid-server.");
 
     match rustls_config {
-        // HTTPS: axum-server terminates TLS over the process-wide aws-lc-rs rustls provider. Its
-        // serve loop owns graceful shutdown internally; Ctrl-C still stops the process.
+        // HTTPS: axum-server terminates TLS over the process-wide aws-lc-rs rustls provider, with the
+        // SAME graceful-shutdown + bind-resolution behaviour as the plain-HTTP path below.
+        //
+        // Bind-addr PARITY: resolve `bind` with `tokio::net::TcpListener::bind`, exactly as the plain
+        // path does, so a hostname:port string (e.g. `localhost:3000`) works in TLS mode too — it
+        // would be rejected by `SocketAddr::parse`, which only accepts a numeric address. We then hand
+        // the already-bound listener to `axum_server::from_tcp_rustls`, which serves TLS over an
+        // existing `std::net::TcpListener` (so no second, parse-restricted bind).
         Some(config) => {
-            let addr: std::net::SocketAddr = bind
-                .parse()
-                .map_err(|e| format!("SOLID_SERVER_BIND ({bind}) is not a socket address: {e}"))?;
-            axum_server::bind_rustls(addr, config)
+            let tokio_listener = tokio::net::TcpListener::bind(&bind).await?;
+            // axum-server wants a blocking `std::net::TcpListener`; converting the tokio one keeps the
+            // resolved address (and avoids re-binding through the numeric-only `SocketAddr` path).
+            let std_listener = tokio_listener.into_std()?;
+            std_listener.set_nonblocking(true)?;
+
+            // Graceful-shutdown PARITY: wire `shutdown_signal()` to `Handle::graceful_shutdown` so
+            // Ctrl-C drains in-flight TLS connections instead of dropping them, matching the plain
+            // path's `with_graceful_shutdown`.
+            let handle = axum_server::Handle::new();
+            let shutdown_handle = handle.clone();
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                // DRAIN TIMEOUT (best-call, per the standing rule): give in-flight requests up to 10s
+                // to finish, then force-close. 10s is the conventional reverse-proxy / k8s
+                // `terminationGracePeriod` default — long enough for a normal LDP request (incl. a
+                // backend SPARQ round-trip) to complete, short enough that a stuck connection cannot
+                // wedge shutdown. `Some(..)` (not `None`) is deliberate: `None` would wait FOREVER for
+                // a hung connection, which is the opposite of graceful.
+                shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
+            });
+
+            axum_server::from_tcp_rustls(std_listener, config)?
+                .handle(handle)
                 .serve(app.into_make_service())
                 .await?;
         }

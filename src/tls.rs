@@ -26,6 +26,7 @@
 //! picks that provider up. We validate at boot that a provider is installed before building a config,
 //! so a misorder surfaces as a clear error rather than a runtime panic on the first handshake.
 
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -120,24 +121,38 @@ impl std::error::Error for TlsConfigError {
 ///
 /// This is pure config parsing — it does NOT touch the filesystem (that is [`build_rustls_config`]'s
 /// job), so a caller can distinguish "you set one of the pair" (a fast, dependency-free error) from
-/// "the file is bad". The env values are trimmed; a present-but-blank value is treated as set (an operator who
-/// exports `SOLID_SERVER_TLS_CERT=` clearly intends TLS and should get the incomplete/empty error,
-/// not a silent plaintext downgrade).
+/// "the file is bad". A present-but-blank value is treated as set (an operator who exports
+/// `SOLID_SERVER_TLS_CERT=` clearly intends TLS and should get the incomplete/empty error, not a
+/// silent plaintext downgrade).
+///
+/// We read with [`std::env::var_os`] (NOT [`std::env::var`]) on purpose: `var` returns `Err` — which
+/// `.ok()` would flatten to `None`, i.e. "absent" — for a value that is PRESENT but not valid Unicode.
+/// Treating a present-but-non-Unicode TLS path as absent would let TWO non-Unicode paths silently
+/// fall back to plaintext, violating the both-or-neither fail-closed rule. `var_os` returns the raw
+/// `OsString` so a present path is honoured regardless of encoding (a path is an `OsStr`, not a
+/// `String`, anyway — so this is also the correct type for a filesystem path).
 pub fn mode_from_env() -> Result<TlsMode, TlsConfigError> {
-    let cert = std::env::var(ENV_TLS_CERT).ok();
-    let key = std::env::var(ENV_TLS_KEY).ok();
+    let cert = std::env::var_os(ENV_TLS_CERT);
+    let key = std::env::var_os(ENV_TLS_KEY);
     mode_from_values(cert.as_deref(), key.as_deref())
 }
 
 /// The testable core of [`mode_from_env`]: resolve the mode from explicit option values. `None`
 /// means the var is absent; `Some("")` (or whitespace) means it is set-but-blank (still "set", which
 /// makes the both-or-neither rule fail closed rather than downgrading to plaintext).
-pub fn mode_from_values(cert: Option<&str>, key: Option<&str>) -> Result<TlsMode, TlsConfigError> {
+///
+/// Takes `Option<&OsStr>` (not `Option<&str>`) so a present-but-non-Unicode path is honoured — never
+/// mistaken for "absent" and silently downgraded to plaintext (the fail-closed invariant). The
+/// `OsString` is carried straight into a `PathBuf`, which is exactly its target type.
+pub fn mode_from_values(
+    cert: Option<&OsStr>,
+    key: Option<&OsStr>,
+) -> Result<TlsMode, TlsConfigError> {
     match (cert, key) {
         (None, None) => Ok(TlsMode::Plain),
         (Some(c), Some(k)) => Ok(TlsMode::Tls {
-            cert_path: PathBuf::from(c.trim()),
-            key_path: PathBuf::from(k.trim()),
+            cert_path: PathBuf::from(trim_os(c)),
+            key_path: PathBuf::from(trim_os(k)),
         }),
         (Some(_), None) => Err(TlsConfigError::Incomplete {
             present: ENV_TLS_CERT,
@@ -147,6 +162,24 @@ pub fn mode_from_values(cert: Option<&str>, key: Option<&str>) -> Result<TlsMode
             present: ENV_TLS_KEY,
             missing: ENV_TLS_CERT,
         }),
+    }
+}
+
+/// Trim leading/trailing ASCII whitespace from an `OsStr` without requiring it to be valid Unicode.
+///
+/// We can't call `str::trim` (the value may be non-Unicode), but a path's leading/trailing ASCII
+/// whitespace is byte-identifiable on every platform whose `OsStr` is byte-based; on platforms where
+/// it is not (e.g. Windows' WTF-8), a Unicode value still trims via the lossy round-trip and a
+/// non-Unicode value is returned verbatim (no silent corruption). The common operator case — a path
+/// with stray surrounding whitespace from a shell export — is handled, while a present non-Unicode
+/// path is preserved intact rather than dropped.
+fn trim_os(value: &OsStr) -> OsString {
+    match value.to_str() {
+        // Valid Unicode: trim like before (covers the common shell-export-with-whitespace case).
+        Some(s) => OsString::from(s.trim()),
+        // Non-Unicode: cannot safely byte-trim across platforms — honour the path verbatim. The
+        // fail-closed point is that it is USED, never dropped.
+        None => value.to_os_string(),
     }
 }
 
@@ -209,6 +242,11 @@ async fn read_pem(which: &'static str, path: &Path) -> Result<Vec<u8>, TlsConfig
 mod tests {
     use super::*;
 
+    /// Build an `Option<&OsStr>` from a `&str` for the mode-resolution tests.
+    fn os(s: &str) -> Option<&OsStr> {
+        Some(OsStr::new(s))
+    }
+
     #[test]
     fn neither_set_is_plain() {
         assert_eq!(mode_from_values(None, None).unwrap(), TlsMode::Plain);
@@ -216,7 +254,7 @@ mod tests {
 
     #[test]
     fn both_set_is_tls() {
-        let mode = mode_from_values(Some("/etc/tls/cert.pem"), Some("/etc/tls/key.pem")).unwrap();
+        let mode = mode_from_values(os("/etc/tls/cert.pem"), os("/etc/tls/key.pem")).unwrap();
         assert_eq!(
             mode,
             TlsMode::Tls {
@@ -228,7 +266,7 @@ mod tests {
 
     #[test]
     fn both_set_trims_whitespace() {
-        let mode = mode_from_values(Some("  /c.pem  "), Some("\t/k.pem\n")).unwrap();
+        let mode = mode_from_values(os("  /c.pem  "), os("\t/k.pem\n")).unwrap();
         assert_eq!(
             mode,
             TlsMode::Tls {
@@ -240,7 +278,7 @@ mod tests {
 
     #[test]
     fn cert_only_is_incomplete() {
-        let err = mode_from_values(Some("/c.pem"), None).unwrap_err();
+        let err = mode_from_values(os("/c.pem"), None).unwrap_err();
         match err {
             TlsConfigError::Incomplete { present, missing } => {
                 assert_eq!(present, ENV_TLS_CERT);
@@ -256,7 +294,7 @@ mod tests {
 
     #[test]
     fn key_only_is_incomplete() {
-        let err = mode_from_values(None, Some("/k.pem")).unwrap_err();
+        let err = mode_from_values(None, os("/k.pem")).unwrap_err();
         match err {
             TlsConfigError::Incomplete { present, missing } => {
                 assert_eq!(present, ENV_TLS_KEY);
@@ -269,8 +307,62 @@ mod tests {
     #[test]
     fn blank_value_counts_as_set_so_one_blank_is_incomplete() {
         // An exported-but-empty var means "I intended TLS" — must NOT silently downgrade to plain.
-        let err = mode_from_values(Some(""), None).unwrap_err();
+        let err = mode_from_values(os(""), None).unwrap_err();
         assert!(matches!(err, TlsConfigError::Incomplete { .. }));
+    }
+
+    #[test]
+    fn non_unicode_paths_do_not_downgrade_to_plaintext() {
+        // FAIL-CLOSED: a present-but-non-Unicode pair must resolve to TLS (the path is HONOURED),
+        // never be mistaken for "absent" and silently downgraded to plaintext. This is the regression
+        // guard for the `var`/`.ok()` bug: `var` would have returned Err for a non-Unicode value,
+        // `.ok()` would have flattened it to None ("absent"), and two such values would have produced
+        // `TlsMode::Plain` — a silent plaintext downgrade. `var_os` + `OsStr` carry the bytes through.
+        let (cert, key) = non_unicode_pair();
+        let mode = mode_from_values(Some(&cert), Some(&key)).unwrap();
+        match mode {
+            TlsMode::Tls {
+                cert_path,
+                key_path,
+            } => {
+                // The exact non-Unicode bytes survived into the PathBuf (not dropped/lossily mangled).
+                assert_eq!(cert_path.as_os_str(), cert.as_os_str());
+                assert_eq!(key_path.as_os_str(), key.as_os_str());
+            }
+            TlsMode::Plain => panic!("non-Unicode TLS paths silently downgraded to plaintext"),
+        }
+    }
+
+    #[test]
+    fn one_non_unicode_path_is_incomplete_not_plain() {
+        // Exactly one non-Unicode path set is still the both-or-neither error, NOT a plaintext
+        // downgrade — the present (non-Unicode) value must be SEEN as present.
+        let (cert, _key) = non_unicode_pair();
+        let err = mode_from_values(Some(&cert), None).unwrap_err();
+        assert!(
+            matches!(err, TlsConfigError::Incomplete { .. }),
+            "one non-Unicode path should be Incomplete, got {err:?}"
+        );
+    }
+
+    /// A cert/key `OsString` pair containing bytes that are NOT valid Unicode, on platforms where
+    /// `OsString` is byte-based (Unix) — the exact case `std::env::var` rejects. On other platforms
+    /// fall back to a valid-Unicode pair (still exercising the `OsStr` path; the non-Unicode-specific
+    /// downgrade bug is Unix-shaped where env values are arbitrary bytes).
+    fn non_unicode_pair() -> (OsString, OsString) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            // 0x80/0xFF are invalid as standalone UTF-8 — `String::from_utf8`/`std::env::var` reject.
+            (
+                OsString::from_vec(vec![b'/', 0x80, b'c', b'.', b'p', b'e', b'm']),
+                OsString::from_vec(vec![b'/', 0xFF, b'k', b'.', b'p', b'e', b'm']),
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            (OsString::from("/c.pem"), OsString::from("/k.pem"))
+        }
     }
 
     #[tokio::test]
