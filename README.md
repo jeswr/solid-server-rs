@@ -109,14 +109,19 @@ cargo build                 # compile
 cargo test                  # run the unit + e2e tests (no SPARQ/S3/IdP needed)
 cargo run                   # boot the experimental server (defaults to 127.0.0.1:3000)
 
-# configurable via env:
+# Configurable via env (the whole block below is one `\`-continued command, so it is copy-paste-safe
+# — the per-variable notes are here, NOT inline after a trailing `\` where they would break it):
+#   SOLID_SERVER_AUDIENCE             RFC 9068 `aud` (defaults to the base URL)
+#   SOLID_SERVER_BIDIRECTIONAL        WebID<->issuer check: strict (default) | warn | off
+#   SOLID_SERVER_JWKS_CACHE_TTL_SECS  JWKS cache TTL in seconds (default 300)
+#   SOLID_SERVER_ALLOW_LOOPBACK       dev/IT ONLY: permit http:/loopback IdP+WebID (default 0)
 SOLID_SERVER_BIND=127.0.0.1:3000 \
 SOLID_SERVER_BASE_URL=https://pod.example \
 SOLID_SERVER_TRUSTED_ISSUER=https://idp.example/realms/solid \
-SOLID_SERVER_AUDIENCE=https://pod.example \          # RFC 9068 `aud` (defaults to base URL)
-SOLID_SERVER_BIDIRECTIONAL=strict \                  # strict (default) | warn | off
-SOLID_SERVER_JWKS_CACHE_TTL_SECS=300 \               # JWKS cache TTL (default 300s)
-SOLID_SERVER_ALLOW_LOOPBACK=0 \                      # dev/IT ONLY: permit http:/loopback IdP+WebID
+SOLID_SERVER_AUDIENCE=https://pod.example \
+SOLID_SERVER_BIDIRECTIONAL=strict \
+SOLID_SERVER_JWKS_CACHE_TTL_SECS=300 \
+SOLID_SERVER_ALLOW_LOOPBACK=0 \
   cargo run
 ```
 

@@ -6,8 +6,8 @@ use axum::body::Bytes;
 use solid_server_rs::error::ServerError;
 use solid_server_rs::ldp::content::{classify, validate_rdf, RdfFormat};
 use solid_server_rs::store::{
-    CompositeStore, InMemoryBlobStore, InMemorySparqClient, ResourceMeta, SparqClient, SparqError,
-    Store,
+    CompositeStore, DeleteOutcome, InMemoryBlobStore, InMemorySparqClient, ResourceMeta,
+    SparqClient, SparqError, Store,
 };
 
 const IRI: &str = "https://pod.example/alice/data";
@@ -282,6 +282,200 @@ async fn deleting_a_container_clears_its_own_containment_set() {
         s.list_children(container).await.unwrap().is_empty(),
         "a deleted container must leave no stale containment set"
     );
+}
+
+// --- M2: ATOMIC empty-container delete (the TOCTOU fix) ---
+
+#[tokio::test]
+async fn delete_container_if_empty_refuses_a_populated_container() {
+    // The atomic op must report NotEmpty for a populated container AND delete NOTHING — the container
+    // and its child both survive (no orphaning). This is the safety invariant: a non-empty container
+    // is never deleted, so a concurrently-added child can't be orphaned under a deleted parent.
+    let s = store();
+    let container = "https://pod.example/alice/";
+    let child = "https://pod.example/alice/note1";
+    s.write(
+        container,
+        Bytes::from_static(b"<#c> <#p> \"C\" ."),
+        "text/turtle",
+    )
+    .await
+    .unwrap();
+    s.create_in_container(
+        container,
+        child,
+        Bytes::from_static(b"<#it> <#p> \"x\" ."),
+        "text/turtle",
+    )
+    .await
+    .unwrap();
+
+    let outcome = s.delete_container_if_empty(container, None).await.unwrap();
+    assert_eq!(outcome, DeleteOutcome::NotEmpty);
+    // NOTHING was deleted: the container + its child + the membership edge all survive.
+    assert!(
+        s.exists(container).await.unwrap(),
+        "a NotEmpty result must leave the container present"
+    );
+    assert!(
+        s.exists(child).await.unwrap(),
+        "a NotEmpty result must leave the child present (not orphaned)"
+    );
+    assert_eq!(
+        s.list_children(container).await.unwrap(),
+        vec![child.to_string()],
+        "a NotEmpty result must leave the membership edge intact"
+    );
+}
+
+#[tokio::test]
+async fn delete_container_if_empty_deletes_an_empty_container() {
+    // The atomic op returns Deleted for an empty container, and it is gone afterwards.
+    let s = store();
+    let container = "https://pod.example/alice/empty/";
+    s.write(
+        container,
+        Bytes::from_static(b"<#c> <#p> \"C\" ."),
+        "text/turtle",
+    )
+    .await
+    .unwrap();
+    assert!(s.exists(container).await.unwrap());
+
+    let outcome = s.delete_container_if_empty(container, None).await.unwrap();
+    assert_eq!(outcome, DeleteOutcome::Deleted);
+    assert!(!s.exists(container).await.unwrap());
+    assert!(matches!(
+        s.read(container).await.unwrap_err(),
+        ServerError::NotFound
+    ));
+}
+
+#[tokio::test]
+async fn delete_container_if_empty_reports_not_found_for_an_absent_container() {
+    // An absent container ⇒ NotFound (the handler maps this to 404), nothing touched.
+    let s = store();
+    let outcome = s
+        .delete_container_if_empty("https://pod.example/alice/nope/", None)
+        .await
+        .unwrap();
+    assert_eq!(outcome, DeleteOutcome::NotFound);
+}
+
+#[tokio::test]
+async fn delete_container_if_empty_detaches_from_parent_and_routes_recreate_clean() {
+    // The atomic empty-delete detaches the (deleted) container from its parent's containment, and a
+    // container re-created at the same IRI inherits no stale membership — the delete-then-recreate
+    // no-stale-membership case routed through the NEW atomic op.
+    let s = store();
+    let parent = "https://pod.example/alice/";
+    let container = "https://pod.example/alice/sub/";
+    let child = "https://pod.example/alice/sub/note1";
+    s.write(
+        parent,
+        Bytes::from_static(b"<#c> <#p> \"P\" ."),
+        "text/turtle",
+    )
+    .await
+    .unwrap();
+    s.create_in_container(
+        parent,
+        container,
+        Bytes::from_static(b"<#c> <#p> \"S\" ."),
+        "text/turtle",
+    )
+    .await
+    .unwrap();
+    s.create_in_container(
+        container,
+        child,
+        Bytes::from_static(b"<#it> <#p> \"x\" ."),
+        "text/turtle",
+    )
+    .await
+    .unwrap();
+
+    // While the sub-container has a member, the atomic delete refuses it (409 ⇒ NotEmpty).
+    assert_eq!(
+        s.delete_container_if_empty(container, Some(parent))
+            .await
+            .unwrap(),
+        DeleteOutcome::NotEmpty
+    );
+
+    // Empty it, then the atomic delete succeeds + detaches from the parent.
+    s.delete(child, Some(container)).await.unwrap();
+    assert_eq!(
+        s.delete_container_if_empty(container, Some(parent))
+            .await
+            .unwrap(),
+        DeleteOutcome::Deleted
+    );
+    assert!(!s.exists(container).await.unwrap());
+    assert!(
+        s.list_children(parent).await.unwrap().is_empty(),
+        "the deleted container must be detached from its parent"
+    );
+
+    // Re-create a container at the SAME IRI — it must inherit NO stale member from the deleted one.
+    s.create_in_container(
+        parent,
+        container,
+        Bytes::from_static(b"<#c> <#p> \"S2\" ."),
+        "text/turtle",
+    )
+    .await
+    .unwrap();
+    assert!(
+        s.list_children(container).await.unwrap().is_empty(),
+        "a re-created container must not inherit a stale containment set"
+    );
+}
+
+#[tokio::test]
+async fn delete_meta_if_empty_on_the_sparq_client_is_atomic() {
+    // Directly exercise the atomic op on the SparqClient: NotEmpty leaves both the container record and
+    // the membership edge intact; Deleted removes the record + clears the containment set.
+    let sparq = InMemorySparqClient::new();
+    let container = "https://pod.example/alice/";
+    let child = "https://pod.example/alice/note1";
+    let meta = ResourceMeta {
+        content_type: "text/turtle".into(),
+        blob_key: "k".into(),
+        etag: "\"e\"".into(),
+    };
+
+    // Absent ⇒ NotFound.
+    assert_eq!(
+        sparq.delete_meta_if_empty(container).await.unwrap(),
+        DeleteOutcome::NotFound
+    );
+
+    // Populated ⇒ NotEmpty, nothing removed.
+    sparq.put_meta(container, meta.clone()).await.unwrap();
+    sparq
+        .create_child(container, child, meta.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        sparq.delete_meta_if_empty(container).await.unwrap(),
+        DeleteOutcome::NotEmpty
+    );
+    assert!(sparq.exists(container).await.unwrap());
+    assert_eq!(
+        sparq.list_children(container).await.unwrap(),
+        vec![child.to_string()]
+    );
+
+    // Empty it, then Deleted ⇒ record gone + containment set cleared.
+    sparq.remove_child(container, child).await.unwrap();
+    sparq.delete_meta(child).await.unwrap();
+    assert_eq!(
+        sparq.delete_meta_if_empty(container).await.unwrap(),
+        DeleteOutcome::Deleted
+    );
+    assert!(!sparq.exists(container).await.unwrap());
+    assert!(sparq.list_children(container).await.unwrap().is_empty());
 }
 
 #[tokio::test]

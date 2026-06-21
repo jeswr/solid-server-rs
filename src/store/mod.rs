@@ -16,7 +16,7 @@ use bytes::Bytes;
 
 pub use blob::{BlobError, BlobStore, InMemoryBlobStore};
 pub use http::{HttpSparqClient, SparqHttpError};
-pub use sparq::{InMemorySparqClient, ResourceMeta, SparqClient, SparqError};
+pub use sparq::{DeleteOutcome, InMemorySparqClient, ResourceMeta, SparqClient, SparqError};
 pub use sparql::{BodyObject, BuildError};
 
 use crate::error::{ServerError, ServerResult};
@@ -68,7 +68,28 @@ pub trait Store: Send + Sync {
     /// Delete a resource: remove its index record + its bytes, and detach it from `parent`'s
     /// containment (if `parent` is given). The caller is responsible for the existence (404) and
     /// empty-container (409) decisions; this performs the removal.
+    ///
+    /// This is the NON-container delete path. A CONTAINER delete must instead go through
+    /// [`delete_container_if_empty`](Store::delete_container_if_empty), which folds the empty-check
+    /// into the delete atomically.
     async fn delete(&self, iri: &str, parent: Option<&str>) -> ServerResult<()>;
+
+    /// ATOMICALLY delete a container ONLY if it is empty (the container-DELETE path).
+    ///
+    /// The membership check (`ldp:contains` empty?) and the delete are performed as ONE store
+    /// operation with NO interleaving between them, so a child POSTed concurrently can never slip in
+    /// between an empty-check and the delete and be orphaned under a deleted container (the TOCTOU the
+    /// separate `list_children` + `delete` had). It detaches the container from `parent`'s
+    /// containment (if given) only AFTER a successful [`DeleteOutcome::Deleted`], and removes the
+    /// container's own bytes. Returns:
+    /// - [`DeleteOutcome::Deleted`] — it existed, was empty, and is gone;
+    /// - [`DeleteOutcome::NotEmpty`] — it existed with members; NOTHING was deleted (⇒ 409);
+    /// - [`DeleteOutcome::NotFound`] — it did not exist (⇒ 404).
+    async fn delete_container_if_empty(
+        &self,
+        iri: &str,
+        parent: Option<&str>,
+    ) -> ServerResult<DeleteOutcome>;
 
     /// List the direct children (their IRIs) of a container — the authoritative `ldp:contains`
     /// membership. Used for the empty-container DELETE refusal.
@@ -226,6 +247,49 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
                 .map_err(|e| ServerError::Storage(format!("{e}")))?;
         }
         Ok(())
+    }
+
+    async fn delete_container_if_empty(
+        &self,
+        iri: &str,
+        parent: Option<&str>,
+    ) -> ServerResult<DeleteOutcome> {
+        // Look up the byte-pointer FIRST so a successful delete can drop the right blob. This read is
+        // outside the atomic empty-check+delete window deliberately: it only governs WHICH blob to GC
+        // on success, never the delete decision, so it cannot reintroduce the TOCTOU (the authoritative
+        // empty-check+delete is the single `delete_meta_if_empty` op below). A missing record here just
+        // means there is no blob to GC; the atomic op will report NotFound.
+        let blob_key = match self.sparq.get_meta(iri).await {
+            Ok(m) => Some(m.blob_key),
+            Err(SparqError::NotFound) => None,
+            Err(SparqError::Backend(e)) => return Err(ServerError::Storage(e)),
+        };
+        // The ATOMIC empty-check + delete (no interleaving — see `delete_meta_if_empty`).
+        let outcome = self
+            .sparq
+            .delete_meta_if_empty(iri)
+            .await
+            .map_err(|e| ServerError::Storage(format!("{e}")))?;
+        if outcome != DeleteOutcome::Deleted {
+            // NotEmpty / NotFound: nothing was deleted, so leave the parent edge + bytes untouched.
+            return Ok(outcome);
+        }
+        // Deleted: detach from the parent's containment (a different graph, idempotent) and GC bytes.
+        // Index-(record-)before-bytes keeps "if it's indexed, its bytes exist": a crash here leaves
+        // orphaned bytes for the reconciler, never an index row pointing at missing bytes.
+        if let Some(p) = parent {
+            self.sparq
+                .remove_child(p, iri)
+                .await
+                .map_err(|e| ServerError::Storage(format!("{e}")))?;
+        }
+        if let Some(key) = blob_key {
+            self.blob
+                .delete(&key)
+                .await
+                .map_err(|e| ServerError::Storage(format!("{e}")))?;
+        }
+        Ok(DeleteOutcome::Deleted)
     }
 
     async fn list_children(&self, container: &str) -> ServerResult<Vec<String>> {

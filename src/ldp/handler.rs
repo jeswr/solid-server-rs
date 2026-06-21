@@ -33,7 +33,7 @@ use crate::ldp::content::{
 use crate::ldp::patch::{apply_patch, classify_patch_media_type, parse_n3_patch};
 use crate::ldp::range::{self, RangeOutcome};
 use crate::ldp::target::{parse_target, LdpTarget};
-use crate::store::{ResourceMeta, Store};
+use crate::store::{DeleteOutcome, ResourceMeta, Store};
 
 /// Shared state for the LDP handlers: the store + the server's public base URL.
 pub struct LdpState<S: Store> {
@@ -273,20 +273,30 @@ pub async fn delete_handler<S: Store>(
         Some(current.etag.as_str()),
     ))?;
 
-    // An empty-container refusal: a container with members cannot be deleted (LDP).
-    if target.is_container {
-        let children = state.store.list_children(&target.iri).await?;
-        if !children.is_empty() {
-            return Err(ServerError::Conflict(
-                "cannot delete a non-empty container".into(),
-            ));
-        }
-    }
-
     let parent = parent_container(&target);
-    state.store.delete(&target.iri, parent.as_deref()).await?;
 
-    Ok(StatusCode::NO_CONTENT.into_response())
+    if target.is_container {
+        // A container DELETE goes through the ATOMIC empty-check+delete (no TOCTOU): the empty check
+        // and the delete are ONE store operation, so a child POSTed concurrently can never slip in
+        // between a separate empty-check and a separate delete and be orphaned. A non-empty container
+        // is a 409; an absent one a 404 (the precondition load above already 404'd a fully-absent
+        // target, but the atomic op is the authoritative existence+empty decision).
+        match state
+            .store
+            .delete_container_if_empty(&target.iri, parent.as_deref())
+            .await?
+        {
+            DeleteOutcome::Deleted => Ok(StatusCode::NO_CONTENT.into_response()),
+            DeleteOutcome::NotEmpty => Err(ServerError::Conflict(
+                "cannot delete a non-empty container".into(),
+            )),
+            DeleteOutcome::NotFound => Err(ServerError::NotFound),
+        }
+    } else {
+        // A plain resource: the (non-atomic) removal is fine — there is no empty-check to race.
+        state.store.delete(&target.iri, parent.as_deref()).await?;
+        Ok(StatusCode::NO_CONTENT.into_response())
+    }
 }
 
 /// `PATCH /{path}` — apply a Solid N3 Patch (`text/n3`).

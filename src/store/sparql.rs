@@ -43,6 +43,19 @@ pub fn p_etag() -> String {
 pub fn p_create_marker() -> String {
     format!("{PSS_NS}createMarker")
 }
+/// Predicate: a per-operation **delete** marker (a unique-nonce literal), written atomically with the
+/// guarded empty-container delete into a SEPARATE scratch graph so the "did the empty+exists guard
+/// match?" confirm is race-resistant (no other op writes or removes THIS nonce).
+pub fn p_delete_marker() -> String {
+    format!("{PSS_NS}deleteMarker")
+}
+/// The reserved scratch graph that per-operation delete markers are written into. It is a DISTINCT
+/// graph from any resource's own graph, so dropping a resource's graph never touches a marker, and a
+/// marker can confirm a delete whose own graph is gone. (Markers are operation-scoped + pruned by the
+/// reconciler — M3-next.)
+pub fn g_delete_markers() -> String {
+    format!("{PSS_NS}deleteMarkers")
+}
 /// The subject every index record hangs off, *within* a resource's own named graph: a stable,
 /// reserved IRI so the record triples never collide with the resource's own RDF.
 pub fn s_record() -> String {
@@ -390,6 +403,75 @@ pub fn update_delete_resource(resource: &str) -> Result<String, BuildError> {
     Ok(format!("DROP SILENT GRAPH {g}", g = iri(resource)?))
 }
 
+/// UPDATE: ATOMICALLY delete a container's whole graph ONLY IF it exists AND is empty (no
+/// `ldp:contains` member), writing a per-operation **delete marker** into a SEPARATE scratch graph in
+/// the SAME atomic update IFF the guard matched — so the caller can confirm the outcome race-free.
+///
+/// This is ONE SPARQL update (`;`-joined) that commits as a single generation, so the empty-check and
+/// the delete cannot be split by a concurrent `create_child`:
+/// - The first statement is a `DELETE { GRAPH <g> { ?s ?p ?o } } WHERE { GRAPH <g> { ?s ?p ?o }
+///   GRAPH <g> { <record> contentType ?anyCt }  FILTER NOT EXISTS { GRAPH <g> { <record> contains
+///   ?c } } }` — it removes EVERY triple of the container's graph (its index record; an empty
+///   container holds no other reserved triples) ONLY when the record EXISTS (the container-exists
+///   guard) AND there is NO `ldp:contains` member (the empty guard). A non-empty or absent container ⇒
+///   the WHERE yields no solution ⇒ nothing is deleted (the safety invariant: a non-empty container is
+///   NEVER deleted).
+/// - The second statement writes `<g> <deleteMarker> "nonce"` into the reserved `deleteMarkers`
+///   scratch graph under the SAME empty+exists guard, so the marker is present **iff** the delete
+///   actually ran. The caller ASKs for THIS nonce ([`ask_delete_marker`]) to learn `Deleted`; its
+///   absence + an [`ask_exists`] check splits `NotEmpty` (record still present) from `NotFound` (record
+///   absent). The marker is in a distinct graph, so the graph-emptying DELETE never removes it.
+///
+/// The marker graph is NEVER a resource graph, so this can't collide with user data; the IRI builders
+/// reject any IRIREF-invalid container, fail-closed.
+pub fn update_delete_container_if_empty(
+    container: &str,
+    nonce: &str,
+) -> Result<String, BuildError> {
+    let g = iri(container)?;
+    let rec = iri_const(&s_record());
+    let pct = iri_const(&p_content_type());
+    let contains = iri_const(LDP_CONTAINS);
+    let mg = iri_const(&g_delete_markers());
+    let pmark = iri_const(&p_delete_marker());
+    // ONE `;`-joined update; both statements share the SAME EXISTS+empty guard. (1) conditionally
+    // empties the container's graph (record only — an empty container holds no other triples); (2)
+    // writes this op's delete marker into the separate scratch graph under the same guard. NO `//`
+    // line comments here — this string is sent verbatim to the SPARQL endpoint.
+    Ok(format!(
+        "DELETE {{ GRAPH {g} {{ ?s ?p ?o }} }} WHERE {{ \
+            GRAPH {g} {{ ?s ?p ?o }} \
+            GRAPH {g} {{ {rec} {pct} ?anyCt }} \
+            FILTER NOT EXISTS {{ GRAPH {g} {{ {rec} {contains} ?anyChild }} }} \
+         }} ; \
+         INSERT {{ GRAPH {mg} {{ {g} {pmark} {nce} }} }} WHERE {{ \
+            GRAPH {g} {{ {rec} {pct} ?anyCt2 }} \
+            FILTER NOT EXISTS {{ GRAPH {g} {{ {rec} {contains} ?anyChild2 }} }} \
+         }}",
+        g = g,
+        rec = rec,
+        pct = pct,
+        contains = contains,
+        mg = mg,
+        pmark = pmark,
+        nce = literal(nonce),
+    ))
+}
+
+/// ASK whether a per-operation delete marker for `container` with `nonce` is present in the reserved
+/// scratch graph — the race-resistant "the empty+exists guard matched, so the delete ran" confirm.
+/// No other operation ever writes or removes THIS nonce, so a concurrent containment mutation cannot
+/// flip the result. Fail-closed.
+pub fn ask_delete_marker(container: &str, nonce: &str) -> Result<String, BuildError> {
+    Ok(format!(
+        "ASK {{ GRAPH {mg} {{ {g} {p} {n} }} }}",
+        mg = iri_const(&g_delete_markers()),
+        g = iri(container)?,
+        p = iri_const(&p_delete_marker()),
+        n = literal(nonce),
+    ))
+}
+
 /// UPDATE: remove a `container ldp:contains child` edge (idempotent — a `DELETE WHERE` of an absent
 /// edge is a no-op).
 pub fn update_remove_child(container: &str, child: &str) -> Result<String, BuildError> {
@@ -721,6 +803,77 @@ mod tests {
             !delete_block.contains(&iri_const(&p_create_marker())),
             "marker must not be in the DELETE block (append-only): {q}"
         );
+    }
+
+    #[test]
+    fn delete_container_if_empty_is_one_guarded_atomic_update() {
+        // The conditional delete must be a SINGLE `;`-joined update: (1) empty the graph only when it
+        // EXISTS (a record contentType) AND has NO `ldp:contains` member (FILTER NOT EXISTS), and (2)
+        // write the per-op delete marker under the SAME guard. The marker keeps the confirm race-free.
+        let q = update_delete_container_if_empty("http://pod/c/", "op-7").unwrap();
+        assert!(
+            q.starts_with("DELETE {"),
+            "starts with the guarded delete: {q}"
+        );
+        // The empty guard + the exists guard are both present.
+        assert!(q.contains("FILTER NOT EXISTS"), "empty guard present: {q}");
+        assert!(
+            q.contains(LDP_CONTAINS),
+            "empty guard targets ldp:contains: {q}"
+        );
+        assert!(
+            q.contains(&iri_const(&p_content_type())),
+            "exists guard present: {q}"
+        );
+        // The two statements are `;`-joined (one atomic update) and the second writes the marker.
+        assert!(q.contains(" ; "), "two `;`-joined statements: {q}");
+        assert!(
+            q.contains(&iri_const(&p_delete_marker())),
+            "marker predicate present: {q}"
+        );
+        assert!(
+            q.contains(&iri_const(&g_delete_markers())),
+            "marker scratch graph present: {q}"
+        );
+        assert!(q.contains("\"op-7\""), "the op nonce is a literal: {q}");
+        // It must NOT use a blanket DROP (which would unconditionally erase a non-empty container).
+        assert!(!q.contains("DROP"), "must not blanket-DROP the graph: {q}");
+        // No `//`-style line comment leaked into the query text (the IRIs legitimately contain `//`,
+        // so check for a comment introducer — `//` followed by a space — which only a stray comment
+        // would produce; an IRI's `//` is always followed by a host character, never a space).
+        assert!(
+            !q.contains("// "),
+            "no `//`-comment markers in the query text: {q}"
+        );
+    }
+
+    #[test]
+    fn delete_container_if_empty_rejects_an_invalid_container_iri() {
+        // An IRIREF-invalid container IRI is rejected fail-closed (never escaped-and-aliased), so an
+        // injection can never reach the endpoint.
+        assert_eq!(
+            update_delete_container_if_empty("http://pod/c d/", "op-1"),
+            Err(BuildError::InvalidIri)
+        );
+    }
+
+    #[test]
+    fn ask_delete_marker_targets_the_scratch_graph_subject_and_nonce() {
+        let q = ask_delete_marker("http://pod/c/", "op-abc").unwrap();
+        assert!(q.starts_with("ASK"));
+        assert!(
+            q.contains(&iri_const(&g_delete_markers())),
+            "scratch graph: {q}"
+        );
+        assert!(
+            q.contains(&iri_const("http://pod/c/")),
+            "container subject: {q}"
+        );
+        assert!(
+            q.contains(&iri_const(&p_delete_marker())),
+            "marker predicate: {q}"
+        );
+        assert!(q.contains("\"op-abc\""), "nonce as a literal: {q}");
     }
 
     #[test]

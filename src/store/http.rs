@@ -65,7 +65,7 @@ use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
 use serde_json::Value;
 
-use super::sparq::{ResourceMeta, SparqClient, SparqError};
+use super::sparq::{DeleteOutcome, ResourceMeta, SparqClient, SparqError};
 use super::sparql;
 
 /// The maximum SPARQL response body this client will buffer (fail-closed bound — a runaway response
@@ -387,6 +387,46 @@ impl SparqClient for HttpSparqClient {
         self.update_raw(&u)
             .await
             .map_err(SparqHttpError::into_sparq)
+    }
+
+    async fn delete_meta_if_empty(&self, iri: &str) -> Result<DeleteOutcome, SparqError> {
+        // A per-operation nonce so the success confirm is RACE-RESISTANT — no concurrent op writes or
+        // removes THIS delete marker, so a containment mutation between the update and the confirm
+        // cannot flip the result (the same pattern as the create-marker).
+        let nonce = next_nonce();
+
+        // ONE atomic update: conditionally empty the container's graph + write the delete marker, BOTH
+        // guarded by container-EXISTS AND `ldp:contains`-empty in the same generation. A non-empty (or
+        // absent) container ⇒ the WHERE yields nothing ⇒ NOTHING is deleted (the safety invariant).
+        let u = sparql::update_delete_container_if_empty(iri, &nonce)?;
+        self.update_raw(&u)
+            .await
+            .map_err(SparqHttpError::into_sparq)?;
+
+        // Disambiguate the outcome with bounded follow-up ASKs (the protocol can't return rows from an
+        // UPDATE; documented). FIRST: did the guard match (⇒ the delete ran)? ASK for OUR marker — a
+        // nonce nothing else touches, so this is immune to a concurrent containment mutation.
+        let marker_q = sparql::ask_delete_marker(iri, &nonce)?;
+        let (body, _ct) = self
+            .query_raw(&marker_q, ACCEPT_RESULTS_JSON)
+            .await
+            .map_err(SparqHttpError::into_sparq)?;
+        if parse_ask_json(&body).map_err(SparqHttpError::into_sparq)? {
+            return Ok(DeleteOutcome::Deleted);
+        }
+        // Marker absent ⇒ the delete did NOT run (container was non-empty OR absent). Split the two by
+        // a single ASK on the container's own record: present ⇒ NotEmpty (it had members, so the empty
+        // guard blocked the delete), absent ⇒ NotFound (it was never indexed). Fail-closed.
+        let exists_q = sparql::ask_exists(iri)?;
+        let (body, _ct) = self
+            .query_raw(&exists_q, ACCEPT_RESULTS_JSON)
+            .await
+            .map_err(SparqHttpError::into_sparq)?;
+        if parse_ask_json(&body).map_err(SparqHttpError::into_sparq)? {
+            Ok(DeleteOutcome::NotEmpty)
+        } else {
+            Ok(DeleteOutcome::NotFound)
+        }
     }
 
     async fn create_child(

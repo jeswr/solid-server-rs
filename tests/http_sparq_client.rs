@@ -28,7 +28,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
 
-use solid_server_rs::store::{BodyObject, HttpSparqClient, ResourceMeta, SparqClient, SparqError};
+use solid_server_rs::store::{
+    BodyObject, DeleteOutcome, HttpSparqClient, ResourceMeta, SparqClient, SparqError,
+};
 
 // ---------------------------------------------------------------------------
 // The in-process mock SPARQL endpoint.
@@ -63,6 +65,9 @@ struct MockStore {
     body: HashMap<String, Vec<String>>,
     /// child graph IRI → its per-operation create-marker nonces (the race-resistant create confirm).
     markers: HashMap<String, Vec<String>>,
+    /// container IRI → its per-operation DELETE-marker nonces (the race-resistant empty-delete confirm,
+    /// stored in a separate scratch graph keyed by the container IRI as the marker subject).
+    delete_markers: HashMap<String, Vec<String>>,
     /// The last SPARQL string the mock received (so a test can assert on the query text/escaping).
     last_sparql: Option<String>,
 }
@@ -141,6 +146,39 @@ async fn handle_sparql(
 /// SPARQL engine — it pattern-matches the specific updates [`solid_server_rs::store::sparql`] emits.
 fn apply_update(state: &MockState, sparql: &str) {
     let mut store = state.store.lock().unwrap();
+    // delete_container_if_empty: a `;`-joined update that (1) conditionally empties the container's
+    // graph (record only) iff it EXISTS and has NO `ldp:contains` member, and (2) writes a delete
+    // marker into the scratch graph under the SAME guard. Recognise it by the `deleteMarker` predicate
+    // (distinguishing it from create_child's `createMarker`). The guard is evaluated against the mock
+    // store: delete iff the container has an index record AND no children.
+    if sparql.contains("deleteMarker") && sparql.starts_with("DELETE {") {
+        // The container graph is the FIRST GRAPH IRI; the marker nonce is the (only) string literal.
+        let container = first_graph_iri(sparql).unwrap_or_default();
+        let nonce = extract_literals(sparql)
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        let exists = store.meta.contains_key(&container);
+        // Empty iff there is no non-empty child set (MSRV 1.81: `map_or(true, …)`, not `is_none_or`).
+        let empty = store
+            .children
+            .get(&container)
+            .map_or(true, |kids| kids.is_empty());
+        if exists && empty {
+            // Empty + present ⇒ drop the record + its (empty) containment entry, and record THIS op's
+            // delete marker in the scratch graph (keyed by the container IRI) so the confirm sees it.
+            store.meta.remove(&container);
+            store.children.remove(&container);
+            store.body.remove(&container);
+            store
+                .delete_markers
+                .entry(container)
+                .or_default()
+                .push(nonce);
+        }
+        // Non-empty or absent ⇒ NOTHING is deleted and NO marker is written (the safety invariant).
+        return;
+    }
     // create_child: `DELETE { GRAPH <child> {…stale record…} } INSERT { GRAPH <child> {…record…}
     //                GRAPH <container> { <record> <ldp:contains> <child> } }
     //                WHERE { GRAPH <container> { <record> <contentType> ?anyCt } OPTIONAL … }`
@@ -231,7 +269,23 @@ fn answer_query(state: &MockState, sparql: &str) -> Response {
     let store = state.store.lock().unwrap();
     if sparql.starts_with("ASK") {
         let graph = first_graph_iri(sparql).unwrap_or_default();
-        let boolean = if sparql.contains("createMarker") {
+        let boolean = if sparql.contains("deleteMarker") {
+            // ask_delete_marker: ASK { GRAPH <scratch> { <container> <deleteMarker> "nonce" } } — true
+            // iff that exact nonce was recorded for the container. The graph here is the SCRATCH graph;
+            // the container is the SUBJECT (the first <...> IRI INSIDE the graph block), and the nonce
+            // is the literal. (`first_graph_iri` returns the scratch graph, so re-extract the subject.)
+            let iris = extract_iris(sparql);
+            // tokens: [scratchGraph, container, deleteMarkerPredicate] — the container is index 1.
+            let container = iris.get(1).cloned().unwrap_or_default();
+            let nonce = extract_literals(sparql)
+                .first()
+                .cloned()
+                .unwrap_or_default();
+            store
+                .delete_markers
+                .get(&container)
+                .is_some_and(|ns| ns.contains(&nonce))
+        } else if sparql.contains("createMarker") {
             // ask_create_marker: ASK { GRAPH <child> { <record> <createMarker> "nonce" } } — true iff
             // that exact nonce was recorded for the child (the race-resistant create confirm).
             let nonce = extract_literals(sparql)
@@ -631,6 +685,46 @@ async fn delete_meta_is_idempotent_on_absent() {
 }
 
 #[tokio::test]
+async fn delete_meta_if_empty_over_http_reports_all_three_outcomes() {
+    // The live client's atomic empty-container delete (a single guarded conditional UPDATE + a
+    // race-resistant delete-marker confirm) must map to NotFound / NotEmpty / Deleted correctly via
+    // the mock — and crucially leave a NON-EMPTY container untouched (the safety invariant).
+    let (url, _state) = spawn_mock().await;
+    let c = HttpSparqClient::new(url);
+
+    // Absent ⇒ NotFound (no marker written ⇒ confirm ASK false ⇒ exists ASK false).
+    assert_eq!(
+        c.delete_meta_if_empty(CONTAINER).await.unwrap(),
+        DeleteOutcome::NotFound
+    );
+
+    // Populated ⇒ NotEmpty, and the container + child both survive (nothing deleted).
+    c.put_meta(CONTAINER, meta()).await.unwrap();
+    c.create_child(CONTAINER, CHILD, meta()).await.unwrap();
+    assert_eq!(
+        c.delete_meta_if_empty(CONTAINER).await.unwrap(),
+        DeleteOutcome::NotEmpty
+    );
+    assert!(
+        c.exists(CONTAINER).await.unwrap(),
+        "a NotEmpty result must not delete the container"
+    );
+    assert_eq!(
+        c.list_children(CONTAINER).await.unwrap(),
+        vec![CHILD.to_string()],
+        "a NotEmpty result must leave the membership intact"
+    );
+
+    // Empty it, then Deleted ⇒ the container's record is gone.
+    c.remove_child(CONTAINER, CHILD).await.unwrap();
+    assert_eq!(
+        c.delete_meta_if_empty(CONTAINER).await.unwrap(),
+        DeleteOutcome::Deleted
+    );
+    assert!(!c.exists(CONTAINER).await.unwrap());
+}
+
+#[tokio::test]
 async fn remove_child_detaches_membership() {
     let (url, _state) = spawn_mock().await;
     let c = HttpSparqClient::new(url);
@@ -805,10 +899,26 @@ async fn live_sparq_round_trip() {
         .unwrap_err();
     assert!(matches!(err, SparqError::NotFound));
 
+    // Atomic empty-container delete: while the child is present it is NotEmpty (nothing deleted);
+    // after detaching the child it is Deleted.
+    assert_eq!(
+        c.delete_meta_if_empty(container).await.unwrap(),
+        DeleteOutcome::NotEmpty
+    );
+    assert!(c.exists(container).await.unwrap());
+
     // remove_child + delete clean up.
     c.remove_child(container, child).await.unwrap();
     assert!(c.list_children(container).await.unwrap().is_empty());
     c.delete_meta(child).await.unwrap();
-    c.delete_meta(container).await.unwrap();
+    assert_eq!(
+        c.delete_meta_if_empty(container).await.unwrap(),
+        DeleteOutcome::Deleted
+    );
     assert!(!c.exists(container).await.unwrap());
+    // A second empty-delete of the now-absent container ⇒ NotFound.
+    assert_eq!(
+        c.delete_meta_if_empty(container).await.unwrap(),
+        DeleteOutcome::NotFound
+    );
 }
