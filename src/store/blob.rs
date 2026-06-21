@@ -7,6 +7,7 @@
 //! `object_store`-backed impl (S3 / Local) is an M2 adapter behind the same trait.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
@@ -24,17 +25,38 @@ pub enum BlobError {
 
 /// One stored blob, as surfaced by [`BlobStore::list`] for the reconciler's orphan sweep.
 ///
-/// The `last_modified` timestamp is LOAD-BEARING for the reconciler's grace period: an orphan is only
-/// GC'd when it is OLDER than the grace window, so a blob whose bytes were just written but whose index
-/// row has not yet committed (the write-in-progress race) is protected. Backends that do not expose a
-/// timestamp (none here yet) must report `None` and are then NEVER GC'd by the reconciler (fail-closed
-/// — we can't prove an undated blob is old enough to be safe to delete).
+/// Two distinct properties travel here, used for two distinct decisions:
+///
+/// - `last_modified` is the AGE witness, LOAD-BEARING for the reconciler's grace period: an orphan is
+///   only GC'd when it is OLDER than the grace window, so a blob whose bytes were just written but whose
+///   index row has not yet committed (the write-in-progress race) is protected. Backends that do not
+///   expose a timestamp must report `None` and are then NEVER GC'd by the reconciler (fail-closed — we
+///   can't prove an undated blob is old enough to be safe to delete).
+///
+/// - `generation` is the CAS WITNESS for [`BlobStore::delete_if_unchanged`]. A `SystemTime` is NOT a
+///   unique write version — two same-key writes can collide on a timestamp (clock granularity, a clock
+///   rollback, coarse backend precision), so a same-timestamp recreate landing between the reconciler's
+///   fresh stat and its delete could slip past a `last_modified`-only CAS and be clobbered. The
+///   generation is a TRUE, strictly-increasing write version: every overwrite gets a STRICTLY DIFFERENT
+///   generation regardless of the clock, so the reconciler can compare-and-delete on it race-free and
+///   clock-independently. For the in-memory store it is a store-wide monotonic counter stamped on each
+///   write; a real `object_store` backend maps it to the backend's native version/ETag/generation (the
+///   `M2-next:` seam below). `None` ⇒ the backend exposes no write version ⇒ the reconciler cannot do a
+///   safe CAS and MUST instead rely on unique-per-write keys (documented in [`delete_if_unchanged`]).
 #[derive(Debug, Clone)]
 pub struct BlobEntry {
     /// The opaque storage key the bytes live under.
     pub key: String,
     /// When the bytes were last written, if the backend records it. `None` ⇒ unknown ⇒ never GC'd.
+    /// The AGE witness for the grace check ONLY — NEVER the CAS-delete witness (a timestamp is not a
+    /// unique write version); the CAS uses `generation`.
     pub last_modified: Option<SystemTime>,
+    /// A strictly-increasing, immutable-per-write version of THIS stored blob — the authoritative CAS
+    /// witness for [`BlobStore::delete_if_unchanged`]. Every write (even a same-millisecond, even a
+    /// clock-rolled-back overwrite) gets a strictly different value, so it distinguishes two writes the
+    /// way a `last_modified` cannot. `None` ⇒ the backend has no native write version ⇒ no safe CAS
+    /// (use unique-per-write keys instead).
+    pub generation: Option<u64>,
 }
 
 /// The byte store: a key/value store of resource bodies, keyed by an opaque storage key.
@@ -93,22 +115,31 @@ pub trait BlobStore: Send + Sync {
         Ok(self.list().await?.into_iter().find(|e| e.key == key))
     }
 
-    /// ATOMIC compare-and-delete: remove `key` **iff** its current `last_modified` still equals
-    /// `expected_last_modified`. Returns `Ok(true)` if it deleted, `Ok(false)` if the witness no longer
-    /// matched (the bytes changed / the key vanished / its stamp moved) — in which case NOTHING was
-    /// removed. The single race-closing primitive the reconciler's final delete uses.
+    /// ATOMIC compare-and-delete: remove `key` **iff** its current `generation` still equals
+    /// `expected_generation`. Returns `Ok(true)` if it deleted, `Ok(false)` if the witness no longer
+    /// matched (the bytes were rewritten ⇒ a new generation / the key vanished) — in which case NOTHING
+    /// was removed. The single race-closing primitive the reconciler's final delete uses.
     ///
-    /// # Why a CAS (the Finding-1 fix — the residual stat→delete TOCTOU)
+    /// # Why the witness is the GENERATION, not `last_modified` (the HIGH fix)
+    /// A [`SystemTime`] is NOT a unique write version. Two same-key writes can share a `last_modified`:
+    /// clock granularity (two writes in one tick), a clock rollback (NTP step), or a backend's coarse
+    /// timestamp precision can all give a recreate the SAME stamp as the bytes it replaced. A
+    /// `last_modified`-keyed CAS would then see "stamp unchanged" and DELETE the recreate's live bytes —
+    /// the very clobber the CAS exists to prevent. The `generation` is a STRICTLY-INCREASING write
+    /// version: every overwrite gets a strictly different generation regardless of what the clock did, so
+    /// it is a TRUE witness for "are these still the bytes I decided to GC?". The reconciler therefore
+    /// compares + deletes on the generation, and the CAS is correct even under clock rollback / coarse
+    /// timestamps. (`last_modified` is still used — but ONLY for the time-based grace/age check, which is
+    /// correct for "old enough"; it is never the delete witness.)
+    ///
+    /// # Why a CAS at all (the residual stat→delete TOCTOU)
     /// With today's deterministic per-IRI blob keys an overwrite REUSES the same key. The reconciler
     /// re-stats a candidate just before deleting it, but a recreate that rewrites the bytes in the gap
     /// between that fresh stat and a plain `delete()` would have its NEW live bytes clobbered by the GC.
     /// A separate `stat()` then `delete()` cannot close that window — there is always a gap between the
     /// two calls. This method collapses the compare and the delete into ONE atomic step, so a concurrent
-    /// rewrite either lands BEFORE it (a newer stamp ⇒ witness mismatch ⇒ `Ok(false)`, not deleted) or
-    /// AFTER it (the old bytes are already gone) — there is no clobber window. The witness is the
-    /// fresh-stat's observed `last_modified`: a [`SystemTime`] (not the whole [`BlobEntry`]) because the
-    /// `last_modified` IS the only mutable property a same-key overwrite changes, so it is the complete
-    /// CAS witness — the cleanest shape.
+    /// rewrite either lands BEFORE it (a new generation ⇒ witness mismatch ⇒ `Ok(false)`, not deleted) or
+    /// AFTER it (the old bytes are already gone) — there is no clobber window.
     ///
     /// # Atomicity contract (load-bearing — an impl MUST honour it)
     /// The comparison AND the removal MUST happen under a single, uninterrupted critical section with no
@@ -120,22 +151,27 @@ pub trait BlobStore: Send + Sync {
     /// a silent footgun. So every impl MUST provide a genuinely atomic implementation.
     ///
     /// M2-next (the `object_store` adapter): implement with a backend-native conditional/versioned delete
-    /// — `object_store` `PutMode`/delete with an `if_match`/version precondition on the backends that
-    /// support it (S3 conditional writes / object versioning). On a backend WITHOUT a conditional delete,
+    /// keyed on the backend's OWN write version — the native ETag / object-version / generation that maps
+    /// into [`BlobEntry::generation`] (`object_store` `PutMode`/delete with an `if_match`/version
+    /// precondition on the backends that support it: S3 conditional writes / object versioning). On a
+    /// backend WITHOUT a conditional delete (and no native version ⇒ [`BlobEntry::generation`] is `None`),
     /// the only safe option is **unique-per-write blob keys** (an overwrite never reuses a candidate's
     /// key, so the reconciler can never target live bytes and the delete can be unconditional) — that
     /// unique-key migration is an orthogonal beaded slice, NOT built here.
     async fn delete_if_unchanged(
         &self,
         key: &str,
-        expected_last_modified: SystemTime,
+        expected_generation: u64,
     ) -> Result<bool, BlobError>;
 }
 
-/// A stored blob in the in-memory double: the bytes + the insert/overwrite time (for the grace check).
+/// A stored blob in the in-memory double: the bytes, the insert/overwrite time (for the grace check),
+/// and a strictly-increasing `generation` (the CAS witness — a true write version that a `last_modified`
+/// cannot be, since two writes can share a timestamp but never a generation).
 struct StoredBlob {
     body: Bytes,
     last_modified: SystemTime,
+    generation: u64,
 }
 
 /// An in-memory [`BlobStore`] for tests and the M1 boot-without-S3 path.
@@ -144,9 +180,21 @@ struct StoredBlob {
 /// `last_modified`, so the reconciler's grace window can be exercised without a real backend. Tests
 /// that need a *specific* age use [`put_with_time`](InMemoryBlobStore::put_with_time) to back-date a
 /// blob deterministically (no `sleep`).
+///
+/// Every write ALSO stamps a fresh `generation` from a store-wide monotonic counter (`next_generation`):
+/// the counter is bumped and the new value written onto the entry on EVERY `put`/`put_with_time`, so any
+/// overwrite — even one with an identical `last_modified` (clock granularity / rollback) — gets a
+/// STRICTLY DIFFERENT generation. That generation is the CAS witness the reconciler deletes on, making
+/// [`delete_if_unchanged`](BlobStore::delete_if_unchanged) race-free AND clock-independent (the HIGH fix:
+/// a `SystemTime` is not a unique write version, a monotonic generation is).
 #[derive(Default)]
 pub struct InMemoryBlobStore {
     inner: Mutex<HashMap<String, StoredBlob>>,
+    /// Store-wide monotonic write counter. Every write does `fetch_add(1)` and stamps the returned value
+    /// onto the entry's `generation`, so generations are globally unique + strictly increasing across the
+    /// store. `Atomic` (not behind the `Mutex`) only so the counter is independent of which key is locked;
+    /// the compare-and-delete still reads the entry's stamped generation under the `Mutex` for atomicity.
+    next_generation: AtomicU64,
 }
 
 impl InMemoryBlobStore {
@@ -154,18 +202,39 @@ impl InMemoryBlobStore {
         Self::default()
     }
 
+    /// The next strictly-increasing generation. `Relaxed` is sufficient: we only need each write to get a
+    /// DISTINCT, monotonically-increasing value (the uniqueness/ordering of the CAS witness), not to
+    /// synchronise other memory — the entry's stamped generation is published/compared under the `Mutex`.
+    fn bump_generation(&self) -> u64 {
+        self.next_generation.fetch_add(1, Ordering::Relaxed)
+    }
+
     /// Insert bytes with an EXPLICIT last-modified time. Test-only helper so the grace-window tests can
     /// back-date a blob deterministically (e.g. "2 hours ago") instead of sleeping. Not part of the
     /// [`BlobStore`] trait — production code uses [`put`](InMemoryBlobStore::put), which stamps `now`.
+    ///
+    /// Still stamps a FRESH monotonic `generation` (the CAS witness) on every call, exactly like `put` —
+    /// so two `put_with_time` calls with the SAME `last_modified` are correctly distinguished by their
+    /// generations (the property the grace-vs-CAS separation relies on).
     pub fn put_with_time(&self, key: &str, body: Bytes, last_modified: SystemTime) {
+        let generation = self.bump_generation();
         let mut guard = self.inner.lock().expect("blob store mutex poisoned");
         guard.insert(
             key.to_string(),
             StoredBlob {
                 body,
                 last_modified,
+                generation,
             },
         );
+    }
+
+    /// Read the current stamped generation of a key (test helper — lets a test capture the CAS witness a
+    /// fresh stat would observe, so it can prove that a SAME-`last_modified` overwrite bumps the
+    /// generation and is therefore refused by `delete_if_unchanged`).
+    pub fn generation_of(&self, key: &str) -> Option<u64> {
+        let guard = self.inner.lock().expect("blob store mutex poisoned");
+        guard.get(key).map(|b| b.generation)
     }
 }
 
@@ -183,6 +252,10 @@ impl BlobStore for InMemoryBlobStore {
     }
 
     async fn put(&self, key: &str, body: Bytes) -> Result<(), BlobError> {
+        // Stamp a fresh monotonic generation BEFORE taking the lock (the counter is independent of the
+        // key). Every put — overwrite or not — gets a strictly different generation, so a same-timestamp
+        // overwrite still has a distinct CAS witness.
+        let generation = self.bump_generation();
         let mut guard = self
             .inner
             .lock()
@@ -192,6 +265,7 @@ impl BlobStore for InMemoryBlobStore {
             StoredBlob {
                 body,
                 last_modified: SystemTime::now(),
+                generation,
             },
         );
         Ok(())
@@ -224,12 +298,14 @@ impl BlobStore for InMemoryBlobStore {
             .map(|(key, blob)| BlobEntry {
                 key: key.clone(),
                 last_modified: Some(blob.last_modified),
+                generation: Some(blob.generation),
             })
             .collect())
     }
 
     /// O(1) single-key re-stat (a HashMap lookup) instead of the trait default's whole-store
-    /// enumeration — the shape the real object_store HEAD will take.
+    /// enumeration — the shape the real object_store HEAD will take. Surfaces BOTH witnesses: the
+    /// `last_modified` (the age/grace witness) and the `generation` (the CAS-delete witness).
     async fn stat(&self, key: &str) -> Result<Option<BlobEntry>, BlobError> {
         let guard = self
             .inner
@@ -238,32 +314,37 @@ impl BlobStore for InMemoryBlobStore {
         Ok(guard.get(key).map(|blob| BlobEntry {
             key: key.to_string(),
             last_modified: Some(blob.last_modified),
+            generation: Some(blob.generation),
         }))
     }
 
     /// ATOMIC compare-and-delete: the compare AND the remove happen under a SINGLE `Mutex` lock
-    /// acquisition with NO `await`/lock release between them, so it is genuinely race-free. A concurrent
-    /// `put`/`put_with_time` (a same-key overwrite) cannot interleave: it either ran before this lock was
-    /// taken (so the stamp no longer equals `expected` ⇒ we DON'T remove, returning `false`) or it runs
-    /// after we release (the old entry is already gone). Either way the overwrite's live bytes are never
-    /// clobbered — there is no TOCTOU window. Returns whether a row was actually removed.
+    /// acquisition with NO `await`/lock release between them, so it is genuinely race-free. The witness is
+    /// the entry's `generation` (a strictly-increasing write version), NOT its `last_modified` — so it is
+    /// also immune to clock issues: a concurrent `put`/`put_with_time` (a same-key overwrite) cannot
+    /// interleave AND always bumps the generation, even if it lands in the same `SystemTime` tick or after
+    /// a clock rollback. The overwrite either ran before this lock was taken (so the current generation no
+    /// longer equals `expected_generation` ⇒ we DON'T remove, returning `false`) or it runs after we
+    /// release (the old entry is already gone). Either way the overwrite's live bytes are never clobbered —
+    /// there is no TOCTOU window and no same-timestamp ambiguity. Returns whether a row was removed.
     async fn delete_if_unchanged(
         &self,
         key: &str,
-        expected_last_modified: SystemTime,
+        expected_generation: u64,
     ) -> Result<bool, BlobError> {
         let mut guard = self
             .inner
             .lock()
             .map_err(|_| BlobError::Backend("poisoned".into()))?;
-        // Compare the CURRENT stamp to the witness, then remove, all while still holding the lock.
+        // Compare the CURRENT generation to the witness, then remove, all while still holding the lock.
         match guard.get(key) {
-            Some(blob) if blob.last_modified == expected_last_modified => {
+            Some(blob) if blob.generation == expected_generation => {
                 guard.remove(key);
                 Ok(true)
             }
-            // Key gone, or its stamp moved since the witness was observed (a rewrite landed) ⇒ do NOT
-            // delete. The bytes under this key are no longer the ones the reconciler decided to GC.
+            // Key gone, or its generation moved since the witness was observed (a rewrite landed — even a
+            // same-millisecond one) ⇒ do NOT delete. The bytes under this key are no longer the ones the
+            // reconciler decided to GC.
             _ => Ok(false),
         }
     }

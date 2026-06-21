@@ -560,11 +560,13 @@ impl BlobStore for CountingBlob {
     async fn delete_if_unchanged(
         &self,
         key: &str,
-        expected: std::time::SystemTime,
+        expected_generation: u64,
     ) -> Result<bool, BlobError> {
         // Delegate to the inner atomic CAS. This is the reconciler's delete path, not the inline
         // post-index-delete `delete` this test counts — so it deliberately does NOT bump `deletes_seen`.
-        self.inner.delete_if_unchanged(key, expected).await
+        self.inner
+            .delete_if_unchanged(key, expected_generation)
+            .await
     }
 }
 
