@@ -71,6 +71,27 @@ pub trait BlobStore: Send + Sync {
     /// works against true object age. Until that adapter lands the in-memory double below is the only
     /// impl.
     async fn list(&self) -> Result<Vec<BlobEntry>, BlobError>;
+
+    /// Re-read ONE key's current state (its present `last_modified`), or `None` if the key no longer
+    /// exists. The single-key counterpart to [`list`](BlobStore::list).
+    ///
+    /// The reconciler uses this to RE-STAT a candidate orphan immediately before deleting it: the
+    /// [`list`](BlobStore::list) snapshot taken at sweep start can be stale by the time the delete loop
+    /// reaches a key, and with today's deterministic per-IRI blob keys an overwrite reuses the same key,
+    /// so a recreate landing between the snapshot and the delete would otherwise let the GC clobber
+    /// newly-written LIVE bytes. Re-stat lets the reconciler notice "this key's bytes are now NEWER than
+    /// my snapshot saw" (⇒ rewritten ⇒ skip) — see [`super::reconcile::reconcile_orphans`].
+    ///
+    /// The default implementation derives the answer from [`list`](BlobStore::list) so existing/future
+    /// impls keep working unchanged; a backend with a cheap single-key HEAD (object_store, the in-memory
+    /// double) SHOULD override this with the O(1) path rather than re-enumerating the whole store.
+    ///
+    /// M2 (the `object_store` adapter): override via `object_store::ObjectStore::head(&location)` — its
+    /// `ObjectMeta.last_modified` maps to [`SystemTime`]; a `NotFound` from the backend maps to `Ok(None)`
+    /// (the key is gone), any other error propagates.
+    async fn stat(&self, key: &str) -> Result<Option<BlobEntry>, BlobError> {
+        Ok(self.list().await?.into_iter().find(|e| e.key == key))
+    }
 }
 
 /// A stored blob in the in-memory double: the bytes + the insert/overwrite time (for the grace check).
@@ -167,5 +188,18 @@ impl BlobStore for InMemoryBlobStore {
                 last_modified: Some(blob.last_modified),
             })
             .collect())
+    }
+
+    /// O(1) single-key re-stat (a HashMap lookup) instead of the trait default's whole-store
+    /// enumeration — the shape the real object_store HEAD will take.
+    async fn stat(&self, key: &str) -> Result<Option<BlobEntry>, BlobError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| BlobError::Backend("poisoned".into()))?;
+        Ok(guard.get(key).map(|blob| BlobEntry {
+            key: key.to_string(),
+            last_modified: Some(blob.last_modified),
+        }))
     }
 }

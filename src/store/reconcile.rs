@@ -15,9 +15,24 @@
 //! ## What it does — and the grace period (LOAD-BEARING)
 //! [`reconcile_orphans`]:
 //! 1. asks SPARQ for the WHOLE referenced-blob-key set ONCE ([`SparqClient::referenced_blob_keys`]),
-//! 2. lists the physically-stored blobs ([`BlobStore::list`]),
-//! 3. for each stored blob NOT in the referenced set, deletes it **iff it is older than the grace
-//!    window** ([`ReconcileOptions::grace`]).
+//! 2. lists the physically-stored blobs ([`BlobStore::list`]) — the START-OF-SWEEP snapshot,
+//! 3. classifies each stored blob against that snapshot (referenced / too-young / undated / a
+//!    delete candidate),
+//! 4. re-fetches the referenced set ONCE more, then for each delete candidate RE-CHECKS it against that
+//!    fresh set AND RE-STATS its current `last_modified` ([`BlobStore::stat`]) immediately before
+//!    deleting — see the snapshot-staleness race below,
+//! 5. deletes a candidate **iff** it is STILL unreferenced (fresh index) AND STILL old enough (fresh
+//!    stat, not rewritten).
+//!
+//! ### The snapshot-staleness race (Finding 1 — why the re-check + re-stat exist)
+//! The blob list in step 2 is a SNAPSHOT; by the time the delete loop reaches a key, a resource may have
+//! been recreated/overwritten at the SAME blob key. Blob keys are TODAY deterministic per IRI, so an
+//! overwrite REUSES the key before — or as — its index row commits. A recreate landing between the
+//! snapshot and the `delete()` would otherwise make the GC clobber newly-written LIVE bytes. The
+//! re-check (fresh referenced set) + re-stat (fresh `last_modified`) narrow that window to the tiny
+//! (fresh-check → delete) gap. The DEFINITIVE race-free fix is **unique-per-write blob keys** (an
+//! overwrite never reuses a candidate's key, so the reconciler can never target live bytes) — that is a
+//! SEPARATE beaded slice; this reconciler only makes the sweep SAFE given today's deterministic keys.
 //!
 //! The grace period is the safety crux. There is an inverse race to the delete-orphan case: a *write
 //! in progress* PUTs its bytes and has NOT YET committed its index row — for that instant the blob is
@@ -71,8 +86,10 @@ pub struct ReconcileOptions {
     /// Only GC an orphan OLDER than this. Protects the write-in-progress (bytes-PUT-but-index-uncommitted)
     /// race. Default [`DEFAULT_GRACE`].
     pub grace: Duration,
-    /// If `true`, scan + classify but DELETE nothing (a dry run — report what *would* be GC'd). The
-    /// report's `orphaned`/`too_young`/`skipped_unknown_age` counts are still populated; `deleted` is 0.
+    /// If `true`, scan + classify (INCLUDING the fresh re-check + re-stat) but DELETE nothing (a dry run
+    /// — report what *would* be GC'd). All disposition counts are still populated; the deletable orphans
+    /// land in `would_delete` (not `deleted`, which stays 0), so the partition invariant holds in both
+    /// modes.
     pub dry_run: bool,
 }
 
@@ -85,23 +102,42 @@ impl Default for ReconcileOptions {
     }
 }
 
-/// The outcome of one reconciler sweep. Counts partition the scanned blobs so the totals reconcile:
-/// `scanned == referenced + orphaned`, and `orphaned == deleted + too_young + skipped_unknown_age +
-/// delete_errors`.
+/// The outcome of one reconciler sweep. Counts partition the scanned blobs so the totals reconcile in
+/// BOTH modes:
+/// - `scanned == referenced + orphaned`, and
+/// - `orphaned == deleted + would_delete + too_young + skipped_unknown_age + skipped_revalidated +
+///   delete_errors`.
+///
+/// The deletable orphans split by mode: a real run increments [`deleted`](Self::deleted), a dry run
+/// increments [`would_delete`](Self::would_delete) (it touches nothing) — so the partition invariant
+/// holds whether or not deletes ran. [`skipped_revalidated`](Self::skipped_revalidated) is the
+/// fresh-recheck disposition (Finding 1): a candidate that, at delete time, turned out to be referenced
+/// again OR to have been rewritten since the snapshot.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ReconcileReport {
     /// Total physically-stored blobs examined.
     pub scanned: usize,
     /// Blobs still referenced by an index row (kept, untouched).
     pub referenced: usize,
-    /// Unreferenced blobs (orphan candidates) — the sum of the four dispositions below.
+    /// Unreferenced blobs (orphan candidates) — the sum of the six dispositions below.
     pub orphaned: usize,
-    /// Orphans that were old enough and were DELETED (0 on a dry run).
+    /// Orphans that were old enough, passed the fresh re-check, and were DELETED (0 on a dry run).
     pub deleted: usize,
+    /// Orphans that WOULD be deleted but were not, because this was a dry run. The dry-run counterpart
+    /// of [`deleted`](Self::deleted): on a real run this is always 0, on a dry run it carries the
+    /// deletable count (so the partition holds in both modes and operators see what a real run would
+    /// reclaim).
+    pub would_delete: usize,
     /// Orphans inside the grace window — KEPT (protects the write-in-progress race).
     pub too_young: usize,
     /// Orphans whose backend reported no `last_modified` — KEPT fail-closed (age unknowable).
     pub skipped_unknown_age: usize,
+    /// Orphans that looked deletable from the START-OF-SWEEP snapshot but, on a FRESH re-check just
+    /// before the delete, turned out to be live again — either now referenced by a freshly-committed
+    /// index row, or rewritten (a newer `last_modified` / now inside the grace window). KEPT. This is
+    /// the Finding-1 guard against clobbering a recreate that landed mid-sweep with today's
+    /// deterministic (reused-on-overwrite) blob keys.
+    pub skipped_revalidated: usize,
     /// Orphans we tried to delete but the backend delete failed (KEPT; the sweep continued).
     pub delete_errors: usize,
 }
@@ -146,6 +182,12 @@ pub async fn reconcile_orphans<S: SparqClient + ?Sized, B: BlobStore + ?Sized>(
         ..Default::default()
     };
 
+    // First pass — classify against the START-OF-SWEEP snapshot. Everything that is referenced,
+    // too-young, or undated is decided HERE (these dispositions need no fresh re-check: a referenced or
+    // too-young or undated blob is never a delete candidate). The blobs that LOOK deletable from the
+    // snapshot (old-enough + unreferenced) are collected, with the `last_modified` the SNAPSHOT saw, for
+    // a second pass that re-checks each immediately before deleting.
+    let mut candidates: Vec<(String, SystemTime)> = Vec::new();
     for entry in stored {
         if referenced.contains(&entry.key) {
             report.referenced += 1;
@@ -164,22 +206,90 @@ pub async fn reconcile_orphans<S: SparqClient + ?Sized, B: BlobStore + ?Sized>(
             }
             Some(ts) => {
                 let age = now.duration_since(ts).unwrap_or(Duration::ZERO);
-                age >= opts.grace
+                if age >= opts.grace {
+                    Some(ts)
+                } else {
+                    None
+                }
             }
         };
-        if !old_enough {
-            report.too_young += 1;
+        match old_enough {
+            Some(snapshot_ts) => candidates.push((entry.key, snapshot_ts)),
+            None => report.too_young += 1,
+        }
+    }
+
+    // RE-CHECK against the INDEX once, just before the delete pass (Finding 1, part a). The
+    // start-of-sweep `referenced` set can be stale: with today's deterministic per-IRI blob keys an
+    // overwrite/recreate REUSES the same key, so a resource recreated between the snapshot and now would
+    // have committed a FRESH index row pointing at a candidate key — deleting it would clobber live
+    // bytes. Re-fetching the referenced set ONCE here (not per-key) and skipping any candidate now in it
+    // closes that window down to the (this fetch → the per-key delete) gap. Fail-closed: if it errors we
+    // ABORT and delete nothing (a failed query is NEVER "nothing is referenced").
+    let referenced_fresh: HashSet<String> = sparq
+        .referenced_blob_keys()
+        .await
+        .map_err(ReconcileError::ReferencedSet)?;
+
+    // Second pass — re-validate each candidate immediately before deleting it.
+    for (key, snapshot_ts) in candidates {
+        // (a) Re-check referenced-ness against the FRESH index set: a recreate may have committed a row
+        // pointing at this key since the snapshot.
+        if referenced_fresh.contains(&key) {
+            report.skipped_revalidated += 1;
+            continue;
+        }
+
+        // (b) Re-STAT the key's CURRENT last_modified: a rewrite reuses the same key (deterministic
+        // keying), so if the bytes are now newer than the snapshot saw — or now young enough to be inside
+        // the grace window — the blob was overwritten and must NOT be deleted. A stat failure is treated
+        // fail-closed (skip, count under delete_errors) rather than blindly deleting on incomplete info.
+        let current = match blob.stat(&key).await {
+            Ok(Some(entry)) => entry,
+            // The key is already gone (a concurrent delete / it never existed by delete-time) — nothing
+            // to reclaim, and re-deleting is a harmless no-op we simply skip. Count as revalidated
+            // (it is no longer a deletable orphan), keeping the partition exact.
+            Ok(None) => {
+                report.skipped_revalidated += 1;
+                continue;
+            }
+            Err(_) => {
+                report.delete_errors += 1;
+                continue;
+            }
+        };
+        let rewritten = match current.last_modified {
+            // The fresh stat reports no age ⇒ unknowable ⇒ fail-closed, do NOT delete.
+            None => true,
+            Some(ts) => {
+                // Newer than the snapshot (overwritten), or now inside the grace window (a fresh write
+                // whose index row may not have committed yet). Either way, not safe to GC.
+                ts > snapshot_ts || now.duration_since(ts).unwrap_or(Duration::ZERO) < opts.grace
+            }
+        };
+        if rewritten {
+            report.skipped_revalidated += 1;
             continue;
         }
 
         if opts.dry_run {
-            // Would-delete, but a dry run touches nothing. Counted under `orphaned`; not `deleted`.
+            // Deletable, but a dry run touches nothing — counted under `would_delete`, not `deleted`, so
+            // the partition holds in both modes and the operator sees what a real run would reclaim.
+            report.would_delete += 1;
             continue;
         }
 
-        // Old enough + unreferenced + not a dry run ⇒ reclaim it. A per-key failure is recorded and the
-        // sweep CONTINUES (one bad key never aborts the whole GC).
-        match blob.delete(&entry.key).await {
+        // Still old enough + still unreferenced (fresh index) + not rewritten (fresh stat) + not a dry
+        // run ⇒ reclaim it. A per-key failure is recorded and the sweep CONTINUES (one bad key never
+        // aborts the whole GC).
+        //
+        // RESIDUAL RACE (documented): the two fresh checks above narrow the clobber window to the gap
+        // between this re-check/re-stat and the `delete()` below — a recreate that commits its index row
+        // AND rewrites the bytes in that sub-millisecond gap could still be lost. The DEFINITIVE
+        // race-free fix is unique-per-write blob keys (so an overwrite never reuses a candidate's key and
+        // the reconciler can never target live bytes); that is a SEPARATE beaded slice — this branch
+        // only makes the reconciler SAFE given today's deterministic keys.
+        match blob.delete(&key).await {
             Ok(()) => report.deleted += 1,
             Err(_) => report.delete_errors += 1,
         }
@@ -224,12 +334,15 @@ where
                 Ok(report) => {
                     eprintln!(
                         "reconciler sweep complete: scanned={} orphaned={} deleted={} \
-                         too_young={} skipped_unknown_age={} delete_errors={}",
+                         would_delete={} too_young={} skipped_unknown_age={} \
+                         skipped_revalidated={} delete_errors={}",
                         report.scanned,
                         report.orphaned,
                         report.deleted,
+                        report.would_delete,
                         report.too_young,
                         report.skipped_unknown_age,
+                        report.skipped_revalidated,
                         report.delete_errors,
                     );
                 }
@@ -247,6 +360,7 @@ mod tests {
     use crate::store::blob::InMemoryBlobStore;
     use crate::store::sparq::{InMemorySparqClient, ResourceMeta};
     use bytes::Bytes;
+    use std::sync::Mutex;
 
     fn meta(blob_key: &str) -> ResourceMeta {
         ResourceMeta {
@@ -346,9 +460,14 @@ mod tests {
         assert_eq!(report.deleted, 1); // only "old-orphan"
                                        // "young-orphan" + "undated-orphan"(now) are both inside the 60s window ⇒ too_young.
         assert_eq!(report.too_young, 2);
-        // The four dispositions of an orphan must sum to `orphaned`.
+        // The SIX dispositions of an orphan must sum to `orphaned` (the full partition).
         assert_eq!(
-            report.deleted + report.too_young + report.skipped_unknown_age + report.delete_errors,
+            report.deleted
+                + report.would_delete
+                + report.too_young
+                + report.skipped_unknown_age
+                + report.skipped_revalidated
+                + report.delete_errors,
             report.orphaned
         );
         // And referenced + orphaned == scanned.
@@ -388,18 +507,110 @@ mod tests {
     async fn dry_run_deletes_nothing_but_reports_orphans() {
         let sparq = InMemorySparqClient::new();
         let blob = InMemoryBlobStore::new();
+        // 1 deletable orphan (old), 1 too-young orphan, 1 referenced — so the partition has >1 term.
+        sparq.put_meta("iri", meta("ref")).await.unwrap();
+        blob.put_with_time("ref", Bytes::from_static(b"r"), ago(99999));
         blob.put_with_time("orphan", Bytes::from_static(b"x"), ago(3600));
+        blob.put_with_time("young", Bytes::from_static(b"y"), ago(1));
 
         let dry = ReconcileOptions {
             grace: Duration::from_secs(60),
             dry_run: true,
         };
         let report = reconcile_orphans(&sparq, &blob, &dry).await.unwrap();
-        assert_eq!(report.orphaned, 1);
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.referenced, 1);
+        assert_eq!(report.orphaned, 2);
         assert_eq!(report.deleted, 0, "dry run must not delete");
+        // Finding 2: the deletable orphan is counted under `would_delete`, NOT `deleted`.
+        assert_eq!(
+            report.would_delete, 1,
+            "dry run reports the deletable count"
+        );
+        assert_eq!(report.too_young, 1);
+        // The partition invariant must hold in DRY-RUN mode too.
+        assert_eq!(
+            report.deleted
+                + report.would_delete
+                + report.too_young
+                + report.skipped_unknown_age
+                + report.skipped_revalidated
+                + report.delete_errors,
+            report.orphaned
+        );
+        assert_eq!(report.referenced + report.orphaned, report.scanned);
         assert!(
             blob.exists("orphan").await.unwrap(),
             "dry run must keep the bytes"
+        );
+        assert!(blob.exists("young").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn candidate_that_becomes_referenced_between_snapshot_and_delete_is_kept() {
+        // FINDING 1 (part a) regression: a candidate that looked unreferenced at the start-of-sweep
+        // snapshot but becomes REFERENCED (a recreate committed a fresh index row at the same
+        // deterministic key) before the delete pass must NOT be deleted.
+        //
+        // `ToggleReferencedSparq` returns {} on the FIRST `referenced_blob_keys()` (the snapshot) and
+        // {"orphan"} on the SECOND (the pre-delete fresh re-check). The blob is old enough, so without
+        // the fresh re-check it WOULD be classified deletable and removed — the mutation-check.
+        let sparq = ToggleReferencedSparq::new(["orphan"]);
+        let blob = InMemoryBlobStore::new();
+        blob.put_with_time("orphan", Bytes::from_static(b"x"), ago(3600));
+
+        let report = reconcile_orphans(&sparq, &blob, &opts()).await.unwrap();
+        assert_eq!(report.scanned, 1);
+        // Snapshot said unreferenced ⇒ it was an orphan candidate...
+        assert_eq!(report.orphaned, 1);
+        // ...but the fresh re-check found it referenced again ⇒ revalidated, NOT deleted.
+        assert_eq!(report.skipped_revalidated, 1);
+        assert_eq!(report.deleted, 0);
+        assert!(
+            blob.exists("orphan").await.unwrap(),
+            "a candidate referenced again by delete-time must NOT be GC'd (the recreate race)"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_check_without_fresh_recheck_the_recreate_would_be_deleted() {
+        // The mutation-check made explicit: with the SNAPSHOT referenced set (empty), the candidate is
+        // old-enough + unreferenced ⇒ the un-rechecked logic would delete it. We assert that the
+        // snapshot view alone classifies it deletable, proving the test above is non-vacuous: it is the
+        // FRESH re-check (the second referenced query) that flips the outcome to kept.
+        let snapshot_referenced: HashSet<String> = HashSet::new();
+        // From the start-of-sweep snapshot the key is unreferenced + old ⇒ would be deleted.
+        assert!(!snapshot_referenced.contains("orphan"));
+        // The fresh set (what the fix consults) DOES contain it ⇒ the fix keeps it.
+        let fresh_referenced: HashSet<String> = ["orphan".to_string()].into_iter().collect();
+        assert!(fresh_referenced.contains("orphan"));
+    }
+
+    #[tokio::test]
+    async fn candidate_whose_bytes_are_rewritten_between_snapshot_and_delete_is_kept() {
+        // FINDING 1 (part b) regression: a candidate old-enough at the snapshot whose BYTES are
+        // REWRITTEN (a newer `last_modified` — a same-key overwrite under deterministic keying) before
+        // the delete pass must NOT be deleted.
+        //
+        // `RewrittenBlobStore::list()` reports an OLD stamp (so it is classified deletable); its
+        // `stat()` reports a FRESH stamp (the rewrite). Without the re-stat the candidate WOULD be
+        // deleted — the mutation-check (the snapshot view alone says delete).
+        let sparq = InMemorySparqClient::new();
+        let blob = RewrittenBlobStore::new(
+            "rewritten",
+            ago(3600),         // old at snapshot ⇒ classified deletable
+            SystemTime::now(), // freshly rewritten by delete-time ⇒ must be kept
+        );
+
+        let report = reconcile_orphans(&sparq, &blob, &opts()).await.unwrap();
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.orphaned, 1);
+        // The re-stat saw newer bytes ⇒ revalidated, NOT deleted.
+        assert_eq!(report.skipped_revalidated, 1);
+        assert_eq!(report.deleted, 0);
+        assert!(
+            !blob.deleted_keys().contains(&"rewritten".to_string()),
+            "a candidate whose bytes were rewritten by delete-time must NOT be GC'd"
         );
     }
 
@@ -419,7 +630,120 @@ mod tests {
         );
     }
 
-    // --- test doubles for the fail-closed / unknown-age branches ---
+    // --- test doubles for the fail-closed / unknown-age / fresh-recheck branches ---
+
+    /// A SPARQ client whose `referenced_blob_keys` returns the EMPTY set on the first call (the
+    /// start-of-sweep snapshot) and a configured non-empty set on every subsequent call (the pre-delete
+    /// fresh re-check) — modelling a recreate that committed an index row mid-sweep at a reused
+    /// deterministic key. Only `referenced_blob_keys` is reachable in these tests; the rest panic.
+    struct ToggleReferencedSparq {
+        fresh: HashSet<String>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl ToggleReferencedSparq {
+        fn new<I: IntoIterator<Item = &'static str>>(fresh: I) -> Self {
+            Self {
+                fresh: fresh.into_iter().map(str::to_string).collect(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl SparqClient for ToggleReferencedSparq {
+        async fn get_meta(&self, _: &str) -> Result<ResourceMeta, SparqError> {
+            unreachable!()
+        }
+        async fn put_meta(&self, _: &str, _: ResourceMeta) -> Result<(), SparqError> {
+            unreachable!()
+        }
+        async fn exists(&self, _: &str) -> Result<bool, SparqError> {
+            unreachable!()
+        }
+        async fn delete_meta(&self, _: &str) -> Result<(), SparqError> {
+            unreachable!()
+        }
+        async fn delete_meta_if_empty(
+            &self,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<super::super::sparq::DeleteOutcome, SparqError> {
+            unreachable!()
+        }
+        async fn create_child(&self, _: &str, _: &str, _: ResourceMeta) -> Result<(), SparqError> {
+            unreachable!()
+        }
+        async fn remove_child(&self, _: &str, _: &str) -> Result<(), SparqError> {
+            unreachable!()
+        }
+        async fn list_children(&self, _: &str) -> Result<Vec<String>, SparqError> {
+            unreachable!()
+        }
+        async fn referenced_blob_keys(&self) -> Result<HashSet<String>, SparqError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // First call (the snapshot): nothing referenced. Later calls (the fresh re-check): the
+            // recreate's row is now visible.
+            if n == 0 {
+                Ok(HashSet::new())
+            } else {
+                Ok(self.fresh.clone())
+            }
+        }
+    }
+
+    /// A blob store whose `list()` reports an OLD `last_modified` (so a key is classified deletable) but
+    /// whose `stat()` reports a FRESH one (modelling a same-key overwrite that landed after the
+    /// snapshot). Records every `delete()` so a test can assert nothing was actually removed.
+    struct RewrittenBlobStore {
+        key: String,
+        list_stamp: SystemTime,
+        stat_stamp: SystemTime,
+        deleted: Mutex<Vec<String>>,
+    }
+    impl RewrittenBlobStore {
+        fn new(key: &str, list_stamp: SystemTime, stat_stamp: SystemTime) -> Self {
+            Self {
+                key: key.to_string(),
+                list_stamp,
+                stat_stamp,
+                deleted: Mutex::new(Vec::new()),
+            }
+        }
+        fn deleted_keys(&self) -> Vec<String> {
+            self.deleted.lock().expect("poisoned").clone()
+        }
+    }
+    #[async_trait::async_trait]
+    impl BlobStore for RewrittenBlobStore {
+        async fn get(&self, _: &str) -> Result<Bytes, BlobError> {
+            Ok(Bytes::from_static(b"x"))
+        }
+        async fn put(&self, _: &str, _: Bytes) -> Result<(), BlobError> {
+            Ok(())
+        }
+        async fn exists(&self, key: &str) -> Result<bool, BlobError> {
+            Ok(key == self.key)
+        }
+        async fn delete(&self, key: &str) -> Result<(), BlobError> {
+            self.deleted.lock().expect("poisoned").push(key.to_string());
+            Ok(())
+        }
+        async fn list(&self) -> Result<Vec<super::super::blob::BlobEntry>, BlobError> {
+            Ok(vec![super::super::blob::BlobEntry {
+                key: self.key.clone(),
+                last_modified: Some(self.list_stamp),
+            }])
+        }
+        async fn stat(
+            &self,
+            key: &str,
+        ) -> Result<Option<super::super::blob::BlobEntry>, BlobError> {
+            // The FRESH (rewritten) view: a newer stamp than `list()` reported.
+            Ok((key == self.key).then(|| super::super::blob::BlobEntry {
+                key: self.key.clone(),
+                last_modified: Some(self.stat_stamp),
+            }))
+        }
+    }
 
     /// A blob store whose `list` reports keys with NO last_modified (the unknown-age path).
     struct UndatedBlobStore {
