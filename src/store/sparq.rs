@@ -131,6 +131,18 @@ pub trait SparqClient: Send + Sync {
 
     /// List the IRIs of `container`'s direct children (its `ldp:contains` members).
     async fn list_children(&self, container: &str) -> Result<Vec<String>, SparqError>;
+
+    /// The set of blob-store keys that ANY index record currently references (the `pss:blobKey`
+    /// pointers across every resource graph).
+    ///
+    /// This is the authoritative answer to "which bytes are still referenced?", the half of the orphan
+    /// sweep that only SPARQ can give: the reconciler enumerates the physically-stored blobs (via
+    /// [`super::BlobStore::list`]) and treats any stored key NOT in this set as a candidate orphan.
+    /// Returned as ONE set (computed once per sweep) rather than a per-key `is_referenced` check, so a
+    /// GC is O(1) backend calls, not O(N-blobs) — see [`super::sparql::select_referenced_blob_keys`].
+    /// Fail-closed: any backend error propagates, so the reconciler ABORTS rather than treating a
+    /// failed referenced-set query as "nothing is referenced" (which would delete the whole pod).
+    async fn referenced_blob_keys(&self) -> Result<std::collections::HashSet<String>, SparqError>;
 }
 
 /// An in-memory [`SparqClient`] for tests and the M1/M2 boot-without-SPARQ path.
@@ -279,5 +291,15 @@ impl SparqClient for InMemorySparqClient {
             .lock()
             .map_err(|_| SparqError::Backend("poisoned".into()))?;
         Ok(guard.children.get(container).cloned().unwrap_or_default())
+    }
+
+    async fn referenced_blob_keys(&self) -> Result<std::collections::HashSet<String>, SparqError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| SparqError::Backend("poisoned".into()))?;
+        // Every metadata record's `blob_key` is a live reference. Mirrors the live path's
+        // `SELECT DISTINCT ?bk` over the `pss:blobKey` predicate across all graphs.
+        Ok(guard.meta.values().map(|m| m.blob_key.clone()).collect())
     }
 }

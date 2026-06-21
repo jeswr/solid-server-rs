@@ -515,6 +515,36 @@ impl SparqClient for HttpSparqClient {
         }
         Ok(children)
     }
+
+    async fn referenced_blob_keys(&self) -> Result<std::collections::HashSet<String>, SparqError> {
+        // ONE `SELECT DISTINCT ?bk` over every graph's `pss:blobKey` — the whole referenced set in a
+        // single round-trip (see the builder doc). No untrusted input, so the query is infallible.
+        let q = sparql::select_referenced_blob_keys();
+        let (body, _ct) = self
+            .query_raw(&q, ACCEPT_RESULTS_JSON)
+            .await
+            .map_err(SparqHttpError::into_sparq)?;
+        let result = parse_select_json(&body).map_err(SparqHttpError::into_sparq)?;
+        let mut keys = std::collections::HashSet::with_capacity(result.rows.len());
+        for row in result.rows {
+            // A `SELECT ?bk` row MUST carry the `bk` binding. A row missing it is a malformed backend
+            // response — surface it as a FATAL error, never silently drop it: a silently-shortened
+            // referenced set would make the reconciler think a still-referenced blob is an orphan and
+            // DELETE live bytes. Fail-closed (the reconciler aborts the whole sweep on this error).
+            match row.get("bk") {
+                Some(bk) => {
+                    keys.insert(bk.clone());
+                }
+                None => {
+                    return Err(SparqHttpError::Malformed(
+                        "referenced-blob-keys row missing the 'bk' binding".into(),
+                    )
+                    .into_sparq())
+                }
+            }
+        }
+        Ok(keys)
+    }
 }
 
 impl HttpSparqClient {

@@ -552,6 +552,10 @@ impl BlobStore for CountingBlob {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.delete(key).await
     }
+
+    async fn list(&self) -> Result<Vec<solid_server_rs::store::BlobEntry>, BlobError> {
+        self.inner.list().await
+    }
 }
 
 #[tokio::test]

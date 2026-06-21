@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -19,6 +20,21 @@ pub enum BlobError {
     NotFound,
     #[error("blob backend error: {0}")]
     Backend(String),
+}
+
+/// One stored blob, as surfaced by [`BlobStore::list`] for the reconciler's orphan sweep.
+///
+/// The `last_modified` timestamp is LOAD-BEARING for the reconciler's grace period: an orphan is only
+/// GC'd when it is OLDER than the grace window, so a blob whose bytes were just written but whose index
+/// row has not yet committed (the write-in-progress race) is protected. Backends that do not expose a
+/// timestamp (none here yet) must report `None` and are then NEVER GC'd by the reconciler (fail-closed
+/// — we can't prove an undated blob is old enough to be safe to delete).
+#[derive(Debug, Clone)]
+pub struct BlobEntry {
+    /// The opaque storage key the bytes live under.
+    pub key: String,
+    /// When the bytes were last written, if the backend records it. `None` ⇒ unknown ⇒ never GC'd.
+    pub last_modified: Option<SystemTime>,
 }
 
 /// The byte store: a key/value store of resource bodies, keyed by an opaque storage key.
@@ -39,17 +55,58 @@ pub trait BlobStore: Send + Sync {
     /// Remove the bytes for a storage key. Idempotent: deleting an absent key is `Ok(())` (the
     /// authoritative existence decision lives in the index, not here).
     async fn delete(&self, key: &str) -> Result<(), BlobError>;
+
+    /// List every stored blob key with its last-modified time (if the backend records one).
+    ///
+    /// This is the read side the reconciler's orphaned-bytes sweep needs: SPARQ is authoritative for
+    /// *which* bytes are referenced, but only the blob store can enumerate which bytes *physically
+    /// exist*, so the reconciler diffs the two. This is the ONLY read path permitted to enumerate the
+    /// blob store directly — the LDP request path must never LIST/HEAD the blob store (the
+    /// "SPARQ is the source of truth" invariant); the reconciler is the documented exception because GC
+    /// is *about* the bytes the index does not know about.
+    ///
+    /// M2-next (the `object_store` adapter): implement via `object_store::ObjectStore::list` — its
+    /// `ObjectMeta` carries `location` (→ `key`) + `last_modified` (a `chrono::DateTime<Utc>` → map to
+    /// [`SystemTime`]), so the real S3/Local backend reports a real timestamp and the grace window
+    /// works against true object age. Until that adapter lands the in-memory double below is the only
+    /// impl.
+    async fn list(&self) -> Result<Vec<BlobEntry>, BlobError>;
+}
+
+/// A stored blob in the in-memory double: the bytes + the insert/overwrite time (for the grace check).
+struct StoredBlob {
+    body: Bytes,
+    last_modified: SystemTime,
 }
 
 /// An in-memory [`BlobStore`] for tests and the M1 boot-without-S3 path.
+///
+/// Each [`put`](InMemoryBlobStore::put) stamps the wall-clock insert time, mirroring an object store's
+/// `last_modified`, so the reconciler's grace window can be exercised without a real backend. Tests
+/// that need a *specific* age use [`put_with_time`](InMemoryBlobStore::put_with_time) to back-date a
+/// blob deterministically (no `sleep`).
 #[derive(Default)]
 pub struct InMemoryBlobStore {
-    inner: Mutex<HashMap<String, Bytes>>,
+    inner: Mutex<HashMap<String, StoredBlob>>,
 }
 
 impl InMemoryBlobStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Insert bytes with an EXPLICIT last-modified time. Test-only helper so the grace-window tests can
+    /// back-date a blob deterministically (e.g. "2 hours ago") instead of sleeping. Not part of the
+    /// [`BlobStore`] trait — production code uses [`put`](InMemoryBlobStore::put), which stamps `now`.
+    pub fn put_with_time(&self, key: &str, body: Bytes, last_modified: SystemTime) {
+        let mut guard = self.inner.lock().expect("blob store mutex poisoned");
+        guard.insert(
+            key.to_string(),
+            StoredBlob {
+                body,
+                last_modified,
+            },
+        );
     }
 }
 
@@ -60,7 +117,10 @@ impl BlobStore for InMemoryBlobStore {
             .inner
             .lock()
             .map_err(|_| BlobError::Backend("poisoned".into()))?;
-        guard.get(key).cloned().ok_or(BlobError::NotFound)
+        guard
+            .get(key)
+            .map(|b| b.body.clone())
+            .ok_or(BlobError::NotFound)
     }
 
     async fn put(&self, key: &str, body: Bytes) -> Result<(), BlobError> {
@@ -68,7 +128,13 @@ impl BlobStore for InMemoryBlobStore {
             .inner
             .lock()
             .map_err(|_| BlobError::Backend("poisoned".into()))?;
-        guard.insert(key.to_string(), body);
+        guard.insert(
+            key.to_string(),
+            StoredBlob {
+                body,
+                last_modified: SystemTime::now(),
+            },
+        );
         Ok(())
     }
 
@@ -87,5 +153,19 @@ impl BlobStore for InMemoryBlobStore {
             .map_err(|_| BlobError::Backend("poisoned".into()))?;
         guard.remove(key);
         Ok(())
+    }
+
+    async fn list(&self) -> Result<Vec<BlobEntry>, BlobError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| BlobError::Backend("poisoned".into()))?;
+        Ok(guard
+            .iter()
+            .map(|(key, blob)| BlobEntry {
+                key: key.clone(),
+                last_modified: Some(blob.last_modified),
+            })
+            .collect())
     }
 }

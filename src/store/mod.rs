@@ -8,14 +8,19 @@
 
 pub mod blob;
 pub mod http;
+pub mod reconcile;
 pub mod sparq;
 pub mod sparql;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 
-pub use blob::{BlobError, BlobStore, InMemoryBlobStore};
+pub use blob::{BlobEntry, BlobError, BlobStore, InMemoryBlobStore};
 pub use http::{HttpSparqClient, SparqHttpError};
+pub use reconcile::{
+    reconcile_orphans, spawn_periodic, ReconcileError, ReconcileOptions, ReconcileReport,
+    DEFAULT_GRACE,
+};
 pub use sparq::{DeleteOutcome, InMemorySparqClient, ResourceMeta, SparqClient, SparqError};
 pub use sparql::{BodyObject, BuildError};
 

@@ -233,6 +233,26 @@ pub fn select_children(container: &str) -> Result<String, BuildError> {
     ))
 }
 
+/// SELECT every blob-key the index references, across ALL resource graphs — the *referenced set* the
+/// reconciler diffs against the physically-stored blobs to find orphans.
+///
+/// This is the efficient shape for the orphan sweep: ONE query returns the WHOLE referenced set
+/// (`SELECT DISTINCT ?bk` over the reserved `pss:blobKey` predicate against the reserved record
+/// subject, in any graph), so the reconciler asks SPARQ *once* and then does O(1) set-membership per
+/// blob — rather than N per-key `ASK`s (one network round-trip per stored blob), which would make a GC
+/// over a large pod O(N) backend calls. `DISTINCT` because two index records could (pathologically)
+/// name the same blob; we only care whether a key is referenced AT ALL.
+///
+/// It takes NO untrusted input — the predicate + subject are reserved-vocab constants — so it cannot
+/// be an injection vector and is infallible-by-construction (returned as `String`, not a `Result`).
+pub fn select_referenced_blob_keys() -> String {
+    format!(
+        "SELECT DISTINCT ?bk WHERE {{ GRAPH ?g {{ {s} {p} ?bk }} }}",
+        s = iri_const(&s_record()),
+        p = iri_const(&p_blob_key()),
+    )
+}
+
 /// UPDATE: create-or-replace ONLY a resource's reserved index-record triples (content type, blob-key,
 /// ETag) — leaving everything else in the graph (containment `ldp:contains` edges, the resource's own
 /// RDF) untouched.
