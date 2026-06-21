@@ -909,6 +909,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn old_orphan_with_no_generation_is_kept_fail_closed_without_any_cas() {
+        // The DIRECT first-pass `generation: None` fail-closed test (the LOW finding): an OLD orphan
+        // (`last_modified: Some(old)`, past the grace window) whose backend reports NO `generation` (a
+        // version-less backend) cannot be CAS-deleted safely, so it must be KEPT — counted under
+        // `skipped_revalidated` — and NO CAS / `delete_if_unchanged` path may be reached.
+        //
+        // This is distinct from `unknown_age_blob_is_kept_fail_closed`: that store exits earlier on
+        // `last_modified: None` (skipped_unknown_age) and so never exercises the `generation: None`
+        // branch with a KNOWN old timestamp. Here the age check PASSES (old enough) and the candidate
+        // is only stopped by the version-less guard.
+        //
+        // MUTATION-CHECK (recorded in the report below): if the first-pass `generation: None` guard were
+        // removed so the entry fell through toward the second pass / CAS, this store's CAS-or-delete
+        // counter would be non-zero and `removed()` true ⇒ this test would fail. (Verified by temporarily
+        // dropping the guard: the candidate reaches `delete_if_unchanged` and the asserts below fail.)
+        let sparq = InMemorySparqClient::new();
+        let blob = VersionlessOldBlobStore::new("versionless-orphan", ago(3600));
+
+        let report = reconcile_orphans(&sparq, &blob, &opts()).await.unwrap();
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.orphaned, 1);
+        // Old enough, but version-less ⇒ no safe CAS ⇒ fail-closed, KEPT under skipped_revalidated.
+        assert_eq!(report.skipped_revalidated, 1);
+        assert_eq!(
+            report.skipped_unknown_age, 0,
+            "the age IS known (old) — not this disposition"
+        );
+        assert_eq!(report.too_young, 0);
+        assert_eq!(report.deleted, 0);
+        // The partition still holds.
+        assert_eq!(
+            report.deleted
+                + report.would_delete
+                + report.too_young
+                + report.skipped_unknown_age
+                + report.skipped_revalidated
+                + report.delete_errors,
+            report.orphaned
+        );
+        // The crux: a version-less candidate is decided in the FIRST pass — NO CAS, NO delete, and the
+        // second referenced-set re-fetch is never reached either (zero candidates ⇒ Finding 2 short-circuit).
+        assert_eq!(
+            blob.cas_or_delete_calls(),
+            0,
+            "a generation:None candidate must be kept fail-closed in the first pass — never reach a \
+             CAS / delete_if_unchanged"
+        );
+        assert!(
+            !blob.removed(),
+            "a version-less orphan must NOT be GC'd (no native write version ⇒ no safe CAS)"
+        );
+    }
+
+    #[tokio::test]
     async fn referenced_set_error_aborts_and_deletes_nothing() {
         // Fail-closed: if the referenced-set query fails we must NOT delete (a failed query is NOT
         // "nothing is referenced"). The blob list is never even consulted.
@@ -1365,6 +1419,96 @@ mod tests {
                     "second referenced-set query must not run with zero candidates".into(),
                 ))
             }
+        }
+    }
+
+    /// A blob store whose `list()` reports a key with a KNOWN OLD `last_modified` (past the grace window,
+    /// so the age check PASSES) but NO `generation` (a version-less backend) — exercising the first-pass
+    /// `generation: None` fail-closed branch. Records every `delete` / `delete_if_unchanged` call so a
+    /// test can assert NONE was reached: the candidate must be skipped (kept) in the first pass before any
+    /// CAS witness is needed.
+    struct VersionlessOldBlobStore {
+        key: String,
+        stamp: SystemTime,
+        cas_or_delete_calls: std::sync::atomic::AtomicUsize,
+        removed: Mutex<bool>,
+    }
+    impl VersionlessOldBlobStore {
+        fn new(key: &str, stamp: SystemTime) -> Self {
+            Self {
+                key: key.to_string(),
+                stamp,
+                cas_or_delete_calls: std::sync::atomic::AtomicUsize::new(0),
+                removed: Mutex::new(false),
+            }
+        }
+        fn cas_or_delete_calls(&self) -> usize {
+            self.cas_or_delete_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn removed(&self) -> bool {
+            *self.removed.lock().expect("poisoned")
+        }
+    }
+    #[async_trait::async_trait]
+    impl BlobStore for VersionlessOldBlobStore {
+        async fn get(&self, _: &str) -> Result<Bytes, BlobError> {
+            Ok(Bytes::from_static(b"x"))
+        }
+        async fn put(&self, _: &str, _: Bytes) -> Result<(), BlobError> {
+            Ok(())
+        }
+        async fn exists(&self, key: &str) -> Result<bool, BlobError> {
+            Ok(key == self.key)
+        }
+        async fn delete(&self, key: &str) -> Result<(), BlobError> {
+            // Must NOT be reached for a version-less candidate (first-pass fail-closed). Record it so the
+            // mutation-check (guard removed) is observable.
+            self.cas_or_delete_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if key == self.key {
+                *self.removed.lock().expect("poisoned") = true;
+            }
+            Ok(())
+        }
+        async fn list(&self) -> Result<Vec<super::super::blob::BlobEntry>, BlobError> {
+            // KNOWN old stamp (age check passes) but NO generation (version-less ⇒ no safe CAS).
+            Ok(vec![super::super::blob::BlobEntry {
+                key: self.key.clone(),
+                last_modified: Some(self.stamp),
+                generation: None,
+            }])
+        }
+        async fn stat(
+            &self,
+            key: &str,
+        ) -> Result<Option<super::super::blob::BlobEntry>, BlobError> {
+            // Should NOT be reached: a version-less candidate is decided in the first pass, before any
+            // re-stat. If it WERE reached (the first-pass guard removed so the entry fell through with
+            // some default snapshot witness), report a CONCRETE generation that still passes the
+            // second-pass age + generation re-checks — so the ONLY guard that can stop the delete is the
+            // first-pass `generation: None` one the LOW finding is about. That makes the mutation-check
+            // bite the FIRST pass specifically (not be masked by the second-pass version-less guard).
+            Ok((key == self.key).then(|| super::super::blob::BlobEntry {
+                key: self.key.clone(),
+                last_modified: Some(self.stamp),
+                generation: Some(0),
+            }))
+        }
+        async fn delete_if_unchanged(
+            &self,
+            key: &str,
+            _expected_generation: u64,
+        ) -> Result<bool, BlobError> {
+            // Must NOT be reached. If the first-pass guard were removed, the candidate would arrive here
+            // and this unconditionally deletes — so the mutation-check fails loudly (removed() true,
+            // cas_or_delete_calls > 0).
+            self.cas_or_delete_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if key == self.key {
+                *self.removed.lock().expect("poisoned") = true;
+            }
+            Ok(true)
         }
     }
 
