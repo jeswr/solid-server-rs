@@ -239,11 +239,21 @@ pub async fn post_handler<S: Store>(
     Ok((StatusCode::CREATED, out).into_response())
 }
 
-/// `DELETE /{path}` — delete a resource.
+/// `DELETE /{path}` — delete a resource OR a container.
 ///
-/// A non-existent target is a 404. A non-empty container is a 409 (LDP refuses to delete a container
-/// with members — recursive delete is M2-next). `If-Match` is honoured (412 on mismatch). On success
-/// returns 204. Fail-closed (public ⇒ 403).
+/// A non-existent target is a 404. `If-Match` / `If-None-Match` are honoured (412 on mismatch). On
+/// success returns 204. Fail-closed (public ⇒ 403).
+///
+/// **Container-delete semantics (the spec choice — documented per the standing make-the-call rule).**
+/// A DELETE on a container path (trailing slash) is permitted ONLY when the container is empty: a
+/// container with members is a **409 Conflict**, never a cascade. This is the conservative choice the
+/// LDP spec permits (LDP §5.2.5.1 lets a server refuse to delete a non-empty container) and what CSS
+/// does by default — it avoids a single request silently destroying an arbitrarily large subtree.
+/// Deleting an empty container removes its own resource record AND its (empty) `ldp:contains` set in
+/// SPARQ (the live store `DROP`s the container's named graph; the in-memory double clears its
+/// children entry), and detaches it from its parent's containment. Recursive / cascade delete is
+/// intentionally NOT offered (an opt-in recursive delete is a possible future slice — file an issue
+/// if a client needs it).
 pub async fn delete_handler<S: Store>(
     State(state): State<Arc<LdpState<S>>>,
     Extension(token): Extension<VerifiedToken>,

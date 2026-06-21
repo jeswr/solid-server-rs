@@ -25,10 +25,15 @@ tower-http = { version = "0.7", features = ["trace"] }
 # TLS: rustls + aws-lc-rs (spike §4 — the house rule, FIPS-capable backend).
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
 # Auth: consume the standalone DPoP/Solid-OIDC verifier as a git dependency — do NOT reimplement.
-# At M1 (network adapters land in its M2); we use its StaticJwksProvider + InMemoryReplayStore seams.
-# Pinned to an exact rev (not the floating default branch) for reproducible, security-reviewable
-# builds; Cargo.lock is committed. M2: re-pin to a tagged release once the verifier cuts one.
-solid-oidc-verifier = { git = "https://github.com/jeswr/solid-oidc-verifier", rev = "c3224652daab67aed9986309b6aa7a8449b58658" }
+# The verifier's M2 landed the DNS-pinned SSRF-guarded network adapters (`NetworkJwksProvider` +
+# `NetworkWebIdResolver` over `SafeFetcher`); we enable its `network` feature so the binary performs
+# REAL OIDC discovery / JWKS fetch / WebID resolution against the live IdP. The middleware itself
+# stays issuer-agnostic + seam-based, so unit tests still drive the verification CORE via the
+# in-memory test doubles. Pinned to an exact rev (not the floating default branch) for reproducible,
+# security-reviewable builds; Cargo.lock is committed.
+# FOLLOW-UP: re-pin after the in-flight `fl9` SSRF change lands a new verifier rev (and re-pin to a
+# tagged release once the verifier cuts one).
+solid-oidc-verifier = { git = "https://github.com/jeswr/solid-oidc-verifier", rev = "6f1b91cf267984ca344af6366684f42803f15472", features = ["network"] }
 # RDF parse/serialise: oxttl (Turtle/N-Triples) + oxjsonld (JSON-LD ↔ RDF), via oxrdf model (spike §4).
 # oxttl 0.2 + oxjsonld 0.2 both pin `oxrdf =0.3.3`, so this is a coherent Oxigraph set.
 oxrdf = "0.3"

@@ -239,6 +239,52 @@ async fn delete_detaches_from_parent_container() {
 }
 
 #[tokio::test]
+async fn deleting_a_container_clears_its_own_containment_set() {
+    // Deleting a container removes its OWN record AND its `ldp:contains` set (parity with the live
+    // `DROP SILENT GRAPH`): a container re-created at the same IRI must not inherit a stale member.
+    let s = store();
+    let parent = "https://pod.example/alice/";
+    let container = "https://pod.example/alice/sub/";
+    let child = "https://pod.example/alice/sub/note1";
+    s.write(
+        parent,
+        Bytes::from_static(b"<#c> <#p> \"P\" ."),
+        "text/turtle",
+    )
+    .await
+    .unwrap();
+    // Create the sub-container as a child of the parent, then a child inside it.
+    s.create_in_container(
+        parent,
+        container,
+        Bytes::from_static(b"<#c> <#p> \"S\" ."),
+        "text/turtle",
+    )
+    .await
+    .unwrap();
+    s.create_in_container(
+        container,
+        child,
+        Bytes::from_static(b"<#it> <#p> \"x\" ."),
+        "text/turtle",
+    )
+    .await
+    .unwrap();
+    // Empty the sub-container (the handler's empty-container precondition), then delete the container.
+    s.delete(child, Some(container)).await.unwrap();
+    assert!(s.list_children(container).await.unwrap().is_empty());
+    s.delete(container, Some(parent)).await.unwrap();
+
+    // The container is gone, detached from its parent, and its own containment set is cleared.
+    assert!(!s.exists(container).await.unwrap());
+    assert!(s.list_children(parent).await.unwrap().is_empty());
+    assert!(
+        s.list_children(container).await.unwrap().is_empty(),
+        "a deleted container must leave no stale containment set"
+    );
+}
+
+#[tokio::test]
 async fn meta_returns_etag_without_bytes() {
     let s = store();
     let written = s

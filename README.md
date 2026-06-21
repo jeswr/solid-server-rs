@@ -39,8 +39,12 @@ The two load-bearing architectural rules, straight from the directive:
    [`BlobStore`](src/store/blob.rs) trait.
 
 Auth is **not reimplemented here**: token + DPoP-proof verification is delegated wholesale to
-`solid-oidc-verifier` (consumed as a `git` dependency), using its `JwksProvider` / `ReplayStore`
-trait seams. This crate only adapts HTTP requests to/from the verifier.
+`solid-oidc-verifier` (consumed as a `git` dependency), using its `JwksProvider` / `WebIdResolver` /
+`ReplayStore` trait seams. This crate only adapts HTTP requests to/from the verifier. The binary
+wires the verifier's **network adapters** (the `network` feature) so verification is REAL: OIDC
+discovery + JWKS fetch (`NetworkJwksProvider`) and the bidirectional WebID↔issuer check
+(`NetworkWebIdResolver`) both run over the verifier's DNS-pinned, SSRF-guarded `SafeFetcher`. Unit
+tests still drive the verification core through the in-memory test doubles.
 
 ## What's in this slice
 
@@ -59,7 +63,12 @@ A coherent, compiling vertical slice with clean trait seams and unit tests:
     and single-range **`Range: bytes=…`** support (206 + `Content-Range`, 416 when unsatisfiable).
   - **PUT** (create-or-replace) and **POST** (create a child in a container — honours `Slug`, mints
     a server URI otherwise, 201 + `Location`; 409 on POST to a non-container).
-  - **DELETE** (404 on a missing target; 409 refusal for a non-empty container).
+  - **DELETE** of a resource OR a container (404 on a missing target; `If-Match` honoured). A
+    container is deletable **only when empty** — a non-empty container is a **409 Conflict**, not a
+    cascade. This is the conservative LDP-permitted spec choice (LDP §5.2.5.1; matches CSS's default)
+    and avoids one request silently destroying an arbitrary subtree. Deleting an empty container
+    removes its own record + its (empty) `ldp:contains` set and detaches it from its parent. A
+    recursive/cascade delete is intentionally **not** offered.
   - **PATCH** — the Solid **N3 Patch** engine (`text/n3`, [`src/ldp/patch.rs`](src/ldp/patch.rs)):
     `solid:inserts` + `solid:deletes` plus the **`solid:where` variable solver** — a basic-graph-pattern
     matcher (conjunctive variable unification) over the target graph whose single binding instantiates
@@ -81,12 +90,15 @@ A coherent, compiling vertical slice with clean trait seams and unit tests:
 
 ### Deferred to later slices (`// M2-next:`-marked seams in the code)
 
-Full **WAC authorization** evaluation (needs the SPARQ access-control design — a separate slice),
-**multipart Range**, **SPARQL-Update PATCH**, recursive
-container delete, notifications (WebSocketChannel2023), the reconciler, TLS termination, the
-**live SPARQ HTTP client** (needs a running SPARQ instance — an integration test), and **live JWKS**
-(needs the verifier's network adapters). The code carries `M2-next:` seam comments where each plugs
-in.
+Full **WAC authorization** evaluation (gated on `sparq#992` — the SPARQ access-control design),
+**multipart Range**, **SPARQL-Update PATCH**, recursive/cascade container delete (deliberately not
+offered — see DELETE above), notifications (WebSocketChannel2023), the reconciler, TLS termination
+(the `rustls`/`aws-lc-rs` provider is installed; a config-gated TLS listener is the next slice —
+terminate at a reverse proxy until then), and the **live SPARQ HTTP client + `object_store` blob
+store** in the binary (the `HttpSparqClient` exists and is tested against a mock endpoint; the binary
+still boots the in-memory store doubles — wiring it in needs a running SPARQ/S3 for the IT). Live
+JWKS / WebID resolution are now **wired** (the verifier's network adapters). The code carries
+seam comments where each remaining piece plugs in.
 
 ## Build & run
 
@@ -99,14 +111,22 @@ cargo run                   # boot the experimental server (defaults to 127.0.0.
 
 # configurable via env:
 SOLID_SERVER_BIND=127.0.0.1:3000 \
-SOLID_SERVER_BASE_URL=http://localhost:3000 \
+SOLID_SERVER_BASE_URL=https://pod.example \
 SOLID_SERVER_TRUSTED_ISSUER=https://idp.example/realms/solid \
+SOLID_SERVER_AUDIENCE=https://pod.example \          # RFC 9068 `aud` (defaults to base URL)
+SOLID_SERVER_BIDIRECTIONAL=strict \                  # strict (default) | warn | off
+SOLID_SERVER_JWKS_CACHE_TTL_SECS=300 \               # JWKS cache TTL (default 300s)
+SOLID_SERVER_ALLOW_LOOPBACK=0 \                      # dev/IT ONLY: permit http:/loopback IdP+WebID
   cargo run
 ```
 
-The server boots with in-memory storage and a static (empty) JWKS, so an authenticated request needs
-a token whose issuer key is registered in the JWKS provider — see the tests ([`tests/`](tests/)) for
-how tokens + DPoP proofs are minted and verified end-to-end.
+Auth is **real**: the server performs live OIDC discovery + JWKS fetch against the trusted issuer
+(over the DNS-pinned SSRF-guarded fetcher) and, by default, the strict bidirectional WebID↔issuer
+check. So an authenticated request needs a DPoP-bound token signed by the trusted IdP. For a local
+dev IdP on `http://`/loopback, set `SOLID_SERVER_ALLOW_LOOPBACK=1` (production refuses non-HTTPS /
+private-host IdP+WebID hosts). Storage is still the in-memory doubles (no SPARQ/S3 needed to boot).
+See the tests ([`tests/`](tests/)) for how tokens + DPoP proofs are minted and verified end-to-end
+against the verification core.
 
 ## Gate
 

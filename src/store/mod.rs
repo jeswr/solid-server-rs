@@ -34,8 +34,10 @@ pub struct Resource {
 /// + records membership; an empty-container check governs DELETE), and the metadata needed for the
 /// conditional-write ETag CAS (the [`ResourceMeta::etag`] the handler compares).
 ///
-/// M2-next: the reconciler that GCs orphaned bytes/index rows after a crash between the byte and
-/// index writes, and recursive container delete.
+/// Next: the reconciler that GCs orphaned bytes/index rows after a crash between the byte and index
+/// writes. Container delete is supported for EMPTY containers — the handler refuses a non-empty one
+/// with 409 (the conservative spec choice); an opt-in recursive/cascade delete is intentionally not
+/// offered yet.
 #[async_trait]
 pub trait Store: Send + Sync {
     /// Read a resource by IRI: its authoritative metadata (SPARQ) + its bytes (blob store).

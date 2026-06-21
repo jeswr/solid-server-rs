@@ -381,6 +381,11 @@ pub fn insert_body_data(
 
 /// UPDATE: drop a resource's whole graph (its index record + RDF) — the DELETE byte-pointer lookup
 /// happens first via [`select_meta`]. `DROP SILENT` is idempotent on an absent graph.
+///
+/// For a CONTAINER target this is also what clears the container's `ldp:contains` set: the container's
+/// own named graph holds both its index record and its containment edges, so dropping the graph
+/// removes the (by-then-empty, per the handler's empty-container precondition) membership too. The
+/// container's edge in its PARENT's graph is detached separately by [`update_remove_child`].
 pub fn update_delete_resource(resource: &str) -> Result<String, BuildError> {
     Ok(format!("DROP SILENT GRAPH {g}", g = iri(resource)?))
 }

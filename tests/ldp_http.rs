@@ -620,6 +620,60 @@ async fn delete_a_non_empty_container_is_409() {
 }
 
 #[tokio::test]
+async fn delete_an_empty_container_succeeds() {
+    let h = Harness::new();
+    h.make_container("/alice/").await;
+
+    // The empty container can be deleted (the spec choice: empty ⇒ allowed, non-empty ⇒ 409).
+    let del = h.request("DELETE", "/alice/", None, Body::empty()).await;
+    assert_eq!(del.status(), StatusCode::NO_CONTENT);
+
+    // It is gone — a subsequent GET is a 404.
+    let get = h.request("GET", "/alice/", None, Body::empty()).await;
+    assert_eq!(get.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_a_container_after_emptying_it_succeeds() {
+    let h = Harness::new();
+    h.make_container("/alice/").await;
+    // POST a child, then DELETE the child (emptying the container), then DELETE the container.
+    let post = h
+        .request_with(
+            "POST",
+            "/alice/",
+            Some("text/turtle"),
+            &[("slug", "child")],
+            Body::from("<#it> <http://xmlns.com/foaf/0.1/name> \"C\" ."),
+        )
+        .await;
+    assert_eq!(post.status(), StatusCode::CREATED);
+    let child_loc = post
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .expect("POST returns a Location")
+        .to_string();
+    // The Location is an absolute IRI; DELETE wants the path.
+    let child_path = child_loc
+        .strip_prefix("https://pod.example")
+        .unwrap_or(&child_loc)
+        .to_string();
+
+    // While the child is present, the container DELETE is refused.
+    let del_full = h.request("DELETE", "/alice/", None, Body::empty()).await;
+    assert_eq!(del_full.status(), StatusCode::CONFLICT);
+
+    // Delete the child, which empties the container.
+    let del_child = h.request("DELETE", &child_path, None, Body::empty()).await;
+    assert_eq!(del_child.status(), StatusCode::NO_CONTENT);
+
+    // Now the (empty) container can be deleted.
+    let del_container = h.request("DELETE", "/alice/", None, Body::empty()).await;
+    assert_eq!(del_container.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn unauthenticated_delete_is_forbidden() {
     let h = Harness::new();
     h.request(
