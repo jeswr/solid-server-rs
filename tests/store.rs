@@ -447,7 +447,7 @@ async fn delete_meta_if_empty_on_the_sparq_client_is_atomic() {
 
     // Absent ⇒ NotFound.
     assert_eq!(
-        sparq.delete_meta_if_empty(container).await.unwrap(),
+        sparq.delete_meta_if_empty(container, None).await.unwrap(),
         DeleteOutcome::NotFound
     );
 
@@ -458,7 +458,7 @@ async fn delete_meta_if_empty_on_the_sparq_client_is_atomic() {
         .await
         .unwrap();
     assert_eq!(
-        sparq.delete_meta_if_empty(container).await.unwrap(),
+        sparq.delete_meta_if_empty(container, None).await.unwrap(),
         DeleteOutcome::NotEmpty
     );
     assert!(sparq.exists(container).await.unwrap());
@@ -471,11 +471,52 @@ async fn delete_meta_if_empty_on_the_sparq_client_is_atomic() {
     sparq.remove_child(container, child).await.unwrap();
     sparq.delete_meta(child).await.unwrap();
     assert_eq!(
-        sparq.delete_meta_if_empty(container).await.unwrap(),
+        sparq.delete_meta_if_empty(container, None).await.unwrap(),
         DeleteOutcome::Deleted
     );
     assert!(!sparq.exists(container).await.unwrap());
     assert!(sparq.list_children(container).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn delete_meta_if_empty_folds_the_parent_detach_into_the_one_op() {
+    // FINDING 2 (in-memory parity): the parent-edge detach must happen IN the same atomic op as the
+    // record delete — a single `delete_meta_if_empty(container, Some(parent))` both removes the
+    // container record AND detaches `<parent> ldp:contains <container>`, with no separate `remove_child`
+    // step. After a Deleted outcome the parent's containment must no longer list the container.
+    let sparq = InMemorySparqClient::new();
+    let parent = "https://pod.example/alice/";
+    let container = "https://pod.example/alice/sub/";
+    let meta = ResourceMeta {
+        content_type: "text/turtle".into(),
+        blob_key: "k".into(),
+        etag: "\"e\"".into(),
+    };
+    sparq.put_meta(parent, meta.clone()).await.unwrap();
+    // Index the empty sub-container AND its edge in the parent (create_child commits both).
+    sparq
+        .create_child(parent, container, meta.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        sparq.list_children(parent).await.unwrap(),
+        vec![container.to_string()],
+        "the parent lists the sub-container before the delete"
+    );
+
+    // ONE op deletes the (empty) sub-container AND detaches it from the parent — no follow-up call.
+    assert_eq!(
+        sparq
+            .delete_meta_if_empty(container, Some(parent))
+            .await
+            .unwrap(),
+        DeleteOutcome::Deleted
+    );
+    assert!(!sparq.exists(container).await.unwrap());
+    assert!(
+        sparq.list_children(parent).await.unwrap().is_empty(),
+        "the parent edge is detached in the SAME atomic op (no separate remove_child)"
+    );
 }
 
 #[tokio::test]

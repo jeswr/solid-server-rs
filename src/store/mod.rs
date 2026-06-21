@@ -76,12 +76,15 @@ pub trait Store: Send + Sync {
 
     /// ATOMICALLY delete a container ONLY if it is empty (the container-DELETE path).
     ///
-    /// The membership check (`ldp:contains` empty?) and the delete are performed as ONE store
-    /// operation with NO interleaving between them, so a child POSTed concurrently can never slip in
-    /// between an empty-check and the delete and be orphaned under a deleted container (the TOCTOU the
-    /// separate `list_children` + `delete` had). It detaches the container from `parent`'s
-    /// containment (if given) only AFTER a successful [`DeleteOutcome::Deleted`], and removes the
-    /// container's own bytes. Returns:
+    /// The membership check (`ldp:contains` empty?), the record delete, AND the detach of the
+    /// container's edge in `parent`'s containment graph are performed as ONE store operation with NO
+    /// interleaving, so neither (a) a child POSTed concurrently can slip between an empty-check and the
+    /// delete and be orphaned under a deleted container (the TOCTOU the separate `list_children` +
+    /// `delete` had), NOR (b) a concurrent POST can recreate the child under the parent in a window
+    /// between the graph delete and a separate parent-edge detach and then be orphaned by that stale
+    /// detach. Only the container's own bytes are GC'd AFTER a successful [`DeleteOutcome::Deleted`]
+    /// (the blob store is a separate system, so it cannot share the index op's atomicity; idempotent +
+    /// reconciler-backstopped). Returns:
     /// - [`DeleteOutcome::Deleted`] — it existed, was empty, and is gone;
     /// - [`DeleteOutcome::NotEmpty`] — it existed with members; NOTHING was deleted (⇒ 409);
     /// - [`DeleteOutcome::NotFound`] — it did not exist (⇒ 404).
@@ -264,25 +267,28 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
             Err(SparqError::NotFound) => None,
             Err(SparqError::Backend(e)) => return Err(ServerError::Storage(e)),
         };
-        // The ATOMIC empty-check + delete (no interleaving — see `delete_meta_if_empty`).
+        // The ATOMIC empty-check + record delete + PARENT-edge detach in ONE index op (no interleaving
+        // — see `delete_meta_if_empty`). The parent-edge detach is folded INTO this single op (it is no
+        // longer a separate `remove_child` afterwards) so there is no window in which the container
+        // graph is gone but the parent still `ldp:contains` it — a window a concurrent recreate could
+        // exploit to be orphaned by a stale detach.
         let outcome = self
             .sparq
-            .delete_meta_if_empty(iri)
+            .delete_meta_if_empty(iri, parent)
             .await
             .map_err(|e| ServerError::Storage(format!("{e}")))?;
         if outcome != DeleteOutcome::Deleted {
             // NotEmpty / NotFound: nothing was deleted, so leave the parent edge + bytes untouched.
             return Ok(outcome);
         }
-        // Deleted: detach from the parent's containment (a different graph, idempotent) and GC bytes.
-        // Index-(record-)before-bytes keeps "if it's indexed, its bytes exist": a crash here leaves
-        // orphaned bytes for the reconciler, never an index row pointing at missing bytes.
-        if let Some(p) = parent {
-            self.sparq
-                .remove_child(p, iri)
-                .await
-                .map_err(|e| ServerError::Storage(format!("{e}")))?;
-        }
+        // Deleted: the record AND the parent edge are already gone (atomically, above). GC the bytes.
+        // Blob GC deliberately stays in Rust AFTER the `Deleted` outcome rather than inside the SPARQ
+        // op: the blob store is a SEPARATE system (object store), so it cannot share the SPARQ
+        // operation's atomicity in the first place. This is safe because (a) the blob delete is
+        // idempotent and (b) a crash in the gap leaves only an ORPHANED blob (an index row never points
+        // at missing bytes — index-(record-)before-bytes), which the reconciler GCs. So the worst case
+        // of doing it here is a transient orphan the backstop sweeps, never an inconsistency a client
+        // can observe.
         if let Some(key) = blob_key {
             self.blob
                 .delete(&key)

@@ -389,16 +389,25 @@ impl SparqClient for HttpSparqClient {
             .map_err(SparqHttpError::into_sparq)
     }
 
-    async fn delete_meta_if_empty(&self, iri: &str) -> Result<DeleteOutcome, SparqError> {
+    async fn delete_meta_if_empty(
+        &self,
+        iri: &str,
+        parent: Option<&str>,
+    ) -> Result<DeleteOutcome, SparqError> {
         // A per-operation nonce so the success confirm is RACE-RESISTANT — no concurrent op writes or
         // removes THIS delete marker, so a containment mutation between the update and the confirm
         // cannot flip the result (the same pattern as the create-marker).
         let nonce = next_nonce();
 
-        // ONE atomic update: conditionally empty the container's graph + write the delete marker, BOTH
-        // guarded by container-EXISTS AND `ldp:contains`-empty in the same generation. A non-empty (or
-        // absent) container ⇒ the WHERE yields nothing ⇒ NOTHING is deleted (the safety invariant).
-        let u = sparql::update_delete_container_if_empty(iri, &nonce)?;
+        // ONE SPARQL 1.1 `DELETE { } INSERT { } WHERE { }` modify: its WHERE (container-EXISTS AND
+        // `ldp:contains`-empty) is evaluated ONCE pre-modification, then the multi-graph DELETE (the
+        // container's own graph AND, when `parent` is given, the `<parent> ldp:contains <container>`
+        // edge in the parent's graph) and the marker INSERT apply atomically against that one solution.
+        // A non-empty (or absent) container ⇒ the WHERE yields nothing ⇒ NOTHING is deleted or detached
+        // (the safety invariant). Folding the parent-edge detach in here (rather than a separate later
+        // `remove_child`) closes the window where a concurrent POST recreates the child and a stale
+        // detach orphans it.
+        let u = sparql::update_delete_container_if_empty(iri, parent, &nonce)?;
         self.update_raw(&u)
             .await
             .map_err(SparqHttpError::into_sparq)?;

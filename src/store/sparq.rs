@@ -85,16 +85,28 @@ pub trait SparqClient: Send + Sync {
     /// caller's existence check governs the 404, so this is a no-op-on-absent at the index layer).
     async fn delete_meta(&self, iri: &str) -> Result<(), SparqError>;
 
-    /// ATOMICALLY delete a container's record + its (empty) containment set ONLY if it is empty.
+    /// ATOMICALLY delete a container's record + its (empty) containment set + its edge in the PARENT's
+    /// graph, ONLY if it is empty — all in ONE index operation.
     ///
-    /// The existence check, the `ldp:contains`-empty check, and the delete are ONE index operation
-    /// with NO interleaving — closing the TOCTOU window in which a concurrent `create_child` could
-    /// add a member between a separate empty-check and a separate delete. Returns
+    /// The existence check, the `ldp:contains`-empty check, the record delete, AND the parent-edge
+    /// detach (`<parent> ldp:contains <container>`, which lives in the PARENT's graph) are ONE index
+    /// operation with NO interleaving. This closes BOTH TOCTOU windows: (1) a concurrent `create_child`
+    /// adding a member between a separate empty-check and a separate delete, and (2) — the reason the
+    /// parent edge is folded in here rather than detached by the caller afterwards — a concurrent POST
+    /// recreating the child under the parent in the window between the graph delete and a separate, later
+    /// parent-edge detach (which would then orphan the just-recreated child). On the live SPARQ path
+    /// this is a SINGLE `DELETE { container-graph ; parent-edge } INSERT { marker } WHERE { exists+empty
+    /// guard }` modify whose WHERE is evaluated once pre-modification (see
+    /// [`super::sparql::update_delete_container_if_empty`]).
+    ///
+    /// `parent` is `None` for a root/parentless container (nothing to detach). Returns
     /// [`DeleteOutcome::Deleted`] if it existed + was empty + is now gone, [`DeleteOutcome::NotEmpty`]
-    /// if it had members (nothing deleted), or [`DeleteOutcome::NotFound`] if it was not indexed. The
-    /// container's edge in its PARENT's graph is detached separately by the caller (a different graph,
-    /// idempotent, not part of this atomicity window).
-    async fn delete_meta_if_empty(&self, iri: &str) -> Result<DeleteOutcome, SparqError>;
+    /// if it had members (nothing deleted), or [`DeleteOutcome::NotFound`] if it was not indexed.
+    async fn delete_meta_if_empty(
+        &self,
+        iri: &str,
+        parent: Option<&str>,
+    ) -> Result<DeleteOutcome, SparqError>;
 
     /// ATOMICALLY create a child resource record: in a SINGLE index operation, verify `container` is
     /// indexed (else [`SparqError::NotFound`]) and commit BOTH `child`'s metadata record AND the
@@ -188,16 +200,22 @@ impl SparqClient for InMemorySparqClient {
         Ok(())
     }
 
-    async fn delete_meta_if_empty(&self, iri: &str) -> Result<DeleteOutcome, SparqError> {
+    async fn delete_meta_if_empty(
+        &self,
+        iri: &str,
+        parent: Option<&str>,
+    ) -> Result<DeleteOutcome, SparqError> {
         let mut guard = self
             .inner
             .lock()
             .map_err(|_| SparqError::Backend("poisoned".into()))?;
-        // ONE atomic step under the SINGLE lock — there is no `await` between the checks and the
-        // delete, so no concurrent `create_child` (which takes the same lock) can interleave a member
-        // between the empty-check and the delete: a concurrent create either runs fully BEFORE this
+        // ONE atomic step under the SINGLE lock — there is no `await` between the checks, the delete,
+        // and the parent-edge detach, so no concurrent `create_child` (which takes the same lock) can
+        // interleave a member between the empty-check and the delete, NOR recreate the child under the
+        // parent between the delete and the detach: a concurrent create either runs fully BEFORE this
         // (its child is then observed ⇒ NotEmpty, nothing deleted) or fully AFTER (the container
-        // record is gone ⇒ its container-EXISTS guard rejects it). No orphaning window exists.
+        // record is gone ⇒ its container-EXISTS guard rejects it). No orphaning window exists. This
+        // mirrors the live path's SINGLE atomic modify (container graph + parent edge + marker).
         if !guard.meta.contains_key(iri) {
             return Ok(DeleteOutcome::NotFound);
         }
@@ -210,6 +228,13 @@ impl SparqClient for InMemorySparqClient {
         // the live `DROP SILENT GRAPH`, so a re-created container at the same IRI inherits no stale set.
         guard.meta.remove(iri);
         guard.children.remove(iri);
+        // ...and detach the parent edge in the SAME atomic step (folded in, per Finding 2), so there is
+        // no window in which the container graph is gone but the parent still `ldp:contains` it.
+        if let Some(p) = parent {
+            if let Some(entry) = guard.children.get_mut(p) {
+                entry.retain(|c| c != iri);
+            }
+        }
         Ok(DeleteOutcome::Deleted)
     }
 
