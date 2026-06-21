@@ -82,9 +82,14 @@ pub trait Store: Send + Sync {
     /// delete and be orphaned under a deleted container (the TOCTOU the separate `list_children` +
     /// `delete` had), NOR (b) a concurrent POST can recreate the child under the parent in a window
     /// between the graph delete and a separate parent-edge detach and then be orphaned by that stale
-    /// detach. Only the container's own bytes are GC'd AFTER a successful [`DeleteOutcome::Deleted`]
-    /// (the blob store is a separate system, so it cannot share the index op's atomicity; idempotent +
-    /// reconciler-backstopped). Returns:
+    /// detach. The container's own bytes are NOT deleted inline: after the atomic index delete they are
+    /// ORPHANED (no index row references them) and GC'd by the reconciler's orphaned-bytes sweep. The
+    /// blob store is a separate system whose `delete` is unconditional, so an inline blob delete of the
+    /// pre-read key races a concurrent same-IRI recreate (deterministic key reuse) — the recreate's NEW
+    /// bytes would be clobbered, leaving a fresh index row pointing at MISSING bytes. Leaving the bytes
+    /// to the reconciler removes that race: the sweep only GCs bytes with NO index row, so it never
+    /// touches a recreate's referenced bytes (transient orphan until the reconciler ships — space only,
+    /// never an observable inconsistency). Returns:
     /// - [`DeleteOutcome::Deleted`] — it existed, was empty, and is gone;
     /// - [`DeleteOutcome::NotEmpty`] — it existed with members; NOTHING was deleted (⇒ 409);
     /// - [`DeleteOutcome::NotFound`] — it did not exist (⇒ 404).
@@ -257,45 +262,34 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
         iri: &str,
         parent: Option<&str>,
     ) -> ServerResult<DeleteOutcome> {
-        // Look up the byte-pointer FIRST so a successful delete can drop the right blob. This read is
-        // outside the atomic empty-check+delete window deliberately: it only governs WHICH blob to GC
-        // on success, never the delete decision, so it cannot reintroduce the TOCTOU (the authoritative
-        // empty-check+delete is the single `delete_meta_if_empty` op below). A missing record here just
-        // means there is no blob to GC; the atomic op will report NotFound.
-        let blob_key = match self.sparq.get_meta(iri).await {
-            Ok(m) => Some(m.blob_key),
-            Err(SparqError::NotFound) => None,
-            Err(SparqError::Backend(e)) => return Err(ServerError::Storage(e)),
-        };
         // The ATOMIC empty-check + record delete + PARENT-edge detach in ONE index op (no interleaving
         // — see `delete_meta_if_empty`). The parent-edge detach is folded INTO this single op (it is no
         // longer a separate `remove_child` afterwards) so there is no window in which the container
         // graph is gone but the parent still `ldp:contains` it — a window a concurrent recreate could
         // exploit to be orphaned by a stale detach.
+        //
+        // reconciler: the container's bytes are NOT deleted inline here. After the atomic index delete,
+        // the bytes become ORPHANED (no index row references them) and are GC'd by the reconciler's
+        // orphaned-bytes sweep (a planned slice). This is the only race-free choice: the blob store is a
+        // SEPARATE system (object store) whose `delete` is unconditional, so an inline `blob.delete` of
+        // the pre-read key races a concurrent same-IRI recreate. Deterministic key reuse means a POST
+        // recreating this container/resource IRI between the index delete and any inline blob delete
+        // writes NEW bytes to the SAME key + a fresh index row; the stale inline delete would then
+        // clobber those NEW bytes, leaving the fresh index row pointing at MISSING bytes. By deleting
+        // NO bytes here we eliminate that race entirely — the reconciler only GCs bytes with NO index
+        // row, so it never touches a recreate's referenced bytes. The trade-off is a transient orphan
+        // until the reconciler ships: benign (disk space only, never an observable inconsistency), and
+        // it IS the documented architecture (SPARQ authoritative; blob store durable bytes; reconciler
+        // GCs orphans — `decisions`/the spike crash-consistency model). The same model already governs
+        // the `write`/`create_in_container` failure paths above.
         let outcome = self
             .sparq
             .delete_meta_if_empty(iri, parent)
             .await
             .map_err(|e| ServerError::Storage(format!("{e}")))?;
-        if outcome != DeleteOutcome::Deleted {
-            // NotEmpty / NotFound: nothing was deleted, so leave the parent edge + bytes untouched.
-            return Ok(outcome);
-        }
-        // Deleted: the record AND the parent edge are already gone (atomically, above). GC the bytes.
-        // Blob GC deliberately stays in Rust AFTER the `Deleted` outcome rather than inside the SPARQ
-        // op: the blob store is a SEPARATE system (object store), so it cannot share the SPARQ
-        // operation's atomicity in the first place. This is safe because (a) the blob delete is
-        // idempotent and (b) a crash in the gap leaves only an ORPHANED blob (an index row never points
-        // at missing bytes — index-(record-)before-bytes), which the reconciler GCs. So the worst case
-        // of doing it here is a transient orphan the backstop sweeps, never an inconsistency a client
-        // can observe.
-        if let Some(key) = blob_key {
-            self.blob
-                .delete(&key)
-                .await
-                .map_err(|e| ServerError::Storage(format!("{e}")))?;
-        }
-        Ok(DeleteOutcome::Deleted)
+        // NotEmpty / NotFound: nothing was deleted. Deleted: the record AND the parent edge are gone
+        // atomically (above); the now-orphaned bytes are the reconciler's responsibility (see above).
+        Ok(outcome)
     }
 
     async fn list_children(&self, container: &str) -> ServerResult<Vec<String>> {

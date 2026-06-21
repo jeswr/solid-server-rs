@@ -2,12 +2,15 @@
 //! Store-trait tests against the in-memory composite (SPARQ-authoritative metadata + blob bytes),
 //! plus the RDF content-type classification + validation.
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use axum::body::Bytes;
 use solid_server_rs::error::ServerError;
 use solid_server_rs::ldp::content::{classify, validate_rdf, RdfFormat};
 use solid_server_rs::store::{
-    CompositeStore, DeleteOutcome, InMemoryBlobStore, InMemorySparqClient, ResourceMeta,
-    SparqClient, SparqError, Store,
+    BlobError, BlobStore, CompositeStore, DeleteOutcome, InMemoryBlobStore, InMemorySparqClient,
+    ResourceMeta, SparqClient, SparqError, Store,
 };
 
 const IRI: &str = "https://pod.example/alice/data";
@@ -516,6 +519,107 @@ async fn delete_meta_if_empty_folds_the_parent_detach_into_the_one_op() {
     assert!(
         sparq.list_children(parent).await.unwrap().is_empty(),
         "the parent edge is detached in the SAME atomic op (no separate remove_child)"
+    );
+}
+
+/// A [`BlobStore`] wrapper whose `delete` is unconditional (exactly like `InMemoryBlobStore`'s and
+/// the real `object_store` delete the HIGH finding is about), but which COUNTS its `delete` calls so
+/// the test can prove the store no longer issues an inline blob delete. The inner store is shared
+/// (`Arc`) so the test can stage the in-window recreate and inspect the surviving bytes directly.
+struct CountingBlob {
+    inner: Arc<InMemoryBlobStore>,
+    deletes_seen: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl BlobStore for CountingBlob {
+    async fn get(&self, key: &str) -> Result<Bytes, BlobError> {
+        self.inner.get(key).await
+    }
+
+    async fn put(&self, key: &str, body: Bytes) -> Result<(), BlobError> {
+        self.inner.put(key, body).await
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool, BlobError> {
+        self.inner.exists(key).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), BlobError> {
+        // Unconditional, idempotent — same contract as the real object_store delete. The point is only
+        // to count: an inline delete here is exactly the clobber the finding describes.
+        self.deletes_seen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.delete(key).await
+    }
+}
+
+#[tokio::test]
+async fn delete_container_if_empty_does_not_clobber_a_concurrent_same_iri_recreate() {
+    // HIGH-finding regression: after the atomic index delete, the (former) post-delete blob GC must
+    // NOT remove a concurrent same-IRI recreate's bytes. With deterministic key reuse, a POST
+    // recreating the SAME resource IRI between the index delete and an inline blob delete writes NEW
+    // bytes to the SAME key + a fresh index row; an inline unconditional `blob.delete` would clobber
+    // those NEW bytes, leaving the fresh index row pointing at MISSING bytes (the FALSE "an index row
+    // never points at missing bytes" invariant). The fix removes the inline delete (bytes are
+    // reconciler-GC'd), so the recreate's bytes always survive.
+    //
+    // We model the race window EXPLICITLY: stage the concurrent recreate's NEW bytes at the (reused)
+    // deterministic key BEFORE the atomic index delete returns — i.e. they are already present when
+    // any inline blob delete would fire. The test is NON-VACUOUS — it FAILS against the old code:
+    //   - OLD code: `delete_container_if_empty` issues an inline `blob.delete(key)` AFTER the index
+    //     delete → the staged recreate bytes are removed → `deletes_seen == 1` AND the key holds NO
+    //     bytes → BOTH asserts FAIL.
+    //   - FIX: no inline delete → `deletes_seen == 0` AND the staged recreate bytes survive → PASS.
+    let recreate_bytes = Bytes::from_static(b"<#recreated> <#p> \"v2\" .");
+    let deletes_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let inner = Arc::new(InMemoryBlobStore::new());
+    let blob = CountingBlob {
+        inner: inner.clone(),
+        deletes_seen: deletes_seen.clone(),
+    };
+    let s = CompositeStore::new(InMemorySparqClient::new(), blob);
+
+    let container = "https://pod.example/alice/sub/";
+    // Create the (empty) container — bytes land at the deterministic key for this IRI.
+    s.write(
+        container,
+        Bytes::from_static(b"<#c> <#p> \"v1\" ."),
+        "text/turtle",
+    )
+    .await
+    .unwrap();
+    // The deterministic key reuse is the precondition of the race: the recreate and the original share
+    // a key (mirrors `CompositeStore::blob_key_for`'s percent-flatten).
+    let key = container.replace([':', '/', '?', '#', '%'], "_");
+
+    // Stage the concurrent same-IRI recreate: it has landed its NEW bytes at the SAME deterministic
+    // key (and, conceptually, a fresh index row). These bytes MUST survive the container delete.
+    inner.put(&key, recreate_bytes.clone()).await.unwrap();
+
+    // Atomically delete the (now-empty, as far as the index is concerned) container's index row.
+    let outcome = s.delete_container_if_empty(container, None).await.unwrap();
+    assert_eq!(outcome, DeleteOutcome::Deleted);
+
+    // The FIX must not have invoked an inline blob delete at all (orphaned bytes are the reconciler's
+    // job, not an inline delete that can race a recreate). Under the OLD code this would be 1.
+    assert_eq!(
+        deletes_seen.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the fixed delete_container_if_empty must NOT delete bytes inline (reconciler GCs orphans); \
+         the old inline-unconditional-delete code would call blob.delete here and clobber a recreate"
+    );
+
+    // The concurrent recreate's bytes at the deterministic key are intact — i.e. the fresh index row a
+    // recreate writes is never left pointing at MISSING bytes. Under the OLD inline-delete code the
+    // staged bytes were removed during the delete, so `get` would be `NotFound`.
+    let surviving = inner
+        .get(&key)
+        .await
+        .expect("a concurrent same-IRI recreate's bytes must survive the container delete");
+    assert_eq!(
+        surviving, recreate_bytes,
+        "the recreated resource's bytes must be intact (never clobbered by an inline GC)"
     );
 }
 
