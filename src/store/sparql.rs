@@ -43,6 +43,19 @@ pub fn p_etag() -> String {
 pub fn p_create_marker() -> String {
     format!("{PSS_NS}createMarker")
 }
+/// Predicate: a per-operation **delete** marker (a unique-nonce literal), written atomically with the
+/// guarded empty-container delete into a SEPARATE scratch graph so the "did the empty+exists guard
+/// match?" confirm is race-resistant (no other op writes or removes THIS nonce).
+pub fn p_delete_marker() -> String {
+    format!("{PSS_NS}deleteMarker")
+}
+/// The reserved scratch graph that per-operation delete markers are written into. It is a DISTINCT
+/// graph from any resource's own graph, so dropping a resource's graph never touches a marker, and a
+/// marker can confirm a delete whose own graph is gone. (Markers are operation-scoped + pruned by the
+/// reconciler — M3-next.)
+pub fn g_delete_markers() -> String {
+    format!("{PSS_NS}deleteMarkers")
+}
 /// The subject every index record hangs off, *within* a resource's own named graph: a stable,
 /// reserved IRI so the record triples never collide with the resource's own RDF.
 pub fn s_record() -> String {
@@ -381,8 +394,116 @@ pub fn insert_body_data(
 
 /// UPDATE: drop a resource's whole graph (its index record + RDF) — the DELETE byte-pointer lookup
 /// happens first via [`select_meta`]. `DROP SILENT` is idempotent on an absent graph.
+///
+/// For a CONTAINER target this is also what clears the container's `ldp:contains` set: the container's
+/// own named graph holds both its index record and its containment edges, so dropping the graph
+/// removes the (by-then-empty, per the handler's empty-container precondition) membership too. The
+/// container's edge in its PARENT's graph is detached separately by [`update_remove_child`].
 pub fn update_delete_resource(resource: &str) -> Result<String, BuildError> {
     Ok(format!("DROP SILENT GRAPH {g}", g = iri(resource)?))
+}
+
+/// UPDATE: ATOMICALLY delete a container's whole graph ONLY IF it exists AND is empty (no
+/// `ldp:contains` member), AND detach it from its parent's containment, AND write a per-operation
+/// **delete marker** — ALL in ONE operation so the caller can confirm the outcome race-free.
+///
+/// This is ONE SPARQL 1.1 `DELETE/INSERT … WHERE` **modify** operation (NOT two `;`-joined
+/// statements). That distinction is load-bearing:
+///
+/// > Under SPARQL 1.1 Update, a `;`-joined sequence evaluates each operation's WHERE against the graph
+/// > AS LEFT BY the previous operation. So a `DELETE …` THEN a separate `INSERT … WHERE {exists+empty
+/// > guard}` would evaluate the marker INSERT's guard AFTER the DELETE already emptied the container —
+/// > the guard no longer matches, the marker is NEVER written, and the caller mis-reports a genuine
+/// > delete as `NotFound`. (This was a real bug in an earlier two-statement form.)
+///
+/// A SINGLE `DELETE { … } INSERT { … } WHERE { … }` instead evaluates its WHERE ONCE against the
+/// pre-modification graph, then applies the deletes and inserts atomically against THAT one solution
+/// set. So the marker INSERT and every DELETE clause share the SAME pre-delete guard match — the
+/// marker is written IFF the delete ran, with no sequencing hazard.
+///
+/// The ONE operation:
+/// - **WHERE (the guard, evaluated once, pre-modification):** the record EXISTS (`<record> contentType
+///   ?anyCt` in the container's graph — the container-exists guard) AND there is NO `ldp:contains`
+///   member (`FILTER NOT EXISTS` — the empty guard). A non-empty or absent container ⇒ no solution ⇒
+///   nothing deletes or inserts (the safety invariant: a non-empty container is NEVER deleted). It
+///   binds `?s ?p ?o` over the container's graph so the DELETE can drop every triple.
+/// - **DELETE (atomic, multi-graph):** removes EVERY triple of the container's own graph
+///   (`GRAPH <g> { ?s ?p ?o }` — its index record; an empty container holds no other triples) AND, when
+///   a `parent` is given, the `<parent-record> ldp:contains <container>` edge that lives in the
+///   PARENT's graph (`GRAPH <pg> { <prec> contains <g> }`). A SPARQL `DELETE` clause may span multiple
+///   graphs, so the parent-edge detach is folded into the SAME guarded operation — closing the window
+///   in which a concurrent POST recreates the child under the parent and a separate, later detach
+///   orphaned it.
+/// - **INSERT (atomic):** writes `<g> <deleteMarker> "nonce"` into the reserved `deleteMarkers` scratch
+///   graph. The caller ASKs for THIS nonce ([`ask_delete_marker`]) to learn `Deleted`; its absence + an
+///   [`ask_exists`] check splits `NotEmpty` (record still present) from `NotFound` (record absent). The
+///   marker is in a distinct graph, so the DELETE never removes it.
+///
+/// `parent` is `None` for a root/parentless container (no edge to detach). It is rendered through the
+/// injection-safe `iri()` builder. The marker graph is NEVER a resource graph, so this can't collide
+/// with user data; the IRI builders reject any IRIREF-invalid container/parent, fail-closed.
+pub fn update_delete_container_if_empty(
+    container: &str,
+    parent: Option<&str>,
+    nonce: &str,
+) -> Result<String, BuildError> {
+    let g = iri(container)?;
+    let rec = iri_const(&s_record());
+    let pct = iri_const(&p_content_type());
+    let contains = iri_const(LDP_CONTAINS);
+    let mg = iri_const(&g_delete_markers());
+    let pmark = iri_const(&p_delete_marker());
+    // The parent-edge DELETE clause: `GRAPH <parent> { <record> ldp:contains <container> }`, folded
+    // into the SAME operation so the detach is atomic with the graph delete. Empty when parentless.
+    let parent_delete = match parent {
+        Some(p) => format!(
+            "GRAPH {pg} {{ {prec} {contains} {childi} }} ",
+            pg = iri(p)?,
+            prec = rec,
+            contains = contains,
+            childi = g,
+        ),
+        None => String::new(),
+    };
+    // ONE SPARQL 1.1 `DELETE { } INSERT { } WHERE { }` modify — its WHERE is evaluated ONCE against the
+    // pre-modification graph, so the multi-graph DELETE (container graph + parent edge) and the marker
+    // INSERT share the SAME exists+empty solution set. NOT `;`-joined (that would re-evaluate the
+    // INSERT guard after the DELETE emptied the graph). NO `//` line comments here — this string is
+    // sent verbatim to the SPARQL endpoint.
+    Ok(format!(
+        "DELETE {{ \
+            GRAPH {g} {{ ?s ?p ?o }} \
+            {parent_delete}\
+         }} INSERT {{ \
+            GRAPH {mg} {{ {g} {pmark} {nce} }} \
+         }} WHERE {{ \
+            GRAPH {g} {{ ?s ?p ?o }} \
+            GRAPH {g} {{ {rec} {pct} ?anyCt }} \
+            FILTER NOT EXISTS {{ GRAPH {g} {{ {rec} {contains} ?anyChild }} }} \
+         }}",
+        g = g,
+        rec = rec,
+        pct = pct,
+        contains = contains,
+        mg = mg,
+        pmark = pmark,
+        nce = literal(nonce),
+        parent_delete = parent_delete,
+    ))
+}
+
+/// ASK whether a per-operation delete marker for `container` with `nonce` is present in the reserved
+/// scratch graph — the race-resistant "the empty+exists guard matched, so the delete ran" confirm.
+/// No other operation ever writes or removes THIS nonce, so a concurrent containment mutation cannot
+/// flip the result. Fail-closed.
+pub fn ask_delete_marker(container: &str, nonce: &str) -> Result<String, BuildError> {
+    Ok(format!(
+        "ASK {{ GRAPH {mg} {{ {g} {p} {n} }} }}",
+        mg = iri_const(&g_delete_markers()),
+        g = iri(container)?,
+        p = iri_const(&p_delete_marker()),
+        n = literal(nonce),
+    ))
 }
 
 /// UPDATE: remove a `container ldp:contains child` edge (idempotent — a `DELETE WHERE` of an absent
@@ -716,6 +837,162 @@ mod tests {
             !delete_block.contains(&iri_const(&p_create_marker())),
             "marker must not be in the DELETE block (append-only): {q}"
         );
+    }
+
+    #[test]
+    fn delete_container_if_empty_is_one_single_modify_not_a_sequence() {
+        // MUTATION-CHECK (the regression for the round's HIGH): the conditional delete MUST be a
+        // SINGLE `DELETE { } INSERT { } WHERE { }` modify — its WHERE evaluated ONCE pre-modification,
+        // so the marker INSERT and the graph DELETE share one guard match. It must NOT be the old
+        // two-statement `DELETE …WHERE… ; INSERT …WHERE…` form, whose second WHERE re-evaluates AFTER
+        // the DELETE emptied the graph (⇒ the marker is never written ⇒ a real delete mis-reports
+        // NotFound). So we assert the SHAPE: exactly one WHERE, no `;`-join, DELETE+INSERT before it.
+        let q = update_delete_container_if_empty("http://pod/c/", None, "op-7").unwrap();
+        assert!(
+            q.starts_with("DELETE {"),
+            "starts with the guarded delete: {q}"
+        );
+        // It is a single DELETE/INSERT/WHERE modify: ONE `INSERT {`, ONE `WHERE {`, ZERO operation
+        // separators (`;`). The two-statement pre-fix form would have TWO `WHERE {` and a ` ; `.
+        assert_eq!(
+            q.matches("WHERE {").count(),
+            1,
+            "exactly ONE WHERE (a single modify, not a `;`-joined pair each with its own WHERE): {q}"
+        );
+        assert_eq!(
+            q.matches("INSERT {").count(),
+            1,
+            "exactly ONE INSERT clause: {q}"
+        );
+        assert!(
+            !q.contains(';'),
+            "no `;` operation separator — a single modify, not a two-statement sequence: {q}"
+        );
+        // The single WHERE carries BOTH the exists guard and the empty guard; the INSERT is the marker.
+        assert!(q.contains("FILTER NOT EXISTS"), "empty guard present: {q}");
+        assert!(
+            q.contains(LDP_CONTAINS),
+            "empty guard targets ldp:contains: {q}"
+        );
+        assert!(
+            q.contains(&iri_const(&p_content_type())),
+            "exists guard present: {q}"
+        );
+        assert!(
+            q.contains(&iri_const(&p_delete_marker())),
+            "marker predicate present: {q}"
+        );
+        assert!(
+            q.contains(&iri_const(&g_delete_markers())),
+            "marker scratch graph present: {q}"
+        );
+        assert!(q.contains("\"op-7\""), "the op nonce is a literal: {q}");
+        // It must NOT use a blanket DROP (which would unconditionally erase a non-empty container).
+        assert!(!q.contains("DROP"), "must not blanket-DROP the graph: {q}");
+        // No `//`-style line comment leaked into the query text (the IRIs legitimately contain `//`,
+        // so check for a comment introducer — `//` followed by a space — which only a stray comment
+        // would produce; an IRI's `//` is always followed by a host character, never a space).
+        assert!(
+            !q.contains("// "),
+            "no `//`-comment markers in the query text: {q}"
+        );
+    }
+
+    #[test]
+    fn delete_container_if_empty_folds_the_parent_edge_into_the_same_modify() {
+        // FINDING 2: the parent containment detach (`<parent> ldp:contains <container>`, in the
+        // PARENT's graph) must be folded INTO the same single modify's DELETE — NOT a separate later
+        // step that races a concurrent recreate. Assert the parent graph + its `ldp:contains` edge
+        // appear inside the ONE operation, and there is still exactly one WHERE / no `;`.
+        let parent = "http://pod/";
+        let container = "http://pod/c/";
+        let q = update_delete_container_if_empty(container, Some(parent), "op-9").unwrap();
+        assert!(
+            q.contains(&iri_const(parent)),
+            "the parent graph IRI must appear in the modify (the detach is folded in): {q}"
+        );
+        // Still a single modify (the parent fold must not reintroduce a sequence).
+        assert_eq!(
+            q.matches("WHERE {").count(),
+            1,
+            "still exactly ONE WHERE after folding the parent edge: {q}"
+        );
+        assert!(
+            !q.contains(';'),
+            "still no `;` separator after folding the parent edge: {q}"
+        );
+        // The parent-edge DELETE clause sits BEFORE the WHERE (in the DELETE template), and the
+        // container IRI is the OBJECT of the `ldp:contains` edge in the parent graph.
+        let where_at = q.find("WHERE {").unwrap();
+        let parent_edge = format!(
+            "GRAPH {pg} {{ {prec} {contains} {childi} }}",
+            pg = iri_const(parent),
+            prec = iri_const(&s_record()),
+            contains = iri_const(LDP_CONTAINS),
+            childi = iri_const(container),
+        );
+        let edge_at = q
+            .find(&parent_edge)
+            .unwrap_or_else(|| panic!("parent-edge DELETE clause present: {q}"));
+        assert!(
+            edge_at < where_at,
+            "the parent-edge detach is in the DELETE template (before WHERE), so it is part of the \
+             atomic modify: {q}"
+        );
+    }
+
+    #[test]
+    fn delete_container_if_empty_omits_the_parent_clause_when_parentless() {
+        // A root/parentless container has no edge to detach: the modify carries only the container
+        // graph + marker, no second GRAPH in the DELETE.
+        let q = update_delete_container_if_empty("http://pod/c/", None, "op-1").unwrap();
+        // The DELETE template (before WHERE) names the container graph exactly once and no parent.
+        let where_at = q.find("WHERE {").unwrap();
+        let delete_block = &q[..where_at];
+        assert_eq!(
+            delete_block.matches("GRAPH <http://pod/c/>").count(),
+            1,
+            "only the container graph in the DELETE template when parentless: {q}"
+        );
+    }
+
+    #[test]
+    fn delete_container_if_empty_rejects_an_invalid_container_iri() {
+        // An IRIREF-invalid container IRI is rejected fail-closed (never escaped-and-aliased), so an
+        // injection can never reach the endpoint.
+        assert_eq!(
+            update_delete_container_if_empty("http://pod/c d/", None, "op-1"),
+            Err(BuildError::InvalidIri)
+        );
+    }
+
+    #[test]
+    fn delete_container_if_empty_rejects_an_invalid_parent_iri() {
+        // An IRIREF-invalid PARENT IRI is likewise rejected fail-closed (the parent flows through the
+        // same injection-safe `iri()` builder).
+        assert_eq!(
+            update_delete_container_if_empty("http://pod/c/", Some("http://pod/ bad/"), "op-1"),
+            Err(BuildError::InvalidIri)
+        );
+    }
+
+    #[test]
+    fn ask_delete_marker_targets_the_scratch_graph_subject_and_nonce() {
+        let q = ask_delete_marker("http://pod/c/", "op-abc").unwrap();
+        assert!(q.starts_with("ASK"));
+        assert!(
+            q.contains(&iri_const(&g_delete_markers())),
+            "scratch graph: {q}"
+        );
+        assert!(
+            q.contains(&iri_const("http://pod/c/")),
+            "container subject: {q}"
+        );
+        assert!(
+            q.contains(&iri_const(&p_delete_marker())),
+            "marker predicate: {q}"
+        );
+        assert!(q.contains("\"op-abc\""), "nonce as a literal: {q}");
     }
 
     #[test]

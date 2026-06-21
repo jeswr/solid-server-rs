@@ -28,7 +28,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
 
-use solid_server_rs::store::{BodyObject, HttpSparqClient, ResourceMeta, SparqClient, SparqError};
+use solid_server_rs::store::{
+    BodyObject, DeleteOutcome, HttpSparqClient, ResourceMeta, SparqClient, SparqError,
+};
 
 // ---------------------------------------------------------------------------
 // The in-process mock SPARQL endpoint.
@@ -63,6 +65,9 @@ struct MockStore {
     body: HashMap<String, Vec<String>>,
     /// child graph IRI → its per-operation create-marker nonces (the race-resistant create confirm).
     markers: HashMap<String, Vec<String>>,
+    /// container IRI → its per-operation DELETE-marker nonces (the race-resistant empty-delete confirm,
+    /// stored in a separate scratch graph keyed by the container IRI as the marker subject).
+    delete_markers: HashMap<String, Vec<String>>,
     /// The last SPARQL string the mock received (so a test can assert on the query text/escaping).
     last_sparql: Option<String>,
 }
@@ -138,9 +143,29 @@ async fn handle_sparql(
 }
 
 /// Apply a (mock) SPARQL update by recognising the client's fixed-shape statements. This is NOT a
-/// SPARQL engine — it pattern-matches the specific updates [`solid_server_rs::store::sparql`] emits.
+/// full SPARQL engine — it pattern-matches the specific updates [`solid_server_rs::store::sparql`]
+/// emits — but it DOES faithfully model SPARQL 1.1 Update SEQUENCING for the delete path: a
+/// `;`-joined request is split into its constituent operations and each is applied IN ORDER, with the
+/// later operation's guard evaluated against the store AS LEFT BY the earlier one. That faithfulness
+/// is what lets a regression test catch the round's HIGH — a two-statement `DELETE …WHERE… ; INSERT
+/// …WHERE…` form would have its INSERT guard re-evaluated after the DELETE emptied the container, so
+/// the marker would NOT be written and a real delete would mis-report NotFound. The fix (a SINGLE
+/// `DELETE { } INSERT { } WHERE { }` modify) has no `;`, so its WHERE is evaluated once and the marker
+/// is written. See `apply_delete_container_modify`.
 fn apply_update(state: &MockState, sparql: &str) {
     let mut store = state.store.lock().unwrap();
+    // delete_container_if_empty: a SINGLE `DELETE { container-graph ; parent-edge } INSERT { marker }
+    // WHERE { exists+empty guard }` modify, recognised by the `deleteMarker` predicate (distinguishing
+    // it from create_child's `createMarker`). Model SPARQL 1.1 sequencing FAITHFULLY: split on the
+    // top-level `;` into operations and apply each in order, re-deriving each op's guard from the
+    // CURRENT (post-previous-op) store. The fix is ONE op (no `;`), so its single WHERE matches the
+    // pre-delete state ⇒ the marker is written. The pre-fix two-op form would NOT write the marker.
+    if sparql.contains("deleteMarker") && sparql.starts_with("DELETE {") {
+        for op in split_top_level_semicolons(sparql) {
+            apply_delete_container_modify(&mut store, op.trim());
+        }
+        return;
+    }
     // create_child: `DELETE { GRAPH <child> {…stale record…} } INSERT { GRAPH <child> {…record…}
     //                GRAPH <container> { <record> <ldp:contains> <child> } }
     //                WHERE { GRAPH <container> { <record> <contentType> ?anyCt } OPTIONAL … }`
@@ -231,7 +256,23 @@ fn answer_query(state: &MockState, sparql: &str) -> Response {
     let store = state.store.lock().unwrap();
     if sparql.starts_with("ASK") {
         let graph = first_graph_iri(sparql).unwrap_or_default();
-        let boolean = if sparql.contains("createMarker") {
+        let boolean = if sparql.contains("deleteMarker") {
+            // ask_delete_marker: ASK { GRAPH <scratch> { <container> <deleteMarker> "nonce" } } — true
+            // iff that exact nonce was recorded for the container. The graph here is the SCRATCH graph;
+            // the container is the SUBJECT (the first <...> IRI INSIDE the graph block), and the nonce
+            // is the literal. (`first_graph_iri` returns the scratch graph, so re-extract the subject.)
+            let iris = extract_iris(sparql);
+            // tokens: [scratchGraph, container, deleteMarkerPredicate] — the container is index 1.
+            let container = iris.get(1).cloned().unwrap_or_default();
+            let nonce = extract_literals(sparql)
+                .first()
+                .cloned()
+                .unwrap_or_default();
+            store
+                .delete_markers
+                .get(&container)
+                .is_some_and(|ns| ns.contains(&nonce))
+        } else if sparql.contains("createMarker") {
             // ask_create_marker: ASK { GRAPH <child> { <record> <createMarker> "nonce" } } — true iff
             // that exact nonce was recorded for the child (the race-resistant create confirm).
             let nonce = extract_literals(sparql)
@@ -291,6 +332,113 @@ fn answer_query(state: &MockState, sparql: &str) -> Response {
             .into_response();
     }
     results_json(r#"{"head":{},"boolean":false}"#)
+}
+
+/// Split a SPARQL update into its top-level `;`-separated operations, IGNORING `;` that appear inside
+/// `{ }` group graph patterns, `< >` IRIs, or `" "` literals. This is what lets the mock model SPARQL
+/// 1.1 sequencing: each returned operation is applied IN ORDER against the store as left by the prior
+/// one. The fix's SINGLE `DELETE { } INSERT { } WHERE { }` modify has no top-level `;`, so this yields
+/// ONE op; the pre-fix `DELETE …WHERE… ; INSERT …WHERE…` form yields TWO.
+fn split_top_level_semicolons(sparql: &str) -> Vec<String> {
+    let mut ops = Vec::new();
+    let mut depth = 0i32;
+    let mut in_iri = false;
+    let mut in_lit = false;
+    let mut start = 0usize;
+    let bytes = sparql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        match c {
+            '"' if !in_iri => in_lit = !in_lit,
+            '<' if !in_lit => in_iri = true,
+            '>' if in_iri => in_iri = false,
+            '{' if !in_iri && !in_lit => depth += 1,
+            '}' if !in_iri && !in_lit => depth -= 1,
+            ';' if depth == 0 && !in_iri && !in_lit => {
+                ops.push(sparql[start..i].to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    ops.push(sparql[start..].to_string());
+    ops
+}
+
+/// Apply ONE operation of the empty-container delete modify against the CURRENT store, modelling
+/// SPARQL 1.1 `DELETE/INSERT … WHERE` semantics faithfully: derive the guard (the WHERE's
+/// exists+empty condition) from the store AS IT IS NOW, and IFF it matches, apply EVERY DELETE and
+/// INSERT clause present in THIS op together (one shared solution). Crucially, the guard is read from
+/// the live store, so when a two-statement `;`-joined form is fed in, the second op's INSERT guard is
+/// re-evaluated AFTER the first op's DELETE emptied the container — it fails, so the marker is NOT
+/// written (the round's HIGH). The single-op fix evaluates its guard once (container still present) and
+/// both the DELETE and the INSERT run, so the marker IS written.
+fn apply_delete_container_modify(store: &mut MockStore, op: &str) {
+    // The container graph is the FIRST GRAPH IRI in the WHERE clause (the guard targets the container's
+    // own graph in BOTH the single-modify and the pre-fix two-statement forms — so deriving it from
+    // WHERE, not the op's first GRAPH, is robust to the INSERT-only op whose first GRAPH is the marker
+    // scratch graph). Fall back to the op's first GRAPH if there is no WHERE (defensive).
+    let container = op
+        .find("WHERE {")
+        .and_then(|w| first_iri_after(op, w))
+        .or_else(|| first_graph_iri(op))
+        .unwrap_or_default();
+    // The guard, evaluated against the CURRENT store: the container record EXISTS and has no member.
+    let exists = store.meta.contains_key(&container);
+    let empty = store
+        .children
+        .get(&container)
+        .map_or(true, |kids| kids.is_empty()); // MSRV 1.81: not `is_none_or`.
+    if !(exists && empty) {
+        // Guard fails ⇒ NOTHING in this op runs (neither DELETE nor INSERT) — the safety invariant.
+        return;
+    }
+    // The op's DELETE clause (the text before INSERT/WHERE) may name the container graph and the
+    // parent edge; the INSERT clause (if present in THIS op) writes the marker. Apply whatever this op
+    // contains, all under the single guard match above.
+    let has_delete = op.trim_start().starts_with("DELETE {");
+    let has_insert = op.contains("INSERT {");
+    if has_delete {
+        // Empty the container's graph (record + body) and, if the DELETE template carries a parent
+        // edge (`GRAPH <parent> { <record> ldp:contains <container> }`), detach that edge too. The
+        // parent graph is the SECOND distinct GRAPH IRI in the DELETE template (before WHERE).
+        let where_pos = op.find("WHERE {").unwrap_or(op.len());
+        let delete_template = &op[..where_pos];
+        let graph_iris = all_graph_iris(delete_template);
+        store.meta.remove(&container);
+        store.children.remove(&container);
+        store.body.remove(&container);
+        for parent in graph_iris.iter().filter(|g| *g != &container) {
+            if let Some(v) = store.children.get_mut(parent) {
+                v.retain(|c| c != &container);
+            }
+        }
+    }
+    if has_insert {
+        let nonce = extract_literals(op).first().cloned().unwrap_or_default();
+        store
+            .delete_markers
+            .entry(container)
+            .or_default()
+            .push(nonce);
+    }
+}
+
+/// Every `GRAPH <...>` IRI in `s`, in order (deduped not required — callers filter). Used to find the
+/// parent-edge graph folded into the delete modify's DELETE template.
+fn all_graph_iris(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = s[from..].find("GRAPH ") {
+        let at = from + rel;
+        if let Some(iri) = first_iri_after(s, at) {
+            out.push(iri);
+        }
+        from = at + "GRAPH ".len();
+    }
+    out
 }
 
 /// Extract the text inside the FIRST `GRAPH <...> { ... }` block — the triples body. Returns the
@@ -631,6 +779,196 @@ async fn delete_meta_is_idempotent_on_absent() {
 }
 
 #[tokio::test]
+async fn delete_meta_if_empty_over_http_reports_all_three_outcomes() {
+    // The live client's atomic empty-container delete (a single `DELETE { } INSERT { } WHERE { }`
+    // modify + a race-resistant delete-marker confirm) must map to NotFound / NotEmpty / Deleted
+    // correctly via the now-sequencing-faithful mock — and crucially leave a NON-EMPTY container
+    // untouched (the safety invariant). Because the mock now models SPARQL 1.1 sequencing, a Deleted
+    // here is REAL evidence the marker was written by a single-WHERE evaluation against the pre-delete
+    // state (the round's HIGH: the old two-statement form would have produced NotFound here).
+    let (url, _state) = spawn_mock().await;
+    let c = HttpSparqClient::new(url);
+
+    // Absent ⇒ NotFound (no marker written ⇒ confirm ASK false ⇒ exists ASK false).
+    assert_eq!(
+        c.delete_meta_if_empty(CONTAINER, None).await.unwrap(),
+        DeleteOutcome::NotFound
+    );
+
+    // Populated ⇒ NotEmpty, and the container + child both survive (nothing deleted).
+    c.put_meta(CONTAINER, meta()).await.unwrap();
+    c.create_child(CONTAINER, CHILD, meta()).await.unwrap();
+    assert_eq!(
+        c.delete_meta_if_empty(CONTAINER, None).await.unwrap(),
+        DeleteOutcome::NotEmpty
+    );
+    assert!(
+        c.exists(CONTAINER).await.unwrap(),
+        "a NotEmpty result must not delete the container"
+    );
+    assert_eq!(
+        c.list_children(CONTAINER).await.unwrap(),
+        vec![CHILD.to_string()],
+        "a NotEmpty result must leave the membership intact"
+    );
+
+    // Empty it, then Deleted ⇒ the container's record is gone.
+    c.remove_child(CONTAINER, CHILD).await.unwrap();
+    assert_eq!(
+        c.delete_meta_if_empty(CONTAINER, None).await.unwrap(),
+        DeleteOutcome::Deleted
+    );
+    assert!(!c.exists(CONTAINER).await.unwrap());
+}
+
+#[tokio::test]
+async fn delete_modify_writes_the_marker_but_a_two_statement_form_does_not() {
+    // NON-VACUOUS MUTATION-CHECK for the round's HIGH, driving the sequencing-faithful mock's
+    // `apply_update` directly (no HTTP round-trip needed — the mock IS the system under test for the
+    // sequencing semantics that the High exploited).
+    // (1) The REAL builder output (a SINGLE `DELETE { } INSERT { } WHERE { }` modify) writes the delete
+    //     marker — its WHERE is evaluated once, pre-delete, so the marker INSERT shares the guard match.
+    // (2) The PRE-FIX shape (two `;`-joined statements: `DELETE …WHERE… ; INSERT …WHERE…`) does NOT
+    //     write the marker — the mock applies the DELETE first (emptying the container), then
+    //     re-evaluates the INSERT's WHERE against the now-empty store, where it fails. This is exactly
+    //     the bug; were the mock NOT sequencing-faithful, both forms would (wrongly) write the marker,
+    //     so this assertion is what makes the new mock faithfulness load-bearing.
+
+    // --- (1) the real single-modify writes the marker ---
+    let state = MockState {
+        mode: Arc::new(Mutex::new(MockMode::default())),
+        store: Arc::new(Mutex::new(MockStore::default())),
+    };
+    state.store.lock().unwrap().meta.insert(
+        CONTAINER.to_string(),
+        (
+            "text/turtle".into(),
+            "blob-key-1".into(),
+            "\"etag-1\"".into(),
+        ),
+    );
+    let real = solid_server_rs::store::sparql::update_delete_container_if_empty(
+        CONTAINER, None, "op-real",
+    )
+    .unwrap();
+    // Shape sanity: the real builder MUST emit a single modify (no top-level `;`), else this test is
+    // not exercising the fix.
+    assert!(
+        !real.contains(';'),
+        "the real builder must emit a single modify (no `;`): {real}"
+    );
+    apply_update(&state, &real);
+    assert!(
+        state
+            .store
+            .lock()
+            .unwrap()
+            .delete_markers
+            .get(CONTAINER)
+            .is_some_and(|v| v.contains(&"op-real".to_string())),
+        "the single-modify form must write the delete marker (one WHERE, evaluated pre-delete)"
+    );
+
+    // --- (2) the PRE-FIX two-statement form does NOT write its marker (the regression the High was) ---
+    let state2 = MockState {
+        mode: Arc::new(Mutex::new(MockMode::default())),
+        store: Arc::new(Mutex::new(MockStore::default())),
+    };
+    state2.store.lock().unwrap().meta.insert(
+        CONTAINER.to_string(),
+        (
+            "text/turtle".into(),
+            "blob-key-1".into(),
+            "\"etag-1\"".into(),
+        ),
+    );
+    let two_statement = two_statement_delete(CONTAINER, "op-buggy");
+    assert!(
+        two_statement.matches("WHERE {").count() == 2 && two_statement.contains(" ; "),
+        "the buggy fixture must be the two-statement `;`-joined form: {two_statement}"
+    );
+    apply_update(&state2, &two_statement);
+    assert!(
+        state2
+            .store
+            .lock()
+            .unwrap()
+            .delete_markers
+            .get(CONTAINER)
+            .map_or(true, |v| !v.contains(&"op-buggy".to_string())),
+        "the two-statement form must NOT write the marker (DELETE empties the graph before the \
+         INSERT's WHERE re-evaluates) — the mutation-check proving the test is non-vacuous"
+    );
+    // ...and the container's record IS gone (the first statement's DELETE ran), so a client using this
+    // buggy shape would see no marker + no record ⇒ wrongly report NotFound for a real delete.
+    assert!(
+        !state2.store.lock().unwrap().meta.contains_key(CONTAINER),
+        "the two-statement form's DELETE still empties the container — so the missing marker mis-maps \
+         a genuine delete to NotFound (exactly the High)"
+    );
+}
+
+/// The PRE-FIX BUGGY shape, as a fixture for the mutation-check above: TWO `;`-joined operations —
+/// `DELETE { graph } WHERE { exists+empty guard } ; INSERT { marker } WHERE { exists+empty guard }`.
+/// Mirrors the predicates/graph IRIs the real builder uses so the mock recognises it, but as two
+/// statements (the shape this round replaced). Built by hand here ONLY to prove the test would catch a
+/// regression to it — the production builder never emits this.
+fn two_statement_delete(container: &str, nonce: &str) -> String {
+    use solid_server_rs::store::sparql::{
+        g_delete_markers, iri, p_content_type, p_delete_marker, s_record, LDP_CONTAINS,
+    };
+    // All known-valid IRIs (constants + the test container), so `iri(...).unwrap()` is the public
+    // equivalent of the crate-private `iri_const` wrapper.
+    let g = iri(container).unwrap();
+    let rec = iri(&s_record()).unwrap();
+    let pct = iri(&p_content_type()).unwrap();
+    let contains = iri(LDP_CONTAINS).unwrap();
+    let mg = iri(&g_delete_markers()).unwrap();
+    let pmark = iri(&p_delete_marker()).unwrap();
+    format!(
+        "DELETE {{ GRAPH {g} {{ ?s ?p ?o }} }} WHERE {{ \
+            GRAPH {g} {{ ?s ?p ?o }} \
+            GRAPH {g} {{ {rec} {pct} ?anyCt }} \
+            FILTER NOT EXISTS {{ GRAPH {g} {{ {rec} {contains} ?anyChild }} }} \
+         }} ; \
+         INSERT {{ GRAPH {mg} {{ {g} {pmark} \"{nonce}\" }} }} WHERE {{ \
+            GRAPH {g} {{ {rec} {pct} ?anyCt2 }} \
+            FILTER NOT EXISTS {{ GRAPH {g} {{ {rec} {contains} ?anyChild2 }} }} \
+         }}",
+    )
+}
+
+#[tokio::test]
+async fn delete_meta_if_empty_over_http_detaches_the_parent_edge_atomically() {
+    // FINDING 2 over HTTP: a single `delete_meta_if_empty(container, Some(parent))` both deletes the
+    // empty sub-container AND detaches `<parent> ldp:contains <container>` in the ONE modify — no
+    // separate remove_child. After Deleted, the parent no longer lists the sub-container.
+    let (url, _state) = spawn_mock().await;
+    let c = HttpSparqClient::new(url);
+    let parent = "https://pod.example/alice/";
+    let container = "https://pod.example/alice/sub/";
+    c.put_meta(parent, meta()).await.unwrap();
+    c.create_child(parent, container, meta()).await.unwrap();
+    assert_eq!(
+        c.list_children(parent).await.unwrap(),
+        vec![container.to_string()],
+        "the parent lists the empty sub-container before the delete"
+    );
+
+    assert_eq!(
+        c.delete_meta_if_empty(container, Some(parent))
+            .await
+            .unwrap(),
+        DeleteOutcome::Deleted
+    );
+    assert!(!c.exists(container).await.unwrap());
+    assert!(
+        c.list_children(parent).await.unwrap().is_empty(),
+        "the parent edge is detached in the SAME atomic modify (no separate remove_child)"
+    );
+}
+
+#[tokio::test]
 async fn remove_child_detaches_membership() {
     let (url, _state) = spawn_mock().await;
     let c = HttpSparqClient::new(url);
@@ -770,6 +1108,7 @@ async fn live_sparq_round_trip() {
     };
     let c = HttpSparqClient::new(url);
 
+    let parent = "https://live.example/";
     let container = "https://live.example/c/";
     let child = "https://live.example/c/item1";
     let m = ResourceMeta {
@@ -781,6 +1120,7 @@ async fn live_sparq_round_trip() {
     // Clean slate.
     c.delete_meta(child).await.ok();
     c.delete_meta(container).await.ok();
+    c.delete_meta(parent).await.ok();
 
     // exists false → put → exists true → get round-trips.
     assert!(!c.exists(container).await.unwrap());
@@ -805,10 +1145,52 @@ async fn live_sparq_round_trip() {
         .unwrap_err();
     assert!(matches!(err, SparqError::NotFound));
 
-    // remove_child + delete clean up.
+    // Atomic empty-container delete (NO parent): while the child is present it is NotEmpty (nothing
+    // deleted); after detaching the child it is Deleted; a second delete of the now-absent container is
+    // NotFound. This asserts all THREE outcomes against the REAL single-modify endpoint — the marker is
+    // reliably written on a genuine delete (the round's HIGH would have returned NotFound for Deleted).
+    assert_eq!(
+        c.delete_meta_if_empty(container, None).await.unwrap(),
+        DeleteOutcome::NotEmpty
+    );
+    assert!(c.exists(container).await.unwrap());
     c.remove_child(container, child).await.unwrap();
     assert!(c.list_children(container).await.unwrap().is_empty());
     c.delete_meta(child).await.unwrap();
-    c.delete_meta(container).await.unwrap();
+    assert_eq!(
+        c.delete_meta_if_empty(container, None).await.unwrap(),
+        DeleteOutcome::Deleted
+    );
     assert!(!c.exists(container).await.unwrap());
+    assert_eq!(
+        c.delete_meta_if_empty(container, None).await.unwrap(),
+        DeleteOutcome::NotFound
+    );
+
+    // FINDING 2 against the REAL endpoint: the parent-edge detach is folded into the ONE modify. Index
+    // a parent that contains an empty sub-container, then a single `delete_meta_if_empty(sub, parent)`
+    // deletes the sub AND detaches the parent edge — the parent must no longer list it.
+    c.put_meta(parent, m.clone()).await.unwrap();
+    c.create_child(parent, container, m.clone()).await.unwrap();
+    assert!(
+        c.list_children(parent)
+            .await
+            .unwrap()
+            .contains(&container.to_string()),
+        "parent lists the empty sub-container before the atomic delete"
+    );
+    assert_eq!(
+        c.delete_meta_if_empty(container, Some(parent))
+            .await
+            .unwrap(),
+        DeleteOutcome::Deleted
+    );
+    assert!(!c.exists(container).await.unwrap());
+    assert!(
+        c.list_children(parent).await.unwrap().is_empty(),
+        "the parent edge is detached in the SAME atomic modify (no separate remove_child)"
+    );
+
+    // Clean up the parent.
+    c.delete_meta(parent).await.ok();
 }

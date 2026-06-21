@@ -26,6 +26,25 @@ pub struct ResourceMeta {
     pub etag: String,
 }
 
+/// The result of an atomic empty-container delete ([`SparqClient::delete_meta_if_empty`] /
+/// [`super::Store::delete_container_if_empty`]).
+///
+/// The three variants are what let the LDP handler map the HTTP status WITHOUT a separate pre-read
+/// that could race the delete: the existence + empty check and the delete are decided in ONE store
+/// operation, so a child POSTed concurrently is either observed (⇒ [`NotEmpty`](Self::NotEmpty),
+/// nothing deleted) or arrives strictly after the container's record is gone (⇒ its create then
+/// fails the container-EXISTS guard) — never a window where an empty-check passes and the delete
+/// then orphans a just-created child (the TOCTOU the separate `list_children` + `delete` had).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// The container existed, was empty, and was deleted.
+    Deleted,
+    /// The container existed but had members — NOTHING was deleted (the handler maps this to 409).
+    NotEmpty,
+    /// The container did not exist (the handler maps this to 404).
+    NotFound,
+}
+
 /// A SPARQ-client error (opaque — never leaks backend detail to a client).
 #[derive(Debug, thiserror::Error)]
 pub enum SparqError {
@@ -65,6 +84,29 @@ pub trait SparqClient: Send + Sync {
     /// Remove a resource's metadata record. Idempotent: deleting an absent IRI is `Ok(())` (the
     /// caller's existence check governs the 404, so this is a no-op-on-absent at the index layer).
     async fn delete_meta(&self, iri: &str) -> Result<(), SparqError>;
+
+    /// ATOMICALLY delete a container's record + its (empty) containment set + its edge in the PARENT's
+    /// graph, ONLY if it is empty — all in ONE index operation.
+    ///
+    /// The existence check, the `ldp:contains`-empty check, the record delete, AND the parent-edge
+    /// detach (`<parent> ldp:contains <container>`, which lives in the PARENT's graph) are ONE index
+    /// operation with NO interleaving. This closes BOTH TOCTOU windows: (1) a concurrent `create_child`
+    /// adding a member between a separate empty-check and a separate delete, and (2) — the reason the
+    /// parent edge is folded in here rather than detached by the caller afterwards — a concurrent POST
+    /// recreating the child under the parent in the window between the graph delete and a separate, later
+    /// parent-edge detach (which would then orphan the just-recreated child). On the live SPARQ path
+    /// this is a SINGLE `DELETE { container-graph ; parent-edge } INSERT { marker } WHERE { exists+empty
+    /// guard }` modify whose WHERE is evaluated once pre-modification (see
+    /// [`super::sparql::update_delete_container_if_empty`]).
+    ///
+    /// `parent` is `None` for a root/parentless container (nothing to detach). Returns
+    /// [`DeleteOutcome::Deleted`] if it existed + was empty + is now gone, [`DeleteOutcome::NotEmpty`]
+    /// if it had members (nothing deleted), or [`DeleteOutcome::NotFound`] if it was not indexed.
+    async fn delete_meta_if_empty(
+        &self,
+        iri: &str,
+        parent: Option<&str>,
+    ) -> Result<DeleteOutcome, SparqError>;
 
     /// ATOMICALLY create a child resource record: in a SINGLE index operation, verify `container` is
     /// indexed (else [`SparqError::NotFound`]) and commit BOTH `child`'s metadata record AND the
@@ -148,7 +190,52 @@ impl SparqClient for InMemorySparqClient {
             .lock()
             .map_err(|_| SparqError::Backend("poisoned".into()))?;
         guard.meta.remove(iri);
+        // Parity with the live SPARQ path (`DROP SILENT GRAPH <iri>`): a resource's named graph holds
+        // BOTH its index record AND — if it is a container — its `ldp:contains` edges, so dropping the
+        // record drops the containment set too. Mirror that here by clearing `iri`'s own children
+        // entry, so a delete-then-recreate of a container at the same IRI cannot inherit a stale
+        // (empty-or-not) membership list. (The empty-container DELETE check has already run in the
+        // handler, so any surviving entry would be a leak, not a live member.)
+        guard.children.remove(iri);
         Ok(())
+    }
+
+    async fn delete_meta_if_empty(
+        &self,
+        iri: &str,
+        parent: Option<&str>,
+    ) -> Result<DeleteOutcome, SparqError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| SparqError::Backend("poisoned".into()))?;
+        // ONE atomic step under the SINGLE lock — there is no `await` between the checks, the delete,
+        // and the parent-edge detach, so no concurrent `create_child` (which takes the same lock) can
+        // interleave a member between the empty-check and the delete, NOR recreate the child under the
+        // parent between the delete and the detach: a concurrent create either runs fully BEFORE this
+        // (its child is then observed ⇒ NotEmpty, nothing deleted) or fully AFTER (the container
+        // record is gone ⇒ its container-EXISTS guard rejects it). No orphaning window exists. This
+        // mirrors the live path's SINGLE atomic modify (container graph + parent edge + marker).
+        if !guard.meta.contains_key(iri) {
+            return Ok(DeleteOutcome::NotFound);
+        }
+        // Empty iff there is no non-empty `ldp:contains` set for this container.
+        let has_members = guard.children.get(iri).is_some_and(|kids| !kids.is_empty());
+        if has_members {
+            return Ok(DeleteOutcome::NotEmpty);
+        }
+        // Empty + present ⇒ drop the record AND its (empty) containment entry together — parity with
+        // the live `DROP SILENT GRAPH`, so a re-created container at the same IRI inherits no stale set.
+        guard.meta.remove(iri);
+        guard.children.remove(iri);
+        // ...and detach the parent edge in the SAME atomic step (folded in, per Finding 2), so there is
+        // no window in which the container graph is gone but the parent still `ldp:contains` it.
+        if let Some(p) = parent {
+            if let Some(entry) = guard.children.get_mut(p) {
+                entry.retain(|c| c != iri);
+            }
+        }
+        Ok(DeleteOutcome::Deleted)
     }
 
     async fn create_child(
