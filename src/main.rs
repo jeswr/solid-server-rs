@@ -18,13 +18,17 @@
 //! Configuration is environment-driven (see the `*_ENV` constants below). Sensible production
 //! defaults: HTTPS-only IdP/WebID (loopback refused), DPoP required, strict bidirectional check.
 //!
+//! ## TLS termination (config-gated)
+//! When `SOLID_SERVER_TLS_CERT` + `SOLID_SERVER_TLS_KEY` (PEM file paths) are BOTH set, the binary
+//! terminates HTTPS in-process via `axum-server` over the house rustls/aws-lc-rs stack; when NEITHER
+//! is set it keeps the plain-TCP listener (terminate TLS at a reverse proxy). See [`solid_server_rs::tls`]
+//! for the config-shape decision (PEM paths, both-or-neither validation, ACME noted as a future seam).
+//!
 //! ## Still seamed (not in this slice)
 //! - The live SPARQ HTTP client + the `object_store`-backed blob store (the binary still boots the
 //!   in-memory store doubles so it runs without SPARQ / S3; swapping in `HttpSparqClient` is wiring).
 //! - WAC authorization (gated on sparq#992 — the LDP layer is fail-closed: mutations need an
 //!   authenticated caller, reads are public since no ACLs exist yet).
-//! - rustls TLS termination (the `rustls`/`aws-lc-rs` provider is installed below; a config-gated TLS
-//!   listener is the next slice — terminate TLS at a reverse proxy until then).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +41,7 @@ use solid_server_rs::app::{build_router, AppState};
 use solid_server_rs::auth::AuthContext;
 use solid_server_rs::ldp::handler::LdpState;
 use solid_server_rs::store::{CompositeStore, InMemoryBlobStore, InMemorySparqClient};
+use solid_server_rs::tls::{self, TlsMode};
 
 // --- Environment configuration keys ----------------------------------------------------------------
 const ENV_BASE_URL: &str = "SOLID_SERVER_BASE_URL";
@@ -76,6 +81,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let bidirectional = parse_bidirectional(std::env::var(ENV_BIDIRECTIONAL).ok().as_deref());
 
+    // --- TLS termination mode (config-gated; both-or-neither). ------------------------------------
+    // Resolve EARLY so a misconfiguration (one TLS var without the other) fails fast at boot, before
+    // we stand up auth/storage. Filesystem + PEM validation happens just before binding, below.
+    let tls_mode = tls::mode_from_env().map_err(|e| format!("TLS configuration error: {e}"))?;
+
     // --- Auth: REAL network-backed verification (delegated to solid-oidc-verifier). ----------------
     // The NetworkJwksProvider does OIDC discovery + JWKS fetch over the DNS-pinned SSRF-guarded path.
     let jwks = NetworkJwksProvider::new(jwks_cache_ttl, allow_loopback)
@@ -112,18 +122,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = build_router(AppState::new(auth, ldp));
 
-    let listener = tokio::net::TcpListener::bind(&bind).await?;
-    eprintln!("solid-server-rs (EXPERIMENTAL) listening on http://{bind} (base {base_url})");
+    // Build the rustls config (reads + validates the PEM files) for TLS mode; `None` for plain mode.
+    // Done after the router is assembled but before binding, so a bad cert/key fails at boot.
+    let rustls_config = tls::build_rustls_config(&tls_mode)
+        .await
+        .map_err(|e| format!("TLS configuration error: {e}"))?;
+
+    let scheme = if rustls_config.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    eprintln!("solid-server-rs (EXPERIMENTAL) listening on {scheme}://{bind} (base {base_url})");
     eprintln!("  trusted issuer: {issuer}  audience: {audience}  bidirectional: {bidirectional:?}");
+    if let TlsMode::Tls {
+        cert_path,
+        key_path,
+    } = &tls_mode
+    {
+        eprintln!(
+            "  TLS: terminating HTTPS in-process (cert {}, key {})",
+            cert_path.display(),
+            key_path.display()
+        );
+    } else {
+        eprintln!("  TLS: plain HTTP — terminate TLS at a reverse proxy (set SOLID_SERVER_TLS_CERT + _KEY to enable in-process HTTPS).");
+    }
     if allow_loopback {
         eprintln!("  WARNING: SOLID_SERVER_ALLOW_LOOPBACK is set — http:/loopback IdP+WebID permitted (DEV/IT ONLY).");
     }
     eprintln!("WARNING: experimental parallel track — NOT the production prod-solid-server.");
 
-    // Graceful shutdown on Ctrl-C. Next slice: drain in-flight + WS tasks (spike R: axum#3003).
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    match rustls_config {
+        // HTTPS: axum-server terminates TLS over the process-wide aws-lc-rs rustls provider. Its
+        // serve loop owns graceful shutdown internally; Ctrl-C still stops the process.
+        Some(config) => {
+            let addr: std::net::SocketAddr = bind
+                .parse()
+                .map_err(|e| format!("SOLID_SERVER_BIND ({bind}) is not a socket address: {e}"))?;
+            axum_server::bind_rustls(addr, config)
+                .serve(app.into_make_service())
+                .await?;
+        }
+        // Plain TCP (unchanged dev/test behaviour). Graceful shutdown on Ctrl-C.
+        None => {
+            let listener = tokio::net::TcpListener::bind(&bind).await?;
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+        }
+    }
     Ok(())
 }
 

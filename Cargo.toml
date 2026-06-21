@@ -24,6 +24,14 @@ tower = "0.5"
 tower-http = { version = "0.7", features = ["trace"] }
 # TLS: rustls + aws-lc-rs (spike §4 — the house rule, FIPS-capable backend).
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
+# HTTPS serving: axum-server is the maintained, widely-used (26M+ downloads) axum/hyper TLS-serving
+# path. We take the `tls-rustls-no-provider` feature (NOT `tls-rustls`) deliberately: that variant
+# does NOT activate its own `rustls/aws-lc-rs` provider — it reuses the process-wide default crypto
+# provider, which `main` already installs (aws-lc-rs) for the SSRF-guarded fetcher. So there is one
+# provider in the tree, no double-install conflict, and TLS termination stays on the house rustls
+# stack. PEM cert/key are loaded from file paths via `RustlsConfig::from_pem`. Config-gated: only
+# linked into the serve path when both TLS env vars are set (plain TCP otherwise).
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
 # Auth: consume the standalone DPoP/Solid-OIDC verifier as a git dependency — do NOT reimplement.
 # The verifier's M2 landed the DNS-pinned SSRF-guarded network adapters (`NetworkJwksProvider` +
 # `NetworkWebIdResolver` over `SafeFetcher`); we enable its `network` feature so the binary performs
@@ -67,8 +75,14 @@ serde_json = "1"
 # The HttpSparqClient unit tests run against an in-process mock SPARQL endpoint (an axum server on a
 # tokio listener) — no live SPARQ. `net` for the listener, `rt-multi-thread` so the client + server
 # run on the same multi-threaded runtime, `time` for the timeout test.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time", "io-util"] }
 http-body-util = "0.1"
+# The (default-`#[ignore]`d) live TLS handshake test drives a rustls client against the axum-server
+# HTTPS listener. tokio-rustls is the canonical rustls+tokio adapter and is ALREADY in the resolved
+# tree (pulled in transitively by axum-server's tls-rustls feature), so this adds NO new crate —
+# it only makes the existing dep nameable from the test. Matches the in-tree rustls 0.23 / aws-lc-rs.
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+rustls-pemfile = "2"
 
 [features]
 default = []

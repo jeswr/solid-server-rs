@@ -35,6 +35,7 @@ pub mod auth;
 pub mod error;
 pub mod ldp;
 pub mod store;
+pub mod tls;
 
 pub use app::{build_router, AppState};
 pub use error::{ServerError, ServerResult};

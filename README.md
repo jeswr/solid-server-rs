@@ -115,6 +115,8 @@ cargo run                   # boot the experimental server (defaults to 127.0.0.
 #   SOLID_SERVER_BIDIRECTIONAL        WebID<->issuer check: strict (default) | warn | off
 #   SOLID_SERVER_JWKS_CACHE_TTL_SECS  JWKS cache TTL in seconds (default 300)
 #   SOLID_SERVER_ALLOW_LOOPBACK       dev/IT ONLY: permit http:/loopback IdP+WebID (default 0)
+#   SOLID_SERVER_TLS_CERT             PEM cert-chain file path; set WITH _TLS_KEY to terminate HTTPS
+#   SOLID_SERVER_TLS_KEY              PEM private-key file path; set WITH _TLS_CERT (both-or-neither)
 SOLID_SERVER_BIND=127.0.0.1:3000 \
 SOLID_SERVER_BASE_URL=https://pod.example \
 SOLID_SERVER_TRUSTED_ISSUER=https://idp.example/realms/solid \
@@ -124,6 +126,25 @@ SOLID_SERVER_JWKS_CACHE_TTL_SECS=300 \
 SOLID_SERVER_ALLOW_LOOPBACK=0 \
   cargo run
 ```
+
+### TLS termination (optional, config-gated)
+
+By default the server serves plain HTTP and you terminate TLS at a reverse proxy. To terminate
+HTTPS **in-process** (over the house rustls/aws-lc-rs stack via `axum-server`), set BOTH TLS env
+vars to PEM file paths — a cert chain and a private key:
+
+```bash
+SOLID_SERVER_TLS_CERT=/etc/tls/fullchain.pem \
+SOLID_SERVER_TLS_KEY=/etc/tls/privkey.pem \
+SOLID_SERVER_BIND=0.0.0.0:443 \
+  cargo run
+```
+
+It is **both-or-neither**: setting exactly one is a boot error (a half-configured TLS server is
+never silently downgraded to plaintext), as is a missing / empty / malformed PEM file — each fails
+fast with a clear message. No auto-cert / ACME this slice (a future seam: an ACME provider would
+produce the same in-memory rustls config, addable behind a third env var without reshaping the
+serve path); supply cert files yourself or front the server with a proxy that does ACME.
 
 Auth is **real**: the server performs live OIDC discovery + JWKS fetch against the trusted issuer
 (over the DNS-pinned SSRF-guarded fetcher) and, by default, the strict bidirectional WebID↔issuer
