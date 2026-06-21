@@ -3,9 +3,12 @@
 //!
 //! Route layout (mounted by [`crate::app::build_router`]):
 //! - `POST /.notifications/WebSocketChannel2023/`  — subscribe; returns a channel description with a
-//!   `receiveFrom` `ws(s)://` URL. **Auth-gated** (behind the DPoP middleware — fail-closed).
-//! - `GET  /.notifications/WebSocketChannel2023/receive?topic=<iri>` — upgrade to a WebSocket and
-//!   register the connection under `<iri>`; the server pushes AS2.0 notifications on change.
+//!   `receiveFrom` `ws(s)://` URL that carries a minted receive token. **Auth-gated** (behind the
+//!   DPoP middleware — fail-closed); the token binds receive to the authenticated subscriber+topic.
+//! - `GET  /.notifications/WebSocketChannel2023/receive?topic=<iri>&token=<tok>` — upgrade to a
+//!   WebSocket and register the connection under `<iri>`. **Token-gated:** the `token` must be a
+//!   valid, unexpired receive token whose bound topic matches `<iri>`, else the upgrade is rejected
+//!   (401, no socket). The server then pushes AS2.0 notifications on change.
 //! - `GET  /.well-known/solid`                     — a storage-description document advertising the
 //!   subscription service (discovery; unauthenticated, like a storage description).
 //!
@@ -20,6 +23,7 @@
 
 use std::sync::Arc;
 
+use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -63,9 +67,11 @@ impl NotifyState {
         format!("{}{SUBSCRIPTION_PATH}", self.base_url.trim_end_matches('/'))
     }
 
-    /// The `receiveFrom` WebSocket URL for a topic. The base URL's scheme is mapped http→ws / https→wss
-    /// (WebSocketChannel2023 §receiveFrom — the receive endpoint is a WebSocket URL).
-    fn receive_from_url(&self, topic: &str) -> String {
+    /// The `receiveFrom` WebSocket URL for a topic, carrying the minted receive `token`. The base
+    /// URL's scheme is mapped http→ws / https→wss (WebSocketChannel2023 §receiveFrom — the receive
+    /// endpoint is a WebSocket URL). The token authorizes the WS upgrade for this topic (a browser
+    /// `WebSocket` cannot send the DPoP `Authorization` header, so the spec carries authz in the URL).
+    fn receive_from_url(&self, topic: &str, token: &str) -> String {
         let base = self.base_url.trim_end_matches('/');
         let ws_base = if let Some(rest) = base.strip_prefix("https://") {
             format!("wss://{rest}")
@@ -74,11 +80,13 @@ impl NotifyState {
         } else {
             base.to_string()
         };
-        // URL-encode the topic into the query string (minimal: encode the few reserved chars that
-        // matter for a query value; the topic is a server-issued absolute IRI, not user free-text).
+        // URL-encode the topic + token into the query string (minimal: encode the few reserved chars
+        // that matter for a query value; the topic is a server-issued absolute IRI and the token is a
+        // server-issued base64url string — neither is user free-text).
         format!(
-            "{ws_base}{RECEIVE_PATH}?topic={}",
-            encode_query_value(topic)
+            "{ws_base}{RECEIVE_PATH}?topic={}&token={}",
+            encode_query_value(topic),
+            encode_query_value(token),
         )
     }
 }
@@ -102,26 +110,34 @@ pub struct SubscriptionRequest {
 /// rejected with 401 — there are NO anonymous subscriptions. (This handler runs behind the DPoP auth
 /// middleware, which injects the [`VerifiedToken`]; `is_public()` ⇒ unauthenticated.)
 ///
+/// On success the handler MINTS an unguessable, short-lived **receive token** bound to
+/// `(authenticated WebID, topic, expiry)` and embeds it in the `receiveFrom` URL — this is what gates
+/// the otherwise-headerless WS receive endpoint (see [`receive_handler`]).
+///
 /// `// M2-next:` per-resource WAC authorization — confirm this WebID has `read` on `topic` — is NOT
 /// yet enforced (gated on `sparq#992`, the SPARQ access-control design; same blocker as LDP read
-/// authorization). KNOWN LIMITATION: a subscriber today must be authenticated but is not yet
-/// ACL-checked per-resource. The seam is exactly here, right after the authentication check.
+/// authorization). KNOWN LIMITATION: a subscriber today must be authenticated (and receive is now
+/// token-gated to that authenticated subscriber+topic) but is not yet ACL-checked per-resource. The
+/// seam is exactly here, right after the authentication check.
 pub async fn subscribe_handler(
     State(state): State<Arc<NotifyState>>,
     Extension(token): Extension<VerifiedToken>,
     Json(req): Json<SubscriptionRequest>,
 ) -> Response {
-    // Fail-closed: no anonymous subscriptions.
-    if token.is_public() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            "authentication required to subscribe",
-        )
-            .into_response();
-    }
+    // Fail-closed: no anonymous subscriptions. After this check `web_id` is `Some`.
+    let web_id = match &token.web_id {
+        Some(w) => w.clone(),
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "authentication required to subscribe",
+            )
+                .into_response();
+        }
+    };
 
-    // M2-next: WAC check here — `wac::can_read(token.web_id, topic)` once sparq#992 lands. Until then
-    // an authenticated caller may subscribe to any topic IRI (documented known limitation).
+    // M2-next: WAC check here — `wac::can_read(&web_id, topic)` once sparq#992 lands. Until then an
+    // authenticated caller may subscribe to any topic IRI (documented known limitation).
 
     // Validate the channel type if the client sent one (reject a wrong type rather than silently
     // treating it as WebSocketChannel2023).
@@ -140,15 +156,21 @@ pub async fn subscribe_handler(
         _ => return (StatusCode::BAD_REQUEST, "missing topic").into_response(),
     };
 
+    // Mint the receive token: unguessable, short-lived, bound to (this authenticated WebID, topic).
+    // Without it the receive endpoint refuses the upgrade — so only this authenticated subscriber of
+    // this topic can connect. The token (never logged) is embedded in `receiveFrom`.
+    let receive_token = state.hub.mint_receive_token(&web_id, topic).await;
+    let receive_from = state.receive_from_url(topic, &receive_token);
+
     // The channel description: per WebSocketChannel2023, `receiveFrom` is the ws(s):// URL the client
     // opens. We do NOT pre-register the topic here — registration happens when the WebSocket connects
     // (so a subscribe POST that is never followed by a connect leaks nothing).
     let body = json!({
         "@context": [NOTIFICATIONS_CONTEXT, AS2_CONTEXT],
-        "id": state.receive_from_url(topic),
+        "id": receive_from,
         "type": WEBSOCKET_CHANNEL_2023_TYPE,
         "topic": topic,
-        "receiveFrom": state.receive_from_url(topic),
+        "receiveFrom": receive_from,
     });
     (
         StatusCode::OK,
@@ -162,29 +184,69 @@ pub async fn subscribe_handler(
 #[derive(Debug, Deserialize)]
 pub struct ReceiveQuery {
     pub topic: Option<String>,
+    /// The receive token minted by the authenticated subscribe (see [`subscribe_handler`]). Required.
+    pub token: Option<String>,
 }
 
-/// `GET /.notifications/WebSocketChannel2023/receive?topic=<iri>` — upgrade to a WebSocket and stream
-/// notifications for `<iri>`.
+/// `GET /.notifications/WebSocketChannel2023/receive?topic=<iri>&token=<tok>` — upgrade to a
+/// WebSocket and stream notifications for `<iri>`.
 ///
-/// ## Auth on the WS upgrade (the spec reality, documented)
+/// ## Auth on the WS upgrade — token-gated (the spec reality, implemented)
 /// A browser `WebSocket` cannot carry the DPoP-bound `Authorization` header, so per the spec the
-/// `receiveFrom` URL carries its own short-lived authorization. THIS slice does not yet mint/verify a
-/// per-channel receive token (the token-in-`receiveFrom` mechanism is a `// M2-next:` seam alongside
-/// WAC) — the receive endpoint is currently reachable without re-presenting the DPoP token. The
-/// fail-closed gate that DOES hold today is on the SUBSCRIBE POST (authenticated WebID required); the
-/// receive URL is unguessable-per-deploy only to the extent the topic is known. KNOWN LIMITATION,
-/// documented here and in the module docs — not a silent gap; it lifts when the receive-token seam +
-/// WAC (sparq#992) land.
+/// `receiveFrom` URL carries its own short-lived authorization. We REQUIRE a valid **receive token**
+/// here: it must exist, be unexpired, and its bound topic must equal the requested `topic`. The token
+/// is minted ONLY by the authenticated subscribe (bound to that WebID + topic), so a connection
+/// without a token — or with an invalid / expired / wrong-topic token — is rejected (401, NO socket,
+/// NO subscriber registered). This closes the previously-open receive bypass (anyone who guessed a
+/// resource IRI could receive its change notifications without subscribing).
+///
+/// `// M2-next:` the DEEPER per-resource WAC check (is this WebID allowed to READ this resource?)
+/// remains the `sparq#992` seam — the token guarantees only that the connecting party is an
+/// authenticated subscriber of THIS topic, which is the minimum bar that closes the bypass.
+/// `ws` is taken as a `Result` (not a bare `WebSocketUpgrade`) ON PURPOSE: the token-gate must run
+/// FIRST and UNCONDITIONALLY. If `WebSocketUpgrade` were a plain extractor, its rejection would
+/// short-circuit BEFORE the token check — so a request with bad/missing upgrade headers would 426
+/// without ever validating authorization, and (more importantly) the security gate would be coupled
+/// to the WS extractor's success. By deferring the `Result`, we reject an absent/invalid/expired/
+/// wrong-topic token with 401 regardless of the upgrade headers, and only surface the WS rejection
+/// after the token has validated.
 pub async fn receive_handler(
     State(state): State<Arc<NotifyState>>,
     Query(q): Query<ReceiveQuery>,
-    ws: WebSocketUpgrade,
+    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
     let topic = match q.topic {
         Some(t) if !t.is_empty() => t,
         _ => return (StatusCode::BAD_REQUEST, "missing topic").into_response(),
     };
+    // Token-gate (runs FIRST, unconditionally): require a valid, unexpired, topic-matching receive
+    // token. Reject (401, no socket) otherwise. We deliberately do NOT echo the token or distinguish
+    // absent/invalid/expired in the response body — a uniform 401 avoids leaking which condition
+    // failed.
+    let token = match q.token {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "a valid receive token is required",
+            )
+                .into_response()
+        }
+    };
+    if !state.hub.validate_receive_token(&token, &topic).await {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "a valid receive token is required",
+        )
+            .into_response();
+    }
+    // The token validated. Now the request MUST be a genuine WS upgrade; surface the extractor's own
+    // rejection (e.g. 426 Upgrade Required) if not.
+    let ws = match ws {
+        Ok(ws) => ws,
+        Err(rej) => return rej.into_response(),
+    };
+    // Only AFTER the token validates do we upgrade + register a subscriber.
     let hub = state.hub.clone();
     ws.on_upgrade(move |socket| stream_notifications(socket, hub, topic))
 }
@@ -327,7 +389,7 @@ mod tests {
     #[test]
     fn receive_from_maps_https_to_wss() {
         let s = state();
-        let url = s.receive_from_url("https://pod.example/a");
+        let url = s.receive_from_url("https://pod.example/a", "tok123");
         assert!(
             url.starts_with("wss://pod.example/.notifications/WebSocketChannel2023/receive?topic="),
             "{url}"
@@ -337,6 +399,8 @@ mod tests {
             url.contains("https%3A%2F%2Fpod.example%2Fa") || url.contains("https://pod.example/a"),
             "{url}"
         );
+        // The receive token is carried in the URL.
+        assert!(url.contains("&token=tok123"), "{url}");
     }
 
     #[test]
@@ -345,7 +409,7 @@ mod tests {
             NotificationHub::new(),
             "http://localhost:3000",
         ));
-        let url = s.receive_from_url("http://localhost:3000/a");
+        let url = s.receive_from_url("http://localhost:3000/a", "tok123");
         assert!(url.starts_with("ws://localhost:3000/"), "{url}");
     }
 

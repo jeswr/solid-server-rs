@@ -206,6 +206,86 @@ async fn subscribe_authenticated_returns_receive_from() {
     assert!(out.contains(WS_TYPE), "{out}");
 }
 
+// --- Receive endpoint token-gate (the HIGH-finding fix; non-ignored, via oneshot) ---------------
+
+/// Build a GET request that LOOKS like a WS upgrade for the receive endpoint with the given query.
+fn ws_upgrade_request(path_and_query: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(path_and_query)
+        .header("connection", "upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// MUTATION-CHECK for the fix: the receive endpoint with NO token must be REJECTED (401). The pre-fix
+/// topic-only receive would have upgraded (101) here — so this test fails against the vulnerable code.
+#[tokio::test]
+async fn receive_without_token_is_rejected() {
+    let h = Harness::new();
+    let req = ws_upgrade_request(
+        "/.notifications/WebSocketChannel2023/receive?topic=https://pod.example/alice/data",
+    );
+    let resp = h.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "an unauthenticated/tokenless receive must be refused (no open-receive bypass)"
+    );
+}
+
+/// An INVALID (never-minted) token is rejected.
+#[tokio::test]
+async fn receive_with_invalid_token_is_rejected() {
+    let h = Harness::new();
+    let req = ws_upgrade_request(
+        "/.notifications/WebSocketChannel2023/receive?topic=https://pod.example/alice/data&token=bogus-token",
+    );
+    let resp = h.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// A VALID token (from an authenticated subscribe) bound to topic A must NOT authorize receive on a
+/// DIFFERENT topic B — the topic-binding is enforced end-to-end through the router.
+#[tokio::test]
+async fn receive_with_valid_token_for_wrong_topic_is_rejected() {
+    let h = Harness::new();
+    // Subscribe (authenticated) to topic A to mint a real token.
+    let topic_a = "https://pod.example/alice/data";
+    let sub_body = serde_json::json!({ "type": WS_TYPE, "topic": topic_a }).to_string();
+    let sub = h
+        .auth_request(
+            "POST",
+            "/.notifications/WebSocketChannel2023/",
+            Some("application/ld+json"),
+            Body::from(sub_body),
+        )
+        .await;
+    assert_eq!(sub.status(), StatusCode::OK);
+    let channel: serde_json::Value = serde_json::from_str(&body_string(sub).await).unwrap();
+    let receive_from = channel["receiveFrom"].as_str().unwrap().to_string();
+    // Extract the minted token from the receiveFrom URL's `&token=` param.
+    let token = receive_from
+        .split("token=")
+        .nth(1)
+        .expect("receiveFrom carries a token")
+        .to_string();
+
+    // Present that valid token but for a DIFFERENT topic B → rejected.
+    let req = ws_upgrade_request(&format!(
+        "/.notifications/WebSocketChannel2023/receive?topic=https://pod.example/alice/OTHER&token={token}"
+    ));
+    let resp = h.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a token bound to topic A must not authorize receive on topic B"
+    );
+}
+
 // --- Live WebSocket end-to-end (default-ignored; binds a real server) ---------------------------
 
 /// A really-bound server whose base URL matches the bound address, so DPoP htu + the WS upgrade work
@@ -277,8 +357,28 @@ async fn live_websocket_delivers_update_on_put() {
     assert_eq!(sub.status(), 200);
     let channel: serde_json::Value = sub.json().await.unwrap();
     let receive_from = channel["receiveFrom"].as_str().unwrap().to_string();
+    // The receiveFrom URL now carries the minted receive token (the WS receive endpoint is
+    // token-gated). Without it the connect below would be refused.
+    assert!(
+        receive_from.contains("&token="),
+        "receiveFrom must carry a receive token: {receive_from}"
+    );
 
-    // 2. Connect the WebSocket to receiveFrom.
+    // 1b. A connect WITHOUT the token is refused (the open-receive bypass is closed). Strip the
+    // `&token=…` query param and confirm the handshake fails.
+    let no_token_url = receive_from
+        .split("&token=")
+        .next()
+        .expect("split keeps the pre-token portion")
+        .to_string();
+    assert!(
+        tokio_tungstenite::connect_async(&no_token_url)
+            .await
+            .is_err(),
+        "a tokenless receive connect must be refused"
+    );
+
+    // 2. Connect the WebSocket to receiveFrom (with the valid token).
     let (mut ws, _) = tokio_tungstenite::connect_async(&receive_from)
         .await
         .expect("ws connects");
