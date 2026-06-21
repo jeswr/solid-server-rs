@@ -192,8 +192,11 @@ pub struct InMemoryBlobStore {
     inner: Mutex<HashMap<String, StoredBlob>>,
     /// Store-wide monotonic write counter. Every write does `fetch_add(1)` and stamps the returned value
     /// onto the entry's `generation`, so generations are globally unique + strictly increasing across the
-    /// store. `Atomic` (not behind the `Mutex`) only so the counter is independent of which key is locked;
-    /// the compare-and-delete still reads the entry's stamped generation under the `Mutex` for atomicity.
+    /// store. The bump is done WHILE the store `Mutex` is held (Finding 2: `bump_generation_locked`), in
+    /// the SAME critical section as the entry insert, so the increment and the insertion cannot interleave
+    /// ⇒ generations are strictly WRITE-ORDERED, matching the strictly-increasing-write-version contract.
+    /// The `AtomicU64` type is retained only to keep the bump callable through the `&self` API; all
+    /// ordering/visibility comes from the surrounding `Mutex`, so `Relaxed` suffices.
     next_generation: AtomicU64,
 }
 
@@ -202,10 +205,20 @@ impl InMemoryBlobStore {
         Self::default()
     }
 
-    /// The next strictly-increasing generation. `Relaxed` is sufficient: we only need each write to get a
-    /// DISTINCT, monotonically-increasing value (the uniqueness/ordering of the CAS witness), not to
-    /// synchronise other memory — the entry's stamped generation is published/compared under the `Mutex`.
-    fn bump_generation(&self) -> u64 {
+    /// The next strictly-increasing generation, read+incremented WHILE the store `Mutex` is held (the
+    /// caller passes its lock guard). Generating AND stamping the generation inside the SAME critical
+    /// section as the entry insert (Finding 2) makes the counter bump and the insertion ONE atomic step, so
+    /// generations are strictly WRITE-ORDERED: a write that observes generation N is the one that inserts
+    /// generation N, and no other write can interleave between the bump and the insert. (The earlier
+    /// before-the-lock bump let two concurrent writes increment the counter and THEN race for the lock, so
+    /// a write could be stamped out of insertion order — violating the strictly-increasing-write-version
+    /// contract `delete_if_unchanged` relies on. Taking the guard makes the doc TRUE.)
+    ///
+    /// `Relaxed` is sufficient on the atomic: it is only ever touched under the `Mutex`, so the lock already
+    /// provides the ordering/visibility — the atomic's own ordering carries no additional guarantee here.
+    /// (The `AtomicU64` is retained over a plain `u64` only to avoid threading a `&mut` field through the
+    /// `&self` API; correctness comes entirely from the surrounding lock.)
+    fn bump_generation_locked(&self, _guard: &HashMap<String, StoredBlob>) -> u64 {
         self.next_generation.fetch_add(1, Ordering::Relaxed)
     }
 
@@ -217,8 +230,11 @@ impl InMemoryBlobStore {
     /// so two `put_with_time` calls with the SAME `last_modified` are correctly distinguished by their
     /// generations (the property the grace-vs-CAS separation relies on).
     pub fn put_with_time(&self, key: &str, body: Bytes, last_modified: SystemTime) {
-        let generation = self.bump_generation();
+        // Finding 2: bump AND stamp the generation while holding the SAME lock as the insert, so the
+        // counter increment + the entry insertion are one atomic critical section ⇒ generations are
+        // strictly WRITE-ORDERED (no interleave between bump and insert).
         let mut guard = self.inner.lock().expect("blob store mutex poisoned");
+        let generation = self.bump_generation_locked(&guard);
         guard.insert(
             key.to_string(),
             StoredBlob {
@@ -252,14 +268,16 @@ impl BlobStore for InMemoryBlobStore {
     }
 
     async fn put(&self, key: &str, body: Bytes) -> Result<(), BlobError> {
-        // Stamp a fresh monotonic generation BEFORE taking the lock (the counter is independent of the
-        // key). Every put — overwrite or not — gets a strictly different generation, so a same-timestamp
-        // overwrite still has a distinct CAS witness.
-        let generation = self.bump_generation();
+        // Finding 2: bump AND stamp the generation WHILE holding the lock, so the counter increment + the
+        // insert are one atomic critical section ⇒ generations are strictly WRITE-ORDERED (a write stamped
+        // generation N is the one that inserts it; no other write interleaves between the bump and the
+        // insert). Every put — overwrite or not — still gets a strictly different generation, so a
+        // same-timestamp overwrite has a distinct CAS witness.
         let mut guard = self
             .inner
             .lock()
             .map_err(|_| BlobError::Backend("poisoned".into()))?;
+        let generation = self.bump_generation_locked(&guard);
         guard.insert(
             key.to_string(),
             StoredBlob {
@@ -347,5 +365,116 @@ impl BlobStore for InMemoryBlobStore {
             // reconciler decided to GC.
             _ => Ok(false),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn two_writes_acquire_strictly_increasing_generations() {
+        // Finding 2 (the write-order contract): each successive write must observe a STRICTLY GREATER
+        // generation than the one before it — the property `delete_if_unchanged` relies on to tell two
+        // writes apart. (Mutation-check: a counter that did not strictly increase — e.g. a stamp that
+        // reused a value — would fail the `<` assertions.)
+        let blob = InMemoryBlobStore::new();
+        let same_stamp = SystemTime::now() - Duration::from_secs(3600);
+
+        blob.put_with_time("k", Bytes::from_static(b"v1"), same_stamp);
+        let g1 = blob.generation_of("k").expect("v1 exists");
+        // A same-key OVERWRITE at the IDENTICAL last_modified still bumps the generation.
+        blob.put_with_time("k", Bytes::from_static(b"v2"), same_stamp);
+        let g2 = blob.generation_of("k").expect("v2 exists");
+        // A DIFFERENT key advances the same store-wide counter.
+        blob.put_with_time("other", Bytes::from_static(b"o"), same_stamp);
+        let g3 = blob.generation_of("other").expect("other exists");
+
+        assert!(
+            g1 < g2,
+            "an overwrite must get a strictly greater generation"
+        );
+        assert!(
+            g2 < g3,
+            "the store-wide generation counter is strictly increasing across keys too"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_writes_get_unique_strictly_ordered_generations() {
+        // Finding 2 (the concurrency crux): with the bump done WHILE the lock is held, the counter
+        // increment and the entry insert are one atomic critical section, so concurrent writes can never be
+        // stamped out of write order. Two observable invariants after a burst of concurrent same-key
+        // overwrites:
+        //   (1) every generation handed out is UNIQUE (no two writes share a CAS witness), and
+        //   (2) the SURVIVING entry's body matches the generation it carries — i.e. the write that won the
+        //       lock is the write whose generation is stamped (bump and insert did not interleave). Under
+        //       the OLD before-the-lock bump, a write could consume a high generation, then lose the lock
+        //       race to a lower-generation write that inserts afterwards, leaving the entry's stamped
+        //       generation NOT the highest actually inserted — the contract violation this fixes.
+        let blob = Arc::new(InMemoryBlobStore::new());
+        let n: usize = 200;
+
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let blob = Arc::clone(&blob);
+            handles.push(tokio::spawn(async move {
+                // Each task writes a DISTINCT body so the surviving body identifies the winning write.
+                blob.put(&format!("k{i}"), Bytes::from(format!("v{i}")))
+                    .await
+                    .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // (1) All N writes landed under distinct keys, each with a UNIQUE generation.
+        let entries = blob.list().await.unwrap();
+        assert_eq!(entries.len(), n, "every concurrent write must persist");
+        let mut gens: Vec<u64> = entries
+            .iter()
+            .map(|e| {
+                e.generation
+                    .expect("in-memory store always stamps a generation")
+            })
+            .collect();
+        gens.sort_unstable();
+        gens.dedup();
+        assert_eq!(
+            gens.len(),
+            n,
+            "every concurrent write must get a UNIQUE generation (no duplicate CAS witnesses)"
+        );
+
+        // (2) Now hammer ONE key concurrently and assert the surviving entry's generation is the GREATEST
+        // stamped to that key — the bump and the insert were atomic, so the last-ordered write won and was
+        // stamped consistently (no interleave that leaves a stale body under a non-max generation).
+        let blob2 = Arc::new(InMemoryBlobStore::new());
+        let mut handles2 = Vec::new();
+        for i in 0..n {
+            let blob2 = Arc::clone(&blob2);
+            handles2.push(tokio::spawn(async move {
+                blob2
+                    .put("hot", Bytes::from(format!("v{i}")))
+                    .await
+                    .unwrap();
+                blob2.generation_of("hot")
+            }));
+        }
+        let mut observed = Vec::new();
+        for h in handles2 {
+            if let Some(g) = h.await.unwrap() {
+                observed.push(g);
+            }
+        }
+        let surviving_gen = blob2.generation_of("hot").expect("hot exists");
+        let max_observed = *observed.iter().max().expect("at least one write");
+        assert_eq!(
+            surviving_gen, max_observed,
+            "the surviving entry must carry the GREATEST generation stamped to the key — bump+insert atomic"
+        );
     }
 }
