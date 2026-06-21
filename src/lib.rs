@@ -25,15 +25,20 @@
 //!   engine (`text/n3`, insert/delete plus the `solid:where` variable solver),
 //! - LDP target/URL parsing + Turtle/JSON-LD content handling ([`ldp::target`], [`ldp::content`]).
 //!
-//! Everything network-facing (the live SPARQ HTTP client, live JWKS) and the parts of the Solid
-//! surface that need designs not yet written (full WAC authorization, notifications, the reconciler,
-//! multipart Range, SPARQL-Update PATCH) are clearly
-//! marked `M2-next:` seams, not implemented. The default impls used here are in-memory test doubles.
+//! Solid Notifications (WebSocketChannel2023) are implemented as a net-new, isolated [`notifications`]
+//! module: an in-process subscription registry + AS2.0 notification builder, an axum WebSocket receive
+//! endpoint, a subscribe endpoint, and discovery (storage description + `Link` rels). The LDP write
+//! path makes a single emit call after a successful mutation. Everything else network-facing (the live
+//! SPARQ HTTP client, live JWKS) and the parts of the Solid surface that need designs not yet written
+//! (full WAC authorization — incl. per-resource authorization of a subscription, the reconciler,
+//! multipart Range, SPARQL-Update PATCH) are clearly marked `M2-next:` seams, not implemented. The
+//! default impls used here are in-memory test doubles.
 
 pub mod app;
 pub mod auth;
 pub mod error;
 pub mod ldp;
+pub mod notifications;
 pub mod store;
 pub mod tls;
 

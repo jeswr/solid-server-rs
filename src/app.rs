@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use solid_oidc_verifier::config::JwksProvider;
 use solid_oidc_verifier::replay::ReplayStore;
@@ -19,6 +19,10 @@ use solid_oidc_verifier::replay::ReplayStore;
 use crate::auth::{auth_middleware, AuthContext};
 use crate::ldp::handler::{
     delete_handler, get_handler, head_handler, patch_handler, post_handler, put_handler, LdpState,
+};
+use crate::notifications::ws::{
+    receive_handler, storage_description_handler, subscribe_handler, NotifyState, RECEIVE_PATH,
+    SUBSCRIPTION_PATH, WELL_KNOWN_SOLID_PATH,
 };
 use crate::store::Store;
 
@@ -42,9 +46,21 @@ where
     }
 }
 
-/// Build the axum router: the LDP routes (GET/HEAD/PUT/POST/DELETE/PATCH), wrapped by the DPoP auth
-/// middleware. A wildcard path captures the resource target; the handler re-parses it against the
-/// base URL.
+/// Build the axum router: the LDP routes (GET/HEAD/PUT/POST/DELETE/PATCH) + the WebSocketChannel2023
+/// notification routes, wrapped by the DPoP auth middleware. A wildcard path captures the resource
+/// target; the handler re-parses it against the base URL.
+///
+/// ## Route precedence (load-bearing)
+/// The notification routes use STATIC paths (`/.notifications/…`, `/.well-known/solid`), which axum
+/// matches BEFORE the LDP `/{*path}` wildcard — so they intercept correctly without the wildcard
+/// shadowing them. They are registered as their own sub-routers carrying [`NotifyState`].
+///
+/// ## Auth split on the notification surface
+/// - `POST /.notifications/WebSocketChannel2023/` is AUTH-GATED (same DPoP middleware as the LDP
+///   routes) so it sees a [`VerifiedToken`] and can fail-closed on an anonymous caller.
+/// - `GET …/receive` (the WS upgrade) and `GET /.well-known/solid` (discovery) are PUBLIC: a browser
+///   WebSocket cannot carry the DPoP header, and discovery is public like a storage description. The
+///   receive-token + per-resource WAC seam (`sparq#992`) is documented in `notifications::ws`.
 pub fn build_router<J, R, S>(state: AppState<J, R, S>) -> Router
 where
     J: JwksProvider + Send + Sync + 'static,
@@ -52,6 +68,13 @@ where
     S: Store + 'static,
 {
     let AppState { auth, ldp } = state;
+
+    // The notification state shares the LDP state's hub + base URL, so a subscriber registered via
+    // `…/receive` is the same registry the LDP emit path fans to.
+    let notify_state = Arc::new(NotifyState::new(
+        ldp.notifications.clone(),
+        ldp.base_url.clone(),
+    ));
 
     // The protected LDP routes carry the LDP state.
     let protected = Router::new()
@@ -72,5 +95,25 @@ where
         ))
         .with_state(ldp);
 
-    Router::new().merge(protected)
+    // The AUTH-GATED subscribe route: behind the SAME DPoP middleware so the handler sees a
+    // VerifiedToken (fail-closed on anonymous).
+    let subscribe = Router::new()
+        .route(SUBSCRIPTION_PATH, post(subscribe_handler))
+        .layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            auth_middleware::<J, R>,
+        ))
+        .with_state(notify_state.clone());
+
+    // The PUBLIC notification routes: the WS receive upgrade + the discovery document (no auth — see
+    // the auth-split note above).
+    let public_notify = Router::new()
+        .route(RECEIVE_PATH, get(receive_handler))
+        .route(WELL_KNOWN_SOLID_PATH, get(storage_description_handler))
+        .with_state(notify_state);
+
+    Router::new()
+        .merge(subscribe)
+        .merge(public_notify)
+        .merge(protected)
 }

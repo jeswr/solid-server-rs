@@ -33,19 +33,34 @@ use crate::ldp::content::{
 use crate::ldp::patch::{apply_patch, classify_patch_media_type, parse_n3_patch};
 use crate::ldp::range::{self, RangeOutcome};
 use crate::ldp::target::{parse_target, LdpTarget};
+use crate::notifications::ws::link_headers;
+use crate::notifications::{ActivityType, NotificationHub};
 use crate::store::{DeleteOutcome, ResourceMeta, Store};
 
-/// Shared state for the LDP handlers: the store + the server's public base URL.
+/// Shared state for the LDP handlers: the store + the server's public base URL + the notification hub.
+///
+/// The hub is the SINGLE emit seam: after a successful mutation the handler calls
+/// [`NotificationHub::notify`] (the only notification coupling in the write path — no handler
+/// refactor). The hub is cheap to clone (an `Arc` inside) and shared with the notification routes.
 pub struct LdpState<S: Store> {
     pub store: S,
     pub base_url: String,
+    pub notifications: NotificationHub,
 }
 
 impl<S: Store> LdpState<S> {
+    /// Build an LDP state with a fresh, isolated notification hub.
     pub fn new(store: S, base_url: impl Into<String>) -> Self {
+        Self::with_hub(store, base_url, NotificationHub::new())
+    }
+
+    /// Build an LDP state sharing an EXISTING notification hub (so the LDP emit path and the
+    /// notification receive routes register against the same registry).
+    pub fn with_hub(store: S, base_url: impl Into<String>, notifications: NotificationHub) -> Self {
         Self {
             store,
             base_url: base_url.into(),
+            notifications,
         }
     }
 }
@@ -108,6 +123,10 @@ async fn serve_read<S: Store>(
     set_str(&mut out, header::ETAG, &resource.meta.etag);
     // Advertise byte-range support (RFC 9110 §14.3).
     set_str(&mut out, header::ACCEPT_RANGES, "bytes");
+    // Notification discovery: advertise the storage-description doc via `describedby` +
+    // `solid:storageDescription` Link rels so a client can HEAD a resource and find the subscription
+    // service (the values live in `notifications::ws::link_headers`, the single discovery home).
+    add_discovery_links(&mut out, &state.base_url);
 
     match outcome {
         RangeOutcome::Unsatisfiable => {
@@ -187,6 +206,24 @@ pub async fn put_handler<S: Store>(
         .write(&target.iri, body, format.media_type())
         .await?;
 
+    // EMIT (the single notification hook on the PUT path): a replace ⇒ Update, a create ⇒ Create. A
+    // PUT-created resource also grows its container's membership, so pass the parent (the hub derives
+    // the parent `Add`); a replace passes no parent (no membership change).
+    let activity = if existed {
+        ActivityType::Update
+    } else {
+        ActivityType::Create
+    };
+    let parent = if existed {
+        None
+    } else {
+        parent_container(&target)
+    };
+    state
+        .notifications
+        .notify(&target.iri, activity, parent.as_deref())
+        .await;
+
     Ok(write_response(existed, &meta, &target.iri))
 }
 
@@ -232,6 +269,13 @@ pub async fn post_handler<S: Store>(
         .store
         .create_in_container(&container.iri, &child_iri, body, format.media_type())
         .await?;
+
+    // EMIT: a POST always CREATES the child and GROWS the container's membership — Create on the child
+    // + a derived Add on the container (the hub fans both from this one call).
+    state
+        .notifications
+        .notify(&child_iri, ActivityType::Create, Some(&container.iri))
+        .await;
 
     let mut out = HeaderMap::new();
     set_str(&mut out, header::ETAG, &meta.etag);
@@ -286,7 +330,15 @@ pub async fn delete_handler<S: Store>(
             .delete_container_if_empty(&target.iri, parent.as_deref())
             .await?
         {
-            DeleteOutcome::Deleted => Ok(StatusCode::NO_CONTENT.into_response()),
+            DeleteOutcome::Deleted => {
+                // EMIT only on an actual delete: Delete on the container + a derived Remove on its
+                // parent (membership shrank). NotEmpty/NotFound deleted nothing ⇒ no notification.
+                state
+                    .notifications
+                    .notify(&target.iri, ActivityType::Delete, parent.as_deref())
+                    .await;
+                Ok(StatusCode::NO_CONTENT.into_response())
+            }
             DeleteOutcome::NotEmpty => Err(ServerError::Conflict(
                 "cannot delete a non-empty container".into(),
             )),
@@ -295,6 +347,11 @@ pub async fn delete_handler<S: Store>(
     } else {
         // A plain resource: the (non-atomic) removal is fine — there is no empty-check to race.
         state.store.delete(&target.iri, parent.as_deref()).await?;
+        // EMIT: Delete on the resource + a derived Remove on its parent container.
+        state
+            .notifications
+            .notify(&target.iri, ActivityType::Delete, parent.as_deref())
+            .await;
         Ok(StatusCode::NO_CONTENT.into_response())
     }
 }
@@ -355,6 +412,23 @@ pub async fn patch_handler<S: Store>(
             stored_format.media_type(),
         )
         .await?;
+
+    // EMIT (same shape as PUT): a patch that edited an existing resource ⇒ Update; a create-on-PATCH
+    // ⇒ Create + a parent membership Add.
+    let activity = if existed {
+        ActivityType::Update
+    } else {
+        ActivityType::Create
+    };
+    let parent = if existed {
+        None
+    } else {
+        parent_container(&target)
+    };
+    state
+        .notifications
+        .notify(&target.iri, activity, parent.as_deref())
+        .await;
 
     Ok(write_response(existed, &meta, &target.iri))
 }
@@ -493,6 +567,18 @@ fn parent_container(target: &LdpTarget) -> Option<String> {
             Some(iri[..=abs].to_string())
         }
         None => None,
+    }
+}
+
+/// Append the notification-discovery `Link` headers (`describedby` + `solid:storageDescription`,
+/// both → the storage description doc) to a read response. Uses `append` (not `insert`) so multiple
+/// rels coexist as separate `Link` header lines. A value that cannot be header-encoded is skipped.
+fn add_discovery_links(headers: &mut HeaderMap, base_url: &str) {
+    for (rel, target) in link_headers(base_url) {
+        let value = format!("<{target}>; rel=\"{rel}\"");
+        if let Ok(v) = HeaderValue::from_str(&value) {
+            headers.append(header::LINK, v);
+        }
     }
 }
 
