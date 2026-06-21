@@ -12,10 +12,10 @@
 //!   set operations over the target graph, with the spec's preconditions (every `deletes` triple
 //!   must be present; an `InsertDeletePatch` must carry at least one of inserts/deletes).
 //! - **`solid:where`** (the templated/conditional form): the variable solver. The `where` formula is
-//!   a basic graph pattern (BGP) of triple *patterns* (terms may be SPARQL variables). It is matched
-//!   against the target's graph by conjunctive variable unification; the **single** resulting binding
-//!   substitutes into the `inserts`/`deletes` templates, which are then applied. See the precise
-//!   spec-faithful solution-count rule below.
+//!   a basic graph pattern (BGP) of triple *patterns* (terms may be SPARQL variables **or
+//!   blank-node existentials** — see below). It is matched against the target's graph by conjunctive
+//!   unification; the **single** resulting binding substitutes into the `inserts`/`deletes`
+//!   templates, which are then applied. See the precise spec-faithful solution-count rule below.
 //!
 //! ## Spec-faithful solution-count semantics (the load-bearing call)
 //!
@@ -33,8 +33,12 @@
 //! - The `inserts`/`deletes` formulae **MUST NOT contain variables that do not occur in the
 //!   `where` formula** — a free (unbound) variable in a template is a structural error (`422`), never
 //!   silently left as a variable in the output graph.
-//! - The `inserts`/`deletes` formulae **MUST NOT contain blank nodes** (`422`). (Blank nodes in the
-//!   target graph and in the `where` pattern are fine.)
+//! - The `inserts`/`deletes` formulae **MUST NOT contain blank nodes** (`422`). A blank node in the
+//!   `where` pattern is fine, but it is an **existential variable** scoped to that formula — `_:x`
+//!   means "there exists some term", matches like a variable, and two `_:x` occurrences in the same
+//!   `where` must bind to the same term (a join). It does NOT match only its parser-generated id.
+//!   (Concrete blank nodes in the *target* graph are matched as usual when a pattern names them via
+//!   a variable/existential.)
 //!
 //! Per the house rule, the patch document is parsed with the vetted `oxttl` N3 parser (formulas →
 //! blank-node-named graphs), never hand-parsed.
@@ -53,16 +57,31 @@ const SOLID_WHERE: &str = "http://www.w3.org/ns/solid/terms#where";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const SOLID_INSERT_DELETE_PATCH: &str = "http://www.w3.org/ns/solid/terms#InsertDeletePatch";
 
-/// A term in a triple pattern: a concrete RDF term or a (named) SPARQL variable.
+/// A term in a triple pattern: a concrete RDF term, a (named) SPARQL variable, or a `where`-scoped
+/// existential (a blank node in the `solid:where` formula).
 ///
 /// Used uniformly for the `where`, `inserts`, and `deletes` formulae. A formula with no variables
 /// collapses to all-`Term` patterns, which is exactly the concrete (un-templated) patch case.
+///
+/// ## Why blank nodes in `where` are existentials, not concrete terms
+///
+/// In N3-Patch (and SPARQL) a blank node in a graph PATTERN is an existential variable: `_:x`
+/// means "there exists some term", scoped to that formula, and repeated occurrences of the same
+/// label within the formula must bind to the **same** term (a join). It must NOT match only the
+/// parser-generated concrete blank-node id. We therefore lift each `where`-clause blank node into a
+/// dedicated [`PatTerm::WhereBlank`] existential, keyed by its (formula-local) label, so the BGP
+/// solver treats it like a variable. Blank nodes in the `inserts`/`deletes` templates remain
+/// forbidden (a parse-time `422`), so this variant only ever originates from a `where` formula.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatTerm {
     /// A concrete RDF term (named node, blank node, or literal).
     Term(Term),
     /// A SPARQL variable (`?x`) — to be bound by the `where` solver.
     Var(Variable),
+    /// A `where`-scoped existential, from a blank node in the `solid:where` formula. The held
+    /// string is the blank node's label (e.g. `x` for `_:x`); two occurrences of the same label in
+    /// one `where` formula are the same existential and must unify to the same term.
+    WhereBlank(String),
 }
 
 /// A triple pattern (subject/predicate/object, each possibly a variable).
@@ -328,14 +347,34 @@ fn unify_term(pat: &PatTerm, concrete: &Term, binding: &mut Binding) -> Option<(
                 None
             }
         }
-        PatTerm::Var(v) => match binding.get(v.as_str()) {
-            Some(already) if already == concrete => Some(()),
-            Some(_) => None, // bound to a different term ⇒ clash
-            None => {
-                binding.insert(v.as_str().to_string(), concrete.clone());
-                Some(())
+        // A SPARQL variable and a `where`-scoped blank-node existential unify identically — bind on
+        // first sight, clash on a re-bind to a different term. They live in DISJOINT binding-key
+        // namespaces (see `binding_key`) so `?x` and `_:x` never alias each other.
+        PatTerm::Var(_) | PatTerm::WhereBlank(_) => {
+            let key = binding_key(pat);
+            match binding.get(&key) {
+                Some(already) if already == concrete => Some(()),
+                Some(_) => None, // bound to a different term ⇒ clash
+                None => {
+                    binding.insert(key, concrete.clone());
+                    Some(())
+                }
             }
-        },
+        }
+    }
+}
+
+/// The binding-map key for a unifiable pattern term (a variable or a `where`-blank existential).
+///
+/// Real SPARQL variable names cannot contain a space (oxrdf's `Variable` validation excludes it), so
+/// prefixing the blank-node existential key with `"_: "` (note the space) guarantees a `where`-blank
+/// `_:x` and a SPARQL variable `?x` occupy DISJOINT key namespaces and can never collide. Returns an
+/// empty string for a concrete term, which never reaches the binding map.
+fn binding_key(pat: &PatTerm) -> String {
+    match pat {
+        PatTerm::Var(v) => v.as_str().to_string(),
+        PatTerm::WhereBlank(label) => format!("_: {label}"),
+        PatTerm::Term(_) => String::new(),
     }
 }
 
@@ -391,6 +430,12 @@ fn resolve(pat: &PatTerm, binding: &Binding) -> Result<Term, ServerError> {
                 v.as_str()
             ))
         }),
+        // A `where`-scoped existential can only originate from a `where` formula — blank nodes are
+        // rejected in inserts/deletes templates at parse time — so it can never reach template
+        // instantiation. Surface the invariant break as a 422 rather than panicking.
+        PatTerm::WhereBlank(label) => Err(ServerError::UnprocessablePatch(format!(
+            "blank node _:{label} unexpectedly reached a template (internal invariant)"
+        ))),
     }
 }
 
@@ -474,7 +519,11 @@ fn pat_term(t: &N3Term, kind: FormulaKind, pos: Position) -> Result<PatTerm, Ser
                 Position::Predicate => Err(ServerError::UnprocessablePatch(
                     "a patch triple predicate must be an IRI".into(),
                 )),
-                _ => Ok(PatTerm::Term(Term::BlankNode(b.clone()))),
+                // A blank node in the `where` formula is an existential variable (scoped to this
+                // formula), NOT a concrete term: it must match like a variable and repeated labels
+                // must unify. Lift it into a `WhereBlank` keyed by its label so the BGP solver
+                // binds it. (Forbidden in templates, handled above, so this is only ever a `where`.)
+                _ => Ok(PatTerm::WhereBlank(b.as_str().to_string())),
             }
         }
         N3Term::Variable(v) => {
@@ -498,13 +547,18 @@ fn collect_vars(patterns: &[PatTriple]) -> std::collections::HashSet<String> {
     s
 }
 
-/// The variables occurring in a single triple pattern.
+/// The named SPARQL variables (`?x`) occurring in a single triple pattern.
+///
+/// Deliberately excludes `where`-scoped blank-node existentials ([`PatTerm::WhereBlank`]): the only
+/// caller is the parse-time "no free template variable" check, and a template can NEVER reference a
+/// `where`-blank (blank nodes are forbidden in templates), so a `where`-blank is irrelevant to that
+/// check and must not be conflated with a named variable name.
 fn pat_triple_vars(t: &PatTriple) -> impl Iterator<Item = &Variable> {
     [&t.subject, &t.predicate, &t.object]
         .into_iter()
         .filter_map(|term| match term {
             PatTerm::Var(v) => Some(v),
-            PatTerm::Term(_) => None,
+            PatTerm::Term(_) | PatTerm::WhereBlank(_) => None,
         })
 }
 
@@ -828,6 +882,186 @@ mod tests {
         assert!(patch.conditions.is_empty());
         let result = apply_patch(&[], &patch).unwrap();
         assert_eq!(result.len(), 1);
+    }
+
+    // --- where-clause blank-node-as-existential-variable tests --------------------------------
+
+    /// A blank node in `where` is an EXISTENTIAL VARIABLE, not a concrete term: `_:x foaf:name ?n`
+    /// must match a subject by its predicate/object and bind, exactly as `?x foaf:name ?n` would.
+    /// (Regression: blank nodes were previously parsed as concrete `Term::BlankNode`, which only
+    /// matched the parser-generated id and so never matched a real named subject ⇒ a spurious 409.)
+    #[test]
+    fn where_blank_node_is_existential_variable() {
+        // where { _:x foaf:age "30" . _:x foaf:name ?n } — _:x is an existential that binds to the
+        // subject; ?n captures that subject's name; insert it onto <#me>.
+        let doc = format!(
+            "{PREFIXES}\
+            _:patch solid:where {{ _:x foaf:age \"30\" . _:x foaf:name ?n . }};\n\
+              solid:inserts {{ <#me> foaf:name ?n . }}.\n"
+        );
+        let patch = parse_n3_patch(doc.as_bytes(), BASE).unwrap();
+        // Both where patterns share the existential _:x.
+        assert_eq!(patch.conditions.len(), 2);
+        let existing = vec![
+            triple(
+                "https://pod.example/alice/data#alice",
+                "http://xmlns.com/foaf/0.1/age",
+                "30",
+            ),
+            triple(
+                "https://pod.example/alice/data#alice",
+                "http://xmlns.com/foaf/0.1/name",
+                "Alice",
+            ),
+        ];
+        let result = apply_patch(&existing, &patch).unwrap();
+        // _:x bound to <#alice> (aged 30), ?n bound to "Alice" ⇒ inserts <#me> foaf:name "Alice".
+        assert!(result.contains(&triple(
+            "https://pod.example/alice/data#me",
+            "http://xmlns.com/foaf/0.1/name",
+            "Alice"
+        )));
+    }
+
+    /// A repeated blank-node LABEL within ONE `where` formula is the SAME existential and must
+    /// unify consistently — i.e. it joins two patterns, exactly like a shared `?var` would. Here
+    /// `_:x` must be the SAME subject across both patterns; only the subject satisfying both binds.
+    #[test]
+    fn where_repeated_blank_label_unifies_as_join() {
+        // where { _:x foaf:knows <#bob> . _:x foaf:name ?n } — the join via _:x pins the person who
+        // knows Bob; ?n is their name. Only Alice both knows Bob AND has a name here.
+        let doc = format!(
+            "{PREFIXES}\
+            _:patch solid:where {{ _:x foaf:knows <#bob> . _:x foaf:name ?n . }};\n\
+              solid:inserts {{ <#out> foaf:name ?n . }}.\n"
+        );
+        let patch = parse_n3_patch(doc.as_bytes(), BASE).unwrap();
+        let existing = vec![
+            // Alice knows Bob and has a name ⇒ satisfies the _:x join.
+            triple_obj_iri(
+                "https://pod.example/alice/data#alice",
+                "http://xmlns.com/foaf/0.1/knows",
+                "https://pod.example/alice/data#bob",
+            ),
+            triple(
+                "https://pod.example/alice/data#alice",
+                "http://xmlns.com/foaf/0.1/name",
+                "Alice",
+            ),
+            // Carol has a name but does NOT know Bob ⇒ must NOT bind _:x (else this would be a 2nd
+            // solution and a 409). The repeated-_:x join must exclude her.
+            triple(
+                "https://pod.example/alice/data#carol",
+                "http://xmlns.com/foaf/0.1/name",
+                "Carol",
+            ),
+        ];
+        let result = apply_patch(&existing, &patch).unwrap();
+        // Exactly one solution: _:x = <#alice>, ?n = "Alice".
+        assert!(result.contains(&triple(
+            "https://pod.example/alice/data#out",
+            "http://xmlns.com/foaf/0.1/name",
+            "Alice"
+        )));
+        // Carol's name must NOT have leaked through (the join excluded her).
+        assert!(!result.contains(&triple(
+            "https://pod.example/alice/data#out",
+            "http://xmlns.com/foaf/0.1/name",
+            "Carol"
+        )));
+    }
+
+    /// The spec-faithful exactly-one-solution → otherwise-409 rule holds for the blank-node-as-var
+    /// case too: TWO distinct subjects satisfying the existential ⇒ multiple solutions ⇒ 409.
+    #[test]
+    fn where_blank_var_multiple_solutions_is_409() {
+        let doc = format!(
+            "{PREFIXES}\
+            _:patch solid:where {{ _:x foaf:name ?n . }};\n\
+              solid:inserts {{ <#out> foaf:name ?n . }}.\n"
+        );
+        let patch = parse_n3_patch(doc.as_bytes(), BASE).unwrap();
+        // Two subjects each have a name ⇒ two distinct (_:x, ?n) bindings ⇒ 409.
+        let existing = vec![
+            triple(
+                "https://pod.example/alice/data#alice",
+                "http://xmlns.com/foaf/0.1/name",
+                "Alice",
+            ),
+            triple(
+                "https://pod.example/alice/data#bob",
+                "http://xmlns.com/foaf/0.1/name",
+                "Bob",
+            ),
+        ];
+        let err = apply_patch(&existing, &patch).unwrap_err();
+        assert_eq!(err.status().as_u16(), 409);
+    }
+
+    /// And ZERO solutions for the blank-node-as-var case is also a 409 (not a no-op).
+    #[test]
+    fn where_blank_var_zero_solutions_is_409() {
+        let doc = format!(
+            "{PREFIXES}\
+            _:patch solid:where {{ _:x foaf:name ?n . }};\n\
+              solid:inserts {{ <#out> foaf:name ?n . }}.\n"
+        );
+        let patch = parse_n3_patch(doc.as_bytes(), BASE).unwrap();
+        // No triple has a foaf:name ⇒ the existential can't bind ⇒ 409.
+        let existing = vec![triple(
+            "https://pod.example/alice/data#alice",
+            "http://xmlns.com/foaf/0.1/age",
+            "30",
+        )];
+        let err = apply_patch(&existing, &patch).unwrap_err();
+        assert_eq!(err.status().as_u16(), 409);
+    }
+
+    /// A `where`-blank `_:x` and a SPARQL variable `?x` of the SAME spelling must NOT alias — they
+    /// live in disjoint binding-key namespaces. Here `?x` and `_:x` bind to DIFFERENT subjects, so
+    /// if they aliased the patch would spuriously 409 (clash) instead of yielding one solution.
+    #[test]
+    fn where_blank_and_named_var_same_spelling_do_not_alias() {
+        // where { ?x foaf:knows _:x . _:x foaf:name ?n } — ?x is alice, _:x is bob; the spellings
+        // collide but the namespaces don't, so this has exactly one solution.
+        let doc = format!(
+            "{PREFIXES}\
+            _:patch solid:where {{ ?x foaf:knows _:x . _:x foaf:name ?n . }};\n\
+              solid:inserts {{ <#out> foaf:name ?n . }}.\n"
+        );
+        let patch = parse_n3_patch(doc.as_bytes(), BASE).unwrap();
+        let existing = vec![
+            triple_obj_iri(
+                "https://pod.example/alice/data#alice",
+                "http://xmlns.com/foaf/0.1/knows",
+                "https://pod.example/alice/data#bob",
+            ),
+            triple(
+                "https://pod.example/alice/data#bob",
+                "http://xmlns.com/foaf/0.1/name",
+                "Bob",
+            ),
+        ];
+        let result = apply_patch(&existing, &patch).unwrap();
+        // ?x = <#alice>, _:x = <#bob>, ?n = "Bob" — one solution, no spurious clash.
+        assert!(result.contains(&triple(
+            "https://pod.example/alice/data#out",
+            "http://xmlns.com/foaf/0.1/name",
+            "Bob"
+        )));
+    }
+
+    /// Blank nodes remain FORBIDDEN (422) in the inserts/deletes templates — the existential rule
+    /// applies ONLY to `where`. (Guards against the fix accidentally relaxing the template rule.)
+    #[test]
+    fn blank_node_in_delete_template_is_422() {
+        let doc = format!(
+            "{PREFIXES}\
+            _:patch solid:where   {{ <#me> foaf:name ?n . }};\n\
+              solid:deletes {{ <#me> foaf:knows _:someone . }}.\n"
+        );
+        let err = parse_n3_patch(doc.as_bytes(), BASE).unwrap_err();
+        assert_eq!(err.status().as_u16(), 422);
     }
 
     #[test]
