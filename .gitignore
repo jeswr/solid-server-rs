@@ -3,3 +3,6 @@
 **/*.rs.bk
 *.pdb
 .DS_Store
+
+# Conformance harness generated reports (EARL/HTML/log) — regenerate with conformance/run.sh
+/conformance/reports/

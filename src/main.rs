@@ -58,6 +58,10 @@ const ENV_ALLOW_LOOPBACK: &str = "SOLID_SERVER_ALLOW_LOOPBACK";
 const ENV_JWKS_CACHE_TTL_SECS: &str = "SOLID_SERVER_JWKS_CACHE_TTL_SECS";
 /// Bidirectional WebID↔issuer check mode: `strict` (default) / `warn` / `off`.
 const ENV_BIDIRECTIONAL: &str = "SOLID_SERVER_BIDIRECTIONAL";
+/// Dev/conformance ONLY: when `1`/`true`, seed the in-memory store with the conformance test users'
+/// WebID profiles + container tree (the Solid CTH bootstraps by dereferencing those WebIDs). NEVER
+/// set against a real (SPARQ/S3) backend. See [`solid_server_rs::seed`].
+const ENV_SEED_CONFORMANCE: &str = "SOLID_SERVER_SEED_CONFORMANCE";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -120,6 +124,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The binary still boots the in-memory doubles so it runs without SPARQ / S3; wiring the live
     // HttpSparqClient + object_store blob store is the next storage slice.
     let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+
+    // Dev/conformance seeding (gated, in-memory only): write the test users' WebID profiles + the
+    // container tree the Solid CTH dereferences to bootstrap. Done BEFORE the store is moved into the
+    // LDP state; a seeding failure aborts boot (better than a half-seeded store).
+    if env_flag(ENV_SEED_CONFORMANCE) {
+        solid_server_rs::seed::seed_conformance(&store, &base_url, &issuer)
+            .await
+            .map_err(|e| format!("conformance seeding failed: {e:?}"))?;
+        eprintln!(
+            "  SEEDED conformance users {:?} (WebID profiles + container tree) — DEV/CONFORMANCE ONLY.",
+            solid_server_rs::seed::SEED_USERS
+        );
+    }
+
     let ldp = LdpState::new(store, base_url.clone());
 
     let app = build_router(AppState::new(auth, ldp));

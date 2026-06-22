@@ -127,6 +127,17 @@ async fn serve_read<S: Store>(
     // `solid:storageDescription` Link rels so a client can HEAD a resource and find the subscription
     // service (the values live in `notifications::ws::link_headers`, the single discovery home).
     add_discovery_links(&mut out, &state.base_url);
+    // LDP/Solid type advertisement (`Link: <type>; rel="type"`): a container advertises
+    // `ldp:BasicContainer` (+ `ldp:Container`/`ldp:Resource`), and the STORAGE ROOT additionally
+    // advertises `pim:Storage` (Solid Protocol §4.1). The conformance harness REQUIRES the
+    // `pim:Storage` rel=type header on the pod root to recognise an accessible storage at bootstrap.
+    add_type_links(&mut out, &target, &state.base_url);
+    // ACL discovery (`Link: <…>; rel="acl"`, Solid Protocol §4.3.1): every resource advertises the URL
+    // of its access-control document (the conventional `<resource>.acl` / `<container>/.acl`). The
+    // conformance harness reads this at bootstrap to locate where to write the test container's ACL.
+    // NB the ACL is NOT yet ENFORCED (WAC is gated on sparq#992) — advertising + storing the .acl
+    // document lets the harness proceed; the WAC scenarios still fail until the engine lands.
+    add_acl_link(&mut out, &target);
 
     match outcome {
         RangeOutcome::Unsatisfiable => {
@@ -582,6 +593,73 @@ fn add_discovery_links(headers: &mut HeaderMap, base_url: &str) {
     }
 }
 
+/// Append the LDP/Solid `Link: <type>; rel="type"` advertisement headers for a read response.
+///
+/// - Any resource advertises `ldp:Resource`.
+/// - A container additionally advertises `ldp:Container` + `ldp:BasicContainer` (the LDP type a Solid
+///   container exposes).
+/// - The STORAGE ROOT container additionally advertises `pim:Storage` — the Solid Protocol §4.1
+///   storage-advertisement the conformance harness reads at bootstrap to recognise the pod. With the
+///   in-memory/seeded layout the storage root is the per-user pod container `…/{user}/`; treat any
+///   container that is a direct child of the server base (`<base>/{seg}/`) as a storage root.
+///
+/// Uses `append` so each rel is its own `Link` header line; values that cannot be header-encoded are
+/// skipped (never panics).
+fn add_type_links(headers: &mut HeaderMap, target: &LdpTarget, base_url: &str) {
+    const LDP_RESOURCE: &str = "http://www.w3.org/ns/ldp#Resource";
+    const LDP_CONTAINER: &str = "http://www.w3.org/ns/ldp#Container";
+    const LDP_BASIC_CONTAINER: &str = "http://www.w3.org/ns/ldp#BasicContainer";
+    const PIM_STORAGE: &str = "http://www.w3.org/ns/pim/space#Storage";
+
+    let mut types: Vec<&str> = vec![LDP_RESOURCE];
+    if target.is_container {
+        types.push(LDP_CONTAINER);
+        types.push(LDP_BASIC_CONTAINER);
+        if is_storage_root(&target.iri, base_url) {
+            types.push(PIM_STORAGE);
+        }
+    }
+    for t in types {
+        let value = format!("<{t}>; rel=\"type\"");
+        if let Ok(v) = HeaderValue::from_str(&value) {
+            headers.append(header::LINK, v);
+        }
+    }
+}
+
+/// Append the `Link: <acl-url>; rel="acl"` ACL-discovery header (Solid Protocol §4.3.1).
+///
+/// The ACL URL follows the conventional sibling-document layout: a container `…/c/` → `…/c/.acl`; a
+/// plain resource `…/r` → `…/r.acl`. Skipped if the value cannot be header-encoded.
+fn add_acl_link(headers: &mut HeaderMap, target: &LdpTarget) {
+    let acl_url = acl_url_for(target);
+    let value = format!("<{acl_url}>; rel=\"acl\"");
+    if let Ok(v) = HeaderValue::from_str(&value) {
+        headers.append(header::LINK, v);
+    }
+}
+
+/// The conventional ACL document URL for a target: `…/c/.acl` for a container `…/c/` (its IRI ends in
+/// `/`, so `{iri}.acl` is `…/c/.acl`), and `…/r.acl` for a resource `…/r`. The same `{iri}.acl`
+/// suffix yields both.
+fn acl_url_for(target: &LdpTarget) -> String {
+    format!("{}.acl", target.iri)
+}
+
+/// Whether `iri` is a storage-root container: a container that is a DIRECT child of the server base
+/// (`<base>/<segment>/`, exactly one interior path segment). The seeded per-user pods (`…/alice/`,
+/// `…/bob/`) are storage roots; deeper containers (`…/alice/profile/`) are not.
+fn is_storage_root(iri: &str, base_url: &str) -> bool {
+    let base = base_url.trim_end_matches('/');
+    let Some(rest) = iri.strip_prefix(base) else {
+        return false;
+    };
+    // rest is the absolute path, e.g. "/alice/". A storage root has exactly one non-empty segment
+    // and a trailing slash.
+    let inner = rest.trim_start_matches('/').trim_end_matches('/');
+    !inner.is_empty() && !inner.contains('/') && rest.ends_with('/')
+}
+
 /// Read a header value as `&str`, or `None` if absent / not valid UTF-8.
 fn header_str(headers: &HeaderMap, name: HeaderName) -> Option<&str> {
     headers.get(name).and_then(|v| v.to_str().ok())
@@ -591,5 +669,117 @@ fn header_str(headers: &HeaderMap, name: HeaderName) -> Option<&str> {
 fn set_str(headers: &mut HeaderMap, name: header::HeaderName, value: &str) {
     if let Ok(v) = HeaderValue::from_str(value) {
         headers.insert(name, v);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target(iri: &str) -> LdpTarget {
+        LdpTarget {
+            htu: iri.to_string(),
+            iri: iri.to_string(),
+            is_container: iri.ends_with('/'),
+        }
+    }
+
+    fn link_values(headers: &HeaderMap) -> Vec<String> {
+        headers
+            .get_all(header::LINK)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn storage_root_is_a_direct_base_child_container() {
+        let base = "https://localhost:3000";
+        assert!(is_storage_root("https://localhost:3000/alice/", base));
+        assert!(is_storage_root("https://localhost:3000/bob/", base));
+        // Nested containers are NOT storage roots.
+        assert!(!is_storage_root(
+            "https://localhost:3000/alice/profile/",
+            base
+        ));
+        assert!(!is_storage_root("https://localhost:3000/alice/test/", base));
+        // The base root itself is not a per-user storage root.
+        assert!(!is_storage_root("https://localhost:3000/", base));
+        // A plain resource (no trailing slash) is not a storage root.
+        assert!(!is_storage_root("https://localhost:3000/alice", base));
+    }
+
+    #[test]
+    fn acl_url_is_the_dot_acl_sibling() {
+        // Container: …/c/ → …/c/.acl
+        assert_eq!(
+            acl_url_for(&target("https://localhost:3000/alice/test/")),
+            "https://localhost:3000/alice/test/.acl"
+        );
+        // Resource: …/r → …/r.acl
+        assert_eq!(
+            acl_url_for(&target("https://localhost:3000/alice/profile/card")),
+            "https://localhost:3000/alice/profile/card.acl"
+        );
+    }
+
+    #[test]
+    fn storage_root_advertises_pim_storage_and_ldp_types() {
+        let mut h = HeaderMap::new();
+        let base = "https://localhost:3000";
+        let t = target("https://localhost:3000/alice/");
+        add_type_links(&mut h, &t, base);
+        let links = link_values(&h);
+        assert!(links
+            .iter()
+            .any(|l| l.contains("ldp#Resource") && l.contains("rel=\"type\"")));
+        assert!(links.iter().any(|l| l.contains("ldp#Container")));
+        assert!(links.iter().any(|l| l.contains("ldp#BasicContainer")));
+        assert!(
+            links.iter().any(|l| l.contains("pim/space#Storage")),
+            "the storage root MUST advertise pim:Storage (harness bootstrap requirement): {links:?}"
+        );
+    }
+
+    #[test]
+    fn nested_container_advertises_ldp_types_but_not_pim_storage() {
+        let mut h = HeaderMap::new();
+        let base = "https://localhost:3000";
+        add_type_links(
+            &mut h,
+            &target("https://localhost:3000/alice/profile/"),
+            base,
+        );
+        let links = link_values(&h);
+        assert!(links.iter().any(|l| l.contains("ldp#BasicContainer")));
+        assert!(!links.iter().any(|l| l.contains("pim/space#Storage")));
+    }
+
+    #[test]
+    fn plain_resource_advertises_only_ldp_resource_type() {
+        let mut h = HeaderMap::new();
+        let base = "https://localhost:3000";
+        add_type_links(
+            &mut h,
+            &target("https://localhost:3000/alice/profile/card"),
+            base,
+        );
+        let links = link_values(&h);
+        assert!(links.iter().any(|l| l.contains("ldp#Resource")));
+        assert!(!links.iter().any(|l| l.contains("ldp#Container")));
+        assert!(!links.iter().any(|l| l.contains("pim/space#Storage")));
+    }
+
+    #[test]
+    fn acl_link_header_is_emitted() {
+        let mut h = HeaderMap::new();
+        add_acl_link(&mut h, &target("https://localhost:3000/alice/test/"));
+        let links = link_values(&h);
+        assert!(
+            links
+                .iter()
+                .any(|l| l.contains("/alice/test/.acl") && l.contains("rel=\"acl\"")),
+            "the ACL-discovery Link rel=acl must be emitted: {links:?}"
+        );
     }
 }

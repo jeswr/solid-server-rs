@@ -39,6 +39,7 @@ pub mod auth;
 pub mod error;
 pub mod ldp;
 pub mod notifications;
+pub mod seed;
 pub mod store;
 pub mod tls;
 
