@@ -28,11 +28,14 @@
 //!    current `generation` (a true write version) still equals that SNAPSHOT witness.
 //!
 //! ### The snapshot-staleness race (Finding 1 — why the re-check + the ATOMIC CAS-delete exist)
-//! The blob list in step 2 is a SNAPSHOT; by the time the delete loop reaches a key, a resource may have
-//! been recreated/overwritten at the SAME blob key. Blob keys are TODAY deterministic per IRI, so an
-//! overwrite REUSES the key before — or as — its index row commits. A recreate landing between the
-//! snapshot and the delete would otherwise make the GC clobber newly-written LIVE bytes. The defence is
-//! two-layered: (a) the fresh referenced-set re-check skips any candidate a recreate has re-referenced;
+//! The blob list in step 2 is a SNAPSHOT; by the time the delete loop reaches a key, the store's view may
+//! have moved on. The composite store now mints UNIQUE-PER-WRITE blob keys
+//! ([`super::CompositeStore::mint_blob_key`]), so a recreate/overwrite gets a DIFFERENT key and can no
+//! longer reuse a candidate's key — the primary clobber path is closed at the root. These re-checks + the
+//! atomic CAS are retained as DEFENCE-IN-DEPTH for any backend/path where a key could still be reused: a
+//! recreate landing between the snapshot and the delete would otherwise make the GC clobber newly-written
+//! LIVE bytes. The defence is two-layered: (a) the fresh referenced-set re-check skips any candidate a
+//! recreate has re-referenced;
 //! and (b) the final delete is an ATOMIC compare-and-delete — [`BlobStore::delete_if_unchanged`] removes
 //! the key ONLY while its current `generation` still equals the witness the fresh stat observed, with
 //! the compare + remove under a single critical section (no suspension point between them). That CLOSES
@@ -65,10 +68,11 @@
 //! generation observed at snapshot time, and skipping on ANY fresh≠snapshot mismatch, means a rewrite at
 //! ANY point is caught: list→stat by the fresh-vs-snapshot mismatch, stat→delete by the atomic CAS.
 //!
-//! The broader **unique-per-write blob keys** migration (an overwrite never reuses a candidate's key, so
-//! the delete could be unconditional) remains an orthogonal improvement on a SEPARATE beaded slice — but
-//! it is **no longer REQUIRED for reconciler correctness**: the atomic CAS already makes the sweep
-//! race-free for an atomic-`delete_if_unchanged` store.
+//! The **unique-per-write blob keys** the composite store now mints
+//! ([`super::CompositeStore::mint_blob_key`]) close the reuse race at its ROOT (an overwrite never reuses
+//! a candidate's key, so the GC can never target live bytes). The atomic CAS + re-checks here are kept as
+//! defence-in-depth and as the safety mechanism for a versionless backend; with unique keys a versionless
+//! backend's unconditional delete is also safe, since the candidate's key is never the live recreate's.
 //!
 //! The grace period is the safety crux. There is an inverse race to the delete-orphan case: a *write
 //! in progress* PUTs its bytes and has NOT YET committed its index row — for that instant the blob is
@@ -174,8 +178,9 @@ pub struct ReconcileReport {
     pub skipped_unknown_age: usize,
     /// Orphans that looked deletable from the START-OF-SWEEP snapshot but turned out to be live again —
     /// either now referenced by a freshly-committed index row, or rewritten. KEPT. This is the Finding-1
-    /// guard against clobbering a recreate that landed mid-sweep with today's deterministic
-    /// (reused-on-overwrite) blob keys, and it catches a rewrite at ANY point in the chain:
+    /// defence-in-depth guard against clobbering a recreate that landed mid-sweep on a reused key (now
+    /// closed at the root by unique-per-write keys, but retained for versionless backends), and it
+    /// catches a rewrite at ANY point in the chain:
     /// - the snapshot itself reported no `generation` (a version-less backend ⇒ no safe CAS — first pass);
     /// - the fresh re-check found it referenced again (a recreate committed a row);
     /// - the fresh stat is gone / undated / newer `last_modified` / now inside the grace window;
@@ -289,11 +294,12 @@ pub async fn reconcile_orphans<S: SparqClient + ?Sized, B: BlobStore + ?Sized>(
     }
 
     // RE-CHECK against the INDEX once, just before the delete pass (Finding 1, part a). The
-    // start-of-sweep `referenced` set can be stale: with today's deterministic per-IRI blob keys an
-    // overwrite/recreate REUSES the same key, so a resource recreated between the snapshot and now would
-    // have committed a FRESH index row pointing at a candidate key — deleting it would clobber live
-    // bytes. Re-fetching the referenced set ONCE here (not per-key) and skipping any candidate now in it
-    // is the first defence; the atomic CAS-delete below is the second. Fail-closed: if it errors we ABORT
+    // start-of-sweep `referenced` set can be stale. With unique-per-write keys a recreate gets a fresh
+    // key so it can no longer re-reference a candidate's key — but on a key-reusing backend a resource
+    // recreated between the snapshot and now could commit a FRESH index row pointing at a candidate key,
+    // and deleting it would clobber live bytes. Re-fetching the referenced set ONCE here (not per-key)
+    // and skipping any candidate now in it is the first defence-in-depth layer; the atomic CAS-delete
+    // below is the second. Fail-closed: if it errors we ABORT
     // and delete nothing (a failed query is NEVER "nothing is referenced"). Reached only when there is at
     // least one candidate (Finding 2).
     let referenced_fresh: HashSet<String> = sparq
@@ -314,9 +320,10 @@ pub async fn reconcile_orphans<S: SparqClient + ?Sized, B: BlobStore + ?Sized>(
         }
 
         // (b) Re-STAT the key's CURRENT state to decide the disposition (via `last_modified`, the AGE
-        // witness) AND to CONFIRM the snapshot generation is still current. A rewrite reuses the same key
-        // (deterministic keying), so if the bytes are now newer than the snapshot saw — or now young
-        // enough to be inside the grace window — the blob was overwritten and must NOT be deleted. A stat
+        // witness) AND to CONFIRM the snapshot generation is still current. On a key-reusing backend a
+        // rewrite would land on the same key, so if the bytes are now newer than the snapshot saw — or
+        // now young enough to be inside the grace window — the blob was overwritten and must NOT be
+        // deleted (defence-in-depth; unique-per-write keys close this at the root). A stat
         // failure is treated fail-closed (skip, count under delete_errors) rather than blindly deleting on
         // incomplete info.
         let current = match blob.stat(&key).await {

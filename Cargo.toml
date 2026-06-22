@@ -67,6 +67,14 @@ http-body-util = "0.1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Cryptographically-strong OS randomness for the unique-per-write blob-key suffix (the root fix that
+# retires the deterministic-key race class — see `store::CompositeStore::mint_blob_key`). `getrandom`
+# is the de-facto OS-RNG crate and is ALREADY resolved in the non-dev tree (transitively via
+# rustls/ring + oxrdf's rand stack), so naming it directly at the same 0.2 line adds NO new crate —
+# it only makes the existing dep callable from our own code. We deliberately depend on `getrandom`
+# directly rather than a higher-level `rand`/`uuid`: the suffix is just 16 random bytes, so the raw
+# OS entropy source is the minimal, audit-small surface for the job.
+getrandom = "0.2"
 
 [dev-dependencies]
 # Mint test JWS access tokens + DPoP proofs for the auth-middleware unit tests (mirrors the

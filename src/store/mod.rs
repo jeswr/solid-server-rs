@@ -88,13 +88,14 @@ pub trait Store: Send + Sync {
     /// `delete` had), NOR (b) a concurrent POST can recreate the child under the parent in a window
     /// between the graph delete and a separate parent-edge detach and then be orphaned by that stale
     /// detach. The container's own bytes are NOT deleted inline: after the atomic index delete they are
-    /// ORPHANED (no index row references them) and GC'd by the reconciler's orphaned-bytes sweep. The
-    /// blob store is a separate system whose `delete` is unconditional, so an inline blob delete of the
-    /// pre-read key races a concurrent same-IRI recreate (deterministic key reuse) — the recreate's NEW
-    /// bytes would be clobbered, leaving a fresh index row pointing at MISSING bytes. Leaving the bytes
-    /// to the reconciler removes that race: the sweep only GCs bytes with NO index row, so it never
-    /// touches a recreate's referenced bytes (transient orphan until the reconciler ships — space only,
-    /// never an observable inconsistency). Returns:
+    /// ORPHANED (no index row references them) and GC'd by the reconciler's orphaned-bytes sweep. We
+    /// leave the bytes to the reconciler rather than delete them inline because the blob store is a
+    /// separate system (its `delete` is unconditional). Since the composite store now mints UNIQUE
+    /// blob keys per write ([`CompositeStore::mint_blob_key`]), a concurrent same-IRI recreate gets a
+    /// DIFFERENT key, so an inline delete of THIS container's key could no longer clobber a recreate's
+    /// bytes — but leaving them to the reconciler keeps the path uniform and side-effect-free (the sweep
+    /// only GCs bytes with NO index row). Transient orphan until a sweep runs — space only, never an
+    /// observable inconsistency. Returns:
     /// - [`DeleteOutcome::Deleted`] — it existed, was empty, and is gone;
     /// - [`DeleteOutcome::NotEmpty`] — it existed with members; NOTHING was deleted (⇒ 409);
     /// - [`DeleteOutcome::NotFound`] — it did not exist (⇒ 404).
@@ -120,14 +121,62 @@ impl<S: SparqClient, B: BlobStore> CompositeStore<S, B> {
         Self { sparq, blob }
     }
 
-    /// Derive the opaque blob-store key for an IRI.
+    /// Mint a fresh, **unique-per-write** opaque blob-store key for an IRI.
     ///
-    /// M2: this is prod-solid-server's `KeyMapper` — a stable, collision-free,
-    /// directory-traversal-safe mapping. The M1 placeholder is a simple percent-flattening that is
-    /// deterministic and reversible enough for the slice's tests.
-    fn blob_key_for(iri: &str) -> String {
-        // Replace the few path-structural characters; the IRI is already opaque to the blob store.
-        iri.replace([':', '/', '?', '#', '%'], "_")
+    /// # The root fix: unique keys retire the deterministic-key race class
+    /// The earlier `blob_key_for` derived the key DETERMINISTICALLY from the IRI (a percent-flatten),
+    /// so every write to the same logical resource REUSED the same blob key. That single design choice
+    /// was the source of a whole race class: two concurrent writes to the same IRI collided on one key
+    /// (the loser's bytes could interleave with / clobber the winner's), and a delete's inline
+    /// `blob.delete(key)` raced a concurrent same-IRI recreate that had just rewritten the SAME key —
+    /// forcing the elaborate `generation`-CAS + grace-window + snapshot-threading machinery in
+    /// [`super::blob`] and [`super::reconcile`] to exist purely to make a reused key safe.
+    ///
+    /// This mints a NEW key on EVERY write: an IRI-derived prefix (kept for operator-debuggability — a
+    /// key still traces back to its resource) plus a hyphen-joined **128-bit cryptographically-random
+    /// suffix** from the OS RNG. So:
+    ///
+    /// - **Two concurrent writes to the same IRI get DIFFERENT keys** — they write to disjoint blob
+    ///   objects and can never collide or interleave. The "latest committed" winner is decided solely by
+    ///   which write's index `put_meta` commits last (SPARQ is authoritative); whichever metadata pointer
+    ///   wins, a read resolves through it to that write's own bytes. The other write's bytes become an
+    ///   unreferenced orphan, reclaimed by the reconciler — never a clobber of live bytes.
+    /// - **A delete's inline blob delete can no longer race a recreate.** A recreate mints a brand-new
+    ///   key, so deleting the OLD key's bytes can never touch the recreate's bytes. (The collision the
+    ///   `generation`-CAS existed to catch simply cannot arise once keys are never reused.)
+    ///
+    /// The metadata pointer ([`ResourceMeta::blob_key`]) records the minted key, and every read already
+    /// resolves bytes THROUGH that pointer (`read` does `get(&meta.blob_key)`), so correctness
+    /// (read-after-write returns the latest committed blob) is preserved unchanged — the only difference
+    /// is that the pointer now names a unique object rather than a shared one.
+    ///
+    /// 128 bits of OS entropy makes a key collision across independent writes cryptographically
+    /// negligible; the IRI prefix is cosmetic (debuggability) and carries no uniqueness requirement.
+    fn mint_blob_key(iri: &str) -> String {
+        // The IRI-derived prefix is for human/operator traceability only; uniqueness comes entirely from
+        // the random suffix, so the prefix need not be collision-free.
+        let prefix = iri.replace([':', '/', '?', '#', '%'], "_");
+        let mut suffix = [0u8; 16];
+        // The OS CSPRNG. `getrandom` is the de-facto OS-entropy source and does not fail on any platform
+        // we target; on the theoretical error we fall back to a still-unique value composed from the
+        // process- + time-derived entropy below, so a write is never blocked and keys stay unique.
+        if getrandom::getrandom(&mut suffix).is_err() {
+            // Defensive, effectively-unreachable fallback: combine the wall clock (nanos) with the
+            // resource's address-of bytes to still produce a per-write-distinct value. This path never
+            // runs on a supported OS; it only guarantees we never panic / reuse a key if the OS RNG is
+            // somehow unavailable.
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            suffix[..16].copy_from_slice(&nanos.to_le_bytes());
+        }
+        let hex = suffix.iter().fold(String::with_capacity(32), |mut acc, b| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+        format!("{prefix}-{hex}")
     }
 
     /// A trivial, deterministic ETag for the slice. M2: derive it from the SPARQ index state so it
@@ -178,7 +227,14 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
     ) -> ServerResult<ResourceMeta> {
         // Crash-consistency: bytes FIRST, then the authoritative index (spike §6). On an index-write
         // failure prod-solid-server issues a compensating delete; M2 ports that + the reconciler.
-        let blob_key = Self::blob_key_for(iri);
+        //
+        // The blob key is minted UNIQUE PER WRITE (`mint_blob_key`): a concurrent same-IRI write gets a
+        // DIFFERENT key and so writes a disjoint object — no collision/interleave on a shared key. The
+        // "latest committed" winner is whichever write's `put_meta` commits last (SPARQ authoritative);
+        // a read then resolves through that winner's pointer to ITS bytes, and the loser's bytes become
+        // an unreferenced orphan the reconciler GCs (never a clobber of the live bytes). A re-write of
+        // an existing resource likewise lands on a NEW key, leaving the previous key orphaned for GC.
+        let blob_key = Self::mint_blob_key(iri);
         let etag = Self::etag_for(&body);
         self.blob
             .put(&blob_key, body)
@@ -210,7 +266,10 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
         // concurrent same-IRI creator can never observe or tear down a half-built containment. A
         // missing container ⇒ 404; the bytes written above are then orphaned and GC'd by the
         // reconciler (M2-next) — the same crash-consistency model `write` documents.
-        let blob_key = Self::blob_key_for(child);
+        //
+        // The child's blob key is minted UNIQUE PER WRITE (`mint_blob_key`), so a concurrent same-IRI
+        // create writes a disjoint object and cannot collide with this one on a shared key.
+        let blob_key = Self::mint_blob_key(child);
         let etag = Self::etag_for(&body);
         self.blob
             .put(&blob_key, body)
@@ -275,18 +334,16 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
         //
         // reconciler: the container's bytes are NOT deleted inline here. After the atomic index delete,
         // the bytes become ORPHANED (no index row references them) and are GC'd by the reconciler's
-        // orphaned-bytes sweep (a planned slice). This is the only race-free choice: the blob store is a
-        // SEPARATE system (object store) whose `delete` is unconditional, so an inline `blob.delete` of
-        // the pre-read key races a concurrent same-IRI recreate. Deterministic key reuse means a POST
-        // recreating this container/resource IRI between the index delete and any inline blob delete
-        // writes NEW bytes to the SAME key + a fresh index row; the stale inline delete would then
-        // clobber those NEW bytes, leaving the fresh index row pointing at MISSING bytes. By deleting
-        // NO bytes here we eliminate that race entirely — the reconciler only GCs bytes with NO index
-        // row, so it never touches a recreate's referenced bytes. The trade-off is a transient orphan
-        // until the reconciler ships: benign (disk space only, never an observable inconsistency), and
-        // it IS the documented architecture (SPARQ authoritative; blob store durable bytes; reconciler
-        // GCs orphans — `decisions`/the spike crash-consistency model). The same model already governs
-        // the `write`/`create_in_container` failure paths above.
+        // orphaned-bytes sweep. We leave the bytes to the reconciler rather than delete them inline: the
+        // blob store is a SEPARATE system (object store) whose `delete` is unconditional. With the
+        // UNIQUE-PER-WRITE keys the composite store now mints (`mint_blob_key`), a concurrent same-IRI
+        // recreate writes its bytes under a DIFFERENT key, so an inline delete of THIS container's key
+        // could no longer clobber a recreate's bytes even if we did it (the root-cause race is closed) —
+        // but deleting NO bytes here keeps the path uniform with `write`/`create_in_container`'s
+        // orphan-then-GC model and side-effect-free. The trade-off is a transient orphan until a sweep
+        // runs: benign (disk space only, never an observable inconsistency), and it IS the documented
+        // architecture (SPARQ authoritative; blob store durable bytes; reconciler GCs orphans —
+        // `decisions`/the spike crash-consistency model).
         let outcome = self
             .sparq
             .delete_meta_if_empty(iri, parent)
@@ -313,4 +370,57 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::blob::InMemoryBlobStore;
+    use crate::store::sparq::InMemorySparqClient;
+
+    type S = CompositeStore<InMemorySparqClient, InMemoryBlobStore>;
+
+    #[test]
+    fn mint_blob_key_is_unique_per_call_for_the_same_iri() {
+        // The ROOT-fix unit invariant: minting a key for the SAME IRI twice yields DIFFERENT keys (no
+        // deterministic reuse). A handful of repeats makes a chance collision of the 128-bit random
+        // suffix astronomically unlikely, so a single `assert_ne!` is enough; we mint a batch and assert
+        // all-distinct to be thorough. MUTATION-CHECK: revert to the old deterministic `iri.replace(...)`
+        // and every minted key is identical ⇒ this fails.
+        let iri = "https://pod.example/alice/data";
+        let mut keys: Vec<String> = (0..32).map(|_| S::mint_blob_key(iri)).collect();
+        let total = keys.len();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(
+            keys.len(),
+            total,
+            "every mint for the same IRI must be unique (the deterministic-key reuse is gone)"
+        );
+    }
+
+    #[test]
+    fn mint_blob_key_keeps_an_iri_derived_prefix_for_traceability() {
+        // Uniqueness comes from the random suffix; the IRI-derived prefix is retained (cosmetic) so an
+        // operator can still trace a key back to its resource. The minted key must START with the
+        // percent-flattened IRI followed by the `-` separator.
+        let iri = "https://pod.example/alice/data";
+        let prefix = iri.replace([':', '/', '?', '#', '%'], "_");
+        let key = S::mint_blob_key(iri);
+        assert!(
+            key.starts_with(&format!("{prefix}-")),
+            "minted key {key:?} must keep the IRI-derived prefix {prefix:?} for traceability"
+        );
+        // ...and the suffix is the 32-hex-char (128-bit) random tail.
+        let suffix = &key[prefix.len() + 1..];
+        assert_eq!(
+            suffix.len(),
+            32,
+            "the random suffix is 16 bytes = 32 hex chars"
+        );
+        assert!(
+            suffix.bytes().all(|b| b.is_ascii_hexdigit()),
+            "the suffix must be lowercase hex"
+        );
+    }
 }

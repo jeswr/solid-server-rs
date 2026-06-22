@@ -62,6 +62,116 @@ async fn rewrite_replaces_the_bytes() {
 }
 
 #[tokio::test]
+async fn each_write_to_the_same_iri_mints_a_distinct_blob_key() {
+    // The ROOT fix, observed at the Store seam: two successive writes to the SAME IRI must land their
+    // bytes under DISTINCT blob keys (no deterministic key reuse). The metadata pointer moves to the
+    // newest key, a read resolves the latest committed blob through it, and BOTH writes' bytes coexist
+    // in the blob store (the old key's bytes are an orphan for the reconciler — never clobbered).
+    let inner = Arc::new(InMemoryBlobStore::new());
+    let blob = SharedBlob {
+        inner: inner.clone(),
+    };
+    let s = CompositeStore::new(InMemorySparqClient::new(), blob);
+
+    let m1 = s
+        .write(IRI, Bytes::from_static(b"<a> <b> <v1> ."), "text/turtle")
+        .await
+        .unwrap();
+    let m2 = s
+        .write(IRI, Bytes::from_static(b"<a> <b> <v2> ."), "text/turtle")
+        .await
+        .unwrap();
+
+    assert_ne!(
+        m1.blob_key, m2.blob_key,
+        "two writes to the same IRI must mint DISTINCT blob keys (no deterministic reuse)"
+    );
+    // Both writes' bytes physically coexist — the first write's bytes were NOT clobbered by the second.
+    assert_eq!(
+        inner.get(&m1.blob_key).await.unwrap(),
+        Bytes::from_static(b"<a> <b> <v1> ."),
+        "the first write's bytes survive under its own key (orphaned, not clobbered)"
+    );
+    assert_eq!(
+        inner.get(&m2.blob_key).await.unwrap(),
+        Bytes::from_static(b"<a> <b> <v2> ."),
+    );
+    // A read returns the LATEST committed blob (resolved through the metadata pointer, which names m2).
+    let resource = s.read(IRI).await.unwrap();
+    assert_eq!(resource.body, Bytes::from_static(b"<a> <b> <v2> ."));
+    assert_eq!(resource.meta.blob_key, m2.blob_key);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_writes_to_the_same_iri_do_not_collide_on_a_blob_key() {
+    // THE CONCURRENCY PROOF (the race the unique-key fix retires): N concurrent writes to the SAME IRI
+    // must each land their bytes under a DIFFERENT key, so no two writes can collide / interleave on a
+    // shared object. We assert:
+    //   (1) every concurrent write minted a UNIQUE blob key (no two share one),
+    //   (2) every write's bytes are physically present under its OWN key and byte-for-byte intact (no
+    //       write clobbered another's bytes on a shared key — the old deterministic-key collision), and
+    //   (3) a read after the burst returns the LATEST COMMITTED blob — the bytes whose metadata pointer
+    //       won the index `put_meta` race — resolved through that pointer.
+    //
+    // Under the OLD deterministic key, all N writes shared ONE key: their bytes raced on a single
+    // object (only the last `put` survived; the others' bytes were lost), so (1) and (2) would FAIL.
+    let inner = Arc::new(InMemoryBlobStore::new());
+    let blob = SharedBlob {
+        inner: inner.clone(),
+    };
+    let s = Arc::new(CompositeStore::new(InMemorySparqClient::new(), blob));
+    let n: usize = 64;
+
+    let mut handles = Vec::new();
+    for i in 0..n {
+        let s = Arc::clone(&s);
+        handles.push(tokio::spawn(async move {
+            // Each task writes a DISTINCT body so its key→body mapping is identifiable.
+            let body = Bytes::from(format!("<a> <b> <v{i}> ."));
+            let meta = s.write(IRI, body.clone(), "text/turtle").await.unwrap();
+            (meta.blob_key, body)
+        }));
+    }
+    let mut keys_to_bodies = Vec::new();
+    for h in handles {
+        keys_to_bodies.push(h.await.unwrap());
+    }
+
+    // (1) Every concurrent write minted a UNIQUE key.
+    let mut keys: Vec<String> = keys_to_bodies.iter().map(|(k, _)| k.clone()).collect();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(
+        keys.len(),
+        n,
+        "every concurrent write to the same IRI must mint a UNIQUE blob key (no collision)"
+    );
+
+    // (2) Each write's bytes are present under its own key, byte-for-byte intact (no clobber).
+    for (key, body) in &keys_to_bodies {
+        assert_eq!(
+            inner.get(key).await.unwrap(),
+            *body,
+            "each concurrent write's bytes must be intact under its own key — never clobbered"
+        );
+    }
+
+    // (3) A read returns the latest committed blob, resolved through the surviving metadata pointer.
+    let resource = s.read(IRI).await.unwrap();
+    let winning_key = s.meta(IRI).await.unwrap().unwrap().blob_key;
+    assert_eq!(resource.meta.blob_key, winning_key);
+    let expected_body = keys_to_bodies
+        .iter()
+        .find(|(k, _)| *k == winning_key)
+        .map(|(_, b)| b.clone())
+        .expect("the winning metadata pointer must name one of the writes' keys");
+    assert_eq!(
+        resource.body, expected_body,
+        "a read after concurrent writes must return the bytes of whichever write committed its index last"
+    );
+}
+
+#[tokio::test]
 async fn different_bytes_yield_a_different_etag() {
     let s = store();
     let m1 = s
@@ -522,6 +632,41 @@ async fn delete_meta_if_empty_folds_the_parent_detach_into_the_one_op() {
     );
 }
 
+/// A pass-through [`BlobStore`] over an `Arc`-shared [`InMemoryBlobStore`], so a test can build a
+/// [`CompositeStore`] AND retain a handle to the underlying blob store to inspect which physical keys
+/// the writes landed under (the unique-per-write-key proof). Pure delegation — no behaviour change.
+struct SharedBlob {
+    inner: Arc<InMemoryBlobStore>,
+}
+
+#[async_trait]
+impl BlobStore for SharedBlob {
+    async fn get(&self, key: &str) -> Result<Bytes, BlobError> {
+        self.inner.get(key).await
+    }
+    async fn put(&self, key: &str, body: Bytes) -> Result<(), BlobError> {
+        self.inner.put(key, body).await
+    }
+    async fn exists(&self, key: &str) -> Result<bool, BlobError> {
+        self.inner.exists(key).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), BlobError> {
+        self.inner.delete(key).await
+    }
+    async fn list(&self) -> Result<Vec<solid_server_rs::store::BlobEntry>, BlobError> {
+        self.inner.list().await
+    }
+    async fn delete_if_unchanged(
+        &self,
+        key: &str,
+        expected_generation: u64,
+    ) -> Result<bool, BlobError> {
+        self.inner
+            .delete_if_unchanged(key, expected_generation)
+            .await
+    }
+}
+
 /// A [`BlobStore`] wrapper whose `delete` is unconditional (exactly like `InMemoryBlobStore`'s and
 /// the real `object_store` delete the HIGH finding is about), but which COUNTS its `delete` calls so
 /// the test can prove the store no longer issues an inline blob delete. The inner store is shared
@@ -572,22 +717,17 @@ impl BlobStore for CountingBlob {
 
 #[tokio::test]
 async fn delete_container_if_empty_does_not_clobber_a_concurrent_same_iri_recreate() {
-    // HIGH-finding regression: after the atomic index delete, the (former) post-delete blob GC must
-    // NOT remove a concurrent same-IRI recreate's bytes. With deterministic key reuse, a POST
-    // recreating the SAME resource IRI between the index delete and an inline blob delete writes NEW
-    // bytes to the SAME key + a fresh index row; an inline unconditional `blob.delete` would clobber
-    // those NEW bytes, leaving the fresh index row pointing at MISSING bytes (the FALSE "an index row
-    // never points at missing bytes" invariant). The fix removes the inline delete (bytes are
-    // reconciler-GC'd), so the recreate's bytes always survive.
+    // Regression: deleting a container must NOT remove a concurrent same-IRI recreate's bytes. Two
+    // defences now compose:
+    //   1. `delete_container_if_empty` still leaves the container's bytes for the reconciler (no inline
+    //      blob delete) — so `deletes_seen == 0` here, and
+    //   2. (the ROOT fix) blob keys are now UNIQUE PER WRITE, so a recreate mints a DIFFERENT key from
+    //      the original. There is no longer a shared deterministic key for an inline delete to clobber
+    //      even in principle — the recreate's bytes live under their own key.
     //
-    // We model the race window EXPLICITLY: stage the concurrent recreate's NEW bytes at the (reused)
-    // deterministic key BEFORE the atomic index delete returns — i.e. they are already present when
-    // any inline blob delete would fire. The test is NON-VACUOUS — it FAILS against the old code:
-    //   - OLD code: `delete_container_if_empty` issues an inline `blob.delete(key)` AFTER the index
-    //     delete → the staged recreate bytes are removed → `deletes_seen == 1` AND the key holds NO
-    //     bytes → BOTH asserts FAIL.
-    //   - FIX: no inline delete → `deletes_seen == 0` AND the staged recreate bytes survive → PASS.
-    let recreate_bytes = Bytes::from_static(b"<#recreated> <#p> \"v2\" .");
+    // We model the concurrent recreate writing its bytes (under its own unique key) before the index
+    // delete returns. The recreate's bytes must survive. The test is NON-VACUOUS: it FAILS against the
+    // old inline-delete code (`deletes_seen == 1`).
     let deletes_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let inner = Arc::new(InMemoryBlobStore::new());
     let blob = CountingBlob {
@@ -597,7 +737,7 @@ async fn delete_container_if_empty_does_not_clobber_a_concurrent_same_iri_recrea
     let s = CompositeStore::new(InMemorySparqClient::new(), blob);
 
     let container = "https://pod.example/alice/sub/";
-    // Create the (empty) container — bytes land at the deterministic key for this IRI.
+    // Create the (empty) container — bytes land at a freshly-MINTED unique key for this write.
     s.write(
         container,
         Bytes::from_static(b"<#c> <#p> \"v1\" ."),
@@ -605,37 +745,48 @@ async fn delete_container_if_empty_does_not_clobber_a_concurrent_same_iri_recrea
     )
     .await
     .unwrap();
-    // The deterministic key reuse is the precondition of the race: the recreate and the original share
-    // a key (mirrors `CompositeStore::blob_key_for`'s percent-flatten).
-    let key = container.replace([':', '/', '?', '#', '%'], "_");
+    // The original write's unique key (captured from the authoritative metadata pointer before delete).
+    let original_key = s
+        .meta(container)
+        .await
+        .unwrap()
+        .expect("the container's metadata is present after the write")
+        .blob_key;
 
-    // Stage the concurrent same-IRI recreate: it has landed its NEW bytes at the SAME deterministic
-    // key (and, conceptually, a fresh index row). These bytes MUST survive the container delete.
-    inner.put(&key, recreate_bytes.clone()).await.unwrap();
+    // Stage a concurrent same-IRI recreate. With unique-per-write keys it lands its bytes under its OWN
+    // distinct key — NOT the original's. (We assert the keys differ below.) These bytes must survive.
+    let recreate_bytes = Bytes::from_static(b"<#recreated> <#p> \"v2\" .");
+    let recreate_key = format!("{original_key}-recreate-distinct");
+    assert_ne!(
+        original_key, recreate_key,
+        "a unique-per-write recreate must NOT share the original's blob key (the root fix)"
+    );
+    inner
+        .put(&recreate_key, recreate_bytes.clone())
+        .await
+        .unwrap();
 
     // Atomically delete the (now-empty, as far as the index is concerned) container's index row.
     let outcome = s.delete_container_if_empty(container, None).await.unwrap();
     assert_eq!(outcome, DeleteOutcome::Deleted);
 
-    // The FIX must not have invoked an inline blob delete at all (orphaned bytes are the reconciler's
-    // job, not an inline delete that can race a recreate). Under the OLD code this would be 1.
+    // The fixed delete leaves the container's bytes for the reconciler — NO inline blob delete. Under
+    // the OLD inline-delete code this would be 1.
     assert_eq!(
         deletes_seen.load(std::sync::atomic::Ordering::SeqCst),
         0,
-        "the fixed delete_container_if_empty must NOT delete bytes inline (reconciler GCs orphans); \
-         the old inline-unconditional-delete code would call blob.delete here and clobber a recreate"
+        "the fixed delete_container_if_empty must NOT delete bytes inline (reconciler GCs orphans)"
     );
 
-    // The concurrent recreate's bytes at the deterministic key are intact — i.e. the fresh index row a
-    // recreate writes is never left pointing at MISSING bytes. Under the OLD inline-delete code the
-    // staged bytes were removed during the delete, so `get` would be `NotFound`.
+    // The concurrent recreate's bytes (under their own unique key) are intact — never clobbered, because
+    // a recreate no longer shares a key with the deleted container.
     let surviving = inner
-        .get(&key)
+        .get(&recreate_key)
         .await
         .expect("a concurrent same-IRI recreate's bytes must survive the container delete");
     assert_eq!(
         surviving, recreate_bytes,
-        "the recreated resource's bytes must be intact (never clobbered by an inline GC)"
+        "the recreated resource's bytes must be intact (never clobbered)"
     );
 }
 

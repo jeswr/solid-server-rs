@@ -99,10 +99,12 @@ pub trait BlobStore: Send + Sync {
     ///
     /// The reconciler uses this to RE-STAT a candidate orphan immediately before deleting it: the
     /// [`list`](BlobStore::list) snapshot taken at sweep start can be stale by the time the delete loop
-    /// reaches a key, and with today's deterministic per-IRI blob keys an overwrite reuses the same key,
-    /// so a recreate landing between the snapshot and the delete would otherwise let the GC clobber
-    /// newly-written LIVE bytes. Re-stat lets the reconciler notice "this key's bytes are now NEWER than
-    /// my snapshot saw" (⇒ rewritten ⇒ skip) — see [`super::reconcile::reconcile_orphans`].
+    /// reaches a key. The composite store now mints UNIQUE-PER-WRITE blob keys
+    /// ([`super::CompositeStore::mint_blob_key`]) so a recreate gets a DIFFERENT key and can no longer
+    /// collide on a candidate's key — but this re-stat + the CAS below remain a defence-in-depth for any
+    /// backend or path where a key could still be reused. Re-stat lets the reconciler notice "this key's
+    /// bytes are now NEWER than my snapshot saw" (⇒ rewritten ⇒ skip) — see
+    /// [`super::reconcile::reconcile_orphans`].
     ///
     /// The default implementation derives the answer from [`list`](BlobStore::list) so existing/future
     /// impls keep working unchanged; a backend with a cheap single-key HEAD (object_store, the in-memory
@@ -133,13 +135,15 @@ pub trait BlobStore: Send + Sync {
     /// correct for "old enough"; it is never the delete witness.)
     ///
     /// # Why a CAS at all (the residual stat→delete TOCTOU)
-    /// With today's deterministic per-IRI blob keys an overwrite REUSES the same key. The reconciler
-    /// re-stats a candidate just before deleting it, but a recreate that rewrites the bytes in the gap
-    /// between that fresh stat and a plain `delete()` would have its NEW live bytes clobbered by the GC.
-    /// A separate `stat()` then `delete()` cannot close that window — there is always a gap between the
-    /// two calls. This method collapses the compare and the delete into ONE atomic step, so a concurrent
-    /// rewrite either lands BEFORE it (a new generation ⇒ witness mismatch ⇒ `Ok(false)`, not deleted) or
-    /// AFTER it (the old bytes are already gone) — there is no clobber window.
+    /// The composite store now mints UNIQUE-PER-WRITE keys ([`super::CompositeStore::mint_blob_key`]), so
+    /// the primary clobber path — a same-IRI overwrite REUSING a candidate's key — no longer arises (a
+    /// recreate gets a fresh key). This atomic CAS is retained as DEFENCE-IN-DEPTH: any path or backend
+    /// that could still present a key collision is covered. The reconciler re-stats a candidate just
+    /// before deleting it, but a separate `stat()` then `delete()` could not close the residual gap (a
+    /// rewrite landing between them would have its NEW live bytes clobbered) — so this method collapses
+    /// the compare and the delete into ONE atomic step: a concurrent rewrite either lands BEFORE it (a new
+    /// generation ⇒ witness mismatch ⇒ `Ok(false)`, not deleted) or AFTER it (the old bytes are already
+    /// gone) — there is no clobber window.
     ///
     /// # Atomicity contract (load-bearing — an impl MUST honour it)
     /// The comparison AND the removal MUST happen under a single, uninterrupted critical section with no
@@ -155,9 +159,9 @@ pub trait BlobStore: Send + Sync {
     /// into [`BlobEntry::generation`] (`object_store` `PutMode`/delete with an `if_match`/version
     /// precondition on the backends that support it: S3 conditional writes / object versioning). On a
     /// backend WITHOUT a conditional delete (and no native version ⇒ [`BlobEntry::generation`] is `None`),
-    /// the only safe option is **unique-per-write blob keys** (an overwrite never reuses a candidate's
-    /// key, so the reconciler can never target live bytes and the delete can be unconditional) — that
-    /// unique-key migration is an orthogonal beaded slice, NOT built here.
+    /// safety rests on the **unique-per-write blob keys** the composite store now mints
+    /// ([`super::CompositeStore::mint_blob_key`]): an overwrite never reuses a candidate's key, so the
+    /// reconciler can never target live bytes and the delete is safe to be unconditional.
     async fn delete_if_unchanged(
         &self,
         key: &str,
