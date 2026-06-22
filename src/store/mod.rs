@@ -152,31 +152,37 @@ impl<S: SparqClient, B: BlobStore> CompositeStore<S, B> {
     ///
     /// 128 bits of OS entropy makes a key collision across independent writes cryptographically
     /// negligible; the IRI prefix is cosmetic (debuggability) and carries no uniqueness requirement.
-    fn mint_blob_key(iri: &str) -> String {
+    ///
+    /// # Why this FAILS CLOSED on RNG failure (the Medium fix)
+    /// Minting is **fallible**: if the OS CSPRNG ([`getrandom`]) cannot fill the 128-bit suffix, this
+    /// returns a [`ServerError::Storage`] and the write is failed — it NEVER mints a key from a
+    /// weak-entropy fallback. The earlier code fell back to a timestamp-only suffix, but the wall clock is
+    /// NOT unique per call: two concurrent mints in the same clock tick would derive the SAME suffix and
+    /// thus the SAME key — reintroducing the exact collision class the unique-per-write keys exist to
+    /// eliminate. `getrandom` does not fail on any platform we target (it reads `getrandom(2)`/`/dev/urandom`
+    /// on Linux, `getentropy` on the BSDs/macOS, `BCryptGenRandom` on Windows), so failing the write on the
+    /// theoretical error is correct: a genuinely unavailable OS RNG is an environment fault, and failing
+    /// closed (no key minted) is strictly safer than minting a key that could collide.
+    fn mint_blob_key(iri: &str) -> ServerResult<String> {
         // The IRI-derived prefix is for human/operator traceability only; uniqueness comes entirely from
         // the random suffix, so the prefix need not be collision-free.
         let prefix = iri.replace([':', '/', '?', '#', '%'], "_");
         let mut suffix = [0u8; 16];
         // The OS CSPRNG. `getrandom` is the de-facto OS-entropy source and does not fail on any platform
-        // we target; on the theoretical error we fall back to a still-unique value composed from the
-        // process- + time-derived entropy below, so a write is never blocked and keys stay unique.
-        if getrandom::getrandom(&mut suffix).is_err() {
-            // Defensive, effectively-unreachable fallback: combine the wall clock (nanos) with the
-            // resource's address-of bytes to still produce a per-write-distinct value. This path never
-            // runs on a supported OS; it only guarantees we never panic / reuse a key if the OS RNG is
-            // somehow unavailable.
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            suffix[..16].copy_from_slice(&nanos.to_le_bytes());
-        }
+        // we target. On the (effectively unreachable) error we FAIL CLOSED — the write errors rather than
+        // minting a key from non-unique fallback entropy that could collide with a concurrent same-tick
+        // mint. There is no safe "still-unique" fallback that does not require either a CSPRNG or a
+        // process-wide monotonic counter, and failing the write is the correct, simplest response to a
+        // missing OS RNG.
+        getrandom::getrandom(&mut suffix).map_err(|e| {
+            ServerError::Storage(format!("OS RNG unavailable for blob-key minting: {e}"))
+        })?;
         let hex = suffix.iter().fold(String::with_capacity(32), |mut acc, b| {
             use std::fmt::Write as _;
             let _ = write!(acc, "{b:02x}");
             acc
         });
-        format!("{prefix}-{hex}")
+        Ok(format!("{prefix}-{hex}"))
     }
 
     /// A trivial, deterministic ETag for the slice. M2: derive it from the SPARQ index state so it
@@ -234,7 +240,10 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
         // a read then resolves through that winner's pointer to ITS bytes, and the loser's bytes become
         // an unreferenced orphan the reconciler GCs (never a clobber of the live bytes). A re-write of
         // an existing resource likewise lands on a NEW key, leaving the previous key orphaned for GC.
-        let blob_key = Self::mint_blob_key(iri);
+        //
+        // Minting FAILS CLOSED if the OS RNG is unavailable (rather than minting a weak, possibly-colliding
+        // key) — the write errors instead, so the no-two-writes-share-a-key invariant holds even then.
+        let blob_key = Self::mint_blob_key(iri)?;
         let etag = Self::etag_for(&body);
         self.blob
             .put(&blob_key, body)
@@ -268,8 +277,10 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
         // reconciler (M2-next) — the same crash-consistency model `write` documents.
         //
         // The child's blob key is minted UNIQUE PER WRITE (`mint_blob_key`), so a concurrent same-IRI
-        // create writes a disjoint object and cannot collide with this one on a shared key.
-        let blob_key = Self::mint_blob_key(child);
+        // create writes a disjoint object and cannot collide with this one on a shared key. Minting FAILS
+        // CLOSED on an unavailable OS RNG (the create errors rather than minting a weak, possibly-colliding
+        // key), so the no-shared-key invariant holds even then.
+        let blob_key = Self::mint_blob_key(child)?;
         let etag = Self::etag_for(&body);
         self.blob
             .put(&blob_key, body)
@@ -388,7 +399,9 @@ mod tests {
         // all-distinct to be thorough. MUTATION-CHECK: revert to the old deterministic `iri.replace(...)`
         // and every minted key is identical ⇒ this fails.
         let iri = "https://pod.example/alice/data";
-        let mut keys: Vec<String> = (0..32).map(|_| S::mint_blob_key(iri)).collect();
+        let mut keys: Vec<String> = (0..32)
+            .map(|_| S::mint_blob_key(iri).expect("the OS RNG must be available in tests"))
+            .collect();
         let total = keys.len();
         keys.sort();
         keys.dedup();
@@ -406,7 +419,7 @@ mod tests {
         // percent-flattened IRI followed by the `-` separator.
         let iri = "https://pod.example/alice/data";
         let prefix = iri.replace([':', '/', '?', '#', '%'], "_");
-        let key = S::mint_blob_key(iri);
+        let key = S::mint_blob_key(iri).expect("the OS RNG must be available in tests");
         assert!(
             key.starts_with(&format!("{prefix}-")),
             "minted key {key:?} must keep the IRI-derived prefix {prefix:?} for traceability"
@@ -422,5 +435,48 @@ mod tests {
             suffix.bytes().all(|b| b.is_ascii_hexdigit()),
             "the suffix must be lowercase hex"
         );
+    }
+
+    #[test]
+    fn mint_blob_key_is_fallible_and_succeeds_on_a_working_os_rng() {
+        // The Medium fix: `mint_blob_key` is FALLIBLE — it propagates an RNG failure (fails closed) rather
+        // than minting a weak, possibly-colliding key from a timestamp-only fallback. On every supported
+        // platform the OS RNG IS available, so it returns `Ok`; the contract this pins is that the return
+        // type is a `Result` carrying a `ServerError::Storage` on the (unreachable here) RNG-failure path —
+        // verified by the `?` propagation at the `write`/`create_in_container` call sites compiling, and by
+        // the success here. There is NO infallible fallback that could mint a same-tick-colliding key.
+        let iri = "https://pod.example/alice/data";
+        let key =
+            S::mint_blob_key(iri).expect("the OS RNG is available on every supported platform");
+        let prefix = iri.replace([':', '/', '?', '#', '%'], "_");
+        assert!(
+            key.starts_with(&format!("{prefix}-")) && key.len() == prefix.len() + 1 + 32,
+            "the success path still mints a prefix + 32-hex-char random suffix"
+        );
+
+        // And a write through the public API succeeds end-to-end (the fallible mint does not regress the
+        // happy path): the resource is then readable, its bytes resolved through the minted blob key.
+        let store = S::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        tokio_test_block_on(async {
+            let meta = store
+                .write(iri, Bytes::from_static(b"body"), "text/turtle")
+                .await
+                .expect("a write with a working RNG must succeed");
+            assert!(
+                meta.blob_key.starts_with(&format!("{prefix}-")),
+                "the persisted pointer names the minted unique key"
+            );
+            let resource = store.read(iri).await.expect("read-after-write");
+            assert_eq!(resource.body, Bytes::from_static(b"body"));
+        });
+    }
+
+    /// A tiny single-thread block-on so the test above can drive the async `Store` API without pulling in
+    /// the `#[tokio::test]` macro for this otherwise-synchronous module.
+    fn tokio_test_block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime")
+            .block_on(f)
     }
 }

@@ -23,9 +23,11 @@
 //!    set AND RE-STATS its current `last_modified` + `generation` ([`BlobStore::stat`]) — see the
 //!    snapshot-staleness race below,
 //! 5. deletes a candidate **iff** it is STILL unreferenced (fresh index) AND STILL old enough (fresh
-//!    stat, not rewritten) AND its fresh `generation` still equals the SNAPSHOT generation, via an
-//!    ATOMIC compare-and-delete ([`BlobStore::delete_if_unchanged`]) that removes the key only while its
-//!    current `generation` (a true write version) still equals that SNAPSHOT witness.
+//!    stat, not rewritten): a VERSIONED candidate via an ATOMIC compare-and-delete
+//!    ([`BlobStore::delete_if_unchanged`]) that removes the key only while its current `generation` (a
+//!    true write version) still equals the SNAPSHOT witness; a VERSIONLESS candidate (no native write
+//!    version) via an unconditional [`BlobStore::delete`], made safe by the composite store's
+//!    unique-per-write keys (Finding 2 — so a versionless orphan is reclaimed, not leaked forever).
 //!
 //! ### The snapshot-staleness race (Finding 1 — why the re-check + the ATOMIC CAS-delete exist)
 //! The blob list in step 2 is a SNAPSHOT; by the time the delete loop reaches a key, the store's view may
@@ -71,8 +73,18 @@
 //! The **unique-per-write blob keys** the composite store now mints
 //! ([`super::CompositeStore::mint_blob_key`]) close the reuse race at its ROOT (an overwrite never reuses
 //! a candidate's key, so the GC can never target live bytes). The atomic CAS + re-checks here are kept as
-//! defence-in-depth and as the safety mechanism for a versionless backend; with unique keys a versionless
-//! backend's unconditional delete is also safe, since the candidate's key is never the live recreate's.
+//! defence-in-depth and as the strictly-stronger path for a backend that DOES expose a write version.
+//!
+//! ### Versionless backends ARE reclaimed (no forever-leak) — the unconditional-delete path
+//! A blob whose backend reports NO `generation` (a version-less object store) cannot do a CAS — but the
+//! unique-per-write keys make an UNCONDITIONAL delete safe, so a versionless orphan is **GC'd**, not
+//! leaked forever. It still passes every safety guard a versioned candidate does — age-gated against the
+//! grace window, re-checked against a FRESH referenced set, and re-statted (still old enough, still
+//! present) immediately before the delete — and is then removed with a plain [`BlobStore::delete`]. This
+//! is sound because a later recreate of the same IRI mints a DIFFERENT key (so the orphan's key can never
+//! be the live recreate's): there is nothing live to clobber. The earlier code skipped versionless
+//! candidates unconditionally, which leaked every old orphan forever on a versionless backend — the bug
+//! this path fixes.
 //!
 //! The grace period is the safety crux. There is an inverse race to the delete-orphan case: a *write
 //! in progress* PUTs its bytes and has NOT YET committed its index row — for that instant the blob is
@@ -179,14 +191,18 @@ pub struct ReconcileReport {
     /// Orphans that looked deletable from the START-OF-SWEEP snapshot but turned out to be live again —
     /// either now referenced by a freshly-committed index row, or rewritten. KEPT. This is the Finding-1
     /// defence-in-depth guard against clobbering a recreate that landed mid-sweep on a reused key (now
-    /// closed at the root by unique-per-write keys, but retained for versionless backends), and it
-    /// catches a rewrite at ANY point in the chain:
-    /// - the snapshot itself reported no `generation` (a version-less backend ⇒ no safe CAS — first pass);
+    /// closed at the root by unique-per-write keys, but retained as the strictly-stronger versioned path),
+    /// and it catches a rewrite at ANY point in the chain:
     /// - the fresh re-check found it referenced again (a recreate committed a row);
     /// - the fresh stat is gone / undated / newer `last_modified` / now inside the grace window;
     /// - the fresh stat's `generation` != the SNAPSHOT generation (rewritten in the list→stat gap — the
     ///   HIGH threading fix); or
     /// - the atomic CAS saw the current `generation` move (rewritten in the stat→delete gap).
+    ///
+    /// A VERSIONLESS orphan is NO LONGER counted here just for being versionless: under unique-per-write
+    /// keys it is now reclaimed via the unconditional-delete path (Finding 2) once it passes the same age +
+    /// fresh-re-check + re-stat guards. It only lands here if one of those guards keeps it (referenced
+    /// again / rewritten / now too young), exactly like a versioned candidate.
     pub skipped_revalidated: usize,
     /// Orphans we tried to delete but the backend delete failed (KEPT; the sweep continued).
     pub delete_errors: usize,
@@ -233,21 +249,31 @@ pub async fn reconcile_orphans<S: SparqClient + ?Sized, B: BlobStore + ?Sized>(
     };
 
     // First pass — classify against the START-OF-SWEEP snapshot. Everything that is referenced,
-    // too-young, undated, or versionless is decided HERE (these dispositions need no fresh re-check: a
-    // referenced or too-young or undated or version-less blob is never a delete candidate). The blobs
-    // that LOOK deletable from the snapshot (old-enough + unreferenced + versioned) are collected — WITH
-    // the SNAPSHOT's `generation` as well as the `last_modified` the SNAPSHOT saw — for a second pass
-    // that re-checks each immediately before deleting.
+    // too-young, or undated is decided HERE (these dispositions need no fresh re-check: a referenced or
+    // too-young or undated blob is never a delete candidate). The blobs that LOOK deletable from the
+    // snapshot (old-enough + unreferenced) are collected — WITH the SNAPSHOT's `generation` (if any) as
+    // well as the `last_modified` the SNAPSHOT saw — for a second pass that re-checks each immediately
+    // before deleting.
     //
-    // FINDING 1 (the candidate-tuple shape, the best call documented): the candidate carries the SNAPSHOT
-    // `generation`, not just the key + snapshot `last_modified`. The whole decision chain (classify → age
-    // → CAS) is then anchored to ONE consistent generation observation taken at `list()` time. The
-    // alternative — carrying only key+timestamp and using the FRESH stat's generation as the CAS witness —
-    // is exactly the HIGH bug: a blob rewritten between `list()` and the fresh `stat()` (same
+    // FINDING 1 (the candidate-tuple shape, the best call documented): a VERSIONED candidate carries the
+    // SNAPSHOT `generation`, not just the key + snapshot `last_modified`. The whole decision chain
+    // (classify → age → CAS) is then anchored to ONE consistent generation observation taken at `list()`
+    // time. The alternative — carrying only key+timestamp and using the FRESH stat's generation as the CAS
+    // witness — is exactly the HIGH bug: a blob rewritten between `list()` and the fresh `stat()` (same
     // `last_modified`, NEW generation) would have the fresh stat report the new generation, which would
     // become its own witness ⇒ the CAS matches ⇒ the live rewrite is deleted. Threading the SNAPSHOT
     // generation end-to-end and requiring fresh == snapshot before deleting closes that window too.
-    let mut candidates: Vec<(String, SystemTime, u64)> = Vec::new();
+    //
+    // FINDING 2 (the versionless-orphan GC, this fix): a candidate whose backend reports NO `generation`
+    // ([`CandidateWitness::Versionless`]) is NO LONGER skipped unconditionally — that leaked every old
+    // orphan forever on a versionless object-store backend. Under the unique-per-write keys the composite
+    // store now mints, a versionless orphan's key can NEVER be reused by a later recreate, so deleting it
+    // is safe WITHOUT a CAS: we still age-gate it (grace window) AND re-verify it is still unreferenced by
+    // a fresh index re-check + a fresh re-stat in the second pass, then delete it unconditionally. A
+    // versioned candidate keeps the strictly-stronger atomic CAS path (defence-in-depth for any backend
+    // where a key COULD be reused). Versionless candidates are still collected here so they go through the
+    // SAME fresh referenced-set re-check (Finding 1 part a) before any delete.
+    let mut candidates: Vec<Candidate> = Vec::new();
     for entry in stored {
         if referenced.contains(&entry.key) {
             report.referenced += 1;
@@ -274,14 +300,20 @@ pub async fn reconcile_orphans<S: SparqClient + ?Sized, B: BlobStore + ?Sized>(
                 }
             }
         };
-        // The SNAPSHOT generation is the CAS witness this candidate will be deleted on (FINDING 1). A
-        // version-less snapshot (`generation` is `None`) cannot be CAS-deleted safely ⇒ fail-closed, kept
-        // (a backend with no native write version must instead use unique-per-write keys — see
-        // `delete_if_unchanged`). Decided HERE so the snapshot witness is fixed at `list()` time.
-        match entry.generation {
-            Some(snapshot_gen) => candidates.push((entry.key, snapshot_ts, snapshot_gen)),
-            None => report.skipped_revalidated += 1,
-        }
+        // The delete WITNESS is fixed at `list()` time (FINDING 1). A VERSIONED snapshot carries its
+        // SNAPSHOT generation for the atomic CAS-delete; a VERSIONLESS snapshot (`generation` is `None`)
+        // has no write version, so it takes the unconditional-delete path that is SAFE under
+        // unique-per-write keys (FINDING 2) — age-gated + fresh-re-checked + fresh-re-statted, then a plain
+        // delete (the candidate's key can never be a later recreate's key, so there is nothing to clobber).
+        let witness = match entry.generation {
+            Some(snapshot_gen) => CandidateWitness::Versioned(snapshot_gen),
+            None => CandidateWitness::Versionless,
+        };
+        candidates.push(Candidate {
+            key: entry.key,
+            snapshot_ts,
+            witness,
+        });
     }
 
     // FINDING 2: short-circuit when there is NOTHING to delete. The pre-delete fresh referenced-set
@@ -308,10 +340,16 @@ pub async fn reconcile_orphans<S: SparqClient + ?Sized, B: BlobStore + ?Sized>(
         .map_err(ReconcileError::ReferencedSet)?;
 
     // Second pass — re-validate each candidate immediately before deleting it. The candidate carries the
-    // SNAPSHOT (`list()`-time) `last_modified` AND `generation`; both are re-confirmed against a fresh
-    // stat before the CAS, so the WHOLE decision chain is anchored to ONE consistent generation
-    // observation (FINDING 1) and a rewrite landing ANYWHERE — list→stat OR stat→delete — is caught.
-    for (key, snapshot_ts, snapshot_gen) in candidates {
+    // SNAPSHOT (`list()`-time) `last_modified` AND (for a versioned candidate) `generation`; both are
+    // re-confirmed against a fresh stat before the delete, so the WHOLE decision chain is anchored to ONE
+    // consistent generation observation (FINDING 1) and a rewrite landing ANYWHERE — list→stat OR
+    // stat→delete — is caught.
+    for candidate in candidates {
+        let Candidate {
+            key,
+            snapshot_ts,
+            witness,
+        } = candidate;
         // (a) Re-check referenced-ness against the FRESH index set: a recreate may have committed a row
         // pointing at this key since the snapshot.
         if referenced_fresh.contains(&key) {
@@ -320,10 +358,10 @@ pub async fn reconcile_orphans<S: SparqClient + ?Sized, B: BlobStore + ?Sized>(
         }
 
         // (b) Re-STAT the key's CURRENT state to decide the disposition (via `last_modified`, the AGE
-        // witness) AND to CONFIRM the snapshot generation is still current. On a key-reusing backend a
-        // rewrite would land on the same key, so if the bytes are now newer than the snapshot saw — or
-        // now young enough to be inside the grace window — the blob was overwritten and must NOT be
-        // deleted (defence-in-depth; unique-per-write keys close this at the root). A stat
+        // witness) AND, for a versioned candidate, to CONFIRM the snapshot generation is still current. On
+        // a key-reusing backend a rewrite would land on the same key, so if the bytes are now newer than
+        // the snapshot saw — or now young enough to be inside the grace window — the blob was overwritten
+        // and must NOT be deleted (defence-in-depth; unique-per-write keys close this at the root). A stat
         // failure is treated fail-closed (skip, count under delete_errors) rather than blindly deleting on
         // incomplete info.
         let current = match blob.stat(&key).await {
@@ -343,7 +381,9 @@ pub async fn reconcile_orphans<S: SparqClient + ?Sized, B: BlobStore + ?Sized>(
         // The AGE re-check uses the fresh `last_modified` (the time witness — correct for "old enough" /
         // "inside the grace window"). An undated fresh stat (`None`) is unknowable ⇒ fail-closed, do NOT
         // delete. Newer than the snapshot (overwritten), or now inside the grace window (a fresh write
-        // whose index row may not have committed yet) ⇒ not safe to GC.
+        // whose index row may not have committed yet) ⇒ not safe to GC. This guard protects BOTH the
+        // versioned and the versionless path: a versionless orphan re-written (under key reuse) since the
+        // snapshot shows a fresh stamp here and is kept.
         match current.last_modified {
             None => {
                 report.skipped_revalidated += 1;
@@ -357,59 +397,103 @@ pub async fn reconcile_orphans<S: SparqClient + ?Sized, B: BlobStore + ?Sized>(
                 }
             }
         }
-        // FINDING 1 (the HIGH fix): the CAS-delete WITNESS is the SNAPSHOT (`list()`-time) `generation`,
-        // and the fresh stat's generation MUST EQUAL it before we delete. The witness is a true,
-        // strictly-increasing write version (NOT `last_modified`: a same-tick / clock-rolled-back overwrite
-        // can share a timestamp but never a generation). Crucially it is the SNAPSHOT generation, NOT the
-        // FRESH stat's: using the fresh generation as the witness would re-derive the witness from
-        // whatever bytes are present at stat time, so a rewrite landing in the list→stat gap (same
-        // `last_modified`, NEW generation) would have the fresh stat hand the recreate its OWN generation
-        // as the witness ⇒ the CAS would match and clobber the live rewrite. Requiring fresh == snapshot
-        // (and a fresh stat with no generation, version-less, fails closed) means a rewrite at ANY point —
-        // list→stat (caught HERE by the mismatch) OR stat→delete (caught by the atomic CAS below) — skips.
-        let fresh_gen = match current.generation {
-            Some(g) => g,
-            None => {
-                report.skipped_revalidated += 1;
-                continue;
-            }
-        };
-        if fresh_gen != snapshot_gen {
-            // The bytes were rewritten between `list()` (snapshot) and this fresh `stat()` — the
-            // generation moved even if the `last_modified` did not. KEEP (a live rewrite must not be GC'd).
-            report.skipped_revalidated += 1;
-            continue;
-        }
-        // Confirmed: fresh == snapshot. Delete on the SNAPSHOT generation as the witness.
-        let witness = snapshot_gen;
 
         if opts.dry_run {
-            // Deletable, but a dry run touches nothing — counted under `would_delete`, not `deleted`, so
-            // the partition holds in both modes and the operator sees what a real run would reclaim.
+            // Deletable (versioned OR versionless), but a dry run touches nothing — counted under
+            // `would_delete`, not `deleted`, so the partition holds in both modes and the operator sees
+            // what a real run would reclaim.
             report.would_delete += 1;
             continue;
         }
 
-        // Still old enough + still unreferenced (fresh index) + not rewritten (fresh stat, fresh gen ==
-        // snapshot gen) + not a dry run ⇒ reclaim it via an ATOMIC compare-and-delete. `delete_if_unchanged`
-        // removes the key ONLY while its current `generation` still equals `witness` (the SNAPSHOT
-        // generation, just confirmed == the fresh stat's), with the compare + remove in ONE critical
-        // section. This CLOSES the residual stat→delete TOCTOU (Finding 1) AND is clock-independent (the
-        // HIGH fix): a recreate that rewrites the bytes after our fresh stat bumps the generation — even if
-        // it lands in the same `SystemTime` tick — so the CAS sees the mismatch and returns `false`
-        // (recorded `skipped_revalidated`, NOT deleted, NOT an error) — the new live bytes are never
-        // clobbered. A genuine backend failure is recorded under `delete_errors` and the sweep CONTINUES
-        // (one bad key never aborts the whole GC).
-        match blob.delete_if_unchanged(&key, witness).await {
-            Ok(true) => report.deleted += 1,
-            // The generation changed between the fresh stat and the CAS (a rewrite landed) ⇒ the CAS
-            // refused to delete. Not an orphan any more — record as revalidated, no clobber.
-            Ok(false) => report.skipped_revalidated += 1,
-            Err(_) => report.delete_errors += 1,
+        match witness {
+            // FINDING 1 (the HIGH fix): the CAS-delete WITNESS is the SNAPSHOT (`list()`-time) `generation`,
+            // and the fresh stat's generation MUST EQUAL it before we delete. The witness is a true,
+            // strictly-increasing write version (NOT `last_modified`: a same-tick / clock-rolled-back
+            // overwrite can share a timestamp but never a generation). Crucially it is the SNAPSHOT
+            // generation, NOT the FRESH stat's: using the fresh generation as the witness would re-derive
+            // the witness from whatever bytes are present at stat time, so a rewrite landing in the
+            // list→stat gap (same `last_modified`, NEW generation) would have the fresh stat hand the
+            // recreate its OWN generation as the witness ⇒ the CAS would match and clobber the live rewrite.
+            // Requiring fresh == snapshot (and a fresh stat that has BECOME version-less fails closed) means
+            // a rewrite at ANY point — list→stat (caught HERE by the mismatch) OR stat→delete (caught by the
+            // atomic CAS below) — skips.
+            CandidateWitness::Versioned(snapshot_gen) => {
+                let fresh_gen = match current.generation {
+                    Some(g) => g,
+                    None => {
+                        report.skipped_revalidated += 1;
+                        continue;
+                    }
+                };
+                if fresh_gen != snapshot_gen {
+                    // The bytes were rewritten between `list()` (snapshot) and this fresh `stat()` — the
+                    // generation moved even if the `last_modified` did not. KEEP (a live rewrite must not
+                    // be GC'd).
+                    report.skipped_revalidated += 1;
+                    continue;
+                }
+                // Confirmed: fresh == snapshot. Reclaim via an ATOMIC compare-and-delete on the SNAPSHOT
+                // generation. `delete_if_unchanged` removes the key ONLY while its current `generation`
+                // still equals the witness, with the compare + remove in ONE critical section. This CLOSES
+                // the residual stat→delete TOCTOU (Finding 1) AND is clock-independent (the HIGH fix): a
+                // recreate that rewrites the bytes after our fresh stat bumps the generation — even in the
+                // same `SystemTime` tick — so the CAS sees the mismatch and returns `false` (recorded
+                // `skipped_revalidated`, NOT deleted). A genuine backend failure is recorded under
+                // `delete_errors` and the sweep CONTINUES (one bad key never aborts the whole GC).
+                match blob.delete_if_unchanged(&key, snapshot_gen).await {
+                    Ok(true) => report.deleted += 1,
+                    // The generation changed between the fresh stat and the CAS (a rewrite landed) ⇒ the
+                    // CAS refused to delete. Not an orphan any more — record as revalidated, no clobber.
+                    Ok(false) => report.skipped_revalidated += 1,
+                    Err(_) => report.delete_errors += 1,
+                }
+            }
+            // FINDING 2 (the versionless-orphan GC): a candidate whose backend has NO native write version
+            // cannot do a CAS — but UNIQUE-PER-WRITE keys make an unconditional delete SAFE: a later
+            // recreate of the same IRI mints a DIFFERENT key, so this orphan's key can never be the live
+            // recreate's, and deleting its bytes can never clobber anything live. It is still age-gated
+            // (grace window, above), re-checked against the FRESH referenced set (above), and re-statted to
+            // confirm it is still old enough + still present (above) before we delete — so a versionless
+            // orphan OLDER than the grace window IS reclaimed (no more forever-leak), while a fresh / re-
+            // referenced / rewritten one is kept. If the fresh stat had BECOME versioned (a backend that
+            // started reporting generations between snapshot and now), we conservatively fall back to the
+            // unconditional delete keyed on the same safety net (unique keys) — the absence of a snapshot
+            // witness means we cannot CAS, and the unique-key invariant already guarantees the bytes are
+            // not live. A backend delete failure is recorded and the sweep CONTINUES.
+            CandidateWitness::Versionless => match blob.delete(&key).await {
+                Ok(()) => report.deleted += 1,
+                Err(_) => report.delete_errors += 1,
+            },
         }
     }
 
     Ok(report)
+}
+
+/// The delete witness threaded END-TO-END for a delete candidate (FINDING 1 + FINDING 2). Fixed at the
+/// START-OF-SWEEP `list()` snapshot so the whole decision chain is anchored to ONE consistent observation.
+enum CandidateWitness {
+    /// The snapshot reported a native write version (`generation`): delete via the ATOMIC CAS keyed on
+    /// THIS snapshot generation (Finding 1) — the strictly-stronger, clock-independent path.
+    Versioned(u64),
+    /// The snapshot reported NO native write version: delete UNCONDITIONALLY after the age, fresh-re-check,
+    /// and re-stat guards (Finding 2). Safe ONLY because the composite store mints unique-per-write keys, so
+    /// the candidate's key can never be a later recreate's — there is nothing live to clobber.
+    Versionless,
+}
+
+/// A delete candidate carried from the first (snapshot-classify) pass into the second (re-validate +
+/// delete) pass, with the witness fixed at `list()` time.
+struct Candidate {
+    /// The blob key being considered for GC.
+    key: String,
+    /// The `last_modified` the START-OF-SWEEP snapshot observed — the AGE anchor the fresh re-stat is
+    /// compared against (a newer fresh stamp ⇒ rewritten ⇒ kept).
+    snapshot_ts: SystemTime,
+    /// How to delete it: an atomic CAS on the snapshot generation (versioned) or an unconditional delete
+    /// made safe by unique-per-write keys (versionless).
+    witness: CandidateWitness,
 }
 
 /// Spawn an OPT-IN periodic reconciler: a tokio task that runs [`reconcile_orphans`] every `interval`.
@@ -916,35 +1000,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_orphan_with_no_generation_is_kept_fail_closed_without_any_cas() {
-        // The DIRECT first-pass `generation: None` fail-closed test (the LOW finding): an OLD orphan
-        // (`last_modified: Some(old)`, past the grace window) whose backend reports NO `generation` (a
-        // version-less backend) cannot be CAS-deleted safely, so it must be KEPT — counted under
-        // `skipped_revalidated` — and NO CAS / `delete_if_unchanged` path may be reached.
+    async fn old_versionless_orphan_is_reclaimed_via_unconditional_delete() {
+        // FINDING 2: an OLD orphan (`last_modified: Some(old)`, past the grace window) whose backend
+        // reports NO `generation` (a version-less object store) IS now reclaimed — NOT leaked forever. The
+        // earlier code skipped every versionless candidate unconditionally, leaking all old orphans on a
+        // versionless backend. Under unique-per-write keys an unconditional delete is safe: the orphan's
+        // key can never be a later recreate's, so deleting its bytes can never clobber anything live.
         //
-        // This is distinct from `unknown_age_blob_is_kept_fail_closed`: that store exits earlier on
-        // `last_modified: None` (skipped_unknown_age) and so never exercises the `generation: None`
-        // branch with a KNOWN old timestamp. Here the age check PASSES (old enough) and the candidate
-        // is only stopped by the version-less guard.
+        // The candidate is age-gated (old enough), re-checked against the FRESH referenced set, and
+        // re-statted (still old enough, still present) before the delete — then removed via the plain
+        // unconditional `delete` (NOT the CAS, which it has no witness for).
         //
-        // MUTATION-CHECK (recorded in the report below): if the first-pass `generation: None` guard were
-        // removed so the entry fell through toward the second pass / CAS, this store's CAS-or-delete
-        // counter would be non-zero and `removed()` true ⇒ this test would fail. (Verified by temporarily
-        // dropping the guard: the candidate reaches `delete_if_unchanged` and the asserts below fail.)
+        // MUTATION-CHECK: revert to skipping versionless candidates and `removed()` is false / `deleted`
+        // is 0 ⇒ this test fails. The store records WHICH path was taken so we also pin that it was the
+        // unconditional `delete`, not the CAS.
         let sparq = InMemorySparqClient::new();
         let blob = VersionlessOldBlobStore::new("versionless-orphan", ago(3600));
 
         let report = reconcile_orphans(&sparq, &blob, &opts()).await.unwrap();
         assert_eq!(report.scanned, 1);
         assert_eq!(report.orphaned, 1);
-        // Old enough, but version-less ⇒ no safe CAS ⇒ fail-closed, KEPT under skipped_revalidated.
-        assert_eq!(report.skipped_revalidated, 1);
+        // Old enough + unreferenced + versionless ⇒ reclaimed via the unconditional-delete path.
+        assert_eq!(report.deleted, 1);
+        assert_eq!(report.skipped_revalidated, 0);
         assert_eq!(
             report.skipped_unknown_age, 0,
             "the age IS known (old) — not this disposition"
         );
         assert_eq!(report.too_young, 0);
-        assert_eq!(report.deleted, 0);
         // The partition still holds.
         assert_eq!(
             report.deleted
@@ -955,17 +1038,41 @@ mod tests {
                 + report.delete_errors,
             report.orphaned
         );
-        // The crux: a version-less candidate is decided in the FIRST pass — NO CAS, NO delete, and the
-        // second referenced-set re-fetch is never reached either (zero candidates ⇒ Finding 2 short-circuit).
-        assert_eq!(
-            blob.cas_or_delete_calls(),
-            0,
-            "a generation:None candidate must be kept fail-closed in the first pass — never reach a \
-             CAS / delete_if_unchanged"
+        assert!(
+            blob.removed(),
+            "an OLD version-less orphan must be GC'd under unique-per-write keys (no forever-leak)"
         );
+        // The delete went through the UNCONDITIONAL `delete` path, never the CAS (it has no witness).
+        assert_eq!(
+            blob.cas_calls(),
+            0,
+            "a versionless candidate must use the unconditional delete, never delete_if_unchanged"
+        );
+        assert_eq!(blob.unconditional_delete_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_versionless_orphan_is_kept_by_the_grace_window() {
+        // FINDING 2 (the safety counterpart): a versionless orphan INSIDE the grace window is NOT
+        // reclaimed — the write-in-progress race protection applies to the versionless path exactly as to
+        // the versioned one. A too-young versionless candidate never even becomes a delete candidate (it is
+        // stopped in the first pass), so no delete of any kind is reached.
+        let sparq = InMemorySparqClient::new();
+        let blob = VersionlessOldBlobStore::new("fresh-versionless", ago(1)); // 1s < 60s grace
+
+        let report = reconcile_orphans(&sparq, &blob, &opts()).await.unwrap();
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.orphaned, 1);
+        assert_eq!(report.too_young, 1);
+        assert_eq!(report.deleted, 0);
         assert!(
             !blob.removed(),
-            "a version-less orphan must NOT be GC'd (no native write version ⇒ no safe CAS)"
+            "a too-young versionless orphan must be protected by the grace window (write-in-progress)"
+        );
+        assert_eq!(
+            blob.cas_calls() + blob.unconditional_delete_calls(),
+            0,
+            "a too-young candidate reaches no delete path at all"
         );
     }
 
@@ -1429,15 +1536,15 @@ mod tests {
         }
     }
 
-    /// A blob store whose `list()` reports a key with a KNOWN OLD `last_modified` (past the grace window,
-    /// so the age check PASSES) but NO `generation` (a version-less backend) — exercising the first-pass
-    /// `generation: None` fail-closed branch. Records every `delete` / `delete_if_unchanged` call so a
-    /// test can assert NONE was reached: the candidate must be skipped (kept) in the first pass before any
-    /// CAS witness is needed.
+    /// A blob store whose `list()` (AND `stat()`) reports a key with a known `last_modified` but NO
+    /// `generation` (a version-less object-store backend) — exercising the FINDING-2 versionless GC path.
+    /// Records the UNCONDITIONAL `delete` calls and the `delete_if_unchanged` (CAS) calls SEPARATELY so a
+    /// test can pin that a versionless candidate is reclaimed via the unconditional delete, never the CAS.
     struct VersionlessOldBlobStore {
         key: String,
         stamp: SystemTime,
-        cas_or_delete_calls: std::sync::atomic::AtomicUsize,
+        unconditional_delete_calls: std::sync::atomic::AtomicUsize,
+        cas_calls: std::sync::atomic::AtomicUsize,
         removed: Mutex<bool>,
     }
     impl VersionlessOldBlobStore {
@@ -1445,13 +1552,17 @@ mod tests {
             Self {
                 key: key.to_string(),
                 stamp,
-                cas_or_delete_calls: std::sync::atomic::AtomicUsize::new(0),
+                unconditional_delete_calls: std::sync::atomic::AtomicUsize::new(0),
+                cas_calls: std::sync::atomic::AtomicUsize::new(0),
                 removed: Mutex::new(false),
             }
         }
-        fn cas_or_delete_calls(&self) -> usize {
-            self.cas_or_delete_calls
+        fn unconditional_delete_calls(&self) -> usize {
+            self.unconditional_delete_calls
                 .load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn cas_calls(&self) -> usize {
+            self.cas_calls.load(std::sync::atomic::Ordering::SeqCst)
         }
         fn removed(&self) -> bool {
             *self.removed.lock().expect("poisoned")
@@ -1469,9 +1580,9 @@ mod tests {
             Ok(key == self.key)
         }
         async fn delete(&self, key: &str) -> Result<(), BlobError> {
-            // Must NOT be reached for a version-less candidate (first-pass fail-closed). Record it so the
-            // mutation-check (guard removed) is observable.
-            self.cas_or_delete_calls
+            // The FINDING-2 versionless reclaim path: a plain unconditional delete (no witness). Record it
+            // distinctly so the test can assert the versionless candidate took THIS path, not the CAS.
+            self.unconditional_delete_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if key == self.key {
                 *self.removed.lock().expect("poisoned") = true;
@@ -1479,7 +1590,7 @@ mod tests {
             Ok(())
         }
         async fn list(&self) -> Result<Vec<super::super::blob::BlobEntry>, BlobError> {
-            // KNOWN old stamp (age check passes) but NO generation (version-less ⇒ no safe CAS).
+            // KNOWN stamp (age check decides too-young vs old) but NO generation (version-less backend).
             Ok(vec![super::super::blob::BlobEntry {
                 key: self.key.clone(),
                 last_modified: Some(self.stamp),
@@ -1490,16 +1601,13 @@ mod tests {
             &self,
             key: &str,
         ) -> Result<Option<super::super::blob::BlobEntry>, BlobError> {
-            // Should NOT be reached: a version-less candidate is decided in the first pass, before any
-            // re-stat. If it WERE reached (the first-pass guard removed so the entry fell through with
-            // some default snapshot witness), report a CONCRETE generation that still passes the
-            // second-pass age + generation re-checks — so the ONLY guard that can stop the delete is the
-            // first-pass `generation: None` one the LOW finding is about. That makes the mutation-check
-            // bite the FIRST pass specifically (not be masked by the second-pass version-less guard).
+            // The fresh re-stat reports the SAME stamp + STILL no generation (the backend is version-less),
+            // so the re-stat confirms "still old enough, still present, still versionless" ⇒ the
+            // unconditional-delete path proceeds.
             Ok((key == self.key).then(|| super::super::blob::BlobEntry {
                 key: self.key.clone(),
                 last_modified: Some(self.stamp),
-                generation: Some(0),
+                generation: None,
             }))
         }
         async fn delete_if_unchanged(
@@ -1507,10 +1615,9 @@ mod tests {
             key: &str,
             _expected_generation: u64,
         ) -> Result<bool, BlobError> {
-            // Must NOT be reached. If the first-pass guard were removed, the candidate would arrive here
-            // and this unconditionally deletes — so the mutation-check fails loudly (removed() true,
-            // cas_or_delete_calls > 0).
-            self.cas_or_delete_calls
+            // Must NOT be reached for a versionless candidate (it has no witness ⇒ takes the unconditional
+            // delete). Record any CAS call so a wrong-path regression is observable.
+            self.cas_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if key == self.key {
                 *self.removed.lock().expect("poisoned") = true;
