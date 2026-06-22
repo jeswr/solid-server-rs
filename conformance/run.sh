@@ -30,6 +30,15 @@
 #   host` is the literal host netns and the socat hop is a harmless passthrough.
 #
 # Produces an EARL + HTML + summary report under conformance/reports/.
+#
+# Result integrity (do NOT regress — the whole point of running this is a trustworthy baseline):
+#   - The report dir is CLEARED before every run, so no stale report from a prior run can be mistaken
+#     for this run's output.
+#   - The harness exit status is CAPTURED (never `|| true`-masked), and the run is only treated as
+#     valid if a FRESH EARL report (report.ttl) was actually produced by THIS run.
+#   - A non-zero harness exit WITH a fresh report is a REAL result (the CTH exits non-zero when
+#     scenarios fail) and is tolerated; a non-zero exit WITHOUT a fresh report is a SCRIPT/HARNESS
+#     error and FAILS loudly.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -54,7 +63,14 @@ FWD_NAME="srs-conformance-fwd"
 docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "ERROR: CTH image '$IMAGE' not present. Build the ath-patched image (see prod-solid-server/conformance/README.md) or set CTH_IMAGE." >&2; exit 1; }
 curl -s -m 5 "${ISSUER}/.well-known/openid-configuration" -o /dev/null || { echo "ERROR: Keycloak realm unreachable at ${ISSUER} — is 'docker compose up -d' running?" >&2; exit 1; }
 
+# Clear the report dir so a FAILED run can never leave stale report.ttl/HTML behind that then look
+# like a fresh baseline. (`reports/` is gitignored — nothing committed lives here.) The marker file
+# pins THIS run's start time; the freshness assertion later requires the EARL report to be newer.
+rm -rf "${REPORTS:?REPORTS unset}"
 mkdir -p "$REPORTS"
+RUN_MARKER="$REPORTS/.run-start"
+: > "$RUN_MARKER"
+EARL_REPORT="$REPORTS/report.ttl"
 
 # --- boot the server (in-memory, TLS, seeded) ---------------------------------------------------
 echo ">> Booting solid-server-rs (in-memory doubles, TLS, seeded) at ${BASE_URL} ..."
@@ -96,6 +112,14 @@ sleep 1
 
 # --- run the harness ----------------------------------------------------------------------------
 echo ">> Running the harness (${IMAGE}) — protocol + WAC suites ..."
+# Capture the harness exit status — do NOT `|| true`-mask it (that swallowed startup/config/mount
+# errors and made a broken run look successful). `|| harness_rc=$?` neutralises `set -e` for this one
+# command while preserving the real exit code for the validity check below.
+#
+# --skip-teardown: the harness writes the EARL/HTML report BEFORE its recursive-DELETE teardown, which
+# hangs against this server (the published-harness teardown bug — prod-solid-server decisions/0007). The
+# in-memory store is discarded with the server on EXIT, so per-resource teardown is dead time.
+harness_rc=0
 docker run -i --rm \
   --network host \
   -e ALLOW_SELF_SIGNED_CERTS=true \
@@ -106,11 +130,33 @@ docker run -i --rm \
   "$IMAGE" \
   --output /reports \
   --target solid-server-rs \
-  --skip-teardown || true
+  --skip-teardown || harness_rc=$?
 
-# --skip-teardown: the harness writes the EARL/HTML report BEFORE its recursive-DELETE teardown, which
-# hangs against this server (the published-harness teardown bug — prod-solid-server decisions/0007). The
-# in-memory store is discarded with the server on EXIT, so per-resource teardown is dead time. `|| true`
-# lets a non-zero harness exit (failing scenarios) still surface the report.
+# --- validate the result --------------------------------------------------------------------------
+# A run is only valid if a FRESH EARL report was produced by THIS invocation: report.ttl must exist
+# AND be newer than the run-start marker written just before boot. If the report is missing or stale,
+# the run is untrustworthy regardless of the harness exit code.
+fresh_report=false
+if [ -f "$EARL_REPORT" ] && [ "$EARL_REPORT" -nt "$RUN_MARKER" ]; then
+  fresh_report=true
+fi
 
-echo ">> Reports in $REPORTS (report.html / report.ttl EARL / report.txt summary). Server log: $REPORTS/server.log"
+if [ "$fresh_report" != true ]; then
+  echo "ERROR: no FRESH EARL report at $EARL_REPORT (harness exit code: ${harness_rc})." >&2
+  echo "       The harness did not produce a report for this run — treat the result as INVALID." >&2
+  echo "       Server log: $REPORTS/server.log" >&2
+  exit 1
+fi
+
+# Parse the per-test outcomes from the EARL report (`earl:outcome earl:passed|failed|...`).
+count_outcome() { grep -cE "earl:outcome[[:space:]]+earl:$1\b" "$EARL_REPORT" || true; }
+passed=$(count_outcome passed)
+failed=$(count_outcome failed)
+untested=$(count_outcome untested)
+inapplicable=$(count_outcome inapplicable)
+total=$((passed + failed + untested + inapplicable))
+
+# A non-zero harness exit WITH a fresh report is a REAL result (the CTH exits non-zero when scenarios
+# fail) — tolerate it and report the score. A zero exit is a clean pass.
+echo ">> Reports in $REPORTS (report.html / report.ttl EARL). Server log: $REPORTS/server.log"
+echo ">> CONFORMANCE RESULT: passed=${passed} failed=${failed} untested=${untested} inapplicable=${inapplicable} total=${total} (harness exit code: ${harness_rc})"
