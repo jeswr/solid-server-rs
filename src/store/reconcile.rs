@@ -398,15 +398,15 @@ pub async fn reconcile_orphans<S: SparqClient + ?Sized, B: BlobStore + ?Sized>(
             }
         }
 
-        if opts.dry_run {
-            // Deletable (versioned OR versionless), but a dry run touches nothing — counted under
-            // `would_delete`, not `deleted`, so the partition holds in both modes and the operator sees
-            // what a real run would reclaim.
-            report.would_delete += 1;
-            continue;
-        }
-
-        match witness {
+        // SECOND-PASS ELIGIBILITY — the SINGLE deletion decision both modes consult. This resolves the
+        // witness against the fresh stat and yields EITHER "this candidate is not deletable, count it
+        // `skipped_revalidated`" OR "this candidate IS deletable, here is the delete plan". Dry-run and
+        // real-run MUST agree on this decision — a dry run has to count a candidate as `would_delete` IFF a
+        // real run would actually delete it (and `skipped_revalidated` in exactly the same cases). Routing
+        // both branches through ONE predicate is what makes dry-run a faithful prediction of real-run (the
+        // Medium fix): the previous code incremented `would_delete` BEFORE the versioned
+        // generation-revalidation, so a dry run OVER-reported a same-timestamp rewrite that a real run skips.
+        let plan = match witness {
             // FINDING 1 (the HIGH fix): the CAS-delete WITNESS is the SNAPSHOT (`list()`-time) `generation`,
             // and the fresh stat's generation MUST EQUAL it before we delete. The witness is a true,
             // strictly-increasing write version (NOT `last_modified`: a same-tick / clock-rolled-back
@@ -417,38 +417,18 @@ pub async fn reconcile_orphans<S: SparqClient + ?Sized, B: BlobStore + ?Sized>(
             // recreate its OWN generation as the witness ⇒ the CAS would match and clobber the live rewrite.
             // Requiring fresh == snapshot (and a fresh stat that has BECOME version-less fails closed) means
             // a rewrite at ANY point — list→stat (caught HERE by the mismatch) OR stat→delete (caught by the
-            // atomic CAS below) — skips.
-            CandidateWitness::Versioned(snapshot_gen) => {
-                let fresh_gen = match current.generation {
-                    Some(g) => g,
-                    None => {
-                        report.skipped_revalidated += 1;
-                        continue;
-                    }
-                };
-                if fresh_gen != snapshot_gen {
-                    // The bytes were rewritten between `list()` (snapshot) and this fresh `stat()` — the
-                    // generation moved even if the `last_modified` did not. KEEP (a live rewrite must not
-                    // be GC'd).
-                    report.skipped_revalidated += 1;
-                    continue;
-                }
-                // Confirmed: fresh == snapshot. Reclaim via an ATOMIC compare-and-delete on the SNAPSHOT
-                // generation. `delete_if_unchanged` removes the key ONLY while its current `generation`
-                // still equals the witness, with the compare + remove in ONE critical section. This CLOSES
-                // the residual stat→delete TOCTOU (Finding 1) AND is clock-independent (the HIGH fix): a
-                // recreate that rewrites the bytes after our fresh stat bumps the generation — even in the
-                // same `SystemTime` tick — so the CAS sees the mismatch and returns `false` (recorded
-                // `skipped_revalidated`, NOT deleted). A genuine backend failure is recorded under
-                // `delete_errors` and the sweep CONTINUES (one bad key never aborts the whole GC).
-                match blob.delete_if_unchanged(&key, snapshot_gen).await {
-                    Ok(true) => report.deleted += 1,
-                    // The generation changed between the fresh stat and the CAS (a rewrite landed) ⇒ the
-                    // CAS refused to delete. Not an orphan any more — record as revalidated, no clobber.
-                    Ok(false) => report.skipped_revalidated += 1,
-                    Err(_) => report.delete_errors += 1,
-                }
-            }
+            // atomic CAS below) — skips. This generation-revalidation is part of the SHARED eligibility, so
+            // a dry run skips the same rewritten candidate a real run does (it is NOT counted `would_delete`).
+            CandidateWitness::Versioned(snapshot_gen) => match current.generation {
+                None => DeletePlan::SkipRevalidated,
+                // The bytes were rewritten between `list()` (snapshot) and this fresh `stat()` — the
+                // generation moved even if the `last_modified` did not. KEEP (a live rewrite must not
+                // be GC'd).
+                Some(fresh_gen) if fresh_gen != snapshot_gen => DeletePlan::SkipRevalidated,
+                // Confirmed: fresh == snapshot ⇒ eligible to reclaim via the atomic CAS on the SNAPSHOT
+                // generation.
+                Some(_) => DeletePlan::DeleteCas(snapshot_gen),
+            },
             // FINDING 2 (the versionless-orphan GC): a candidate whose backend has NO native write version
             // cannot do a CAS — but UNIQUE-PER-WRITE keys make an unconditional delete SAFE: a later
             // recreate of the same IRI mints a DIFFERENT key, so this orphan's key can never be the live
@@ -460,15 +440,78 @@ pub async fn reconcile_orphans<S: SparqClient + ?Sized, B: BlobStore + ?Sized>(
             // started reporting generations between snapshot and now), we conservatively fall back to the
             // unconditional delete keyed on the same safety net (unique keys) — the absence of a snapshot
             // witness means we cannot CAS, and the unique-key invariant already guarantees the bytes are
-            // not live. A backend delete failure is recorded and the sweep CONTINUES.
-            CandidateWitness::Versionless => match blob.delete(&key).await {
+            // not live. A versionless candidate is ALWAYS eligible here (it has passed every guard), so a
+            // dry run faithfully counts it `would_delete`.
+            CandidateWitness::Versionless => DeletePlan::DeleteUnconditional,
+        };
+
+        // A candidate the shared eligibility refused (rewritten / version-mismatch) is revalidated in BOTH
+        // modes — never counted as deletable.
+        let plan = match plan {
+            DeletePlan::SkipRevalidated => {
+                report.skipped_revalidated += 1;
+                continue;
+            }
+            deletable => deletable,
+        };
+
+        if opts.dry_run {
+            // Deletable (versioned OR versionless), but a dry run touches nothing — counted under
+            // `would_delete`, not `deleted`, so the partition holds in both modes and the operator sees
+            // what a real run would reclaim. Because we reached here only via the SAME eligibility decision
+            // the real run uses, `would_delete` counts EXACTLY the candidates a real run would `delete`.
+            report.would_delete += 1;
+            continue;
+        }
+
+        match plan {
+            // The atomic compare-and-delete on the SNAPSHOT generation. `delete_if_unchanged` removes the
+            // key ONLY while its current `generation` still equals the witness, with the compare + remove in
+            // ONE critical section. This CLOSES the residual stat→delete TOCTOU (Finding 1) AND is
+            // clock-independent (the HIGH fix): a recreate that rewrites the bytes after our fresh stat bumps
+            // the generation — even in the same `SystemTime` tick — so the CAS sees the mismatch and returns
+            // `false` (recorded `skipped_revalidated`, NOT deleted). A genuine backend failure is recorded
+            // under `delete_errors` and the sweep CONTINUES (one bad key never aborts the whole GC).
+            DeletePlan::DeleteCas(snapshot_gen) => {
+                match blob.delete_if_unchanged(&key, snapshot_gen).await {
+                    Ok(true) => report.deleted += 1,
+                    // The generation changed between the fresh stat and the CAS (a rewrite landed) ⇒ the
+                    // CAS refused to delete. Not an orphan any more — record as revalidated, no clobber.
+                    Ok(false) => report.skipped_revalidated += 1,
+                    Err(_) => report.delete_errors += 1,
+                }
+            }
+            // The versionless unconditional-delete path (safe under unique-per-write keys). A backend delete
+            // failure is recorded and the sweep CONTINUES.
+            DeletePlan::DeleteUnconditional => match blob.delete(&key).await {
                 Ok(()) => report.deleted += 1,
                 Err(_) => report.delete_errors += 1,
             },
+            // Unreachable: SkipRevalidated `continue`d above.
+            DeletePlan::SkipRevalidated => {
+                unreachable!("revalidated candidates were already skipped")
+            }
         }
     }
 
     Ok(report)
+}
+
+/// The SHARED second-pass eligibility outcome — the SINGLE "would this candidate be deleted?" decision
+/// that both the dry-run and real-run branches consult, so a dry run counts a candidate as `would_delete`
+/// IFF a real run would actually `delete` it (and `skipped_revalidated` in exactly the same cases). It
+/// resolves the witness against the fresh stat ONCE; the dry-run branch then only increments a counter and
+/// the real-run branch only performs the delete (CAS or unconditional) — neither re-decides eligibility, so
+/// they can never diverge (the Medium fix).
+enum DeletePlan {
+    /// Not deletable — revalidated since the snapshot (a versioned candidate whose fresh generation no
+    /// longer matches the snapshot, OR a fresh stat that became version-less). Counted `skipped_revalidated`
+    /// in BOTH modes.
+    SkipRevalidated,
+    /// Eligible — reclaim via the ATOMIC compare-and-delete on the carried SNAPSHOT generation.
+    DeleteCas(u64),
+    /// Eligible — reclaim via the unconditional delete (a versionless candidate, safe under unique keys).
+    DeleteUnconditional,
 }
 
 /// The delete witness threaded END-TO-END for a delete candidate (FINDING 1 + FINDING 2). Fixed at the
@@ -968,6 +1011,62 @@ mod tests {
             "a candidate rewritten between list() and the fresh stat() (same last_modified, new \
              generation) must NOT be GC'd — the CAS witness is the SNAPSHOT generation (the HIGH fix)"
         );
+    }
+
+    #[tokio::test]
+    async fn dry_run_does_not_count_a_versioned_rewrite_as_would_delete() {
+        // THE MEDIUM FIX regression: dry-run must PREDICT real-run. A VERSIONED candidate old-enough at the
+        // snapshot (generation 1) but rewritten between `list()` and the fresh `stat()` to the SAME
+        // `last_modified` with a BUMPED generation (2) is a same-timestamp rewrite a REAL run skips
+        // (`skipped_revalidated`, via the snapshot≠fresh generation mismatch). A DRY run must therefore NOT
+        // count it under `would_delete` — it must reach the SAME `skipped_revalidated` disposition.
+        //
+        // MUTATION-CHECK (the exact Medium bug): increment `would_delete` BEFORE the versioned
+        // generation-revalidation (the pre-fix order) and this candidate is counted `would_delete = 1` /
+        // `skipped_revalidated = 0` — OVER-reporting what a real run would reclaim. Routing both modes
+        // through the shared eligibility makes the dry run agree with the real run, so this asserts
+        // `would_delete == 0` and `skipped_revalidated == 1`, matching the real-run counterpart
+        // (`candidate_rewritten_between_list_and_stat_same_timestamp_new_generation_is_kept`).
+        let sparq = InMemorySparqClient::new();
+        let same_stamp = ago(3600);
+        let blob =
+            SnapshotGenerationRewriteBlobStore::new("dry-rewritten-list-to-stat", same_stamp);
+
+        let dry = ReconcileOptions {
+            grace: Duration::from_secs(60),
+            dry_run: true,
+        };
+        let report = reconcile_orphans(&sparq, &blob, &dry).await.unwrap();
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.orphaned, 1);
+        // The shared eligibility refuses the rewritten candidate ⇒ revalidated, NOT a would-delete — EXACTLY
+        // as a real run skips it (matching the real-run test).
+        assert_eq!(
+            report.skipped_revalidated, 1,
+            "a dry run must skip a versioned same-timestamp rewrite, like a real run"
+        );
+        assert_eq!(
+            report.would_delete, 0,
+            "dry-run must NOT over-report a rewrite a real run would skip (the Medium fix)"
+        );
+        assert_eq!(report.deleted, 0, "dry run deletes nothing");
+        // The CAS is never reached (the snapshot≠fresh mismatch is caught first) and nothing is removed.
+        assert!(
+            !blob.cas_called(),
+            "the generation mismatch must skip before any CAS, in dry-run too"
+        );
+        assert!(!blob.removed(), "dry run must touch nothing");
+        // The partition holds in dry-run mode.
+        assert_eq!(
+            report.deleted
+                + report.would_delete
+                + report.too_young
+                + report.skipped_unknown_age
+                + report.skipped_revalidated
+                + report.delete_errors,
+            report.orphaned
+        );
+        assert_eq!(report.referenced + report.orphaned, report.scanned);
     }
 
     #[tokio::test]
