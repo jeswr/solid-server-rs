@@ -1776,7 +1776,7 @@ dependencies = [
 [[package]]
 name = "solid-oidc-verifier"
 version = "0.1.0"
-source = "git+https://github.com/jeswr/solid-oidc-verifier?rev=6f1b91cf267984ca344af6366684f42803f15472#6f1b91cf267984ca344af6366684f42803f15472"
+source = "git+https://github.com/jeswr/solid-oidc-verifier?rev=836899dfea0b06d03b689d71e70d2e078be5224d#836899dfea0b06d03b689d71e70d2e078be5224d"
 dependencies = [
  "base64",
  "hickory-resolver",
