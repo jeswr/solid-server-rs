@@ -34,15 +34,23 @@ const CA_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test-
 /// no `dangerous` cert-verification bypass), so a successful handshake proves the server presented a
 /// CA-chained, SAN-valid leaf for `localhost`.
 fn client_config() -> ClientConfig {
+    client_config_with_alpn(&[])
+}
+
+/// As [`client_config`], but advertising `alpn` in the client's ALPN list — so a test can offer `h2`
+/// (and observe the server negotiate it) or offer only `http/1.1` (and observe the fallback).
+fn client_config_with_alpn(alpn: &[&[u8]]) -> ClientConfig {
     let pem = std::fs::read(CA_PATH).expect("read fixture CA");
     let mut roots = RootCertStore::empty();
     for cert in certs(&mut pem.as_slice()) {
         let cert: CertificateDer<'_> = cert.expect("parse fixture CA");
         roots.add(cert).expect("add fixture CA to roots");
     }
-    ClientConfig::builder()
+    let mut cfg = ClientConfig::builder()
         .with_root_certificates(roots)
-        .with_no_client_auth()
+        .with_no_client_auth();
+    cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    cfg
 }
 
 #[tokio::test]
@@ -223,4 +231,134 @@ async fn tls_graceful_shutdown_drains_via_handle() {
         .expect("server did not shut down within timeout — graceful_shutdown not wired")
         .expect("server task panicked");
     result.expect("serve returned an error");
+}
+
+/// HTTP/2-over-ALPN negotiation, `#[ignore]`d (fixture cert + real socket I/O). Boots the server over
+/// the EXACT serve construction the binary uses (`from_tcp_rustls(..).handle(..).serve(..)`, whose
+/// `auto::Builder` serves whatever ALPN selected), then:
+///   (1) an `h2`-capable client (offers `[h2, http/1.1]`) MUST negotiate `h2`;
+///   (2) an HTTP/1.1-only client (offers `[http/1.1]`) MUST negotiate `http/1.1` and still get a
+///       working response — proving h2 is ADDITIVE (an old client is never broken, it negotiates down).
+/// Together these pin the transport contract: h2 when offered, h1 fallback always.
+#[tokio::test]
+#[ignore = "needs the fixture test cert + real socket I/O; run with --ignored"]
+async fn alpn_negotiates_h2_when_offered_and_h1_fallback() {
+    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let mode = TlsMode::Tls {
+        cert_path: CERT_PATH.into(),
+        key_path: KEY_PATH.into(),
+    };
+    let rustls_config = build_rustls_config(&mode)
+        .await
+        .expect("build rustls config")
+        .expect("TLS mode yields a config");
+
+    // Sanity: the server's advertised ALPN is exactly [h2, http/1.1] (the owned contract).
+    assert_eq!(
+        rustls_config.get_inner().alpn_protocols,
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        "server config must advertise [h2, http/1.1]"
+    );
+
+    let app = Router::new().route("/healthz", get(|| async { "ok" }));
+
+    let tokio_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = tokio_listener.local_addr().expect("local addr");
+    let std_listener = tokio_listener.into_std().expect("into_std");
+    std_listener.set_nonblocking(true).expect("set_nonblocking");
+    let handle = axum_server::Handle::new();
+    let server_handle = handle.clone();
+    let server_task = tokio::spawn(async move {
+        let _ = axum_server::from_tcp_rustls(std_listener, rustls_config)
+            .expect("from_tcp_rustls")
+            .handle(server_handle)
+            .serve(app.into_make_service())
+            .await;
+    });
+
+    // (1a) h2-capable client → MUST negotiate h2 at the TLS handshake layer.
+    let negotiated = negotiated_alpn(addr, &[b"h2", b"http/1.1"]).await;
+    assert_eq!(
+        negotiated.as_deref(),
+        Some(&b"h2"[..]),
+        "an h2-capable client must negotiate h2 (got {negotiated:?})"
+    );
+
+    // (1b) ...and the server must actually SERVE an HTTP/2 request over it: drive a real GET /healthz
+    // with an h2-preferring reqwest client (trusting only the fixture CA) and assert the RESPONSE is
+    // HTTP/2 + 200/ok. (ALPN advertising h2 but the server failing to serve h2 would pass (1a) but
+    // fail here — that is exactly the gap this drive closes.)
+    let url = format!("https://localhost:{}/healthz", addr.port());
+    let h2_client = reqwest_client(/* http1_only = */ false);
+    let resp = h2_client.get(&url).send().await.expect("h2 GET /healthz");
+    assert_eq!(
+        resp.version(),
+        reqwest::Version::HTTP_2,
+        "the response must be served over HTTP/2 (not just negotiated)"
+    );
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(resp.text().await.expect("body"), "ok");
+
+    // (2a) h1-only client → MUST negotiate http/1.1 at the handshake layer (the additive guarantee).
+    let negotiated = negotiated_alpn(addr, &[b"http/1.1"]).await;
+    assert_eq!(
+        negotiated.as_deref(),
+        Some(&b"http/1.1"[..]),
+        "an http/1.1-only client must negotiate http/1.1 (got {negotiated:?})"
+    );
+
+    // (2b) ...and an HTTP/1.1-only client must get a WORKING HTTP/1.1 response — proving the h1
+    // fallback path actually serves, so an old client is never broken by adding h2.
+    let h1_client = reqwest_client(/* http1_only = */ true);
+    let resp = h1_client.get(&url).send().await.expect("h1 GET /healthz");
+    assert_eq!(
+        resp.version(),
+        reqwest::Version::HTTP_11,
+        "an http/1.1-only client must be served over HTTP/1.1"
+    );
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(resp.text().await.expect("body"), "ok");
+
+    handle.graceful_shutdown(Some(std::time::Duration::from_secs(1)));
+    server_task.abort();
+}
+
+/// A `reqwest` client trusting ONLY the fixture CA (no system roots), resolving `localhost` to the
+/// loopback test server. With `http1_only=false` it offers h2 via ALPN (so it negotiates + uses h2
+/// when the server offers it); with `http1_only=true` it offers only http/1.1 (the fallback path).
+fn reqwest_client(http1_only: bool) -> reqwest::Client {
+    let ca_pem = std::fs::read(CA_PATH).expect("read fixture CA");
+    let ca = reqwest::Certificate::from_pem(&ca_pem).expect("parse fixture CA");
+    let mut builder = reqwest::Client::builder()
+        .add_root_certificate(ca)
+        .use_rustls_tls();
+    if http1_only {
+        builder = builder.http1_only();
+    }
+    builder.build().expect("build reqwest client")
+}
+
+/// Complete a TLS handshake offering `offer` as the client ALPN list and return the protocol the
+/// server selected (`None` if no ALPN was negotiated). Retries the TCP connect briefly to avoid
+/// racing the server bind; a handshake failure on a CONNECTED socket is surfaced (a real error).
+async fn negotiated_alpn(addr: std::net::SocketAddr, offer: &[&[u8]]) -> Option<Vec<u8>> {
+    let connector = TlsConnector::from(Arc::new(client_config_with_alpn(offer)));
+    let dns_name = ServerName::try_from("localhost").expect("server name");
+    for _ in 0..50 {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(tcp) => {
+                let stream = connector
+                    .connect(dns_name.clone(), tcp)
+                    .await
+                    .expect("TLS handshake on a connected socket");
+                let (_io, conn) = stream.get_ref();
+                return conn.alpn_protocol().map(|p| p.to_vec());
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+        }
+    }
+    panic!("could not connect to the server to negotiate ALPN");
 }

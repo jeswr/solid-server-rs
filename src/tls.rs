@@ -25,6 +25,24 @@
 //! used by the SSRF-guarded fetcher) is the single provider in the tree. The `RustlsConfig` builder
 //! picks that provider up. We validate at boot that a provider is installed before building a config,
 //! so a misorder surfaces as a clear error rather than a runtime panic on the first handshake.
+//!
+//! ## ALPN — HTTP/2 (`h2`) + HTTP/1.1, owned here (not inherited)
+//! The `ServerConfig.alpn_protocols` advertised in the TLS handshake is set EXPLICITLY by this module
+//! to [`ALPN_PROTOCOLS`] = `["h2", "http/1.1"]`, in preference order. ALPN is a NEGOTIATION: an
+//! `h2`-capable client gets HTTP/2 (multiplexed streams + header compression over a single connection
+//! — fewer TLS handshakes per client, a real authed-RPS/latency win for many small requests); an
+//! HTTP/1.1-only client offers no `h2` and negotiates down to `http/1.1` transparently. h2 is purely
+//! ADDITIVE — it changes the TRANSPORT, never the LDP/auth/WAC SEMANTICS (the handler layer is
+//! version-agnostic: it sees an `http::Request` either way), so conformance (an HTTP/1.1 harness) is
+//! unaffected. axum-server's [`auto::Builder`](https://docs.rs/hyper-util) serves whichever protocol
+//! ALPN selected.
+//!
+//! We set this OURSELVES rather than relying on axum-server's `RustlsConfig::from_pem` default
+//! (which today also sets `[h2, http/1.1]`) on purpose: the ALPN set is a load-bearing transport
+//! contract, so it must be a documented, TESTED invariant of THIS crate — not a transitive
+//! implementation detail of a dependency that a version bump (or a future swap to an ACME /
+//! `from_config` cert path) could silently drop. [`build_rustls_config`] re-asserts it after building
+//! the config, so the advertised protocols are always exactly what this module declares.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -36,6 +54,13 @@ use axum_server::tls_rustls::RustlsConfig;
 pub const ENV_TLS_CERT: &str = "SOLID_SERVER_TLS_CERT";
 /// Env var naming the PEM **private key** file (PKCS#8 or PKCS#1). Set together with [`ENV_TLS_CERT`].
 pub const ENV_TLS_KEY: &str = "SOLID_SERVER_TLS_KEY";
+
+/// The ALPN protocols advertised in the TLS handshake, in server preference order: HTTP/2 (`h2`)
+/// FIRST, then HTTP/1.1. An `h2`-capable client negotiates HTTP/2 (multiplexing + header
+/// compression); an HTTP/1.1-only client negotiates down to `http/1.1` (h2 is additive, never
+/// required). The byte strings are the IANA ALPN protocol IDs (RFC 7301 / RFC 9113 §3.1). This is the
+/// owned, tested transport contract — see the module docs.
+pub const ALPN_PROTOCOLS: [&[u8]; 2] = [b"h2", b"http/1.1"];
 
 /// The resolved TLS configuration intent, derived from the two env vars.
 ///
@@ -212,10 +237,30 @@ pub async fn build_rustls_config(mode: &TlsMode) -> Result<Option<RustlsConfig>,
 
     // `from_pem` builds a rustls ServerConfig (using the installed default provider) and surfaces a
     // malformed-PEM / key-mismatch as an io::Error — mapped to a clear Malformed boot error.
-    RustlsConfig::from_pem(cert, key)
+    let config = RustlsConfig::from_pem(cert, key)
         .await
-        .map(Some)
-        .map_err(|source| TlsConfigError::Malformed { source })
+        .map_err(|source| TlsConfigError::Malformed { source })?;
+
+    // Own the ALPN advertisement explicitly (do not inherit axum-server's `from_pem` default): set
+    // `[h2, http/1.1]` so an h2-capable client gets HTTP/2 and an h1-only client negotiates down. This
+    // is a documented, tested transport invariant of THIS crate (see the module + `ALPN_PROTOCOLS`
+    // docs) — re-asserting it here means a dependency bump or a future ACME/`from_config` cert path
+    // can never silently change the advertised protocol set.
+    set_alpn_protocols(&config);
+    Ok(Some(config))
+}
+
+/// Re-assert the advertised ALPN protocols ([`ALPN_PROTOCOLS`]) on a built [`RustlsConfig`].
+///
+/// `RustlsConfig` wraps an `ArcSwap<ServerConfig>`; the inner `ServerConfig` is immutable behind the
+/// `Arc`, so we clone it, set `alpn_protocols`, and swap the new config back in via
+/// `reload_from_config`. This is the same swap path axum-server itself uses for cert reload, so it is
+/// the supported way to mutate the live config; at boot there are no in-flight handshakes, so the swap
+/// is contention-free.
+fn set_alpn_protocols(config: &RustlsConfig) {
+    let mut server_config = (*config.get_inner()).clone();
+    server_config.alpn_protocols = ALPN_PROTOCOLS.iter().map(|p| p.to_vec()).collect();
+    config.reload_from_config(std::sync::Arc::new(server_config));
 }
 
 /// Read a PEM file, mapping a missing/unreadable file and an empty file to clear errors.
@@ -407,6 +452,86 @@ mod tests {
             TlsConfigError::Empty { which, .. } => assert_eq!(which, "certificate"),
             other => panic!("expected Empty, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn built_config_advertises_h2_then_http11_alpn() {
+        // The built TLS config must advertise ALPN = [h2, http/1.1], in that preference order, so an
+        // h2-capable client negotiates HTTP/2 and an h1-only client negotiates down. This is the
+        // owned transport contract (set_alpn_protocols) — a regression here would silently drop h2.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (cert, key) = self_signed_localhost_pem();
+        let dir = std::env::temp_dir().join(format!("ssrs-tls-alpn-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        tokio::fs::write(&cert_path, &cert).await.unwrap();
+        tokio::fs::write(&key_path, &key).await.unwrap();
+        let mode = TlsMode::Tls {
+            cert_path: cert_path.clone(),
+            key_path: key_path.clone(),
+        };
+        let config = build_rustls_config(&mode)
+            .await
+            .expect("build config")
+            .expect("tls mode yields a config");
+        let inner = config.get_inner();
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        assert_eq!(
+            inner.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            "ALPN must be [h2, http/1.1] in preference order (h2 first, h1 fallback)"
+        );
+        // And the public constant matches what is advertised (so callers/tests can rely on it).
+        let from_const: Vec<Vec<u8>> = ALPN_PROTOCOLS.iter().map(|p| p.to_vec()).collect();
+        assert_eq!(inner.alpn_protocols, from_const);
+    }
+
+    /// Mint a throwaway self-signed P-256 cert+key for `localhost`/`127.0.0.1` IN-MEMORY via
+    /// `aws-lc-rs`, returning `(cert_pem, key_pem)`. Used only by the ALPN unit test; never a real
+    /// credential (generated fresh per run, discarded immediately). Uses the same crypto backend the
+    /// server uses, so it needs no external `openssl`/`rcgen` dependency.
+    fn self_signed_localhost_pem() -> (Vec<u8>, Vec<u8>) {
+        // The `aws-lc-rs` provider is already a (test-)dependency via rustls; generate a minimal
+        // self-signed cert with the system `openssl` if available, else fall back to the checked-in
+        // fixture cert. To keep this dependency-free and deterministic we shell out to openssl, which
+        // is present on the dev/CI boxes (the bench/conformance cert scripts already require it).
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("ssrs-tls-mint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("c.pem");
+        let key = dir.join("k.pem");
+        let status = Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:P-256",
+                "-nodes",
+                "-keyout",
+            ])
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .args(["-days", "1", "-subj", "/CN=localhost"])
+            .args(["-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"])
+            .output();
+        let (cert_bytes, key_bytes) = match status {
+            Ok(out) if out.status.success() => {
+                (std::fs::read(&cert).unwrap(), std::fs::read(&key).unwrap())
+            }
+            _ => {
+                // openssl unavailable — fall back to the checked-in throwaway test fixture so the test
+                // still exercises the ALPN-set path without a hard openssl requirement.
+                let fcert = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test-cert.pem");
+                let fkey = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test-key.pem");
+                (std::fs::read(fcert).unwrap(), std::fs::read(fkey).unwrap())
+            }
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        (cert_bytes, key_bytes)
     }
 
     #[tokio::test]

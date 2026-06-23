@@ -132,9 +132,12 @@ futures-util = "0.3"
 # (`examples/auth_load.rs`). reqwest is ALREADY in the resolved tree (the verifier's `network` feature
 # pulls it in for OIDC/JWKS/WebID fetches with `rustls-tls`), so naming these features here adds NO new
 # crate — `rustls-tls` is already resolved. `rustls-tls` is required so the auth load client can speak
-# HTTPS to the bench server's self-signed localhost listener; `json` for the WS test. Used ONLY in
+# HTTPS to the bench server's self-signed localhost listener; `json` for the WS test. `http2` lets the
+# ALPN test (`tests/tls_handshake.rs`) drive a REAL HTTP/2 request and assert the response is served
+# over h2 (not just negotiated) — it only enables already-resolved deps (`h2`, `hyper/http2`,
+# `hyper-util/http2` are all in the tree via axum-server), so it adds NO new crate. Used ONLY in
 # default-`#[ignore]`d tests + the auth-load example (never the server binary).
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
 
 [features]
 default = []

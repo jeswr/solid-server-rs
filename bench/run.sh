@@ -3,10 +3,12 @@
 # Reproducible HTTPS load benchmark for the EXPERIMENTAL Rust solid-server-rs.
 #
 # Boots solid-server-rs with the IN-MEMORY store doubles (CompositeStore over InMemorySparqClient +
-# InMemoryBlobStore — NO S3, NO live SPARQ) terminating TLS in-process (rustls/aws-lc-rs, HTTP/1.1
-# only — no h2 ALPN), seeded with the BENCHMARK fixtures (SOLID_SERVER_SEED_BENCH=N): a public RDF
-# document, a public listing container with N children, and an owner-private document. It then drives
-# `oha` (an HTTP/1.1 load generator) through a concurrency sweep against:
+# InMemoryBlobStore — NO S3, NO live SPARQ) terminating TLS in-process (rustls/aws-lc-rs; ALPN
+# advertises [h2, http/1.1] so an h2-capable client gets HTTP/2 and an h1-only client negotiates
+# down), seeded with the BENCHMARK fixtures (SOLID_SERVER_SEED_BENCH=N): a public RDF document, a
+# public listing container with N children, and an owner-private document. It then drives `oha`
+# (HTTP/1.1 by default; set BENCH_HTTP2=1 to drive HTTP/2 via `oha --http2`, measuring the
+# multiplexing effect) through a concurrency sweep against:
 #   (a) GET a public document       — the TLS/pipeline ceiling (no auth, no RDF render);
 #   (b) GET the listing container    — the RDF membership render path;
 # and records max sustained RPS + p50/p99/p999 latency per concurrency level into bench/results/.
@@ -44,6 +46,12 @@ DURATION="${BENCH_DURATION:-10s}"             # oha -z per concurrency level (be
 WARMUP_DURATION="${BENCH_WARMUP:-3s}"         # discarded warm-up before the measured sweep
 # The concurrency sweep. Override with a space-separated list, e.g. BENCH_CONCURRENCY="1 16 64".
 CONCURRENCY="${BENCH_CONCURRENCY:-1 8 16 32 64 128 256 512}"
+# Drive HTTP/2 (oha --http2, multiplexing streams over one connection) when BENCH_HTTP2=1; default is
+# HTTP/1.1. The server advertises both via ALPN, so the SAME server/binary serves either — set this to
+# measure the h2 multiplexing effect against the h1 baseline on the same box/run.
+HTTP2="${BENCH_HTTP2:-0}"
+OHA_PROTO_FLAG=""
+case "$HTTP2" in 1|true|TRUE|True) OHA_PROTO_FLAG="--http2" ;; esac
 SERVER_BIN="${SERVER_BIN:-$REPO/target/release/solid-server-rs}"
 CERT="$HERE/tls/server-cert.pem"
 KEY="$HERE/tls/server-key.pem"
@@ -138,17 +146,19 @@ run_scenario() {  # $1=scenario-name $2=url
   echo ""
   echo ">> Scenario ($name): $url"
   # One warm-up at mid concurrency (discarded) to prime keep-alive connections + caches.
-  oha --no-tui --insecure --output-format quiet -c 16 -z "$WARMUP_DURATION" "$url" >/dev/null 2>&1 || true
+  oha --no-tui --insecure $OHA_PROTO_FLAG --output-format quiet -c 16 -z "$WARMUP_DURATION" "$url" >/dev/null 2>&1 || true
   for c in $CONCURRENCY; do
     local jf="$RESULTS/${name}-c${c}.json"
     # Cap requests-in-flight at the concurrency; -z drives by duration (best sustained over the window).
-    oha --no-tui --insecure --output-format json -c "$c" -z "$DURATION" "$url" > "$jf" 2>/dev/null
+    # $OHA_PROTO_FLAG is empty (HTTP/1.1) by default, or `--http2` when BENCH_HTTP2=1.
+    oha --no-tui --insecure $OHA_PROTO_FLAG --output-format json -c "$c" -z "$DURATION" "$url" > "$jf" 2>/dev/null
     parse_and_record "$name" "$c" "$jf"
   done
 }
 
 # Note the box: core count + model (for the BASELINE doc — these go in the doc by hand, not Date.now).
 echo ">> Machine: $(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m), cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo '?')"
+echo ">> Transport: $([ -n "$OHA_PROTO_FLAG" ] && echo 'HTTP/2 (oha --http2)' || echo 'HTTP/1.1')"
 
 run_scenario "public-doc" "$PUBLIC_DOC"
 run_scenario "listing"    "$LISTING"

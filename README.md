@@ -146,6 +146,15 @@ fast with a clear message. No auto-cert / ACME this slice (a future seam: an ACM
 produce the same in-memory rustls config, addable behind a third env var without reshaping the
 serve path); supply cert files yourself or front the server with a proxy that does ACME.
 
+The in-process TLS listener advertises **ALPN `[h2, http/1.1]`**: an HTTP/2-capable client negotiates
+**HTTP/2** (multiplexed streams + header compression over a single connection — fewer TLS handshakes
+per client, a real win for many small authenticated requests), and an HTTP/1.1-only client negotiates
+down to HTTP/1.1 transparently. HTTP/2 is purely additive — it changes the transport, not the
+LDP/auth/WAC semantics — so an old client is never broken. The ALPN set is owned + tested in
+[`src/tls.rs`](src/tls.rs) (`ALPN_PROTOCOLS`), not inherited from a dependency default. (When TLS is
+terminated at a reverse proxy instead, the proxy owns h2 to the client; the plain-HTTP listener
+behind it stays HTTP/1.1.)
+
 ### Horizontal scaling — the distributed Redis DPoP-`jti` replay store (opt-in)
 
 The default DPoP-`jti` replay store is **per-instance** (an in-memory set): correct for a single
