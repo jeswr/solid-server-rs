@@ -564,13 +564,21 @@ pub async fn post_handler<S: Store>(
     // CONTAINER — never `acl:Control`. Yet `sanitise_slug` keeps `.`, so a `Slug: secret.acl` would
     // mint `…/secret.acl`, which the WAC resolver then reads as the OWN ACL of `…/secret` (overriding
     // inheritance). That lets an Append-only caller author an ACL granting itself Control over a
-    // sibling resource — a full read + ACL-ownership bypass. A create of a `.acl`/`.meta` is a
-    // Control operation; the Append-only POST chokepoint MUST refuse it (a Control-gated PUT/PATCH of
-    // an `.acl` is the only legitimate path to author one). Reject rather than silently rename — a
+    // sibling resource — a full read + ACL-ownership bypass. A create of a `.acl` is a Control
+    // operation; the Append-only POST chokepoint MUST refuse it (a Control-gated PUT/PATCH of an
+    // `.acl` is the only legitimate path to author one). Reject rather than silently rename — a
     // silently-renamed `.acl` is surprising and could still confuse a client. The check is on the
     // MINTED IRI (covering Slug AND any generated-name edge) and is case-insensitive
-    // (`is_auxiliary_suffix`) so no case/suffix variant slips through.
-    if crate::authz::is_auxiliary_suffix(&child_iri) {
+    // (`is_acl_auxiliary_suffix`), mirroring the access-side `is_acl_resource`, so no case variant
+    // slips through.
+    //
+    // SCOPE: `.acl` ONLY. `.meta` description-resources are NOT load-bearing in this server (the WAC
+    // resolver never consults a `.meta`, and the PUT/PATCH create paths only special-case `.acl`), so
+    // a `secret.meta` minted here is just a normal resource — guarding it ONLY at POST while PUT/PATCH
+    // would create it freely is an inconsistency with no security benefit, so it is not guarded. If
+    // `.meta` (or any other auxiliary) ever becomes load-bearing it MUST be guarded UNIFORMLY across
+    // POST/PUT/PATCH/DELETE/read — not POST-only (see `is_acl_auxiliary_suffix`).
+    if crate::authz::is_acl_auxiliary_suffix(&child_iri) {
         return Err(ServerError::Forbidden);
     }
 
@@ -2344,27 +2352,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_slug_dot_meta_is_also_denied() {
-        // The guard also covers `.meta` (the conventional metadata auxiliary suffix) so the moment any
-        // metadata-auxiliary handling exists, an Append-only POST cannot plant a load-bearing `.meta`.
+    async fn post_slug_dot_meta_is_allowed_meta_is_not_load_bearing() {
+        // `.meta` is NOT load-bearing in this server: the WAC resolver never consults a `.meta`, and
+        // the create paths only special-case `.acl`. So `secret.meta` is just a normal resource name
+        // with no security effect — guarding it ONLY at POST (while a PUT/PATCH could create it freely)
+        // was an inconsistency with no benefit. An Append-only POST of `Slug: secret.meta` is therefore
+        // ALLOWED, exactly like any other benign append. (If `.meta` ever becomes load-bearing it must
+        // be guarded UNIFORMLY across POST/PUT/PATCH/DELETE/read — see `is_acl_auxiliary_suffix`.)
         let store = store_alice_container_bob_append_only().await;
         let state = Arc::new(LdpState::new(store, "https://pod.example"));
         let uri: axum::http::Uri = "/alice/c/".parse().unwrap();
-        let err = post_handler(
+        let resp = post_handler(
             State(state.clone()),
             Extension(bob_token()),
             uri,
             post_turtle_headers_with_slug("secret.meta"),
-            AxBytes::from("<https://pod.example/alice/c/secret> <p> <o> ."),
+            AxBytes::from("<https://pod.example/alice/c/secret> <http://p> <http://o> ."),
         )
         .await
-        .expect_err("a .meta slug must be denied at the mint chokepoint");
-        assert_eq!(err.status(), StatusCode::FORBIDDEN);
-        assert!(!state
+        .expect("a .meta slug is a normal resource name and must be allowed");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert!(state
             .store
             .exists("https://pod.example/alice/c/secret.meta")
             .await
             .unwrap());
+        // And it grants Bob NOTHING over the sibling `…/secret` — a `.meta` is not consulted by WAC,
+        // so `secret` stays Alice-private by inheritance.
+        let get_uri: axum::http::Uri = "/alice/c/secret".parse().unwrap();
+        let get_err = get_handler(
+            State(state),
+            Extension(bob_token()),
+            get_uri,
+            HeaderMap::new(),
+        )
+        .await
+        .expect_err("Bob must not be able to read Alice's private resource");
+        assert_eq!(get_err.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
