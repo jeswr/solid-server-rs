@@ -47,7 +47,13 @@ CLIENT_SECRET="${AUTH_CLIENT_SECRET:-conformance-alice-secret}"
 DURATION_SECS="${AUTH_DURATION_SECS:-10}"       # measured window per concurrency level
 WARMUP_SECS="${AUTH_WARMUP_SECS:-3}"            # discarded warm-up before each scenario
 CONCURRENCY="${AUTH_CONCURRENCY:-1 8 16 32 64 128 256 512}"
-LISTING_CHILDREN="${AUTH_LISTING_CHILDREN:-100}" # children PUT into the authed-listing container (scenario d)
+LISTING_CHILDREN="${AUTH_LISTING_CHILDREN:-100}" # owner-private children the CLIENT PUTs into the authed-listing container (scenario d)
+# The PUBLIC bench seed (SOLID_SERVER_SEED_BENCH) just needs to be ON so `/bench/public/doc` exists for
+# the anonymous comparison sweep — its child count is irrelevant (that sweep hits the doc, not the
+# listing). It is DECOUPLED from LISTING_CHILDREN (which seeds alice's PRIVATE listing via the client),
+# so AUTH_LISTING_CHILDREN=0 cannot disable the public doc + break the anon sweep (roborev Low). `1` ==
+# "bench seeding ON, default count" (see main.rs::bench_seed_count) — the count does not matter here.
+PUBLIC_BENCH_SEED="${AUTH_PUBLIC_BENCH_SEED:-1}"
 # DPoP replay-store capacity for the bench server. The PRODUCTION default is 100_000 live jtis within
 # the proof-age TTL window (~305s) — which a SUSTAINED high-RPS authed run fills in seconds, after
 # which the store CORRECTLY fails closed (rejecting further proofs). That is a real production
@@ -90,7 +96,7 @@ SOLID_SERVER_ALLOW_LOOPBACK=1 \
 SOLID_SERVER_BIDIRECTIONAL=off \
 SOLID_SERVER_TRUSTED_ISSUER="$ISSUER" \
 SOLID_SERVER_SEED_CONFORMANCE=1 \
-SOLID_SERVER_SEED_BENCH="$LISTING_CHILDREN" \
+SOLID_SERVER_SEED_BENCH="$PUBLIC_BENCH_SEED" \
 SOLID_SERVER_REPLAY_MAX_ENTRIES="$REPLAY_MAX_ENTRIES" \
 SOLID_SERVER_TLS_CERT="$CERT" \
 SOLID_SERVER_TLS_KEY="$KEY" \

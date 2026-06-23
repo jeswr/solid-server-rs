@@ -58,14 +58,16 @@ const ENV_ALLOW_LOOPBACK: &str = "SOLID_SERVER_ALLOW_LOOPBACK";
 const ENV_JWKS_CACHE_TTL_SECS: &str = "SOLID_SERVER_JWKS_CACHE_TTL_SECS";
 /// Bidirectional WebID↔issuer check mode: `strict` (default) / `warn` / `off`.
 const ENV_BIDIRECTIONAL: &str = "SOLID_SERVER_BIDIRECTIONAL";
-/// Dev/BENCHMARK ONLY: override the in-memory DPoP-replay-store capacity (live `jti`s). UNSET keeps
-/// the production default (100_000, `InMemoryReplayStore::with_window`) UNCHANGED — so conformance and
-/// the production posture are byte-identical without this var. It exists ONLY so the authenticated
-/// load benchmark can measure the steady-state token/DPoP-verify cost without the replay store
-/// reaching its fail-closed capacity mid-sweep (a sustained high-RPS authed run fills 100k unique
-/// jtis within the proof-age TTL window and then — correctly — rejects further proofs). This changes
-/// NO request-handling logic, only a capacity number; the fail-closed semantics are unchanged. NEVER
-/// raise it in production to dodge the cap — the cap is a real single-instance safety bound (the
+/// Dev/BENCHMARK ONLY: RAISE the in-memory DPoP-replay-store capacity (live `jti`s) above the
+/// production default. UNSET — or any value `<=` the default — keeps the production default (100_000,
+/// `InMemoryReplayStore::with_window`) UNCHANGED, so conformance and the production posture are
+/// byte-identical without this var, and a mis-set value can only ever RAISE the cap, never shrink it
+/// (a too-small cap would fail authenticated traffic closed sooner). It exists ONLY so the
+/// authenticated load benchmark can measure the steady-state token/DPoP-verify cost without the replay
+/// store reaching its fail-closed capacity mid-sweep (a sustained high-RPS authed run fills 100k
+/// unique jtis within the proof-age TTL window and then — correctly — rejects further proofs). This
+/// changes NO request-handling logic, only a capacity number; the fail-closed semantics are unchanged.
+/// NEVER raise it in production to dodge the cap — the cap is a real single-instance safety bound (the
 /// shared-Redis ReplayStore is the horizontal-scaling seam). See bench/AUTH-BASELINE.md.
 const ENV_REPLAY_MAX_ENTRIES: &str = "SOLID_SERVER_REPLAY_MAX_ENTRIES";
 /// Dev/conformance ONLY: when `1`/`true`, seed the in-memory store with the conformance test users'
@@ -132,14 +134,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The in-memory jti replay store fails CLOSED at capacity (single-instance posture). A shared
     // (Redis SET NX) ReplayStore is the horizontal-scaling seam. The capacity is the production
-    // default (100_000) UNLESS the dev/bench-only ENV_REPLAY_MAX_ENTRIES override is set — which exists
-    // solely so the auth benchmark can measure steady-state verify cost without the cap's fail-closed
-    // path firing mid-sweep (see the const's doc). Unset ⇒ byte-identical to before (conformance-neutral).
+    // default (REPLAY_PRODUCTION_DEFAULT) UNLESS the dev/bench-only ENV_REPLAY_MAX_ENTRIES override
+    // RAISES it (a value <= the default is ignored, so it can only ever raise — see the const's doc).
+    // The override exists solely so the auth benchmark can measure steady-state verify cost without the
+    // cap's fail-closed path firing mid-sweep. Unset ⇒ byte-identical to before (conformance-neutral).
     let replay = match parse_replay_max_entries(std::env::var(ENV_REPLAY_MAX_ENTRIES).ok()) {
         Some(max_entries) => {
             eprintln!(
-                "  DEV/BENCH: DPoP replay-store capacity overridden to {max_entries} live jtis \
-                 (production default is 100_000) — NEVER set this in production."
+                "  DEV/BENCH: DPoP replay-store capacity RAISED to {max_entries} live jtis \
+                 (production default is {REPLAY_PRODUCTION_DEFAULT}) — NEVER set this in production."
             );
             InMemoryReplayStore::new(max_entries, config.replay_ttl())
         }
@@ -303,16 +306,22 @@ fn bench_seed_count(key: &str) -> Option<usize> {
     Some(solid_server_rs::seed::BENCH_DEFAULT_CHILDREN)
 }
 
+/// The production DPoP-replay-store capacity (live `jti`s), matching `InMemoryReplayStore::with_window`
+/// (the verifier's TS-parity default). The bench override can only RAISE above this — never below.
+const REPLAY_PRODUCTION_DEFAULT: u64 = 100_000;
+
 /// Parse the dev/bench-only DPoP-replay-store capacity override ([`ENV_REPLAY_MAX_ENTRIES`]).
 ///
-/// Returns `Some(n)` ONLY for a positive integer (the explicit override); `None` for absent / empty /
-/// non-numeric / `0` — in which case the caller keeps the PRODUCTION default (100_000, via
-/// `InMemoryReplayStore::with_window`). `0` maps to `None` (not a zero-capacity store) so a typo can
-/// never accidentally disable replay protection — the only effect of this var is to RAISE the cap for
-/// a benchmark; it can never weaken the default posture.
+/// Returns `Some(n)` ONLY for a positive integer STRICTLY GREATER than the production default
+/// ([`REPLAY_PRODUCTION_DEFAULT`]); `None` for absent / empty / non-numeric / `0` / any value
+/// `<= REPLAY_PRODUCTION_DEFAULT` — in which case the caller keeps the production default (via
+/// `InMemoryReplayStore::with_window`). The override can therefore ONLY RAISE the cap: a smaller (or
+/// zero) value can never SHRINK it, so a mis-set var can never degrade availability (a too-small cap
+/// would fail authenticated traffic closed sooner — roborev Medium) nor weaken replay protection. The
+/// var's only effect is to lift the cap for a benchmark — exactly as documented.
 fn parse_replay_max_entries(raw: Option<String>) -> Option<u64> {
     raw.and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&n| n > 0)
+        .filter(|&n| n > REPLAY_PRODUCTION_DEFAULT)
 }
 
 /// Parse the bidirectional-check mode env value. Default (absent/unknown) is `Strict` — the secure
@@ -436,9 +445,8 @@ mod tests {
 
     #[test]
     fn replay_max_entries_unset_or_invalid_keeps_production_default() {
-        // Absent / empty / non-numeric / zero ⇒ None ⇒ the caller keeps the 100_000 production
-        // default. Crucially `0` is None (NOT a zero-capacity store), so a typo cannot weaken replay
-        // protection — the override can only RAISE the cap.
+        // Absent / empty / non-numeric / zero ⇒ None ⇒ the caller keeps the production default. `0` is
+        // None (NOT a zero-capacity store), so a typo cannot weaken replay protection.
         assert_eq!(parse_replay_max_entries(None), None);
         assert_eq!(parse_replay_max_entries(Some("".to_string())), None);
         assert_eq!(parse_replay_max_entries(Some("   ".to_string())), None);
@@ -448,15 +456,24 @@ mod tests {
     }
 
     #[test]
-    fn replay_max_entries_positive_integer_is_the_override() {
-        assert_eq!(parse_replay_max_entries(Some("1".to_string())), Some(1));
+    fn replay_max_entries_can_only_raise_never_shrink() {
+        // A value <= the production default is IGNORED (None ⇒ keep the default) — so a mis-set var
+        // can never SHRINK the cap and degrade availability (roborev Medium). Only a value strictly
+        // GREATER than the default takes effect. This is the load-bearing safety property.
+        assert_eq!(parse_replay_max_entries(Some("1".to_string())), None);
+        assert_eq!(parse_replay_max_entries(Some("99999".to_string())), None);
+        assert_eq!(
+            parse_replay_max_entries(Some(REPLAY_PRODUCTION_DEFAULT.to_string())),
+            None,
+            "exactly the default is a no-op (keep with_window)"
+        );
+        assert_eq!(
+            parse_replay_max_entries(Some((REPLAY_PRODUCTION_DEFAULT + 1).to_string())),
+            Some(REPLAY_PRODUCTION_DEFAULT + 1)
+        );
         assert_eq!(
             parse_replay_max_entries(Some("  5000000  ".to_string())),
             Some(5_000_000)
-        );
-        assert_eq!(
-            parse_replay_max_entries(Some("100000".to_string())),
-            Some(100_000)
         );
     }
 }
