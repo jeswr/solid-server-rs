@@ -722,16 +722,76 @@ fn validate_writable(
 /// HIGH this closes). This whole posture is interim; the WAC engine (Cluster B) supersedes it with
 /// per-resource ACL.
 fn is_public_readable(iri: &str, base_url: &str) -> bool {
-    let base = base_url.trim_end_matches('/');
-    let Some(rest) = iri.strip_prefix(base) else {
+    // ORIGIN-EXACT match, NOT a raw string prefix. A bare `strip_prefix(base)` on the full IRI is a
+    // string-prefix test with no authority boundary, so `https://localhost:3000evil/profile/card`
+    // string-matches the base `https://localhost:3000` (rest = `evil/profile/card`) — a different
+    // host that would be wrongly treated as ours. Instead split each IRI into (origin, path) where
+    // origin = `scheme://authority`, and require the IRI's origin to EQUAL the base's origin. The
+    // authority `localhost:3000evil` ≠ `localhost:3000`, so the spoof fails the origin check.
+    let Some((iri_origin, iri_path)) = split_origin_and_path(iri) else {
         return false;
     };
-    // The seeded WebID profile document is EXACTLY `/{user}/profile/card`. Match the precise shape —
-    // a single top-level `{user}` segment, then `profile`, then `card` — and nothing else. Splitting
-    // on '/' over the leading-slash-trimmed path yields exactly `["{user}", "profile", "card"]` for a
-    // direct profile card; a nested `…/private/profile/card` yields four+ segments and is rejected.
-    let segments: Vec<&str> = rest.trim_start_matches('/').split('/').collect();
+    let Some((base_origin, _)) = split_origin_and_path(base_url) else {
+        return false;
+    };
+    if iri_origin != base_origin {
+        return false;
+    }
+    // The seeded WebID profile document is EXACTLY the PATH `/{user}/profile/card`. Match the precise
+    // shape — a single top-level `{user}` segment, then `profile`, then `card` — and nothing else.
+    // Splitting on '/' over the leading-slash-trimmed path yields exactly `["{user}", "profile",
+    // "card"]` for a direct profile card; a nested `…/private/profile/card` yields four+ segments and
+    // is rejected.
+    let segments: Vec<&str> = iri_path.trim_start_matches('/').split('/').collect();
     matches!(segments.as_slice(), [user, "profile", "card"] if !user.is_empty())
+}
+
+/// Split an absolute `http`/`https` IRI into `(origin, path)` where `origin` is the case-insensitively
+/// normalised `scheme://authority` (scheme + host + optional `:port`) and `path` is everything from the
+/// first `/` after the authority (defaulting to `/`). Returns `None` for any non-`http(s)` or
+/// authority-less input. The origin is the security boundary: two IRIs are "same origin" iff their
+/// origins compare equal, so an authority like `localhost:3000evil` is distinct from `localhost:3000`.
+fn split_origin_and_path(iri: &str) -> Option<(String, &str)> {
+    // Scheme is matched case-insensitively per RFC 3986 §3.1; only http(s) carry a network authority.
+    // Determine the scheme + the `://`-terminated prefix length WITHOUT allocating, then slice the
+    // original (case-preserving) string so authority/path slices stay borrowed from `iri`.
+    // `get(..n)` is used (not `iri[..n]`) so a leading multibyte char that straddles index n yields
+    // `None` rather than panicking on a non-char-boundary slice.
+    let (proto, prefix_len) = if iri
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    {
+        ("https", 8usize)
+    } else if iri
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+    {
+        ("http", 7usize)
+    } else {
+        return None;
+    };
+    let after_scheme = &iri[prefix_len..];
+    // The authority ends at the first '/', '?' or '#'. A path/query/fragment-less IRI is all authority.
+    let auth_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..auth_end];
+    if authority.is_empty() {
+        return None;
+    }
+    // Path is the slice starting at the first '/' (if any); '?'/'#' terminate it; default "/".
+    let rest_after_auth = &after_scheme[auth_end..];
+    let path = if rest_after_auth.starts_with('/') {
+        let end = rest_after_auth
+            .find(['?', '#'])
+            .unwrap_or(rest_after_auth.len());
+        &rest_after_auth[..end]
+    } else {
+        "/"
+    };
+    // Host is case-insensitive; lowercase the authority so `LOCALHOST:3000` == `localhost:3000`.
+    let origin = format!("{proto}://{}", authority.to_ascii_lowercase());
+    Some((origin, path))
 }
 
 /// Synthesise a container's LDP representation and content-negotiate it.
@@ -1360,6 +1420,99 @@ mod tests {
             "https://localhost:3000/alice/profile/card/",
             base
         ));
+    }
+
+    /// REGRESSION (the HIGH): the base match must be ORIGIN-EXACT (scheme + host + port), not a raw
+    /// string prefix. `https://localhost:3000evil/profile/card` string-PREFIX-matches the base
+    /// `https://localhost:3000` (rest = `evil/profile/card` → `[evil, profile, card]`) but is a
+    /// DIFFERENT host (`localhost:3000evil` ≠ `localhost:3000`), so it must NOT be public. The
+    /// previous fix tightened the path shape but left the loose prefix base match.
+    #[test]
+    fn origin_spoof_prefix_is_not_public_readable() {
+        let base = "https://localhost:3000";
+        // The exact in-origin profile card stays public.
+        assert!(is_public_readable(
+            "https://localhost:3000/alice/profile/card",
+            base
+        ));
+        // The authority-confusion spoof: a host that merely STARTS WITH the base authority string.
+        assert!(!is_public_readable(
+            "https://localhost:3000evil/profile/card",
+            base
+        ));
+        // The prior nested case stays closed.
+        assert!(!is_public_readable(
+            "https://localhost:3000/a/private/profile/card",
+            base
+        ));
+        // A different scheme is a different origin.
+        assert!(!is_public_readable(
+            "http://localhost:3000/alice/profile/card",
+            base
+        ));
+        // A different port is a different origin.
+        assert!(!is_public_readable(
+            "https://localhost:4000/alice/profile/card",
+            base
+        ));
+        // A different host is a different origin.
+        assert!(!is_public_readable(
+            "https://localhost.evil:3000/alice/profile/card",
+            base
+        ));
+        // A non-absolute / non-http(s) input has no origin and is never public.
+        assert!(!is_public_readable("/alice/profile/card", base));
+        assert!(!is_public_readable(
+            "ftp://localhost:3000/alice/profile/card",
+            base
+        ));
+        // Host case is insensitive: `LOCALHOST:3000` is the same origin as `localhost:3000`.
+        assert!(is_public_readable(
+            "https://LOCALHOST:3000/alice/profile/card",
+            base
+        ));
+        // A trailing-slash base normalises to the same origin (no path) and still matches.
+        assert!(is_public_readable(
+            "https://localhost:3000/alice/profile/card",
+            "https://localhost:3000/"
+        ));
+    }
+
+    #[test]
+    fn split_origin_and_path_parses_authority_and_path() {
+        assert_eq!(
+            split_origin_and_path("https://localhost:3000/a/b"),
+            Some(("https://localhost:3000".to_string(), "/a/b"))
+        );
+        // No path → defaults to "/".
+        assert_eq!(
+            split_origin_and_path("https://localhost:3000"),
+            Some(("https://localhost:3000".to_string(), "/"))
+        );
+        // Query/fragment terminate authority and path.
+        assert_eq!(
+            split_origin_and_path("https://h:1/p?q=1#f"),
+            Some(("https://h:1".to_string(), "/p"))
+        );
+        assert_eq!(
+            split_origin_and_path("https://h:1?q"),
+            Some(("https://h:1".to_string(), "/"))
+        );
+        // The spoof authority is captured whole — distinct from the base authority.
+        assert_eq!(
+            split_origin_and_path("https://localhost:3000evil/profile/card"),
+            Some(("https://localhost:3000evil".to_string(), "/profile/card"))
+        );
+        // Scheme is case-insensitive; authority is lowercased.
+        assert_eq!(
+            split_origin_and_path("HTTPS://Localhost:3000/X"),
+            Some(("https://localhost:3000".to_string(), "/X"))
+        );
+        // Non-http(s) and authority-less inputs yield None.
+        assert_eq!(split_origin_and_path("ftp://h/p"), None);
+        assert_eq!(split_origin_and_path("/a/b"), None);
+        assert_eq!(split_origin_and_path("https://"), None);
+        assert_eq!(split_origin_and_path("not-a-url"), None);
     }
 
     #[test]
