@@ -333,14 +333,14 @@ mod tests {
         // (via the pod-root `acl:default`).
         let target = "https://localhost:3000/alice/test/data";
         assert!(matches!(
-            wac.authorize(target, AccessMode::Write, Some(alice))
+            wac.authorize(target, AccessMode::Write, Some(alice), None)
                 .await
                 .unwrap(),
             Decision::Allow(_)
         ));
         // Bob is NOT granted on Alice's pod → 403.
         assert_eq!(
-            wac.authorize(target, AccessMode::Read, Some(bob))
+            wac.authorize(target, AccessMode::Read, Some(bob), None)
                 .await
                 .unwrap(),
             Decision::Forbidden
@@ -349,16 +349,20 @@ mod tests {
         // The WebID profile card is PUBLIC-readable (anonymous GET allowed) but NOT public-writable.
         let card = "https://localhost:3000/alice/profile/card";
         assert!(matches!(
-            wac.authorize(card, AccessMode::Read, None).await.unwrap(),
+            wac.authorize(card, AccessMode::Read, None, None)
+                .await
+                .unwrap(),
             Decision::Allow(_)
         ));
         assert_eq!(
-            wac.authorize(card, AccessMode::Write, None).await.unwrap(),
+            wac.authorize(card, AccessMode::Write, None, None)
+                .await
+                .unwrap(),
             Decision::Unauthenticated
         );
         // Alice fully controls her own card.
         assert!(matches!(
-            wac.authorize(card, AccessMode::Control, Some(alice))
+            wac.authorize(card, AccessMode::Control, Some(alice), None)
                 .await
                 .unwrap(),
             Decision::Allow(_)

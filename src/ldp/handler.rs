@@ -128,9 +128,10 @@ impl<S: Store> LdpState<S> {
         method: &str,
         target: &LdpTarget,
         token: &VerifiedToken,
+        origin: Option<&str>,
     ) -> Result<std::collections::BTreeSet<AccessMode>, ServerError> {
         let required = mode_for_operation(method, &target.iri, target.is_container);
-        self.authorize_mode(target, required, token).await
+        self.authorize_mode(target, required, token, origin).await
     }
 
     /// Run Web Access Control for `target` with an EXPLICIT required mode (used by PATCH, whose mode
@@ -142,6 +143,7 @@ impl<S: Store> LdpState<S> {
         target: &LdpTarget,
         required: AccessMode,
         token: &VerifiedToken,
+        origin: Option<&str>,
     ) -> Result<std::collections::BTreeSet<AccessMode>, ServerError> {
         // An `.acl` resource is governed by Control regardless of the operation/content.
         let required = if crate::authz::is_acl_resource(&target.iri) {
@@ -151,7 +153,7 @@ impl<S: Store> LdpState<S> {
         };
         let wac = WacAuthorizer::new(&self.store, &self.base_url);
         match wac
-            .authorize(&target.iri, required, token.web_id.as_deref())
+            .authorize(&target.iri, required, token.web_id.as_deref(), origin)
             .await?
         {
             Decision::Allow(modes) => Ok(modes),
@@ -168,10 +170,11 @@ impl<S: Store> LdpState<S> {
         target_iri: &str,
         required: AccessMode,
         token: &VerifiedToken,
+        origin: Option<&str>,
     ) -> Result<(), ServerError> {
         let wac = WacAuthorizer::new(&self.store, &self.base_url);
         match wac
-            .authorize(target_iri, required, token.web_id.as_deref())
+            .authorize(target_iri, required, token.web_id.as_deref(), origin)
             .await?
         {
             Decision::Allow(_) => Ok(()),
@@ -190,11 +193,12 @@ impl<S: Store> LdpState<S> {
         &self,
         target: &LdpTarget,
         token: &VerifiedToken,
+        origin: Option<&str>,
     ) -> Result<(), ServerError> {
         let parent = self.nearest_existing_container(&target.iri).await?;
         let container =
             parent.unwrap_or_else(|| format!("{}/", self.base_url.trim_end_matches('/')));
-        self.authorize_iri(&container, AccessMode::Append, token)
+        self.authorize_iri(&container, AccessMode::Append, token, origin)
             .await
     }
 
@@ -269,8 +273,14 @@ async fn serve_read<S: Store>(
     // private data answers 401 (anonymous) / 403 (authenticated-but-unauthorized). Authorization runs
     // BEFORE the existence check, so a permitted read of a missing resource is a 404, while an
     // unauthorized read of the same is a 401/403 (no existence leak).
+    let origin = request_origin(req_headers);
     let user_modes = state
-        .authorize(if with_body { "GET" } else { "HEAD" }, &target, token)
+        .authorize(
+            if with_body { "GET" } else { "HEAD" },
+            &target,
+            token,
+            origin,
+        )
         .await?;
 
     let resource = state.store.read(&target.iri).await?;
@@ -344,7 +354,7 @@ async fn serve_read<S: Store>(
     // this target. The `user` set was already resolved by the read authorization above (the FULL
     // granted set, not just `read`), so we pass it through to avoid re-walking the ACL; the public set
     // is resolved independently (== user when the requester is anonymous).
-    let wac_allow = wac_allow_value(state, &target, token, user_modes).await?;
+    let wac_allow = wac_allow_value(state, &target, token, origin, user_modes).await?;
     set_str(&mut out, HeaderName::from_static("wac-allow"), &wac_allow);
 
     match outcome {
@@ -411,12 +421,13 @@ pub async fn put_handler<S: Store>(
     //    creating a new member mutates the container, NOT the (absent) target.
     //  - **`.acl` target**: routes to `acl:Control` on the protected resource (managing access rules).
     // Resolve existence ONCE here and reuse it for both the authorization branch and the create path.
+    let origin = request_origin(&headers);
     let current = state.store.meta(&target.iri).await?;
     let existed = current.is_some();
     if existed || crate::authz::is_acl_resource(&target.iri) {
-        state.authorize("PUT", &target, &token).await?;
+        state.authorize("PUT", &target, &token, origin).await?;
     } else {
-        state.authorize_create(&target, &token).await?;
+        state.authorize_create(&target, &token, origin).await?;
     }
 
     // Slash-semantics: a trailing-slash IRI (a container) and the same IRI without the slash (a plain
@@ -445,6 +456,11 @@ pub async fn put_handler<S: Store>(
 
     let meta = if existed {
         // A replace: rewrite the bytes in place; containment is unchanged.
+        state.store.write(&target.iri, body, &stored_type).await?
+    } else if crate::authz::is_acl_resource(&target.iri) {
+        // A CREATE of an AUXILIARY `.acl` resource: it is NOT a contained child. Store it via a plain
+        // `write` (no `ldp:contains` edge on the parent, and a later DELETE mutates no parent
+        // containment) — the Solid auxiliary-resource model. Auth for `.acl` is Control (above).
         state.store.write(&target.iri, body, &stored_type).await?
     } else {
         // A CREATE via PUT must create intermediate containers (Solid Protocol §writing-resource —
@@ -500,7 +516,8 @@ pub async fn post_handler<S: Store>(
     // existence checks so an unauthorized caller cannot probe existence (the read-access POST cases
     // accept `[403]` for a real container and `[403, 404]` for a fictive one — authorize-first 403 is
     // within both).
-    state.authorize("POST", &container, &token).await?;
+    let origin = request_origin(&headers);
+    state.authorize("POST", &container, &token, origin).await?;
 
     // POST creates a CHILD in a CONTAINER — the target must be a container (trailing-slash path).
     // A POST to a non-container target is NOT a containment operation: per the Solid Protocol
@@ -597,11 +614,16 @@ pub async fn delete_handler<S: Store>(
     } else {
         AccessMode::Write
     };
-    state.authorize_mode(&target, target_mode, &token).await?;
+    let origin = request_origin(&headers);
+    state
+        .authorize_mode(&target, target_mode, &token, origin)
+        .await?;
     if !is_acl {
         let parent = state.nearest_existing_container(&target.iri).await?;
         if let Some(p) = parent {
-            state.authorize_iri(&p, AccessMode::Write, &token).await?;
+            state
+                .authorize_iri(&p, AccessMode::Write, &token, origin)
+                .await?;
         }
     }
 
@@ -629,7 +651,14 @@ pub async fn delete_handler<S: Store>(
         Some(current.etag.as_str()),
     ))?;
 
-    let parent = parent_container(&target);
+    // An AUXILIARY `.acl` resource is NOT a contained child (it is created via `store.write`, never via
+    // `create_in_container`), so its DELETE must NOT touch parent containment — pass `None` for the
+    // parent. (A non-`.acl` resource detaches from its parent's `ldp:contains` as before.)
+    let parent = if is_acl {
+        None
+    } else {
+        parent_container(&target)
+    };
 
     if target.is_container {
         // A container DELETE goes through the ATOMIC empty-check+delete (no TOCTOU): the empty check
@@ -698,25 +727,43 @@ pub async fn patch_handler<S: Store>(
         PatchKind::SparqlUpdate => parse_sparql_update(&body, &target.iri)?,
     };
 
+    let origin = request_origin(&headers);
+
     // Load the current representation (if any) FIRST — the authorization branch depends on whether the
-    // target exists (modify vs create-on-PATCH).
-    let current = state.store.read(&target.iri).await.ok();
+    // target exists (modify vs create-on-PATCH). Match the read result EXPLICITLY: ONLY a `NotFound`
+    // means "absent" (the create-on-PATCH path); ANY OTHER store error (a backend/blob inconsistency)
+    // PROPAGATES here, BEFORE any authorization branch — never collapse a storage failure into "missing"
+    // (that would fail OPEN by taking the create/authorize path on an inconsistent backend).
+    let current = match state.store.read(&target.iri).await {
+        Ok(r) => Some(r),
+        Err(ServerError::NotFound) => None,
+        Err(e) => return Err(e),
+    };
 
     // WAC for PATCH (Solid WAC write-access matrix):
     //  - **Modify** (target exists): an INSERT-ONLY patch (no `solid:deletes`) needs `acl:Append`; a
     //    patch with ANY delete needs `acl:Write`. (An `.acl` target needs `acl:Control` — handled by
     //    `authorize_mode`.)
-    //  - **Create-on-PATCH** (target absent, insert-only): creation rights live on the PARENT
-    //    container (same as PUT-create) — authorize `acl:Append` at the nearest existing ancestor.
-    let required = if patch.deletes.is_empty() {
-        AccessMode::Append
-    } else {
+    //  - **Delete-on-missing**: a patch with ANY delete needs `acl:Write` on the TARGET even when the
+    //    target is absent — a delete is NOT a create, so it must NOT be routed through the parent-Append
+    //    create path. Authorizing Write-on-target here (rather than the create path) both enforces the
+    //    correct right AND closes the 403-vs-409 existence oracle: an append-only/anonymous caller gets
+    //    the SAME denial whether or not the resource exists, instead of leaking existence via a
+    //    create-authorized-then-409 (present) vs create-denied-403 (absent) split.
+    //  - **Create-on-PATCH** (target absent, INSERT-ONLY): creation rights live on the PARENT container
+    //    (same as PUT-create) — authorize `acl:Append` at the nearest existing ancestor.
+    let has_deletes = !patch.deletes.is_empty();
+    let required = if has_deletes {
         AccessMode::Write
-    };
-    if current.is_some() || crate::authz::is_acl_resource(&target.iri) {
-        state.authorize_mode(&target, required, &token).await?;
     } else {
-        state.authorize_create(&target, &token).await?;
+        AccessMode::Append
+    };
+    if current.is_some() || has_deletes || crate::authz::is_acl_resource(&target.iri) {
+        state
+            .authorize_mode(&target, required, &token, origin)
+            .await?;
+    } else {
+        state.authorize_create(&target, &token, origin).await?;
     }
 
     // Apply preconditions against the current ETag.
@@ -747,6 +794,20 @@ pub async fn patch_handler<S: Store>(
     let parent = parent_container(&target);
 
     let meta = if existed {
+        state
+            .store
+            .write(
+                &target.iri,
+                Bytes::from(new_body),
+                stored_format.media_type(),
+            )
+            .await?
+    } else if crate::authz::is_acl_resource(&target.iri) {
+        // Create-on-PATCH of an AUXILIARY `.acl` resource: it is NOT a contained child. Storing it via
+        // `create_in_container` would add an `ldp:contains` edge to the parent (and a later DELETE would
+        // skip parent-write authorization while still mutating containment). An `.acl` is an auxiliary
+        // resource (Solid's auxiliary-resource model) — store it via a plain `write` so it carries no
+        // containment edge. (Auth for `.acl` ops is Control, already enforced above.)
         state
             .store
             .write(
@@ -1331,11 +1392,17 @@ async fn wac_allow_value<S: Store>(
     state: &Arc<LdpState<S>>,
     target: &LdpTarget,
     token: &VerifiedToken,
+    origin: Option<&str>,
     user_modes: std::collections::BTreeSet<AccessMode>,
 ) -> Result<String, ServerError> {
     let wac = WacAuthorizer::new(&state.store, &state.base_url);
     let perms = wac
-        .effective_permissions(&target.iri, token.web_id.as_deref(), Some(user_modes))
+        .effective_permissions(
+            &target.iri,
+            token.web_id.as_deref(),
+            origin,
+            Some(user_modes),
+        )
         .await?;
     Ok(wac_allow_header(&perms))
 }
@@ -1357,6 +1424,17 @@ fn is_storage_root(iri: &str, base_url: &str) -> bool {
 /// Read a header value as `&str`, or `None` if absent / not valid UTF-8.
 fn header_str(headers: &HeaderMap, name: HeaderName) -> Option<&str> {
     headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// The request's `Origin` header (the requesting web app's origin), trimmed; `None` if absent, empty,
+/// or not valid UTF-8. Threaded into WAC so an `acl:origin`-restricted authorization grants only from
+/// a matching Origin (and a request with no Origin never satisfies such a rule — fail-closed). A bare
+/// `Origin: null` is treated as a present-but-non-matching opaque origin (kept verbatim — it will only
+/// match a literal `acl:origin <null>`, which is not a real grant).
+fn request_origin(headers: &HeaderMap) -> Option<&str> {
+    header_str(headers, header::ORIGIN)
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
 }
 
 /// Insert a header value, silently skipping a value that cannot be encoded (never panics).
@@ -1523,5 +1601,115 @@ mod tests {
         let mut present = HeaderMap::new();
         present.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
         assert_eq!(require_content_type(&present).unwrap(), "text/plain");
+    }
+
+    #[test]
+    fn request_origin_trims_and_filters_empty() {
+        let mut present = HeaderMap::new();
+        present.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://app.example"),
+        );
+        assert_eq!(request_origin(&present), Some("https://app.example"));
+        // Whitespace is trimmed.
+        let mut padded = HeaderMap::new();
+        padded.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("  https://app.example  "),
+        );
+        assert_eq!(request_origin(&padded), Some("https://app.example"));
+        // Absent ⇒ None.
+        assert_eq!(request_origin(&HeaderMap::new()), None);
+        // Empty/whitespace-only ⇒ None.
+        let mut blank = HeaderMap::new();
+        blank.insert(header::ORIGIN, HeaderValue::from_static("   "));
+        assert_eq!(request_origin(&blank), None);
+    }
+
+    // --- Finding 4: a non-NotFound read error must NOT collapse to "missing" (fail-CLOSED) --------
+
+    use crate::store::{DeleteOutcome, Resource, ResourceMeta};
+    use async_trait::async_trait;
+    use axum::body::Bytes as AxBytes;
+
+    /// A [`Store`] whose `read` ALWAYS fails with a non-`NotFound` (`Storage`) error — a simulated
+    /// backend/blob inconsistency. Every other method reports the resource as ABSENT, so if the
+    /// handler ever (wrongly) treated the failed read as "missing" it would happily take the
+    /// create/authorize path. The PATCH handler must instead PROPAGATE the `Storage` error (→ 500),
+    /// never authorize.
+    struct FaultyReadStore;
+
+    #[async_trait]
+    impl Store for FaultyReadStore {
+        async fn read(&self, _iri: &str) -> ServerResult<Resource> {
+            // NON-`NotFound`: a real storage/blob inconsistency, not an absent resource.
+            Err(ServerError::Storage(
+                "simulated backend inconsistency".into(),
+            ))
+        }
+        async fn meta(&self, _iri: &str) -> ServerResult<Option<ResourceMeta>> {
+            Ok(None)
+        }
+        async fn exists(&self, _iri: &str) -> ServerResult<bool> {
+            Ok(false)
+        }
+        async fn write(
+            &self,
+            _iri: &str,
+            _body: AxBytes,
+            _content_type: &str,
+        ) -> ServerResult<ResourceMeta> {
+            panic!("write must not be reached: the read error must propagate before any write");
+        }
+        async fn create_in_container(
+            &self,
+            _container: &str,
+            _child: &str,
+            _body: AxBytes,
+            _content_type: &str,
+        ) -> ServerResult<ResourceMeta> {
+            panic!("create_in_container must not be reached on a faulted read");
+        }
+        async fn delete(&self, _iri: &str, _parent: Option<&str>) -> ServerResult<()> {
+            Ok(())
+        }
+        async fn delete_container_if_empty(
+            &self,
+            _iri: &str,
+            _parent: Option<&str>,
+        ) -> ServerResult<DeleteOutcome> {
+            Ok(DeleteOutcome::NotFound)
+        }
+        async fn list_children(&self, _container: &str) -> ServerResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    use crate::error::ServerResult;
+
+    #[tokio::test]
+    async fn patch_propagates_non_notfound_read_error_does_not_treat_as_missing() {
+        // An INSERT-ONLY PATCH whose target `read` fails with a STORAGE error (not NotFound). With the
+        // fix, the handler propagates the error (→ 500) BEFORE any authorization/create branch; the
+        // faulty store panics if `write`/`create_in_container` is reached. The pre-fix `read().ok()`
+        // would have collapsed the error into `None` and taken the create-on-PATCH path (fail-OPEN).
+        let state = Arc::new(LdpState::new(FaultyReadStore, "https://pod.example"));
+        let token = VerifiedToken {
+            web_id: Some("https://pod.example/alice/profile/card#me".into()),
+            ..VerifiedToken::default()
+        };
+        let uri: axum::http::Uri = "/alice/data".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/n3"));
+        let patch_body = AxBytes::from(
+            "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
+             @prefix foaf: <http://xmlns.com/foaf/0.1/> .\n\
+             _:p solid:inserts { <https://pod.example/alice/data#me> foaf:name \"X\" . }.\n",
+        );
+        let err = patch_handler(State(state), Extension(token), uri, headers, patch_body)
+            .await
+            .expect_err("a non-NotFound read error must surface, not be treated as missing");
+        // It must surface as the storage error (500), NOT a create-path 201 / a 403 / a 404.
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

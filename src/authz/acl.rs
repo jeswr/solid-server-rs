@@ -44,19 +44,31 @@ pub enum AclScope {
 }
 
 /// The verified requester identity as the matcher needs it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Requester<'a> {
     /// The requester's WebID, or `None` for an anonymous/public request.
     pub web_id: Option<&'a str>,
+    /// The request's HTTP `Origin` header (the requesting web app's origin), or `None` when the
+    /// request carried no `Origin` (e.g. a non-browser / same-origin / server-to-server request).
+    ///
+    /// WAC's `acl:origin` restriction is matched against THIS value: a rule that lists one or more
+    /// `acl:origin` values grants ONLY when this origin matches one of them. A request with NO
+    /// `Origin` can never satisfy an `acl:origin`-restricted rule (fail-closed) — but it is fully
+    /// unaffected by a rule that carries no `acl:origin` (the common case).
+    pub origin: Option<&'a str>,
 }
 
 impl<'a> Requester<'a> {
     pub fn anonymous() -> Self {
-        Self { web_id: None }
+        Self {
+            web_id: None,
+            origin: None,
+        }
     }
     pub fn authenticated(web_id: &'a str) -> Self {
         Self {
             web_id: Some(web_id),
+            origin: None,
         }
     }
     fn is_authenticated(&self) -> bool {
@@ -83,6 +95,12 @@ pub fn modes_for(
             continue;
         }
         if !matches_agent(triples, &rule, requester) {
+            continue;
+        }
+        // `acl:origin` restriction (app-scoping): a rule with one or more `acl:origin` values grants
+        // ONLY when the request's Origin matches one of them. A rule with NO `acl:origin` applies
+        // regardless of origin (the common case). Checked AFTER the agent match — both must hold.
+        if !matches_origin(triples, &rule, requester) {
             continue;
         }
         for mode in granted_modes(triples, &rule) {
@@ -187,6 +205,28 @@ fn matches_agent(triples: &[Triple], rule: &NamedOrBlankNode, requester: &Reques
     false
 }
 
+/// Whether the rule's `acl:origin` restriction (if any) is satisfied by the request's Origin.
+///
+/// WAC `acl:origin` (the trusted-app restriction): a rule that lists one or more `acl:origin` values
+/// applies ONLY to a request whose `Origin` header EXACTLY matches one of those values; a rule with
+/// NO `acl:origin` value applies to ANY origin (the common, unrestricted case). A request that
+/// carried no `Origin` (anonymous-of-origin: a non-browser, same-origin, or server-to-server request)
+/// can NEVER satisfy an origin-restricted rule (fail-closed) — otherwise an app-scoped authorization
+/// would be valid from any caller that simply omits the header.
+fn matches_origin(triples: &[Triple], rule: &NamedOrBlankNode, requester: &Requester<'_>) -> bool {
+    let origin_pred = acl_iri("origin");
+    let allowed = named_objects(triples, rule, &origin_pred);
+    if allowed.is_empty() {
+        // Unrestricted rule — applies regardless of the request's Origin.
+        return true;
+    }
+    // Origin-restricted: the request MUST carry an Origin that exactly matches a listed value.
+    match requester.origin {
+        Some(origin) => allowed.contains(&origin),
+        None => false,
+    }
+}
+
 /// The modes a rule lists via `acl:mode`. A non-NamedNode object is ignored (defensive — ACLs are
 /// user-controlled), and an unrecognised mode IRI contributes nothing.
 fn granted_modes(triples: &[Triple], rule: &NamedOrBlankNode) -> Vec<AccessMode> {
@@ -225,7 +265,22 @@ mod tests {
         web_id: Option<&str>,
         scope: AclScope,
     ) -> BTreeSet<AccessMode> {
-        let r = Requester { web_id };
+        let r = Requester {
+            web_id,
+            origin: None,
+        };
+        modes_for(t, resource, &r, scope)
+    }
+
+    /// Like [`modes`] but with an explicit request `Origin` — for the `acl:origin` tests.
+    fn modes_with_origin(
+        t: &[Triple],
+        resource: &str,
+        web_id: Option<&str>,
+        origin: Option<&str>,
+        scope: AclScope,
+    ) -> BTreeSet<AccessMode> {
+        let r = Requester { web_id, origin };
         modes_for(t, resource, &r, scope)
     }
 
@@ -384,5 +439,128 @@ mod tests {
         let t = parse(&ttl);
         assert!(modes(&t, RES, Some(BOB), AclScope::AccessTo).contains(&AccessMode::Read));
         assert!(modes(&t, other, Some(BOB), AclScope::AccessTo).contains(&AccessMode::Read));
+    }
+
+    // --- acl:origin (app-scoping) -------------------------------------------------------------
+
+    const APP: &str = "https://app.example";
+    const OTHER_APP: &str = "https://evil.example";
+
+    fn origin_restricted_acl() -> Vec<Triple> {
+        // Bob is granted Read on RES, but ONLY from the app at https://app.example.
+        let ttl = format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+            <#bob> a acl:Authorization;
+                   acl:agent <{BOB}>;
+                   acl:origin <{APP}>;
+                   acl:accessTo <{RES}>;
+                   acl:mode acl:Read."#
+        );
+        parse(&ttl)
+    }
+
+    #[test]
+    fn origin_restricted_rule_grants_only_from_matching_origin() {
+        let t = origin_restricted_acl();
+        // Matching Origin → granted.
+        assert!(
+            modes_with_origin(&t, RES, Some(BOB), Some(APP), AclScope::AccessTo)
+                .contains(&AccessMode::Read)
+        );
+    }
+
+    #[test]
+    fn origin_restricted_rule_denies_from_other_origin() {
+        let t = origin_restricted_acl();
+        // A DIFFERENT Origin → not granted (the over-grant the HIGH finding is about).
+        assert!(
+            modes_with_origin(&t, RES, Some(BOB), Some(OTHER_APP), AclScope::AccessTo).is_empty()
+        );
+    }
+
+    #[test]
+    fn origin_restricted_rule_denies_when_origin_absent() {
+        let t = origin_restricted_acl();
+        // No Origin header at all → an origin-restricted rule must NOT match (fail-closed): a
+        // non-browser/server-to-server caller cannot bypass an app restriction by omitting Origin.
+        assert!(modes_with_origin(&t, RES, Some(BOB), None, AclScope::AccessTo).is_empty());
+        // The legacy `modes` helper (no origin) must likewise deny an origin-restricted rule.
+        assert!(modes(&t, RES, Some(BOB), AclScope::AccessTo).is_empty());
+    }
+
+    #[test]
+    fn rule_without_acl_origin_grants_from_any_origin() {
+        // The common case: a rule with NO acl:origin applies regardless of the request Origin.
+        let ttl = format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+            <#bob> a acl:Authorization;
+                   acl:agent <{BOB}>;
+                   acl:accessTo <{RES}>;
+                   acl:mode acl:Read."#
+        );
+        let t = parse(&ttl);
+        // From a specific Origin.
+        assert!(
+            modes_with_origin(&t, RES, Some(BOB), Some(APP), AclScope::AccessTo)
+                .contains(&AccessMode::Read)
+        );
+        // From a different Origin.
+        assert!(
+            modes_with_origin(&t, RES, Some(BOB), Some(OTHER_APP), AclScope::AccessTo)
+                .contains(&AccessMode::Read)
+        );
+        // With no Origin at all.
+        assert!(
+            modes_with_origin(&t, RES, Some(BOB), None, AclScope::AccessTo)
+                .contains(&AccessMode::Read)
+        );
+    }
+
+    #[test]
+    fn multiple_acl_origin_values_any_one_matches() {
+        // A rule listing several acl:origin values grants from ANY of them, denies from outside the set.
+        let app2 = "https://app2.example";
+        let ttl = format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+            <#bob> a acl:Authorization;
+                   acl:agent <{BOB}>;
+                   acl:origin <{APP}>, <{app2}>;
+                   acl:accessTo <{RES}>;
+                   acl:mode acl:Read."#
+        );
+        let t = parse(&ttl);
+        assert!(
+            modes_with_origin(&t, RES, Some(BOB), Some(APP), AclScope::AccessTo)
+                .contains(&AccessMode::Read)
+        );
+        assert!(
+            modes_with_origin(&t, RES, Some(BOB), Some(app2), AclScope::AccessTo)
+                .contains(&AccessMode::Read)
+        );
+        assert!(
+            modes_with_origin(&t, RES, Some(BOB), Some(OTHER_APP), AclScope::AccessTo).is_empty()
+        );
+    }
+
+    #[test]
+    fn origin_restriction_also_applies_to_public_class_rules() {
+        // An `acl:agentClass foaf:Agent` (public) rule that ALSO carries acl:origin is app-scoped: it
+        // grants the public ONLY from the trusted origin, never from another origin or no Origin.
+        let ttl = format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+            @prefix foaf: <http://xmlns.com/foaf/0.1/>.
+            <#pub> a acl:Authorization;
+                   acl:agentClass foaf:Agent;
+                   acl:origin <{APP}>;
+                   acl:accessTo <{RES}>;
+                   acl:mode acl:Read."#
+        );
+        let t = parse(&ttl);
+        assert!(
+            modes_with_origin(&t, RES, None, Some(APP), AclScope::AccessTo)
+                .contains(&AccessMode::Read)
+        );
+        assert!(modes_with_origin(&t, RES, None, Some(OTHER_APP), AclScope::AccessTo).is_empty());
+        assert!(modes_with_origin(&t, RES, None, None, AclScope::AccessTo).is_empty());
     }
 }

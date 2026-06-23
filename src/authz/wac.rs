@@ -61,7 +61,12 @@ impl<'a, S: Store> WacAuthorizer<'a, S> {
     }
 
     /// Authorize an operation: the `target` IRI, the `required` mode (from
-    /// [`super::mode::mode_for_operation`]), and the requester's `web_id` (`None` ⇒ anonymous).
+    /// [`super::mode::mode_for_operation`]), the requester's `web_id` (`None` ⇒ anonymous), and the
+    /// request's `origin` (the HTTP `Origin` header; `None` when the request carried none).
+    ///
+    /// The `origin` is threaded into rule-matching so an `acl:origin`-restricted authorization grants
+    /// ONLY when the request's Origin matches one of the rule's `acl:origin` values (an app-scoping
+    /// restriction); a rule with no `acl:origin` is unaffected by it.
     ///
     /// Resolves the effective ACL of the PROTECTED resource (for an `.acl` target that is the resource
     /// the ACL governs — Control of THAT resource gates reading/writing its `.acl`), computes the
@@ -71,9 +76,10 @@ impl<'a, S: Store> WacAuthorizer<'a, S> {
         target: &str,
         required: AccessMode,
         web_id: Option<&str>,
+        origin: Option<&str>,
     ) -> Result<Decision, ServerError> {
         let protected = self.protected_resource(target);
-        let requester = Requester { web_id };
+        let requester = Requester { web_id, origin };
         let granted = self.effective_modes(&protected, &requester).await?;
 
         if satisfies(&granted, required) {
@@ -97,6 +103,7 @@ impl<'a, S: Store> WacAuthorizer<'a, S> {
         &self,
         target: &str,
         web_id: Option<&str>,
+        origin: Option<&str>,
         user_modes: Option<BTreeSet<AccessMode>>,
     ) -> Result<EffectivePermissions, ServerError> {
         let protected = self.protected_resource(target);
@@ -104,7 +111,7 @@ impl<'a, S: Store> WacAuthorizer<'a, S> {
         let user = match user_modes {
             Some(m) => m,
             None => {
-                self.effective_modes(&protected, &Requester { web_id })
+                self.effective_modes(&protected, &Requester { web_id, origin })
                     .await?
             }
         };
@@ -277,14 +284,14 @@ mod tests {
         let wac = WacAuthorizer::new(&s, BASE);
         // Bob is DENIED on the resource (own acl wins; the inherited default does NOT apply).
         assert_eq!(
-            wac.authorize(resource, AccessMode::Read, Some(BOB))
+            wac.authorize(resource, AccessMode::Read, Some(BOB), None)
                 .await
                 .unwrap(),
             Decision::Forbidden
         );
         // Alice IS allowed by the own acl.
         assert!(matches!(
-            wac.authorize(resource, AccessMode::Read, Some(ALICE))
+            wac.authorize(resource, AccessMode::Read, Some(ALICE), None)
                 .await
                 .unwrap(),
             Decision::Allow(_)
@@ -305,13 +312,13 @@ mod tests {
         let wac = WacAuthorizer::new(&s, BASE);
         // Alice inherits read/write/control via the pod-root default.
         let d = wac
-            .authorize(resource, AccessMode::Write, Some(ALICE))
+            .authorize(resource, AccessMode::Write, Some(ALICE), None)
             .await
             .unwrap();
         assert!(matches!(d, Decision::Allow(_)));
         // Bob inherits nothing → 403.
         assert_eq!(
-            wac.authorize(resource, AccessMode::Read, Some(BOB))
+            wac.authorize(resource, AccessMode::Read, Some(BOB), None)
                 .await
                 .unwrap(),
             Decision::Forbidden
@@ -342,13 +349,13 @@ mod tests {
         .await;
         let wac = WacAuthorizer::new(&s, BASE);
         assert_eq!(
-            wac.authorize(resource, AccessMode::Read, Some(BOB))
+            wac.authorize(resource, AccessMode::Read, Some(BOB), None)
                 .await
                 .unwrap(),
             Decision::Forbidden
         );
         assert!(matches!(
-            wac.authorize(resource, AccessMode::Read, Some(ALICE))
+            wac.authorize(resource, AccessMode::Read, Some(ALICE), None)
                 .await
                 .unwrap(),
             Decision::Allow(_)
@@ -373,7 +380,7 @@ mod tests {
         .await;
         let wac = WacAuthorizer::new(&s, BASE);
         assert!(matches!(
-            wac.authorize(resource, AccessMode::Read, None)
+            wac.authorize(resource, AccessMode::Read, None, None)
                 .await
                 .unwrap(),
             Decision::Allow(_)
@@ -397,14 +404,14 @@ mod tests {
         let wac = WacAuthorizer::new(&s, BASE);
         // Anonymous → 401 (Unauthenticated).
         assert_eq!(
-            wac.authorize(resource, AccessMode::Read, None)
+            wac.authorize(resource, AccessMode::Read, None, None)
                 .await
                 .unwrap(),
             Decision::Unauthenticated
         );
         // Bob (authenticated, not granted) → 403 (Forbidden).
         assert_eq!(
-            wac.authorize(resource, AccessMode::Read, Some(BOB))
+            wac.authorize(resource, AccessMode::Read, Some(BOB), None)
                 .await
                 .unwrap(),
             Decision::Forbidden
@@ -432,13 +439,13 @@ mod tests {
         let wac = WacAuthorizer::new(&s, BASE);
         // Reading the .acl requires Control: Bob (Read only) is FORBIDDEN; Alice (Control) is ALLOWED.
         assert_eq!(
-            wac.authorize(acl, AccessMode::Control, Some(BOB))
+            wac.authorize(acl, AccessMode::Control, Some(BOB), None)
                 .await
                 .unwrap(),
             Decision::Forbidden
         );
         assert!(matches!(
-            wac.authorize(acl, AccessMode::Control, Some(ALICE))
+            wac.authorize(acl, AccessMode::Control, Some(ALICE), None)
                 .await
                 .unwrap(),
             Decision::Allow(_)
@@ -465,21 +472,21 @@ mod tests {
         let wac = WacAuthorizer::new(&s, BASE);
         // Bob has Write but not Control → a Control decision is FORBIDDEN.
         assert_eq!(
-            wac.authorize(resource, AccessMode::Control, Some(BOB))
+            wac.authorize(resource, AccessMode::Control, Some(BOB), None)
                 .await
                 .unwrap(),
             Decision::Forbidden
         );
         // Bob's Write decision is still allowed (Write does not imply, but is granted).
         assert!(matches!(
-            wac.authorize(resource, AccessMode::Write, Some(BOB))
+            wac.authorize(resource, AccessMode::Write, Some(BOB), None)
                 .await
                 .unwrap(),
             Decision::Allow(_)
         ));
         // Alice (Control) is allowed Control.
         assert!(matches!(
-            wac.authorize(resource, AccessMode::Control, Some(ALICE))
+            wac.authorize(resource, AccessMode::Control, Some(ALICE), None)
                 .await
                 .unwrap(),
             Decision::Allow(_)
@@ -495,13 +502,13 @@ mod tests {
         let wac = WacAuthorizer::new(&s, BASE);
         // No ACL exists at all → denied. Anonymous → 401, authenticated → 403.
         assert_eq!(
-            wac.authorize(resource, AccessMode::Read, None)
+            wac.authorize(resource, AccessMode::Read, None, None)
                 .await
                 .unwrap(),
             Decision::Unauthenticated
         );
         assert_eq!(
-            wac.authorize(resource, AccessMode::Read, Some(BOB))
+            wac.authorize(resource, AccessMode::Read, Some(BOB), None)
                 .await
                 .unwrap(),
             Decision::Forbidden
@@ -529,7 +536,7 @@ mod tests {
         .await;
         let wac = WacAuthorizer::new(&s, BASE);
         assert_eq!(
-            wac.authorize(resource, AccessMode::Read, Some(ALICE))
+            wac.authorize(resource, AccessMode::Read, Some(ALICE), None)
                 .await
                 .unwrap(),
             Decision::Forbidden
@@ -555,26 +562,26 @@ mod tests {
         let wac = WacAuthorizer::new(&s, BASE);
         // Wrong WebID (Bob) cannot read or write.
         assert_eq!(
-            wac.authorize(resource, AccessMode::Read, Some(BOB))
+            wac.authorize(resource, AccessMode::Read, Some(BOB), None)
                 .await
                 .unwrap(),
             Decision::Forbidden
         );
         assert_eq!(
-            wac.authorize(resource, AccessMode::Write, Some(BOB))
+            wac.authorize(resource, AccessMode::Write, Some(BOB), None)
                 .await
                 .unwrap(),
             Decision::Forbidden
         );
         // Anonymous cannot read or write.
         assert_eq!(
-            wac.authorize(resource, AccessMode::Read, None)
+            wac.authorize(resource, AccessMode::Read, None, None)
                 .await
                 .unwrap(),
             Decision::Unauthenticated
         );
         assert_eq!(
-            wac.authorize(resource, AccessMode::Write, None)
+            wac.authorize(resource, AccessMode::Write, None, None)
                 .await
                 .unwrap(),
             Decision::Unauthenticated
@@ -582,7 +589,7 @@ mod tests {
         // A near-miss WebID (same prefix, different agent) is NOT Alice — no string-prefix bypass.
         let near = "https://pod.example/alice/profile/card#evil";
         assert_eq!(
-            wac.authorize(resource, AccessMode::Read, Some(near))
+            wac.authorize(resource, AccessMode::Read, Some(near), None)
                 .await
                 .unwrap(),
             Decision::Forbidden
@@ -610,7 +617,7 @@ mod tests {
         let wac = WacAuthorizer::new(&s, BASE);
         // Alice's WAC-Allow: user = read/write/control, public = read.
         let perms = wac
-            .effective_permissions(resource, Some(ALICE), None)
+            .effective_permissions(resource, Some(ALICE), None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -623,7 +630,7 @@ mod tests {
 
         // An anonymous reader's WAC-Allow: user == public == read.
         let pub_perms = wac
-            .effective_permissions(resource, None, None)
+            .effective_permissions(resource, None, None, None)
             .await
             .unwrap();
         assert_eq!(pub_perms.user, [AccessMode::Read].into_iter().collect());
@@ -647,7 +654,7 @@ mod tests {
         .await;
         let wac = WacAuthorizer::new(&s, BASE);
         let perms = wac
-            .effective_permissions(resource, Some(BOB), None)
+            .effective_permissions(resource, Some(BOB), None, None)
             .await
             .unwrap();
         assert_eq!(perms.user, [AccessMode::Read].into_iter().collect());

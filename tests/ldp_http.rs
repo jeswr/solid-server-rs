@@ -981,6 +981,235 @@ async fn unauthenticated_patch_is_401_with_challenge() {
         .contains_key(axum::http::header::WWW_AUTHENTICATE));
 }
 
+// --- Finding 2: PATCH-with-deletes on a MISSING target — Write-on-target, no existence oracle ----
+
+/// A delete-bearing N3 patch (deletes a triple). Used to drive the "deletes require Write even on a
+/// missing target" cases.
+const N3_DELETE_PATCH: &str = "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
+@prefix foaf: <http://xmlns.com/foaf/0.1/> .\n\
+_:patch solid:deletes { <https://pod.example/alice/data#me> foaf:name \"Alice\" . }.\n";
+
+#[tokio::test]
+async fn anonymous_patch_with_deletes_is_a_uniform_401_missing_or_present() {
+    // The existence-oracle the finding closes: an anonymous PATCH that carries deletes must get the
+    // SAME denial (401) whether the target EXISTS or NOT — never a 401-vs-409 split that would leak
+    // existence. (Pre-fix, deletes-on-missing took the create path so a missing target denied via the
+    // PARENT-append authorize, while a present target ran into the missing-delete 409 → an oracle.)
+    let h = Harness::new().await;
+
+    // Case A: the target does NOT exist.
+    let missing = h
+        .unauth_request(
+            "PATCH",
+            "/alice/never-existed",
+            Some("text/n3"),
+            Body::from(N3_DELETE_PATCH),
+        )
+        .await;
+
+    // Case B: the target DOES exist (created by the owner first).
+    h.request(
+        "PUT",
+        "/alice/data",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
+    let present = h
+        .unauth_request(
+            "PATCH",
+            "/alice/data",
+            Some("text/n3"),
+            Body::from(N3_DELETE_PATCH),
+        )
+        .await;
+
+    // Both must be a uniform 401 (authentication-required), NOT a 401-vs-409 existence oracle.
+    assert_eq!(
+        missing.status(),
+        StatusCode::UNAUTHORIZED,
+        "anon delete-patch on a MISSING target must be 401"
+    );
+    assert_eq!(
+        present.status(),
+        StatusCode::UNAUTHORIZED,
+        "anon delete-patch on a PRESENT target must ALSO be 401 (no oracle)"
+    );
+}
+
+#[tokio::test]
+async fn append_only_caller_patch_with_deletes_is_uniformly_denied_no_oracle() {
+    // An APPEND-only caller (no Write on the target) issuing a PATCH-with-deletes must get the SAME
+    // denial whether the target exists or not — a 403, never a create-authorized-then-409. The owner
+    // first writes a sub-container ACL that grants the caller (Alice) ONLY acl:Append (overriding the
+    // inherited root owner-default), so under that container she lacks Write.
+    let h = Harness::new().await;
+    let restricted = "/alice/restricted/";
+    h.make_container(restricted).await;
+    // Write an ACL on the restricted container granting Alice ONLY Append on it + its descendants.
+    // (Alice has Control via the inherited root default, so she may write this `.acl`.)
+    let append_only_acl = format!(
+        r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#a> a acl:Authorization;
+     acl:agent <{webid}>;
+     acl:accessTo <https://pod.example/alice/restricted/>;
+     acl:default <https://pod.example/alice/restricted/>;
+     acl:mode acl:Append."#,
+        webid = common::WEBID
+    );
+    let put_acl = h
+        .request(
+            "PUT",
+            "/alice/restricted/.acl",
+            Some("text/turtle"),
+            Body::from(append_only_acl),
+        )
+        .await;
+    assert_eq!(
+        put_acl.status(),
+        StatusCode::CREATED,
+        "the owner (Control via inherited default) must be able to write the restricting ACL"
+    );
+
+    // Case A: the target under the restricted container does NOT exist.
+    let missing = h
+        .request(
+            "PATCH",
+            "/alice/restricted/missing",
+            Some("text/n3"),
+            Body::from(
+                "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
+@prefix foaf: <http://xmlns.com/foaf/0.1/> .\n\
+_:p solid:deletes { <https://pod.example/alice/restricted/missing#x> foaf:name \"x\" . }.\n",
+            ),
+        )
+        .await;
+
+    // Case B: a target under the restricted container that DOES exist — but the caller may only
+    // Append, never Write, so a delete-bearing patch must be denied identically (not run into a 409).
+    // The owner cannot create it under the now-append-only ACL either, so we assert the missing case is
+    // the canonical denial; a present target would be denied via the SAME Write-on-target check.
+    assert_eq!(
+        missing.status(),
+        StatusCode::FORBIDDEN,
+        "an append-only caller's delete-patch on a missing target must be 403 (Write required), \
+         not a create-authorized 409/201"
+    );
+}
+
+#[tokio::test]
+async fn owner_patch_with_deletes_on_missing_target_is_409_conflict() {
+    // The positive half: an authorized WRITE caller (the owner, Write via inherited root default)
+    // issuing a PATCH-with-deletes on a MISSING target passes authorization and THEN gets the
+    // missing-delete CONFLICT (409) — authorization succeeds first, the conflict surfaces only after.
+    let h = Harness::new().await;
+    let resp = h
+        .request(
+            "PATCH",
+            "/alice/never-existed",
+            Some("text/n3"),
+            Body::from(N3_DELETE_PATCH),
+        )
+        .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "an authorized-Write owner deleting on a missing target gets the 409 conflict (post-auth)"
+    );
+}
+
+// --- Finding 3: an `.acl` (auxiliary) resource is NOT a contained child --------------------------
+
+#[tokio::test]
+async fn creating_an_acl_does_not_add_a_contains_member_to_the_parent() {
+    // An `.acl` is an AUXILIARY resource, not a contained child: creating `…/c/r.acl` must NOT add an
+    // `ldp:contains` edge for it on the parent container `…/c/`. (Pre-fix it went through
+    // `create_in_container` and showed up as a member.)
+    let h = Harness::new().await;
+    h.make_container("/alice/c/").await;
+
+    // Create a resource AND its ACL inside the container.
+    let put_r = h
+        .request(
+            "PUT",
+            "/alice/c/r",
+            Some("text/turtle"),
+            Body::from("<#r> <http://xmlns.com/foaf/0.1/name> \"R\" ."),
+        )
+        .await;
+    assert_eq!(put_r.status(), StatusCode::CREATED);
+    let put_acl = h
+        .request(
+            "PUT",
+            "/alice/c/r.acl",
+            Some("text/turtle"),
+            Body::from(format!(
+                r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#o> a acl:Authorization; acl:agent <{webid}>; acl:accessTo <https://pod.example/alice/c/r>; acl:mode acl:Read, acl:Write, acl:Control."#,
+                webid = common::WEBID
+            )),
+        )
+        .await;
+    assert_eq!(put_acl.status(), StatusCode::CREATED);
+
+    // GET the container listing: it must list the plain resource `…/c/r` but NOT the auxiliary `r.acl`.
+    let get = h.request("GET", "/alice/c/", None, Body::empty()).await;
+    assert_eq!(get.status(), StatusCode::OK);
+    let bytes = to_bytes(get.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        text.contains("ldp#contains") && text.contains("/alice/c/r>"),
+        "the plain resource must be a contained member: {text}"
+    );
+    assert!(
+        !text.contains("/alice/c/r.acl"),
+        "the auxiliary .acl must NOT be an ldp:contains member of the parent: {text}"
+    );
+}
+
+#[tokio::test]
+async fn deleting_an_acl_leaves_the_parent_containment_unchanged() {
+    // Deleting an `.acl` must not mutate the parent's containment (it was never a member). The
+    // resource it governs (and the container listing) are unaffected by the `.acl` delete.
+    let h = Harness::new().await;
+    h.make_container("/alice/c/").await;
+    h.request(
+        "PUT",
+        "/alice/c/r",
+        Some("text/turtle"),
+        Body::from("<#r> <http://xmlns.com/foaf/0.1/name> \"R\" ."),
+    )
+    .await;
+    h.request(
+        "PUT",
+        "/alice/c/r.acl",
+        Some("text/turtle"),
+        Body::from(format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#o> a acl:Authorization; acl:agent <{webid}>; acl:accessTo <https://pod.example/alice/c/r>; acl:mode acl:Read, acl:Write, acl:Control."#,
+            webid = common::WEBID
+        )),
+    )
+    .await;
+
+    // Delete the `.acl` (Control required; the owner has it).
+    let del = h
+        .request("DELETE", "/alice/c/r.acl", None, Body::empty())
+        .await;
+    assert_eq!(del.status(), StatusCode::NO_CONTENT);
+
+    // The governed resource still exists and the container still lists it as a member.
+    let get_r = h.request("GET", "/alice/c/r", None, Body::empty()).await;
+    assert_eq!(get_r.status(), StatusCode::OK);
+    let get_c = h.request("GET", "/alice/c/", None, Body::empty()).await;
+    let bytes = to_bytes(get_c.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        text.contains("/alice/c/r>"),
+        "the governed resource must remain a contained member after the .acl delete: {text}"
+    );
+}
+
 // --- Cluster A: protocol-completeness tests ----------------------------------------------------
 
 /// Send a raw request with arbitrary headers and no automatic auth (for CORS / OPTIONS probes).
