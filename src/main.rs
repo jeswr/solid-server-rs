@@ -62,6 +62,12 @@ const ENV_BIDIRECTIONAL: &str = "SOLID_SERVER_BIDIRECTIONAL";
 /// WebID profiles + container tree (the Solid CTH bootstraps by dereferencing those WebIDs). NEVER
 /// set against a real (SPARQ/S3) backend. See [`solid_server_rs::seed`].
 const ENV_SEED_CONFORMANCE: &str = "SOLID_SERVER_SEED_CONFORMANCE";
+/// Dev/BENCHMARK ONLY: when set, seed the in-memory store with the HTTPS-load-benchmark fixtures (a
+/// public doc, a public listing container with N children, a private doc — see
+/// [`solid_server_rs::seed::seed_bench`]). The value is the child count (an integer); a bare `1`/
+/// `true` (or any non-integer) uses [`seed::BENCH_DEFAULT_CHILDREN`]. NEVER set against a real
+/// (SPARQ/S3) backend. Purely additive seeding — it changes no request-handling behaviour.
+const ENV_SEED_BENCH: &str = "SOLID_SERVER_SEED_BENCH";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -135,6 +141,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "  SEEDED conformance users {:?} (WebID profiles + container tree) — DEV/CONFORMANCE ONLY.",
             solid_server_rs::seed::SEED_USERS
+        );
+    }
+
+    // Dev/benchmark seeding (gated, in-memory only): purely additive fixtures for the HTTPS load
+    // benchmark. Like the conformance seed it only writes resources; it changes no request handling.
+    if let Some(child_count) = bench_seed_count(ENV_SEED_BENCH) {
+        let fixtures = solid_server_rs::seed::seed_bench(&store, &base_url, child_count)
+            .await
+            .map_err(|e| format!("bench seeding failed: {e:?}"))?;
+        eprintln!(
+            "  SEEDED bench fixtures — DEV/BENCH ONLY: public_doc={} listing={} ({} children) private_doc={}",
+            fixtures.public_doc, fixtures.listing, fixtures.child_count, fixtures.private_doc
         );
     }
 
@@ -226,6 +244,22 @@ fn env_flag(key: &str) -> bool {
     matches!(
         std::env::var(key).ok().as_deref().map(str::trim),
         Some("1") | Some("true") | Some("TRUE") | Some("True")
+    )
+}
+
+/// Resolve the bench-seed child count from `key`. Returns `None` when the var is absent/empty/`0`/
+/// `false` (bench seeding OFF), else `Some(n)`: an integer value is used directly, and a truthy-but-
+/// non-integer value (`1`/`true`) falls back to [`seed::BENCH_DEFAULT_CHILDREN`].
+fn bench_seed_count(key: &str) -> Option<usize> {
+    let raw = std::env::var(key).ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("false") || raw == "0" {
+        return None;
+    }
+    // An explicit integer is the child count; a truthy non-integer uses the default.
+    Some(
+        raw.parse::<usize>()
+            .unwrap_or(solid_server_rs::seed::BENCH_DEFAULT_CHILDREN),
     )
 }
 

@@ -259,6 +259,209 @@ fn profile_card_acl_turtle(profile_doc: &str, webid: &str) -> ServerResult<Vec<u
     serialize_triples(RdfFormat::Turtle, &triples)
 }
 
+// --- Benchmark seeding (dev-only; gated by SOLID_SERVER_SEED_BENCH) --------------------------------
+//
+// Identical in nature to the conformance seed: it ONLY writes fixtures into the in-memory store at
+// boot and changes NO request-handling code path. It exists so the HTTPS load benchmark
+// (`bench/run.sh`) has stable, AUTH-FREE fixtures to measure the read hot path against without
+// standing up Keycloak:
+//   - a PUBLIC-readable RDF document,
+//   - a PUBLIC-readable container with a configurable number of PUBLIC children (the listing path),
+//   - a PRIVATE (owner-only) RDF document — present so an authenticated-throughput follow-up can
+//     target it; it is NOT anonymously readable.
+// The public fixtures live UNDER a dedicated `/{BENCH_USER}/` pod whose pod-root ACL grants
+// `foaf:Agent acl:Read` by `acl:default`, so every descendant is anonymously readable for the read
+// benchmark — and the private document carries its OWN owner-only `.acl` overriding that default.
+
+/// The bench fixture pod owner (a synthetic WebID — bench fixtures are not tied to a real user).
+pub const BENCH_USER: &str = "bench";
+/// The default number of children seeded into the bench listing container (overridable via
+/// `SOLID_SERVER_SEED_BENCH` = an integer; any non-integer / unset-but-flag-on ⇒ this default).
+pub const BENCH_DEFAULT_CHILDREN: usize = 100;
+
+/// Seed the deterministic benchmark fixtures into `store` (dev-only; see the module note above).
+///
+/// `base_url` is the server's public origin without a trailing slash. `child_count` is how many
+/// public children to place in the listing container. Returns the seeded fixture IRIs (for the
+/// bench harness / a log line) — the public doc, the listing container, and the private doc.
+pub async fn seed_bench<S: Store>(
+    store: &S,
+    base_url: &str,
+    child_count: usize,
+) -> ServerResult<BenchFixtures> {
+    let base = base_url.trim_end_matches('/');
+
+    // Root + the bench pod must exist before anything under them.
+    let root = format!("{base}/");
+    ensure_container(store, &root, None).await?;
+    let pod = format!("{base}/{BENCH_USER}/");
+    ensure_container(store, &pod, Some(&root)).await?;
+
+    // The bench WebID owner subject (used by the owner-only private-doc ACL).
+    let owner = format!("{base}/{BENCH_USER}/profile/card#me");
+
+    // The pod-root ACL: PUBLIC Read by default (`acl:default`, so descendants inherit it) PLUS the
+    // owner full control. This is what makes the public doc + listing container anonymously readable.
+    let pod_acl = format!("{pod}.acl");
+    let pod_acl_body = public_read_default_acl_turtle(&pod, &owner)?;
+    store
+        .write(
+            &pod_acl,
+            Bytes::from(pod_acl_body),
+            RdfFormat::Turtle.media_type(),
+        )
+        .await?;
+
+    // (a) The PUBLIC document — a small RDF resource (inherits the pod-root public-read default).
+    let public_doc = format!("{base}/{BENCH_USER}/public/doc");
+    let public_dir = format!("{base}/{BENCH_USER}/public/");
+    ensure_container(store, &public_dir, Some(&pod)).await?;
+    let public_body = bench_doc_turtle(&public_doc, "public benchmark document")?;
+    store
+        .create_in_container(
+            &public_dir,
+            &public_doc,
+            Bytes::from(public_body),
+            RdfFormat::Turtle.media_type(),
+        )
+        .await?;
+
+    // (b) The PUBLIC listing container with `child_count` children (inherits public-read default).
+    let listing = format!("{base}/{BENCH_USER}/listing/");
+    ensure_container(store, &listing, Some(&pod)).await?;
+    for i in 0..child_count {
+        let child = format!("{listing}item-{i:04}");
+        let body = bench_doc_turtle(&child, &format!("listing child {i}"))?;
+        store
+            .create_in_container(
+                &listing,
+                &child,
+                Bytes::from(body),
+                RdfFormat::Turtle.media_type(),
+            )
+            .await?;
+    }
+
+    // (c) The PRIVATE document — owner-only. Its OWN `.acl` overrides the pod-root public default, so
+    // an anonymous GET answers 401 (the auth-verify hot path the bench's authed follow-up targets).
+    let private_dir = format!("{base}/{BENCH_USER}/private/");
+    ensure_container(store, &private_dir, Some(&pod)).await?;
+    let private_doc = format!("{base}/{BENCH_USER}/private/doc");
+    let private_body = bench_doc_turtle(&private_doc, "private benchmark document")?;
+    store
+        .create_in_container(
+            &private_dir,
+            &private_doc,
+            Bytes::from(private_body),
+            RdfFormat::Turtle.media_type(),
+        )
+        .await?;
+    // Owner-only ACL on the private document (no public grant) — overrides the inherited public read.
+    let private_acl = format!("{private_doc}.acl");
+    let private_acl_body = owner_only_acl_turtle(&private_doc, &owner)?;
+    store
+        .write(
+            &private_acl,
+            Bytes::from(private_acl_body),
+            RdfFormat::Turtle.media_type(),
+        )
+        .await?;
+
+    Ok(BenchFixtures {
+        public_doc,
+        listing,
+        private_doc,
+        child_count,
+    })
+}
+
+/// The IRIs the bench seed produced (echoed at boot so the harness/log shows exactly what to hit).
+#[derive(Debug, Clone)]
+pub struct BenchFixtures {
+    pub public_doc: String,
+    pub listing: String,
+    pub private_doc: String,
+    pub child_count: usize,
+}
+
+/// A tiny RDF document body for a bench fixture: `<subject> rdfs:label "label"`. Built via oxrdf
+/// triples + the server's own serialiser (never hand-concatenated — the house rule).
+fn bench_doc_turtle(subject_iri: &str, label: &str) -> ServerResult<Vec<u8>> {
+    const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
+    let subject = NamedNode::new(subject_iri).map_err(|e| {
+        crate::error::ServerError::Storage(format!("invalid bench IRI {subject_iri}: {e}"))
+    })?;
+    let pred = NamedNode::new(RDFS_LABEL)
+        .map_err(|e| crate::error::ServerError::Storage(format!("invalid rdfs:label: {e}")))?;
+    let triples = vec![Triple::new(
+        subject,
+        pred,
+        oxrdf::Literal::new_simple_literal(label),
+    )];
+    serialize_triples(RdfFormat::Turtle, &triples)
+}
+
+/// A pod-root ACL granting the PUBLIC (`foaf:Agent`) `acl:Read` by default (inherited by descendants)
+/// AND the owner full control. Used only for the bench fixtures' public-read posture.
+fn public_read_default_acl_turtle(pod_root: &str, webid: &str) -> ServerResult<Vec<u8>> {
+    let acl_doc = format!("{pod_root}.acl");
+    let owner_auth = acl_nn(&format!("{acl_doc}#owner"))?;
+    let public_auth = acl_nn(&format!("{acl_doc}#public"))?;
+    let root = acl_nn(pod_root)?;
+    let me = acl_nn(webid)?;
+    let triples = vec![
+        // Owner: full control on the root + descendants.
+        Triple::new(
+            owner_auth.clone(),
+            acl_nn(RDF_TYPE)?,
+            acl_nn(ACL_AUTHORIZATION)?,
+        ),
+        Triple::new(owner_auth.clone(), acl_nn(ACL_AGENT)?, me),
+        Triple::new(owner_auth.clone(), acl_nn(ACL_ACCESS_TO)?, root.clone()),
+        Triple::new(owner_auth.clone(), acl_nn(ACL_DEFAULT)?, root.clone()),
+        Triple::new(owner_auth.clone(), acl_nn(ACL_MODE)?, acl_nn(ACL_READ)?),
+        Triple::new(owner_auth.clone(), acl_nn(ACL_MODE)?, acl_nn(ACL_WRITE)?),
+        Triple::new(owner_auth, acl_nn(ACL_MODE)?, acl_nn(ACL_CONTROL)?),
+        // Public: Read on the root AND by default on descendants.
+        Triple::new(
+            public_auth.clone(),
+            acl_nn(RDF_TYPE)?,
+            acl_nn(ACL_AUTHORIZATION)?,
+        ),
+        Triple::new(
+            public_auth.clone(),
+            acl_nn(ACL_AGENT_CLASS)?,
+            acl_nn(FOAF_AGENT)?,
+        ),
+        Triple::new(public_auth.clone(), acl_nn(ACL_ACCESS_TO)?, root.clone()),
+        Triple::new(public_auth.clone(), acl_nn(ACL_DEFAULT)?, root),
+        Triple::new(public_auth, acl_nn(ACL_MODE)?, acl_nn(ACL_READ)?),
+    ];
+    serialize_triples(RdfFormat::Turtle, &triples)
+}
+
+/// An owner-only `.acl` on a single document (`acl:accessTo` only, no public grant, no `acl:default`)
+/// — overrides an inherited public-read default so the document is owner-private.
+fn owner_only_acl_turtle(doc: &str, webid: &str) -> ServerResult<Vec<u8>> {
+    let acl_doc = format!("{doc}.acl");
+    let owner_auth = acl_nn(&format!("{acl_doc}#owner"))?;
+    let d = acl_nn(doc)?;
+    let me = acl_nn(webid)?;
+    let triples = vec![
+        Triple::new(
+            owner_auth.clone(),
+            acl_nn(RDF_TYPE)?,
+            acl_nn(ACL_AUTHORIZATION)?,
+        ),
+        Triple::new(owner_auth.clone(), acl_nn(ACL_AGENT)?, me),
+        Triple::new(owner_auth.clone(), acl_nn(ACL_ACCESS_TO)?, d),
+        Triple::new(owner_auth.clone(), acl_nn(ACL_MODE)?, acl_nn(ACL_READ)?),
+        Triple::new(owner_auth.clone(), acl_nn(ACL_MODE)?, acl_nn(ACL_WRITE)?),
+        Triple::new(owner_auth, acl_nn(ACL_MODE)?, acl_nn(ACL_CONTROL)?),
+    ];
+    serialize_triples(RdfFormat::Turtle, &triples)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,6 +588,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!(n, 4, "four triples in the seeded profile");
+    }
+
+    #[tokio::test]
+    async fn seeds_bench_fixtures_public_and_private() {
+        use crate::authz::wac::{Decision, WacAuthorizer};
+        use crate::authz::AccessMode;
+
+        let s = store();
+        let base = "https://localhost:3000";
+        let fx = seed_bench(&s, base, 10).await.unwrap();
+
+        // The public doc + listing container exist, and the listing has exactly the seeded children.
+        assert!(s.exists(&fx.public_doc).await.unwrap());
+        assert!(s.exists(&fx.listing).await.unwrap());
+        assert!(s.exists(&fx.private_doc).await.unwrap());
+        assert_eq!(fx.child_count, 10);
+        assert_eq!(s.list_children(&fx.listing).await.unwrap().len(), 10);
+
+        let wac = WacAuthorizer::new(&s, base);
+        // The public doc + listing container are ANONYMOUSLY readable (public-read default).
+        assert!(matches!(
+            wac.authorize(&fx.public_doc, AccessMode::Read, None, None)
+                .await
+                .unwrap(),
+            Decision::Allow(_)
+        ));
+        assert!(matches!(
+            wac.authorize(&fx.listing, AccessMode::Read, None, None)
+                .await
+                .unwrap(),
+            Decision::Allow(_)
+        ));
+        // The private doc is NOT anonymously readable (its own owner-only ACL overrides the default).
+        assert_eq!(
+            wac.authorize(&fx.private_doc, AccessMode::Read, None, None)
+                .await
+                .unwrap(),
+            Decision::Unauthenticated
+        );
+        // The owner CAN read the private doc.
+        let owner = format!("{base}/{BENCH_USER}/profile/card#me");
+        assert!(matches!(
+            wac.authorize(&fx.private_doc, AccessMode::Read, Some(&owner), None)
+                .await
+                .unwrap(),
+            Decision::Allow(_)
+        ));
     }
 
     #[tokio::test]

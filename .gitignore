@@ -6,3 +6,7 @@
 
 # Conformance harness generated reports (EARL/HTML/log) — regenerate with conformance/run.sh
 /conformance/reports/
+
+# Bench harness DEV artifacts (regenerate with bench/run.sh)
+/bench/tls/
+/bench/results/
