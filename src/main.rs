@@ -41,6 +41,9 @@ use solid_oidc_verifier::verifier::Verifier;
 use solid_oidc_verifier::webid::{BidirectionalMode, NetworkWebIdResolver};
 use solid_server_rs::app::{build_router, AppState};
 use solid_server_rs::auth::AuthContext;
+use solid_server_rs::auth_cache::{
+    ProofPolicy, SharedReplay, VerifiedTokenCache, DEFAULT_CACHE_CAPACITY,
+};
 use solid_server_rs::ldp::handler::LdpState;
 use solid_server_rs::store::{CompositeStore, InMemoryBlobStore, InMemorySparqClient};
 use solid_server_rs::tls::{self, TlsMode};
@@ -80,6 +83,13 @@ const ENV_SEED_CONFORMANCE: &str = "SOLID_SERVER_SEED_CONFORMANCE";
 /// `true` (or any non-integer) uses [`seed::BENCH_DEFAULT_CHILDREN`]. NEVER set against a real
 /// (SPARQ/S3) backend. Purely additive seeding — it changes no request-handling behaviour.
 const ENV_SEED_BENCH: &str = "SOLID_SERVER_SEED_BENCH";
+/// Round-3 verified-access-token cache capacity (distinct live access tokens). Unset =>
+/// [`DEFAULT_CACHE_CAPACITY`]. The cache removes the redundant per-request access-token *signature +
+/// claims* re-verify (the token is stable across a client's requests) while STILL fully verifying the
+/// fresh DPoP proof + `jti` replay + `cnf.jkt` binding on every request -- it can never turn a
+/// would-be-401/403 into a 200. Set to `0` to DISABLE the cache (every authenticated request runs the
+/// full verifier -- the pre-round-3 path). Conformance-neutral. See [`solid_server_rs::auth_cache`].
+const ENV_TOKEN_CACHE_CAPACITY: &str = "SOLID_SERVER_TOKEN_CACHE_CAPACITY";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -138,7 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // RAISES it (a value <= the default is ignored, so it can only ever raise — see the const's doc).
     // The override exists solely so the auth benchmark can measure steady-state verify cost without the
     // cap's fail-closed path firing mid-sweep. Unset ⇒ byte-identical to before (conformance-neutral).
-    let replay = match parse_replay_max_entries(std::env::var(ENV_REPLAY_MAX_ENTRIES).ok()) {
+    let inner_replay = match parse_replay_max_entries(std::env::var(ENV_REPLAY_MAX_ENTRIES).ok()) {
         Some(max_entries) => {
             eprintln!(
                 "  DEV/BENCH: DPoP replay-store capacity RAISED to {max_entries} live jtis \
@@ -148,8 +158,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => InMemoryReplayStore::with_window(config.replay_ttl()),
     };
-    let verifier = Verifier::new(config, jwks, replay)?;
-    let auth = AuthContext::new(verifier, base_url.clone());
+
+    // Round-3 verified-access-token cache. Capture the proof policy from the SAME config the verifier
+    // is built with (so the cache's hit-path proof verification enforces byte-identical semantics),
+    // BEFORE `config` is moved into the verifier. Wrap ONE replay store behind an `Arc` and give the
+    // verifier a `SharedReplay` over it + the cache a clone of the same `Arc` -- so the hit path and
+    // miss path mark the SAME jti set (the replay-bypass guard; see auth_cache).
+    let proof_policy = ProofPolicy {
+        clock_tolerance_secs: config.clock_tolerance_secs,
+        allow_missing_ath: config.allow_missing_ath,
+        replay_fail_closed: config.replay_fail_closed,
+    };
+    let cache_capacity = parse_cache_capacity(std::env::var(ENV_TOKEN_CACHE_CAPACITY).ok());
+
+    let shared_replay = SharedReplay::new(Arc::new(inner_replay));
+    // The cache marks jti through a CLONE of the SAME `SharedReplay` (it forwards to the one inner
+    // `Arc<InMemoryReplayStore>`), so the verifier's miss path and the cache's hit path share one jti
+    // set -- the replay-bypass guard. Cloning `SharedReplay` clones only the inner `Arc`.
+    let cache_replay = Arc::new(shared_replay.clone());
+    let verifier = Verifier::new(config, jwks, shared_replay)?;
+    let auth = match cache_capacity {
+        // 0 => cache DISABLED: the pre-round-3 full-verify-every-request path.
+        0 => {
+            eprintln!("  AUTH: verified-access-token cache DISABLED (full verify per request).");
+            AuthContext::new(verifier, base_url.clone())
+        }
+        cap => {
+            eprintln!(
+                "  AUTH: verified-access-token cache ENABLED (capacity {cap} tokens; DPoP proof + \
+                 jti-replay + cnf.jkt re-verified every request)."
+            );
+            // Bound the cache's validation TTL by the CONFIGURED JWKS cache TTL (not the hard-coded
+            // default): if an operator lowers SOLID_SERVER_JWKS_CACHE_TTL_SECS for faster key-
+            // revocation response, the token cache honours the same window (roborev round-2 Medium) --
+            // a revoked signing key forces a full re-verify within one JWKS-TTL, never up to `exp`.
+            let max_entry_ttl = jwks_cache_ttl.as_secs() as i64;
+            let cache = VerifiedTokenCache::with_max_entry_ttl(cap, proof_policy, max_entry_ttl);
+            AuthContext::with_cache(verifier, base_url.clone(), cache, cache_replay)
+        }
+    };
 
     // --- Storage. SPARQ authoritative for metadata; object_store backup-only for bytes. -----------
     // The binary still boots the in-memory doubles so it runs without SPARQ / S3; wiring the live
@@ -270,6 +317,21 @@ fn env_flag(key: &str) -> bool {
         std::env::var(key).ok().as_deref().map(str::trim),
         Some("1") | Some("true") | Some("TRUE") | Some("True")
     )
+}
+
+/// Resolve the verified-access-token cache capacity from the env value.
+/// - absent / empty / non-numeric => [`DEFAULT_CACHE_CAPACITY`] (cache ENABLED, default size);
+/// - `0` => `0` (cache DISABLED -- full verify per request);
+/// - `>0` => that literal capacity (clamped to >=1 internally by the cache).
+///
+/// A non-numeric value falls back to the default rather than silently disabling the cache (disabling
+/// is an explicit `0` only) -- a fat-fingered value should not quietly drop the perf win, and the cache
+/// is fail-safe (a miss just re-verifies).
+fn parse_cache_capacity(raw: Option<String>) -> usize {
+    match raw.as_deref().map(str::trim) {
+        None | Some("") => DEFAULT_CACHE_CAPACITY,
+        Some(s) => s.parse::<usize>().unwrap_or(DEFAULT_CACHE_CAPACITY),
+    }
 }
 
 /// Resolve the bench-seed child count from `key`. Returns `None` when bench seeding is OFF

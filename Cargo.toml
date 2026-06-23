@@ -80,14 +80,23 @@ serde_json = "1"
 # directly rather than a higher-level `rand`/`uuid`: the suffix is just 16 random bytes, so the raw
 # OS entropy source is the minimal, audit-small surface for the job.
 getrandom = "0.2"
+# Round-3 verified-access-token cache (`auth_cache`): `sha2` for the SHA-256 cache key (full-token
+# hash) + the DPoP `ath` value, `base64` (URL-safe, no pad) for the `ath`/thumbprint encodings, and
+# `url` to normalise the DPoP `htu` the SAME way the verifier does (strip query/fragment, normalise
+# default ports). All three are ALREADY resolved in the non-dev tree (transitively via
+# `solid-oidc-verifier`: `sha2`/`base64` for its thumbprint/ath, `url` for its WebID/SSRF URL
+# parsing), so naming them directly at the same versions adds NO new crate — it only makes the
+# existing deps callable from this server's own cache code. The cache reuses the verifier's PUBLIC
+# crypto/thumbprint/replay primitives (R1: it does not reimplement verification — see `auth_cache`).
+sha2 = "0.10"
+base64 = "0.22"
+url = "2"
 
 [dev-dependencies]
 # Mint test JWS access tokens + DPoP proofs for the auth-middleware unit tests (mirrors the
 # verifier crate's own test helpers — ES256 keys + RFC 7638 thumbprint).
 p256 = { version = "0.13", features = ["ecdsa", "jwk", "pem", "std"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
-base64 = "0.22"
-sha2 = "0.10"
 serde_json = "1"
 # The HttpSparqClient unit tests run against an in-process mock SPARQL endpoint (an axum server on a
 # tokio listener) — no live SPARQ. `net` for the listener, `rt-multi-thread` so the client + server

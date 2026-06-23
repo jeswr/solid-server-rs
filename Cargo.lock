@@ -1826,6 +1826,7 @@ dependencies = [
  "tokio-tungstenite",
  "tower",
  "tower-http 0.7.0",
+ "url",
 ]
 
 [[package]]

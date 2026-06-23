@@ -25,6 +25,7 @@ use solid_oidc_verifier::verifier::{AuthRequest, Verifier};
 
 pub use solid_oidc_verifier::verifier::VerifiedToken;
 
+use crate::auth_cache::{CacheDecision, VerifiedTokenCache};
 use crate::error::ServerError;
 use crate::ldp::target::parse_target;
 
@@ -37,18 +38,61 @@ pub struct AuthContext<J: JwksProvider, R: ReplayStore> {
     pub verifier: Verifier<J, R>,
     /// The server's public origin (no trailing slash), used to reconstruct the DPoP `htu`.
     pub base_url: String,
+    /// The round-3 verified-access-token cache (default-on; see [`crate::auth_cache`]). `None` =>
+    /// every authenticated request runs the verifier's full `verify()` (the pre-round-3 behaviour).
+    ///
+    /// When `Some`, the cache + `replay` MUST share the SAME replay store the `verifier` holds -- the
+    /// hit path marks the proof `jti` through `replay`, so it must be the verifier's store or a
+    /// replay used on the miss path could be replayed on the hit path. The server wires this by
+    /// building one `Arc<InMemoryReplayStore>`, giving the verifier `SharedReplay<_>` over it and the
+    /// cache a clone of the same `Arc`. This `replay` handle is exactly that clone.
+    cache: Option<TokenCache<R>>,
+}
+
+/// The token cache + the shared replay handle it marks `jti`s through (the SAME store the verifier
+/// uses). Bundled so they cannot be wired independently (which would split the replay set).
+struct TokenCache<R: ReplayStore> {
+    cache: VerifiedTokenCache,
+    replay: Arc<R>,
 }
 
 impl<J: JwksProvider, R: ReplayStore> AuthContext<J, R> {
+    /// Construct WITHOUT the verified-token cache -- every authenticated request runs the full verifier
+    /// (the pre-round-3 path). Used where no shared replay handle is available (e.g. unit harnesses).
     pub fn new(verifier: Verifier<J, R>, base_url: impl Into<String>) -> Self {
         Self {
             verifier,
             base_url: base_url.into(),
+            cache: None,
+        }
+    }
+
+    /// Construct WITH the round-3 verified-access-token cache. `replay` MUST be a clone of the `Arc`
+    /// the `verifier`'s `SharedReplay` wraps (so the hit + miss paths mark the SAME jti set -- the
+    /// replay-bypass guard). See [`crate::auth_cache`].
+    pub fn with_cache(
+        verifier: Verifier<J, R>,
+        base_url: impl Into<String>,
+        cache: VerifiedTokenCache,
+        replay: Arc<R>,
+    ) -> Self {
+        Self {
+            verifier,
+            base_url: base_url.into(),
+            cache: Some(TokenCache { cache, replay }),
         }
     }
 
     /// Verify the request and return the caller's [`VerifiedToken`] (possibly public), or the
     /// verifier's error mapped onto a [`ServerError::Unauthorized`] (carrying its status + challenge).
+    ///
+    /// ## Round-3 verified-access-token cache (when enabled via [`with_cache`](Self::with_cache))
+    /// For a `DPoP <token>` request, the cache may already hold the verified result of THIS token.
+    /// On a cache HIT the access-token signature + RFC-9068 claims are NOT re-verified (the saving),
+    /// but the FRESH DPoP proof + `jti` replay + `cnf.jkt` binding ARE fully verified for this request
+    /// (the cache cannot turn a failing proof into a success). On a MISS (or any non-DPoP request) the
+    /// full verifier runs, and a successful DPoP-bound result is inserted for the token's `exp` window.
+    /// Disabling the cache is byte-identical to the pre-round-3 path.
     pub fn authenticate(
         &self,
         authorization: Option<String>,
@@ -59,10 +103,69 @@ impl<J: JwksProvider, R: ReplayStore> AuthContext<J, R> {
         // Reconstruct the htu the verifier checks the DPoP proof against. A bad target is a 400
         // before we even reach the verifier (it would otherwise reject on htu mismatch as a 401).
         let target = parse_target(&self.base_url, path)?;
+        let method_uc = method.to_ascii_uppercase();
+
+        // Cache fast-path: ONLY for a `DPoP <token>` request (the production posture). Everything else
+        // -- absent auth (public), Bearer, or an unparseable header -- goes straight to the verifier,
+        // which owns those decisions. We extract the bearer token string purely as the cache key + the
+        // `ath` input; the verifier remains the sole authority on a miss.
+        //
+        // Extract the access token as an OWNED `String` (not a borrow of `authorization`) so that on a
+        // MISS we can still move `authorization` into the verifier's `AuthRequest` while using the
+        // token string for the cache `insert`. The clone is one small string per cache-eligible request
+        // -- negligible against the ES256 verify a hit saves, and only paid when the cache is enabled.
+        let cache_token: Option<String> = self.cache.as_ref().and(
+            authorization
+                .as_deref()
+                .and_then(dpop_scheme_access_token)
+                .map(str::to_string),
+        );
+        if let (Some(tc), Some(access_token)) = (self.cache.as_ref(), cache_token.as_deref()) {
+            match tc.cache.authenticate(
+                access_token,
+                dpop.as_deref(),
+                &method_uc,
+                &target.htu,
+                now_secs(),
+                tc.replay.as_ref(),
+            ) {
+                CacheDecision::Verified(token) => return Ok(token),
+                CacheDecision::Reject(e) => {
+                    return Err(ServerError::Unauthorized {
+                        status: e.status(),
+                        message: e.message().to_string(),
+                        www_authenticate: self.verifier.www_authenticate(&e),
+                    })
+                }
+                // Fall through to the full verifier; on success, populate the cache.
+                CacheDecision::Miss => {
+                    let req = AuthRequest {
+                        authorization,
+                        dpop,
+                        method: method_uc,
+                        url: target.htu,
+                    };
+                    let token =
+                        self.verifier
+                            .verify(&req)
+                            .map_err(|e| ServerError::Unauthorized {
+                                status: e.status(),
+                                message: e.message().to_string(),
+                                www_authenticate: self.verifier.www_authenticate(&e),
+                            })?;
+                    // Only a SUCCESSFUL full verification reaches here => safe to cache. A non-DPoP-bound
+                    // token (no cnf.jkt/exp) is silently not cached by `insert`.
+                    tc.cache.insert(access_token, &token, now_secs());
+                    return Ok(token);
+                }
+            }
+        }
+
+        // No cache (or a non-DPoP request): the full verifier owns the decision.
         let req = AuthRequest {
             authorization,
             dpop,
-            method: method.to_ascii_uppercase(),
+            method: method_uc,
             url: target.htu,
         };
         self.verifier
@@ -154,5 +257,59 @@ fn header_string(req: &Request, name: axum::http::HeaderName) -> Result<Option<S
     match req.headers().get(&name) {
         None => Ok(None),
         Some(value) => value.to_str().map(|s| Some(s.to_string())).map_err(|_| ()),
+    }
+}
+
+/// Extract the access-token string from a `DPoP <token>` Authorization header, returning `None` for
+/// any other scheme (Bearer, etc.) or a malformed/empty header.
+///
+/// This MUST parse the header EXACTLY as the verifier's own `parse_authorization` does -- trim the
+/// header, split on the FIRST space, lowercase the scheme, trim the token -- so the cache key is the
+/// byte-identical token the verifier verifies on a miss (a divergent parse could key the cache by a
+/// different string than the one verified, splitting the cache or, worse, reusing a verification for a
+/// token that was never verified). It is consulted ONLY for the cache fast-path; the verifier remains
+/// the sole authority on every miss, so this never makes a security decision on its own.
+fn dpop_scheme_access_token(header: &str) -> Option<&str> {
+    let trimmed = header.trim();
+    let sp = trimmed.find(' ')?;
+    let scheme = &trimmed[..sp];
+    if !scheme.eq_ignore_ascii_case("dpop") {
+        return None;
+    }
+    let token = trimmed[sp + 1..].trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
+/// Current UNIX time in seconds (the cache's `now` for token-`exp` + proof-`iat` checks). Matches the
+/// verifier's internal clock.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dpop_scheme_access_token;
+
+    #[test]
+    fn extracts_dpop_token_only() {
+        assert_eq!(
+            dpop_scheme_access_token("DPoP abc.def.ghi"),
+            Some("abc.def.ghi")
+        );
+        // Case-insensitive scheme, trims surrounding + inter-token whitespace exactly like the verifier.
+        assert_eq!(dpop_scheme_access_token("  dpop   tok  "), Some("tok"));
+        // Non-DPoP schemes are not cache-eligible (verifier decides).
+        assert_eq!(dpop_scheme_access_token("Bearer tok"), None);
+        // Malformed / empty.
+        assert_eq!(dpop_scheme_access_token("DPoP"), None);
+        assert_eq!(dpop_scheme_access_token("DPoP "), None);
+        assert_eq!(dpop_scheme_access_token(""), None);
     }
 }
