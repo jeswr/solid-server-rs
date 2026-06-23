@@ -2,6 +2,8 @@
 //! The LDP / Solid Protocol request path (M1 + the M2 verb-completion slice).
 //!
 //! - [`target`] — request-URL / LDP-target parsing (pure value logic).
+//! - [`cors`] — the Solid Protocol CORS middleware (reflective origin + credentials, preflight,
+//!   exposed headers, case-sensitive `Vary: Origin`) — a hand-rolled axum middleware.
 //! - [`content`] — Turtle / JSON-LD classification, RDF validation, re-serialisation, and `Accept`
 //!   content negotiation.
 //! - [`conditional`] — `If-Match` / `If-None-Match` precondition evaluation over the strong ETag.
@@ -12,10 +14,12 @@
 //!   [`crate::store::Store`] seam.
 //!
 //! M2-next (clearly seamed, not implemented): full WAC authorization (needs the SPARQ access-control
-//! design), multipart Range, and `application/sparql-update` PATCH.
+//! design) and multipart Range. `application/sparql-update` PATCH now supports the INSERT/DELETE DATA
+//! subset (see [`patch`]).
 
 pub mod conditional;
 pub mod content;
+pub mod cors;
 pub mod handler;
 pub mod patch;
 pub mod range;

@@ -23,7 +23,10 @@ axum = { version = "0.8", features = ["ws"] }
 # `broadcast`/`Mutex` (the per-topic subscription fan-out). Declare them directly — do NOT rely on a
 # transitive enable, which is fragile under feature-unification changes.
 tokio = { version = "1", features = ["fs", "rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
-# tower-http middleware layer set (spike §4). M2 wires in CORS/security-headers/trace/body-limit.
+# tower-http middleware layer set (spike §4). M2 wires in security-headers/trace/body-limit. CORS is a
+# hand-rolled axum middleware (`ldp::cors`) rather than `tower-http`'s `CorsLayer`, because the Solid
+# CTH asserts case-sensitive `Vary: Origin` + expose-headers on the preflight, which the layer does
+# not emit out of the box — so no `cors` feature is needed here.
 tower = "0.5"
 tower-http = { version = "0.7", features = ["trace"] }
 # TLS: rustls + aws-lc-rs (spike §4 — the house rule, FIPS-capable backend).

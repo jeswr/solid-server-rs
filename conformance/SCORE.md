@@ -5,61 +5,63 @@
 > SPARQ) terminating TLS in-process and seeded with the conformance users. Re-run with
 > `./conformance/run.sh`; the authoritative numbers come from the EARL report (`reports/report.ttl`).
 
-## Headline — first real baseline (2026-06-22)
+## Headline — Cluster A landed: Protocol 25/25 (2026-06-23)
 
-**41 test cases · 9 passed · 32 failed · 0 skipped → 22% pass.**
+**41 test cases · 26 passed · 15 failed · 0 skipped → 63% pass.** Protocol is now **25/25 (100%)**;
+the 15 remaining failures are the WAC suite (Cluster B, gated on sparq#992) minus the one WAC case
+that incidentally passes under the pre-WAC posture.
 
-This is the true starting score now that auth works (the earlier discovery measured 0% only because
-of the auth panic, which is fixed — solid-server-rs `main` `53bf0c1`). The full DPoP-bound Solid-OIDC
-auth chain runs end-to-end: the harness obtains DPoP-bound RFC-9068 `at+jwt` tokens from the shared
-Keycloak `solid` realm, the server validates them (signature, `iss`, `aud`, DPoP `htu`/`htm`/`ath`,
-`cnf.jkt`), and authenticated CRUD reaches the LDP handlers. The remaining failures are LDP-surface
-and WAC gaps, not auth gaps.
+The Cluster-A protocol-completeness work (branch `conformance/protocol-fixes`) took Protocol from
+9/25 → **25/25**: the root `/` route + a `ldp:contains` container listing rendered from
+`store.list_children` (via `oxrdf` triples, never hand-concatenated), a hand-rolled Solid CORS
+middleware (reflective ACAO + credentials, preflight, case-sensitive `Vary: Origin`,
+expose-headers on the preflight too), the OPTIONS/`Allow`/`Accept-Post`/`Accept-Patch`
+advertisement, a pre-WAC 401-vs-anonymous posture (anonymous → 401 + `WWW-Authenticate`, except a
+public WebID profile card), `content-type-reject` (absent Content-Type → 400), the
+trailing-slash co-existence guard, PUT/PATCH intermediate-container creation + membership wiring,
+opaque binary-resource writes (`text/plain` etc.), `application/sparql-update` INSERT/DELETE-DATA
+PATCH, and `Link: ldp:BasicContainer; rel="type"` container-POST.
+
+The full DPoP-bound Solid-OIDC auth chain runs end-to-end (signature, `iss`, `aud`, DPoP
+`htu`/`htm`/`ath`, `cnf.jkt`). The remaining failures are WAC enforcement gaps, not auth or
+LDP-surface gaps.
 
 | Suite | Cases | Passed | Failed | Skipped | Pass % |
 |---|---:|---:|---:|---:|---:|
-| **Protocol** | 25 | 9 | 16 | 0 | 36% |
-| **WAC** | 16 | 0 | 16 | 0 | 0% |
-| **Total** | **41** | **9** | **32** | **0** | **22%** |
+| **Protocol** | 25 | 25 | 0 | 0 | 100% |
+| **WAC** | 16 | 1 | 15 | 0 | 6% |
+| **Total** | **41** | **26** | **15** | **0** | **63%** |
 
 (Skip tags applied in the TestSubject: `acp`, `wac-agent-group`, `http-redirect` — same as
-prod-solid-server. Karate-step view, for reference: 650 scenarios, 29 passed; the conformance metric
-is the per-test-case EARL verdict above, not the scenario count.)
+prod-solid-server. The conformance metric is the per-test-case EARL verdict above. Re-generate with
+`cargo build --release && ./conformance/run.sh` — the authoritative numbers come from the EARL
+report `reports/report.ttl`; the `CONFORMANCE RESULT` line run.sh prints is the headline.)
+
+### Previous baseline (2026-06-22, pre-Cluster-A)
+
+**9 passed / 32 failed (22%)** — Protocol 9/25, WAC 0/16. The first real baseline once auth worked
+(the earlier 0% was the now-fixed auth panic, `main` `53bf0c1`).
 
 ## Per-test-case verdicts (from the EARL report)
 
-### Protocol — 9 PASS
+### Protocol — 25 PASS (all)
 
-`content-negotiation-turtle`, `content-negotiation-jsonld`, `content-negotiation-named-graphs`,
-`describedby-unique`, `if-none-match-asterisk`, `method-not-allowed`, `post-uri-assignment`,
-`slug-uri-assignment`, `uri-assignment`.
+`authentication-header`, `content-negotiation-turtle`, `content-negotiation-jsonld`,
+`content-negotiation-named-graphs`, `content-type-reject`, `cors-acao-vary`, `cors-accept-acah`,
+`cors-access-control-headers`, `cors-enumerate`, `cors-options`, `cors-preflight-requests`,
+`cors-simple-requests`, `delete-protect-nonempty-container`, `delete-remove-containment`,
+`describedby-unique`, `if-none-match-asterisk`, `method-not-allowed`, `post-target-not-found`,
+`post-uri-assignment`, `read-method-allow`, `read-method-support`, `slash-semantics-exclude`,
+`slug-uri-assignment`, `uri-assignment`, `writing-resource-containment`.
 
-(Content negotiation Turtle↔JSON-LD incl. named graphs, conditional `If-None-Match: *`, the 405 for
-an unsupported method, POST URI/Slug assignment, and the storage-description `describedby` link all
-work.)
+The whole Protocol surface conforms: content negotiation (Turtle↔JSON-LD, named graphs),
+conditional `If-None-Match`, the 405 path, POST URI/Slug assignment, the storage-description
+`describedby` link, CORS (simple + preflight + exposed-headers + `Vary: Origin`), the
+OPTIONS/`Allow`/`Accept-*` advertisement, the 401-vs-anonymous `WWW-Authenticate` posture,
+`content-type-reject`, the trailing-slash co-existence guard, intermediate-container creation +
+`ldp:contains` containment/removal, and `application/sparql-update` PATCH.
 
-### Protocol — 16 FAIL
-
-| Test case | Root cause (confirmed by direct probe) |
-|---|---|
-| `read-method-support` | `OPTIONS` is not handled → axum returns **405** (should be 204/200 with `Allow`) |
-| `read-method-allow` | `OPTIONS`/`Allow` semantics: 405 on OPTIONS; no `Accept-Post`/`Accept-Patch` advertised |
-| `cors-simple-requests` | No CORS headers — `Access-Control-Allow-Origin` absent on a GET with `Origin` |
-| `cors-preflight-requests` | `OPTIONS` preflight → **405**, no `Access-Control-Allow-*` headers |
-| `cors-access-control-headers` | No `Access-Control-*` headers on any response |
-| `cors-acao-vary` | No `Access-Control-Allow-Origin` / `Vary: Origin` |
-| `cors-accept-acah` | No `Access-Control-Allow-Headers` on preflight |
-| `cors-enumerate` | No CORS exposed-headers enumeration |
-| `cors-options` | `OPTIONS` → 405 instead of a CORS-bearing 204 |
-| `authentication-header` | Unauthenticated access to a protected resource → **404/403, no `WWW-Authenticate`** (should be 401 + challenge) |
-| `writing-resource-containment` | Container GET body is **empty** — no `ldp:contains` listing; also uses `application/sparql-update` PATCH (only `text/n3` supported → 415) |
-| `delete-remove-containment` | Container GET does not render `ldp:contains`, so the harness cannot verify membership removal |
-| `delete-protect-nonempty-container` | Depends on container `ldp:contains` listing to set up the non-empty state |
-| `post-target-not-found` | POST to a missing container — needs verification against the exact 404 shape the harness asserts |
-| `content-type-reject` | The reject-unknown-content-type path differs from the harness's exact assertion (needs the failing-step detail) |
-| `slash-semantics-exclude` | Slash-semantics (a `/`-suffixed resource vs container) edge differs from the harness assertion |
-
-### WAC — all 16 FAIL (expected: WAC not implemented)
+### WAC — 15 FAIL, 1 PASS (Cluster B — WAC not implemented)
 
 `acl-object-none`, `acl-object-access-to`, `acl-object-default`, `acl-object-access-to-default`,
 `protected-operation-acl-propagation`, `read-access-public`, `read-access-agent`, `read-access-bob`,
@@ -68,71 +70,52 @@ work.)
 `server-wac-allow-public-access-direct`, `server-wac-allow-public-access-indirect`.
 
 **Root cause: WAC is not implemented** (gated on the SPARQ access-control design, sparq#992). The LDP
-layer is fail-closed-on-write / open-on-read with no per-resource ACL evaluation, no `WAC-Allow`
-header, and ACLs are advertised (`Link rel="acl"`) + storable but **not enforced**. Every WAC
-scenario therefore fails: read/write access decisions are not gated by `.acl`, and the `WAC-Allow`
-header is absent. These are claimed in the TestSubject (not skipped) deliberately, to measure the gap.
+layer runs a coarse PRE-WAC posture (anonymous → 401; an authenticated caller is permitted) with no
+per-resource ACL evaluation, no `WAC-Allow` header, and ACLs advertised (`Link rel="acl"`) + storable
+but **not enforced**. The WAC scenarios that require a per-ACL grant/deny decision (Bob vs Alice,
+public-vs-agent, `WAC-Allow`) therefore fail; one case (an anonymous-deny) incidentally passes under
+the pre-WAC 401 posture. These are claimed in the TestSubject (not skipped) deliberately, to measure
+the gap.
 
-## What was fixed to reach this baseline (server bugs that BLOCKED the harness)
+## What was fixed to reach this score
 
-Two minimal, regression-tested fixes were required for the harness to bootstrap at all (without them
-the harness aborts in `prepareServer` and reports 0 cases — the same 0% the panic produced):
+### Cluster A — Protocol completeness (branch `conformance/protocol-fixes`, 2026-06-23): 9/25 → 25/25
 
-1. **`Link: <pim:Storage>; rel="type"` on the storage root** (+ `ldp:Resource`/`Container`/
-   `BasicContainer` type links). The harness's pod-accessibility check requires the pod root to
-   advertise `pim:Storage`; without it: *"Pod … is not a valid storage as it missing a [pim#Storage]
-   header"*. (`src/ldp/handler.rs` `add_type_links` / `is_storage_root`.)
-2. **`Link: <…>; rel="acl"` ACL discovery** on every resource. The harness needs the ACL URL to set
-   up the test container's ACL during `prepareServer`; without it: *"Cannot get ACL url for root test
-   container"*. The ACL is advertised + storable (a normal resource) but NOT yet enforced.
-   (`src/ldp/handler.rs` `add_acl_link` / `acl_url_for`.)
+All on the LDP request path (router + `src/ldp/handler.rs` + a new `src/ldp/cors.rs` + `src/ldp/patch.rs`),
+RDF built via `oxrdf` triples + the server serializers (never hand-concatenated):
 
-Plus the conformance bootstrap seeding (`src/seed.rs`, `SOLID_SERVER_SEED_CONFORMANCE=1`): the WebID
-profiles (`pim:storage` + `solid:oidcIssuer`, built via `oxrdf` triples + the server's Turtle
-serializer) + the container tree the harness dereferences.
+1. **Root `/` route + container semantics.** Registered an explicit `/` route (the `/{*path}`
+   wildcard does not match the empty path) and made `parse_target` treat `/` as a container so `GET /`
+   renders the root's `ldp:contains` listing. (`src/app.rs`, `src/ldp/target.rs`.)
+2. **Container `ldp:contains` listing.** `render_container` synthesises `<c> a ldp:BasicContainer,
+   ldp:Container, ldp:Resource ; ldp:contains <child> …` from `store.list_children`, content-negotiated.
+3. **Solid CORS middleware** (`src/ldp/cors.rs`, hand-rolled — `tower-http`'s `CorsLayer` lowercases
+   `vary` and omits expose-headers on the preflight, both of which the CTH rejects): reflective ACAO +
+   `Allow-Credentials: true`, preflight 204 with reflected `Allow-Headers`, concrete (non-`*`)
+   expose-headers on every response, case-sensitive `Vary: Origin`.
+4. **OPTIONS + `Allow`/`Accept-Post`/`Accept-Patch`** advertised on OPTIONS and on the GET/HEAD read
+   response (`read-method-support`/`-allow`).
+5. **Pre-WAC 401 posture:** an anonymous request → 401 + `WWW-Authenticate` (single-sourced through
+   the verifier's challenge builder), EXCEPT a public WebID profile card.
+6. **Edges:** `content-type-reject` (absent Content-Type → 400, distinct from unsupported-415);
+   trailing-slash co-existence guard (resource/container can't share a name → 409); POST to a
+   non-container → 404/405; binary (`text/plain` etc.) resources stored verbatim; PUT/PATCH create
+   intermediate containers + wire `ldp:contains`; `Link: ldp:BasicContainer; rel=type` container-POST.
+7. **`application/sparql-update` PATCH** (INSERT/DELETE DATA subset → the shared N3 apply engine).
+
+### Bootstrap fixes (earlier baseline)
+
+Two fixes let the harness bootstrap at all: the storage-root `Link: <pim:Storage>; rel="type"` (+ LDP
+type links) and the `Link rel="acl"` ACL discovery on every resource (advertised + storable, NOT
+enforced). Plus the conformance seeding (`src/seed.rs`, `SOLID_SERVER_SEED_CONFORMANCE=1`).
 
 ## Ordered fix-list (independently dispatchable)
 
-**Cluster A — Protocol (do first; each lands ~1-3 protocol cases):**
+**Cluster A — Protocol: ✅ DONE (25/25, branch `conformance/protocol-fixes`).** See "What was fixed".
 
-1. **Root `/` route + seeded root container.** Add the `/` route (the `/{*path}` wildcard does not
-   match the empty path) and serve the seeded root container. (Owner: ldp.) Unblocks root-targeting
-   scenarios; prerequisite for clean discovery. *Probe: `GET /` → 404 today.*
-2. **Container listing: render `ldp:contains` + `ldp:BasicContainer` typing in the GET body.** The
-   container GET must serialise the authoritative membership (`store.list_children`) as
-   `<container> a ldp:BasicContainer ; ldp:contains <child> …`. House rule: build via typed RDF
-   accessors / `oxrdf`, never hand-concat. (Owner: ldp + rdf.) Fixes `writing-resource-containment`,
-   `delete-remove-containment`, `delete-protect-nonempty-container`; prerequisite for WAC container
-   tests. *Probe: container GET body is empty today.*
-3. **CORS + preflight.** Add a `tower-http` `CorsLayer` (or explicit handling): `OPTIONS` preflight →
-   204 with `Access-Control-Allow-Origin` (echo the trusted/configured origin) + `-Allow-Methods` +
-   `-Allow-Headers` (incl. `authorization`, `dpop`) + `Vary: Origin`; simple requests → `ACAO` +
-   exposed headers. (Owner: ldp/platform.) Fixes all 7 CORS cases (`cors-simple-requests`,
-   `cors-preflight-requests`, `cors-access-control-headers`, `cors-acao-vary`, `cors-accept-acah`,
-   `cors-enumerate`, `cors-options`). *Probe: no `Access-Control-*` headers; OPTIONS → 405 today.*
-4. **`OPTIONS` handler + `Allow` / `Accept-Post` / `Accept-Patch`.** Handle `OPTIONS` (currently
-   axum auto-405) returning 204 + `Allow` (the verb set), `Accept-Post` (`text/turtle`,
-   `application/ld+json`) on containers, `Accept-Patch` (`text/n3` — and `application/sparql-update`
-   once supported). (Owner: ldp.) Fixes `read-method-support`, `read-method-allow`; reinforces the
-   CORS preflight path. *Probe: OPTIONS → 405 with only `Allow` today.*
-5. **Unauthenticated access to a protected resource → 401 + `WWW-Authenticate`.** Today an absent
-   token degrades to public and a missing resource is 404 / a write is a bare 403. The
-   `authentication-header` scenario expects a 401 with a `WWW-Authenticate` (Bearer/DPoP) challenge
-   when credentials are required. (Owner: auth/ldp — note this overlaps the WAC 401-vs-403 split.)
-   Fixes `authentication-header`. *Probe: unauth GET → 404, no `WWW-Authenticate` today.*
-6. **`content-type-reject` + `slash-semantics-exclude` + `post-target-not-found` — confirm against
-   the failing-step detail.** Re-run each filtered (`--filter <name>` via the harness) to read the
-   exact assertion, then align the status/headers. Likely: the unknown-content-type reject status,
-   the `/`-suffixed-resource vs container distinction, and the POST-to-missing-container 404 shape.
-   (Owner: ldp.) Up to 3 cases.
-7. **(Optional, for `writing-resource-containment` full pass) `application/sparql-update` PATCH.**
-   The containment feature PATCHes with `application/sparql-update`; only `text/n3` is supported
-   today (→ 415). Add SPARQL-Update PATCH (an `M2-next` seam already noted in the code) OR accept
-   that this one feature needs both the listing fix AND sparql-update. (Owner: ldp/patch.)
+**Cluster B — WAC (the remaining 15 cases; needs the local WAC engine):**
 
-**Cluster B — WAC (do second; needs the local WAC engine; all 16 cases):**
-
-8. **Implement WAC authorization** (the 16 WAC cases). Per the maintainer's directive WAC eval is
+8. **Implement WAC authorization** (the remaining WAC cases). Per the maintainer's directive WAC eval is
    SPARQ-authoritative (sparq#992) — the ACL graph in SPARQ is the source of truth and SPARQ does the
    per-resource decision. Required pieces, in order: (a) read `.acl` documents (the
    `acl:accessTo`/`acl:default`, `acl:mode`, `acl:agent`/`agentClass foaf:Agent`/`acl:agentGroup`
@@ -142,9 +125,8 @@ serializer) + the container tree the harness dereferences.
    hand-built triples. Prerequisite: Cluster-A #2 (container listing) for the container ACL tests.
    This is the single largest item; it can be sub-split along (a)-(e), but they share the engine.
 
-Cluster A is fully independent of B and should be parallelised across ldp/platform agents (#1, #2,
-#3, #4 touch different parts of the read/response path; #5 touches auth). B (#8) is one coherent
-auth/authz workstream gated on the SPARQ design.
+Cluster A is fully landed (Protocol 25/25). B (#8) is one coherent auth/authz workstream gated on the
+SPARQ design — the only remaining conformance gap.
 
 ## How to re-run
 

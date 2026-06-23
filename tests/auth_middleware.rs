@@ -7,8 +7,6 @@
 
 mod common;
 
-use std::sync::Arc;
-
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::{jwks_provider, mint_access_token, mint_dpop_proof, KeyKit, BASE_URL, WEBID};
@@ -163,13 +161,31 @@ fn replayed_dpop_proof_jti_is_rejected() {
 }
 
 #[tokio::test]
-async fn http_get_without_auth_is_public_and_reaches_a_404() {
-    // End-to-end through the router: no Authorization ⇒ public credentials ⇒ the handler runs and,
-    // since nothing is stored, returns 404 (NOT 401). Proves the middleware injects public creds.
+async fn http_get_without_auth_injects_public_creds_and_the_ldp_layer_gates() {
+    // End-to-end through the router: no Authorization ⇒ the middleware injects PUBLIC credentials and
+    // the handler runs (it does NOT 400/short-circuit). The pre-WAC read posture then decides:
+    //   - a PUBLIC WebID profile document (…/profile/card) is readable anonymously ⇒ reaches the
+    //     handler and 404s (nothing stored) — proving public creds were injected and the read ran;
+    //   - any OTHER resource requires auth ⇒ 401 + `WWW-Authenticate`.
     let issuer_key = KeyKit::generate();
     let app = test_app(&issuer_key);
 
-    let resp = app
+    // A public profile document: anonymous read is allowed, so it reaches the (empty) store → 404.
+    let public = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/alice/profile/card")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(public.status(), StatusCode::NOT_FOUND);
+
+    // A non-public resource: anonymous read ⇒ 401 + challenge (the pre-WAC gate).
+    let gated = app
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -179,7 +195,10 @@ async fn http_get_without_auth_is_public_and_reaches_a_404() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(gated.status(), StatusCode::UNAUTHORIZED);
+    assert!(gated
+        .headers()
+        .contains_key(axum::http::header::WWW_AUTHENTICATE));
 }
 
 #[tokio::test]
@@ -237,9 +256,6 @@ fn test_app(issuer_key: &KeyKit) -> axum::Router {
     let ctx = auth_context(issuer_key);
     let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
     let ldp = LdpState::new(store, BASE_URL);
-    let state = AppState {
-        auth: Arc::new(ctx),
-        ldp: Arc::new(ldp),
-    };
-    build_router(state)
+    // `AppState::new` wires the verifier-derived anonymous-401 challenge into the LDP layer.
+    build_router(AppState::new(ctx, ldp))
 }

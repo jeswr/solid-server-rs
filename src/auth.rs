@@ -19,6 +19,7 @@ use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use solid_oidc_verifier::config::JwksProvider;
+use solid_oidc_verifier::error::{ErrorKind, VerifyError};
 use solid_oidc_verifier::replay::ReplayStore;
 use solid_oidc_verifier::verifier::{AuthRequest, Verifier};
 
@@ -71,6 +72,39 @@ impl<J: JwksProvider, R: ReplayStore> AuthContext<J, R> {
                 message: e.message().to_string(),
                 www_authenticate: self.verifier.www_authenticate(&e),
             })
+    }
+
+    /// Build the 401 + `WWW-Authenticate` challenge for a request that REQUIRES authentication but
+    /// arrived without credentials (a public [`VerifiedToken`]).
+    ///
+    /// The verifier returns a *public* token (not an error) when no `Authorization` header is present
+    /// — that is correct for the auth layer (an anonymous request is a valid, public identity). The
+    /// LDP layer then decides whether the target needs auth; when it does and the caller is public, it
+    /// must answer 401 with a challenge (Solid Protocol / RFC 6750), NOT a bare 403. This synthesises
+    /// the SAME challenge string the verifier emits on a token failure (it names the trusted issuer(s)
+    /// and DPoP `algs`), so a client knows where to obtain a token. We route it through the verifier's
+    /// own [`Verifier::www_authenticate`] so the challenge format stays single-sourced in the verifier.
+    pub fn unauthenticated_error(&self) -> ServerError {
+        ServerError::Unauthorized {
+            status: 401,
+            message: "Authentication required for this resource.".to_string(),
+            www_authenticate: self.unauthenticated_challenge(),
+        }
+    }
+
+    /// The `WWW-Authenticate` challenge string for an anonymous request to a resource that requires
+    /// authentication. Single-sourced through the verifier's own challenge builder so the format
+    /// (scheme, `error=`, `issuer=`, `algs=`) matches every other challenge this server emits. The LDP
+    /// layer caches this once (it does not vary per request) and attaches it to a 401.
+    pub fn unauthenticated_challenge(&self) -> String {
+        // An `invalid_token` DPoP-scheme error is the canonical "you need a (DPoP-bound) token" signal;
+        // `www_authenticate` widens it to `DPoP` + `algs` per the verifier's require_dpop policy.
+        let err = VerifyError::new(
+            ErrorKind::InvalidToken,
+            "Authentication required for this resource.",
+        )
+        .with_dpop(true);
+        self.verifier.www_authenticate(&err)
     }
 }
 

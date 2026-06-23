@@ -562,11 +562,26 @@ fn pat_triple_vars(t: &PatTriple) -> impl Iterator<Item = &Variable> {
         })
 }
 
-/// Classify a PATCH `Content-Type`: only `text/n3` is supported on this slice. Any other type is a
-/// 415 (an unsupported PATCH must NOT be silently accepted).
-pub fn classify_patch_media_type(content_type: Option<&str>) -> Result<(), ServerError> {
-    let raw = content_type
-        .ok_or_else(|| ServerError::UnsupportedMediaType("missing PATCH content-type".into()))?;
+/// The PATCH document language, selected from the request `Content-Type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchKind {
+    /// `text/n3` — the Solid N3 Patch (insert/delete + `solid:where`).
+    N3,
+    /// `application/sparql-update` — the SPARQL 1.1 Update language. We support the **`INSERT DATA` /
+    /// `DELETE DATA`** subset (concrete triples, no `WHERE` solver), which is what the Solid Protocol
+    /// containment scenarios use; a templated `DELETE/INSERT … WHERE` is rejected (422) until the
+    /// solver lands.
+    SparqlUpdate,
+}
+
+/// Classify a PATCH `Content-Type` into a supported [`PatchKind`].
+///
+/// An ABSENT Content-Type is a 400 Bad Request (`content-type-reject` — a write MUST declare its
+/// type); a PRESENT-but-unsupported type is a 415. The two Solid PATCH media types are `text/n3` and
+/// `application/sparql-update`.
+pub fn classify_patch_media_type(content_type: Option<&str>) -> Result<PatchKind, ServerError> {
+    let raw =
+        content_type.ok_or_else(|| ServerError::BadRequest("missing PATCH content-type".into()))?;
     let essence = raw
         .split(';')
         .next()
@@ -574,11 +589,155 @@ pub fn classify_patch_media_type(content_type: Option<&str>) -> Result<(), Serve
         .trim()
         .to_ascii_lowercase();
     match essence.as_str() {
-        "text/n3" => Ok(()),
-        // M2-next: `application/sparql-update` is the other Solid PATCH media type; deferred. It is a
-        // 415 (unsupported), never a silent accept.
+        "text/n3" => Ok(PatchKind::N3),
+        "application/sparql-update" => Ok(PatchKind::SparqlUpdate),
         other => Err(ServerError::UnsupportedMediaType(other.to_string())),
     }
+}
+
+/// Parse the supported `application/sparql-update` subset (`INSERT DATA { … }` / `DELETE DATA { … }`)
+/// into the same [`N3Patch`] shape the N3 engine applies.
+///
+/// Only the **concrete-data** forms are supported: `INSERT DATA { triples }` and
+/// `DELETE DATA { triples }` (each optional, both may appear). The inner group is a set of ground
+/// triples in Turtle syntax, so it is parsed with the vetted `oxttl` Turtle parser (the house rule —
+/// never hand-parse RDF), resolving relative IRIs against `base_iri`. A templated
+/// `DELETE/INSERT … WHERE`, a `WITH`/`USING`, or any graph-management verb is **rejected (422)** — the
+/// `WHERE` solver is not wired for SPARQL-Update yet, and silently ignoring it would mis-apply the
+/// patch. The braces are extracted by depth-tracked scanning (no nested groups in `… DATA`).
+pub fn parse_sparql_update(body: &[u8], base_iri: &str) -> Result<N3Patch, ServerError> {
+    let text = std::str::from_utf8(body)
+        .map_err(|_| ServerError::UnprocessablePatch("SPARQL-Update must be UTF-8".into()))?;
+
+    let mut inserts: Vec<PatTriple> = Vec::new();
+    let mut deletes: Vec<PatTriple> = Vec::new();
+    let mut saw_any = false;
+    // Collected SPARQL prologue declarations, translated to Turtle so the `oxttl` parser of each DATA
+    // group sees the prefixes. A SPARQL `PREFIX p: <iri>` becomes Turtle `@prefix p: <iri> .`; a
+    // SPARQL `BASE <iri>` becomes `@base <iri> .`.
+    let mut prologue = String::new();
+    // Scan the body case-insensitively for `INSERT DATA` / `DELETE DATA`, parsing each `{ … }` block.
+    // Anything that is not one of these two concrete-data verbs (e.g. a bare `DELETE`/`INSERT` with a
+    // WHERE, `WITH`, `LOAD`, `CLEAR`, …) is unsupported and fails closed. `to_ascii_lowercase` only
+    // remaps ASCII A–Z, so `lower` shares byte indices with `text` (slicing stays in sync).
+    let lower = text.to_ascii_lowercase();
+    let mut cursor = 0usize;
+    while cursor < text.len() {
+        // Skip whitespace.
+        let lo = &lower[cursor..];
+        let ws = lo.len() - lo.trim_start().len();
+        cursor += ws;
+        let lo = &lower[cursor..];
+        if lo.is_empty() {
+            break;
+        }
+        // SPARQL `PREFIX p: <iri>` / `BASE <iri>` declarations: consume to end of line and translate
+        // to a Turtle `@prefix`/`@base … .` for the DATA-group parser. A `@`-prefixed Turtle-style
+        // prologue (`@prefix … .`) is also accepted and copied through verbatim.
+        if lo.starts_with("prefix")
+            || lo.starts_with("base")
+            || lo.starts_with("@prefix")
+            || lo.starts_with("@base")
+        {
+            let nl = text[cursor..].find('\n').unwrap_or(text.len() - cursor);
+            let line = text[cursor..cursor + nl].trim();
+            if line.starts_with('@') {
+                // Already Turtle-shaped; keep as-is (ensure it terminates with a '.').
+                let stmt = line.trim_end_matches('.').trim();
+                prologue.push_str(stmt);
+                prologue.push_str(" .\n");
+            } else {
+                // SPARQL prologue → Turtle directive (lower-cased keyword).
+                let mut parts = line.splitn(2, char::is_whitespace);
+                let kw = parts.next().unwrap_or("").to_ascii_lowercase();
+                let body = parts
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_end_matches('.')
+                    .trim();
+                prologue.push('@');
+                prologue.push_str(&kw);
+                prologue.push(' ');
+                prologue.push_str(body);
+                prologue.push_str(" .\n");
+            }
+            cursor += nl;
+            continue;
+        }
+        let kind = if lo.starts_with("insert data") {
+            cursor += "insert data".len();
+            Some(false)
+        } else if lo.starts_with("delete data") {
+            cursor += "delete data".len();
+            Some(true)
+        } else {
+            None
+        };
+        let Some(is_delete) = kind else {
+            // An unsupported verb (templated INSERT/DELETE with WHERE, WITH, LOAD, CLEAR, …).
+            return Err(ServerError::UnprocessablePatch(
+                "only INSERT DATA / DELETE DATA SPARQL-Update is supported".into(),
+            ));
+        };
+        // Find the `{ … }` group.
+        let after = &text[cursor..];
+        let open = after.find('{').ok_or_else(|| {
+            ServerError::UnprocessablePatch("SPARQL-Update DATA block missing '{'".into())
+        })?;
+        let group_start = cursor + open + 1;
+        // DATA blocks contain no nested groups; the matching close is the next '}'.
+        let close_rel = text[group_start..].find('}').ok_or_else(|| {
+            ServerError::UnprocessablePatch("SPARQL-Update DATA block missing '}'".into())
+        })?;
+        let group = &text[group_start..group_start + close_rel];
+        // Parse the group as Turtle WITH the collected prologue prepended (so prefixed names resolve).
+        let with_prologue = format!("{prologue}{group}");
+        let triples = parse_to_concrete_triples(&with_prologue, base_iri)?;
+        if is_delete {
+            deletes.extend(triples);
+        } else {
+            inserts.extend(triples);
+        }
+        saw_any = true;
+        cursor = group_start + close_rel + 1;
+    }
+
+    if !saw_any || (inserts.is_empty() && deletes.is_empty()) {
+        return Err(ServerError::UnprocessablePatch(
+            "SPARQL-Update must contain a non-empty INSERT DATA / DELETE DATA".into(),
+        ));
+    }
+
+    Ok(N3Patch {
+        conditions: Vec::new(),
+        deletes,
+        inserts,
+    })
+}
+
+/// Parse a Turtle triple block into concrete (variable-free) [`PatTriple`]s, resolving relative IRIs
+/// against `base_iri`. Used by the SPARQL-Update `INSERT/DELETE DATA` path.
+fn parse_to_concrete_triples(group: &str, base_iri: &str) -> Result<Vec<PatTriple>, ServerError> {
+    use oxttl::TurtleParser;
+    let parser = TurtleParser::new()
+        .with_base_iri(base_iri)
+        .map_err(|e| ServerError::BadRequest(format!("invalid base IRI: {e}")))?;
+    let mut out = Vec::new();
+    for t in parser.for_slice(group.as_bytes()) {
+        let t = t.map_err(|e| {
+            ServerError::UnprocessablePatch(format!("invalid SPARQL-Update DATA triple: {e}"))
+        })?;
+        // A DATA block holds GROUND triples; every term is carried through as a concrete
+        // [`PatTerm::Term`] (the apply engine treats these as ground, with the empty binding). The
+        // containment scenarios use only IRIs/literals.
+        out.push(PatTriple {
+            subject: PatTerm::Term(Term::from(t.subject)),
+            predicate: PatTerm::Term(Term::NamedNode(t.predicate)),
+            object: PatTerm::Term(t.object),
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -618,19 +777,55 @@ mod tests {
     }
 
     #[test]
-    fn media_type_only_text_n3() {
-        assert!(classify_patch_media_type(Some("text/n3")).is_ok());
-        assert!(classify_patch_media_type(Some("text/n3; charset=utf-8")).is_ok());
-        // SPARQL Update is deferred ⇒ 415, not a silent accept.
-        let err = classify_patch_media_type(Some("application/sparql-update")).unwrap_err();
-        assert_eq!(err.status().as_u16(), 415);
+    fn media_type_selects_n3_or_sparql_update() {
         assert_eq!(
-            classify_patch_media_type(None)
+            classify_patch_media_type(Some("text/n3")).unwrap(),
+            PatchKind::N3
+        );
+        assert_eq!(
+            classify_patch_media_type(Some("text/n3; charset=utf-8")).unwrap(),
+            PatchKind::N3
+        );
+        // SPARQL-Update (INSERT/DELETE DATA subset) is now supported.
+        assert_eq!(
+            classify_patch_media_type(Some("application/sparql-update")).unwrap(),
+            PatchKind::SparqlUpdate
+        );
+        // An unsupported PATCH type ⇒ 415, never a silent accept.
+        assert_eq!(
+            classify_patch_media_type(Some("application/json"))
                 .unwrap_err()
                 .status()
                 .as_u16(),
             415
         );
+        // An ABSENT Content-Type ⇒ 400 (content-type-reject), distinct from unsupported-415.
+        assert_eq!(
+            classify_patch_media_type(None)
+                .unwrap_err()
+                .status()
+                .as_u16(),
+            400
+        );
+    }
+
+    #[test]
+    fn sparql_update_insert_delete_data_parses_to_concrete_triples() {
+        let doc = "PREFIX foaf: <http://xmlns.com/foaf/0.1/>\n\
+            DELETE DATA { <#me> foaf:name \"Old\" . }\n\
+            INSERT DATA { <#me> foaf:name \"New\" . }\n";
+        let patch = parse_sparql_update(doc.as_bytes(), BASE).unwrap();
+        assert!(patch.conditions.is_empty());
+        assert_eq!(patch.deletes.len(), 1);
+        assert_eq!(patch.inserts.len(), 1);
+    }
+
+    #[test]
+    fn sparql_update_rejects_templated_where() {
+        // A templated `DELETE … WHERE` is not the supported DATA subset ⇒ 422 (never silently ignored).
+        let doc = "DELETE { ?s ?p ?o } WHERE { ?s ?p ?o }";
+        let err = parse_sparql_update(doc.as_bytes(), BASE).unwrap_err();
+        assert_eq!(err.status().as_u16(), 422);
     }
 
     #[test]

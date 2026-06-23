@@ -14,11 +14,12 @@ fn parses_a_simple_resource_path() {
 }
 
 #[test]
-fn the_root_is_a_valid_target_and_not_a_container() {
+fn the_root_is_a_valid_target_and_is_a_container() {
     let t = parse_target(BASE, "/").unwrap();
     assert_eq!(t.iri, "https://pod.example/");
-    // "/" alone is the root, not a sub-container.
-    assert!(!t.is_container);
+    // "/" is the storage ROOT container (an `ldp:BasicContainer`), so it IS a container — a `GET /`
+    // must render its `ldp:contains` listing.
+    assert!(t.is_container);
 }
 
 #[test]

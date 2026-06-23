@@ -15,11 +15,13 @@ The harness loads the Solid Protocol + WAC manifests from `solid-contrib/specifi
 the scenarios our `TestSubject` claims: **41 test cases** (25 Protocol + 16 WAC) after the 3 skip tags
 (`acp`, `wac-agent-group`, `http-redirect`). The same suite prod-solid-server runs.
 
-`config/test-subjects.ttl` claims the LDP/Solid surface the Rust server implements (LDP CRUD,
-Turtle/JSON-LD content negotiation, conditional + Range requests, n3-patch PATCH, storage description +
-`/.well-known/solid` discovery, WebSocketChannel2023 notifications) AND deliberately claims the WAC
-suite even though WAC is **not yet implemented** (gated on the SPARQ access-control design, sparq#992):
-the WAC scenarios fail by design in this baseline so the gap is measured rather than hidden.
+`config/test-subjects.ttl` claims the LDP/Solid surface the Rust server implements (LDP CRUD incl.
+intermediate-container creation + `ldp:contains` listing, Turtle/JSON-LD content negotiation,
+conditional + Range requests, CORS, OPTIONS/`Allow`/`Accept-*`, `text/n3` + `application/sparql-update`
+PATCH, storage description + `/.well-known/solid` discovery, WebSocketChannel2023 notifications) AND
+deliberately claims the WAC suite even though WAC is **not yet implemented** (gated on the SPARQ
+access-control design, sparq#992): the WAC scenarios fail by design so the gap is measured rather than
+hidden. The Protocol manifest passes **25/25**; see `SCORE.md`.
 
 ## Reusing the prod-solid-server apparatus (don't rebuild)
 

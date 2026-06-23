@@ -31,8 +31,10 @@
 //! path makes a single emit call after a successful mutation. Everything else network-facing (the live
 //! SPARQ HTTP client, live JWKS) and the parts of the Solid surface that need designs not yet written
 //! (full WAC authorization — incl. per-resource authorization of a subscription, the reconciler,
-//! multipart Range, SPARQL-Update PATCH) are clearly marked `M2-next:` seams, not implemented. The
-//! default impls used here are in-memory test doubles.
+//! multipart Range) are clearly marked `M2-next:` seams, not implemented. PATCH supports both the
+//! Solid N3 Patch and the `application/sparql-update` INSERT/DELETE-DATA subset. The Solid Protocol
+//! conformance suite passes 25/25 on the Protocol manifest (WAC is the remaining gap — see
+//! `conformance/SCORE.md`). The default impls used here are in-memory test doubles.
 
 pub mod app;
 pub mod auth;

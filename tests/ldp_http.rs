@@ -6,8 +6,6 @@
 
 mod common;
 
-use std::sync::Arc;
-
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use common::{jwks_provider, mint_access_token, mint_dpop_proof, KeyKit, BASE_URL};
@@ -40,10 +38,9 @@ impl Harness {
         let ctx = AuthContext::new(verifier, BASE_URL);
         let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
         let ldp = LdpState::new(store, BASE_URL);
-        let app = build_router(AppState {
-            auth: Arc::new(ctx),
-            ldp: Arc::new(ldp),
-        });
+        // Use `AppState::new` (not the struct literal) so the LDP layer's anonymous-401
+        // `WWW-Authenticate` challenge is derived from the verifier (names the trusted issuer + algs).
+        let app = build_router(AppState::new(ctx, ldp));
         Self {
             app,
             issuer_key,
@@ -205,23 +202,55 @@ async fn head_returns_headers_without_a_body() {
 }
 
 #[tokio::test]
-async fn put_with_an_unsupported_content_type_is_415() {
+async fn put_with_a_non_rdf_content_type_is_stored_as_a_binary_resource() {
+    // The Solid Protocol stores ANY content type — a non-RDF type (here a text/plain blob) is stored
+    // VERBATIM as an opaque binary resource (the CORS scenarios create text/plain resources). It is
+    // NOT a 415: 415 is only for an unsupported PATCH language, not a write content type.
+    let h = Harness::new();
+    let put = h
+        .request(
+            "PUT",
+            "/alice/blob.txt",
+            Some("text/plain"),
+            Body::from("Hello"),
+        )
+        .await;
+    assert_eq!(put.status(), StatusCode::CREATED);
+
+    // Read it back verbatim with its declared content type.
+    let get = h
+        .request("GET", "/alice/blob.txt", None, Body::empty())
+        .await;
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(
+        get.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+        "text/plain"
+    );
+    let bytes = to_bytes(get.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&bytes[..], b"Hello");
+}
+
+#[tokio::test]
+async fn put_malformed_rdf_in_a_declared_rdf_type_is_400() {
+    // An RDF content type IS validated — a malformed Turtle body is a 400 (only RDF types are parsed;
+    // a binary type is stored unparsed).
     let h = Harness::new();
     let resp = h
         .request(
             "PUT",
             "/alice/data",
-            Some("application/json"),
-            Body::from("{}"),
+            Some("text/turtle"),
+            Body::from("<a> <b> ."),
         )
         .await;
-    assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
-async fn unauthenticated_put_is_forbidden_fail_closed() {
-    // A write from a public/unauthenticated caller must be rejected (403), not allowed — the slice
-    // has no ACLs yet, so it fails closed on writes rather than fail open.
+async fn unauthenticated_put_is_401_with_challenge_fail_closed() {
+    // A write from a public/unauthenticated caller must be rejected — the pre-WAC posture answers a
+    // 401 + `WWW-Authenticate` (so a client knows to obtain a token), not a bare 403, and never a
+    // fail-open write.
     let h = Harness::new();
     let resp = h
         .unauth_request(
@@ -231,7 +260,10 @@ async fn unauthenticated_put_is_forbidden_fail_closed() {
             Body::from(TURTLE),
         )
         .await;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(resp
+        .headers()
+        .contains_key(axum::http::header::WWW_AUTHENTICATE));
 
     // And nothing was written — a subsequent (authenticated) GET still 404s.
     let get = h.request("GET", "/alice/data", None, Body::empty()).await;
@@ -530,9 +562,11 @@ async fn post_mints_a_uri_without_a_slug() {
 }
 
 #[tokio::test]
-async fn post_to_a_non_container_is_409() {
+async fn post_to_a_non_container_target_is_404_or_405() {
     let h = Harness::new();
-    // The target is a plain resource path (no trailing slash) ⇒ not a container.
+    // The target is a plain resource path (no trailing slash) that does not exist ⇒ 404 (per the
+    // Solid Protocol `post-target-not-found` — POST is not a containment op on a non-container; the
+    // accepted statuses are 404 when nothing is there / 405 when a resource is there).
     let resp = h
         .request(
             "POST",
@@ -541,7 +575,25 @@ async fn post_to_a_non_container_is_409() {
             Body::from(TURTLE),
         )
         .await;
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // When a plain resource DOES exist at the target, POST is 405 Method Not Allowed.
+    h.request(
+        "PUT",
+        "/alice/data",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
+    let resp = h
+        .request(
+            "POST",
+            "/alice/data",
+            Some("text/turtle"),
+            Body::from(TURTLE),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
 
 #[tokio::test]
@@ -560,12 +612,15 @@ async fn post_to_a_missing_container_is_404() {
 }
 
 #[tokio::test]
-async fn unauthenticated_post_is_forbidden() {
+async fn unauthenticated_post_is_401_with_challenge() {
     let h = Harness::new();
     let resp = h
         .unauth_request("POST", "/alice/", Some("text/turtle"), Body::from(TURTLE))
         .await;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(resp
+        .headers()
+        .contains_key(axum::http::header::WWW_AUTHENTICATE));
 }
 
 // --- M2: DELETE --------------------------------------------------------------------------------
@@ -674,7 +729,7 @@ async fn delete_a_container_after_emptying_it_succeeds() {
 }
 
 #[tokio::test]
-async fn unauthenticated_delete_is_forbidden() {
+async fn unauthenticated_delete_is_401_with_challenge() {
     let h = Harness::new();
     h.request(
         "PUT",
@@ -686,7 +741,10 @@ async fn unauthenticated_delete_is_forbidden() {
     let del = h
         .unauth_request("DELETE", "/alice/data", None, Body::empty())
         .await;
-    assert_eq!(del.status(), StatusCode::FORBIDDEN);
+    assert_eq!(del.status(), StatusCode::UNAUTHORIZED);
+    assert!(del
+        .headers()
+        .contains_key(axum::http::header::WWW_AUTHENTICATE));
 }
 
 // --- M2: PATCH (N3 Patch) ----------------------------------------------------------------------
@@ -739,16 +797,46 @@ async fn patch_with_an_unsupported_media_type_is_415() {
         Body::from(TURTLE),
     )
     .await;
-    // SPARQL Update is deferred — must be 415, never silently accepted.
+    // An unsupported PATCH type (neither text/n3 nor application/sparql-update) ⇒ 415.
+    let resp = h
+        .request(
+            "PATCH",
+            "/alice/data",
+            Some("application/json-patch+json"),
+            Body::from("[]"),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
+async fn patch_with_sparql_update_insert_data_applies() {
+    // The SPARQL-Update INSERT DATA subset is now supported (the containment scenario uses it).
+    let h = Harness::new();
+    h.request(
+        "PUT",
+        "/alice/data",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
     let resp = h
         .request(
             "PATCH",
             "/alice/data",
             Some("application/sparql-update"),
-            Body::from("INSERT DATA { <#s> <#p> <#o> }"),
+            Body::from(
+                "INSERT DATA { <https://pod.example/alice/data#me> \
+                 <http://xmlns.com/foaf/0.1/nick> \"al\" . }",
+            ),
         )
         .await;
-    assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let get = h.request("GET", "/alice/data", None, Body::empty()).await;
+    let bytes = to_bytes(get.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("\"al\""), "patched body: {text}");
 }
 
 #[tokio::test]
@@ -830,7 +918,7 @@ _:patch solid:where { <https://pod.example/alice/data#me> foaf:name ?n . };\n\
 }
 
 #[tokio::test]
-async fn unauthenticated_patch_is_forbidden() {
+async fn unauthenticated_patch_is_401_with_challenge() {
     let h = Harness::new();
     h.request(
         "PUT",
@@ -847,5 +935,507 @@ async fn unauthenticated_patch_is_forbidden() {
             Body::from(N3_PATCH),
         )
         .await;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(resp
+        .headers()
+        .contains_key(axum::http::header::WWW_AUTHENTICATE));
+}
+
+// --- Cluster A: protocol-completeness tests ----------------------------------------------------
+
+/// Send a raw request with arbitrary headers and no automatic auth (for CORS / OPTIONS probes).
+async fn raw(
+    h: &Harness,
+    method: &str,
+    path: &str,
+    extra: &[(&str, &str)],
+) -> axum::http::Response<Body> {
+    let mut builder = Request::builder().method(method).uri(path);
+    for (k, v) in extra {
+        builder = builder.header(*k, *v);
+    }
+    h.app
+        .clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn options_is_not_405() {
+    // read-method-support: OPTIONS must not be 405/501. The CORS layer answers every OPTIONS (200),
+    // which satisfies the "OPTIONS is supported" requirement.
+    let h = Harness::new();
+    let resp = raw(&h, "OPTIONS", "/alice/", &[]).await;
+    assert_ne!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_ne!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn get_response_advertises_allow_accept_post_accept_patch() {
+    // read-method-allow: a GET response on a container must carry `Allow` listing GET + HEAD; the
+    // container also advertises `Accept-Post` + `Accept-Patch`.
+    let h = Harness::new();
+    h.make_container("/alice/").await;
+    let get = h
+        .request_with(
+            "GET",
+            "/alice/",
+            None,
+            &[("accept", "text/turtle")],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(get.status(), StatusCode::OK);
+    let allow = get
+        .headers()
+        .get(axum::http::header::ALLOW)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        allow.contains("GET") && allow.contains("HEAD"),
+        "Allow: {allow}"
+    );
+    let accept_post = get.headers().get("accept-post").unwrap().to_str().unwrap();
+    assert!(accept_post.contains("text/turtle"));
+    let accept_patch = get.headers().get("accept-patch").unwrap().to_str().unwrap();
+    assert!(accept_patch.contains("text/n3"));
+}
+
+#[tokio::test]
+async fn container_get_renders_ldp_contains_listing() {
+    // delete-remove-containment / writing-resource-containment: a container GET must render
+    // ldp:BasicContainer + an ldp:contains triple per member.
+    let h = Harness::new();
+    h.make_container("/alice/").await;
+    let post = h
+        .request_with(
+            "POST",
+            "/alice/",
+            Some("text/turtle"),
+            &[("slug", "doc1")],
+            Body::from("<#it> <http://xmlns.com/foaf/0.1/name> \"D\" ."),
+        )
+        .await;
+    assert_eq!(post.status(), StatusCode::CREATED);
+
+    let get = h
+        .request_with(
+            "GET",
+            "/alice/",
+            None,
+            &[("accept", "text/turtle")],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(get.status(), StatusCode::OK);
+    let bytes = to_bytes(get.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        text.contains("ldp#BasicContainer"),
+        "container body: {text}"
+    );
+    assert!(text.contains("ldp#contains"), "container body: {text}");
+    assert!(
+        text.contains("https://pod.example/alice/doc1"),
+        "container body must list the member: {text}"
+    );
+
+    // After deleting the member, the listing no longer contains it.
+    let del = h
+        .request("DELETE", "/alice/doc1", None, Body::empty())
+        .await;
+    assert_eq!(del.status(), StatusCode::NO_CONTENT);
+    let get2 = h
+        .request_with(
+            "GET",
+            "/alice/",
+            None,
+            &[("accept", "text/turtle")],
+            Body::empty(),
+        )
+        .await;
+    let bytes2 = to_bytes(get2.into_body(), usize::MAX).await.unwrap();
+    let text2 = String::from_utf8(bytes2.to_vec()).unwrap();
+    assert!(
+        !text2.contains("https://pod.example/alice/doc1"),
+        "deleted member must be gone from the listing: {text2}"
+    );
+}
+
+#[tokio::test]
+async fn root_route_is_served() {
+    // Cluster-A #1: GET / must reach the handler (the /{*path} wildcard does not match the empty path).
+    // With nothing seeded the root does not exist ⇒ 404 (not a routing 404 with no handler) — proving
+    // the route is wired. After creating it, it reads back as a container.
+    let h = Harness::new();
+    let get = h.request("GET", "/", None, Body::empty()).await;
+    assert_eq!(get.status(), StatusCode::NOT_FOUND);
+
+    // Create a child under root via PUT (auto-creates the root container), then GET / lists it.
+    let put = h
+        .request(
+            "PUT",
+            "/top",
+            Some("text/turtle"),
+            Body::from("<#t> <http://xmlns.com/foaf/0.1/name> \"T\" ."),
+        )
+        .await;
+    assert_eq!(put.status(), StatusCode::CREATED);
+    let get_root = h
+        .request_with(
+            "GET",
+            "/",
+            None,
+            &[("accept", "text/turtle")],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(get_root.status(), StatusCode::OK);
+    let bytes = to_bytes(get_root.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("ldp#BasicContainer"), "root body: {text}");
+    assert!(
+        text.contains("https://pod.example/top"),
+        "root must list /top: {text}"
+    );
+}
+
+#[tokio::test]
+async fn cors_preflight_returns_acao_allow_methods_and_reflected_headers() {
+    // cors-preflight-requests / cors-accept-acah: an OPTIONS with Origin + Access-Control-Request-*
+    // returns ACAO == origin, Allow-Methods contains the method, Allow-Headers reflects the request.
+    let h = Harness::new();
+    let resp = raw(
+        &h,
+        "OPTIONS",
+        "/alice/",
+        &[
+            ("origin", "https://tester"),
+            ("access-control-request-method", "POST"),
+            (
+                "access-control-request-headers",
+                "X-CUSTOM, Content-Type, Accept",
+            ),
+        ],
+    )
+    .await;
+    assert!(
+        resp.status() == StatusCode::NO_CONTENT || resp.status() == StatusCode::OK,
+        "preflight status: {}",
+        resp.status()
+    );
+    let acao = resp
+        .headers()
+        .get("access-control-allow-origin")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(acao, "https://tester");
+    let methods = resp
+        .headers()
+        .get("access-control-allow-methods")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(methods.contains("POST"), "allow-methods: {methods}");
+    let allow_headers = resp
+        .headers()
+        .get("access-control-allow-headers")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(
+        allow_headers.contains("x-custom"),
+        "allow-headers: {allow_headers}"
+    );
+    assert!(
+        allow_headers.contains("content-type"),
+        "allow-headers: {allow_headers}"
+    );
+    assert!(
+        allow_headers.contains("accept"),
+        "allow-headers: {allow_headers}"
+    );
+}
+
+#[tokio::test]
+async fn cors_simple_request_carries_acao_and_expose_headers_even_on_401() {
+    // cors-simple-requests: an unauthenticated GET with Origin gets 401 BUT still carries
+    // Access-Control-Allow-Origin == origin and a concrete (non-'*') Access-Control-Expose-Headers.
+    let h = Harness::new();
+    let resp = raw(&h, "GET", "/alice/", &[("origin", "https://tester")]).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "https://tester"
+    );
+    let expose = resp
+        .headers()
+        .get("access-control-expose-headers")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(!expose.is_empty());
+    assert_ne!(expose, "*");
+}
+
+#[tokio::test]
+async fn cors_authenticated_get_has_vary_origin() {
+    // acao-vary: a credentialed GET with Origin returns ACAO + Vary: Origin.
+    let h = Harness::new();
+    h.request(
+        "PUT",
+        "/alice/data",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
+    let (authz, dpop) = h.auth_headers("GET", "/alice/data");
+    let resp = raw(
+        &h,
+        "GET",
+        "/alice/data",
+        &[
+            ("authorization", &authz),
+            ("dpop", &dpop),
+            ("origin", "https://tester"),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "https://tester"
+    );
+    let vary = resp
+        .headers()
+        .get(axum::http::header::VARY)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(vary.contains("origin"), "Vary: {vary}");
+}
+
+#[tokio::test]
+async fn put_creates_intermediate_containers_and_wires_membership() {
+    // writing-resource-containment: PUT a grandchild ⇒ intermediate containers exist + list members.
+    let h = Harness::new();
+    let put = h
+        .request(
+            "PUT",
+            "/alice/mid/leaf.ttl",
+            Some("text/turtle"),
+            Body::from("<#x> <http://xmlns.com/foaf/0.1/name> \"L\" ."),
+        )
+        .await;
+    assert_eq!(put.status(), StatusCode::CREATED);
+
+    // The intermediate container /alice/mid/ lists the leaf.
+    let mid = h
+        .request_with(
+            "GET",
+            "/alice/mid/",
+            None,
+            &[("accept", "text/turtle")],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(mid.status(), StatusCode::OK);
+    let mid_text = String::from_utf8(
+        to_bytes(mid.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        mid_text.contains("https://pod.example/alice/mid/leaf.ttl"),
+        "intermediate container must list the leaf: {mid_text}"
+    );
+
+    // The grandparent /alice/ lists the intermediate container.
+    let top = h
+        .request_with(
+            "GET",
+            "/alice/",
+            None,
+            &[("accept", "text/turtle")],
+            Body::empty(),
+        )
+        .await;
+    let top_text = String::from_utf8(
+        to_bytes(top.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        top_text.contains("https://pod.example/alice/mid/"),
+        "grandparent must list the intermediate container: {top_text}"
+    );
+}
+
+#[tokio::test]
+async fn put_without_content_type_is_400() {
+    // content-type-reject: a write with no Content-Type is 400 (not 415).
+    let h = Harness::new();
+    let resp = h
+        .request("PUT", "/alice/data", None, Body::from(TURTLE))
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn slash_semantics_resource_and_container_cannot_coexist() {
+    // slash-semantics-exclude: PUT a container, then a same-name resource ⇒ 409 (and vice versa).
+    let h = Harness::new();
+    h.make_container("/alice/").await;
+
+    // Container /alice/foo/ then resource /alice/foo ⇒ conflict.
+    let put_container = h
+        .request(
+            "PUT",
+            "/alice/foo/",
+            Some("text/turtle"),
+            Body::from("<#c> <http://xmlns.com/foaf/0.1/name> \"C\" ."),
+        )
+        .await;
+    assert_eq!(put_container.status(), StatusCode::CREATED);
+    let put_resource = h
+        .request(
+            "PUT",
+            "/alice/foo",
+            Some("text/plain"),
+            Body::from("<#r> <http://xmlns.com/foaf/0.1/name> \"R\" ."),
+        )
+        .await;
+    assert_eq!(put_resource.status(), StatusCode::CONFLICT);
+
+    // The reverse: resource /alice/bar then container /alice/bar/ ⇒ conflict.
+    let put_res = h
+        .request(
+            "PUT",
+            "/alice/bar",
+            Some("text/turtle"),
+            Body::from("<#r> <http://xmlns.com/foaf/0.1/name> \"R\" ."),
+        )
+        .await;
+    assert_eq!(put_res.status(), StatusCode::CREATED);
+    let put_cont = h
+        .request(
+            "PUT",
+            "/alice/bar/",
+            Some("text/turtle"),
+            Body::from("<#c> <http://xmlns.com/foaf/0.1/name> \"C\" ."),
+        )
+        .await;
+    assert_eq!(put_cont.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn patch_sparql_update_creates_intermediate_containers() {
+    // containment.feature PATCH scenario: a create-on-PATCH with INSERT DATA wires containment.
+    let h = Harness::new();
+    let patch = h
+        .request(
+            "PATCH",
+            "/alice/p/leaf.ttl",
+            Some("application/sparql-update"),
+            Body::from("INSERT DATA { <#hello> <#linked> <#world> . }"),
+        )
+        .await;
+    assert!(
+        patch.status().is_success(),
+        "PATCH create status: {}",
+        patch.status()
+    );
+    let mid = h
+        .request_with(
+            "GET",
+            "/alice/p/",
+            None,
+            &[("accept", "text/turtle")],
+            Body::empty(),
+        )
+        .await;
+    let mid_text = String::from_utf8(
+        to_bytes(mid.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        mid_text.contains("https://pod.example/alice/p/leaf.ttl"),
+        "intermediate container must list the PATCH-created leaf: {mid_text}"
+    );
+}
+
+#[tokio::test]
+async fn post_with_basic_container_link_creates_a_container_child() {
+    // slash-semantics-exclude / LDP §5.2.3.4: a POST carrying
+    // `Link: <ldp#BasicContainer>; rel="type"` creates a CONTAINER child — the Location ends in '/'.
+    let h = Harness::new();
+    h.make_container("/alice/").await;
+    let resp = h
+        .request_with(
+            "POST",
+            "/alice/",
+            Some("text/turtle"),
+            &[(
+                "link",
+                "<http://www.w3.org/ns/ldp#BasicContainer>; rel=\"type\"",
+            )],
+            Body::from("<#c> <http://xmlns.com/foaf/0.1/name> \"C\" ."),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let location = resp
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        location.ends_with('/'),
+        "a container POST Location must end with '/': {location}"
+    );
+
+    // The created child is a container (GET renders an ldp:BasicContainer listing).
+    let path = location.strip_prefix("https://pod.example").unwrap();
+    let get = h
+        .request_with(
+            "GET",
+            path,
+            None,
+            &[("accept", "text/turtle")],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(get.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        to_bytes(get.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        text.contains("ldp#BasicContainer"),
+        "container body: {text}"
+    );
 }

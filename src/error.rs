@@ -38,10 +38,15 @@ pub enum ServerError {
     #[error("not found")]
     NotFound,
 
-    /// A request that conflicts with the current state of the target — e.g. POST to a
-    /// non-container, or DELETE of a non-empty container (LDP refuses both).
+    /// A request that conflicts with the current state of the target — e.g. DELETE of a non-empty
+    /// container, or a PUT whose path collides with an existing resource of the opposite slash-kind.
     #[error("conflict: {0}")]
     Conflict(String),
+
+    /// The method is not allowed on this target — e.g. POST to a plain (non-container) resource. Maps
+    /// to 405 Method Not Allowed (RFC 9110 §15.5.6).
+    #[error("method not allowed")]
+    MethodNotAllowed,
 
     /// A conditional request's precondition (`If-Match` / `If-None-Match`) was not met (RFC 9110
     /// §13). A failed `If-None-Match: *` create-guard, or an `If-Match` ETag mismatch, maps here.
@@ -81,6 +86,7 @@ impl ServerError {
             ServerError::Forbidden => StatusCode::FORBIDDEN,
             ServerError::NotFound => StatusCode::NOT_FOUND,
             ServerError::Conflict(_) => StatusCode::CONFLICT,
+            ServerError::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             ServerError::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
             ServerError::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
             ServerError::NotAcceptable => StatusCode::NOT_ACCEPTABLE,
@@ -112,6 +118,7 @@ impl IntoResponse for ServerError {
             StatusCode::INTERNAL_SERVER_ERROR => "internal server error",
             StatusCode::NOT_FOUND => "not found",
             StatusCode::FORBIDDEN => "forbidden",
+            StatusCode::METHOD_NOT_ALLOWED => "method not allowed",
             StatusCode::CONFLICT => "conflict",
             StatusCode::PRECONDITION_FAILED => "precondition failed",
             StatusCode::RANGE_NOT_SATISFIABLE => "range not satisfiable",

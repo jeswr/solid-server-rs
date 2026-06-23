@@ -42,8 +42,10 @@ pub fn parse_target(base: &str, path: &str) -> Result<LdpTarget, ServerError> {
         return Err(ServerError::BadRequest("path must be absolute".into()));
     }
 
-    // A trailing slash (other than the root "/") names a container.
-    let is_container = path_only.ends_with('/') && path_only.len() > 1;
+    // A trailing-slash path names a container — INCLUDING the storage root "/" itself (the root is a
+    // `ldp:BasicContainer`, so a `GET /` must render its `ldp:contains` listing, not be treated as a
+    // plain resource).
+    let is_container = path_only.ends_with('/');
 
     // Split into interior segments: drop the leading empty segment (before the first '/') and a
     // single trailing empty segment (the container slash). Any remaining empty segment is an

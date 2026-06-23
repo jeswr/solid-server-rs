@@ -17,8 +17,10 @@ use solid_oidc_verifier::config::JwksProvider;
 use solid_oidc_verifier::replay::ReplayStore;
 
 use crate::auth::{auth_middleware, AuthContext};
+use crate::ldp::cors::cors_middleware;
 use crate::ldp::handler::{
-    delete_handler, get_handler, head_handler, patch_handler, post_handler, put_handler, LdpState,
+    delete_handler, get_handler, head_handler, options_handler, patch_handler, post_handler,
+    put_handler, LdpState,
 };
 use crate::notifications::ws::{
     receive_handler, storage_description_handler, subscribe_handler, NotifyState, RECEIVE_PATH,
@@ -38,7 +40,10 @@ where
     R: ReplayStore,
     S: Store,
 {
-    pub fn new(auth: AuthContext<J, R>, ldp: LdpState<S>) -> Self {
+    pub fn new(auth: AuthContext<J, R>, mut ldp: LdpState<S>) -> Self {
+        // Single-source the anonymous-401 challenge: derive it from the verifier (it names the trusted
+        // issuer(s) + DPoP algs) and hand it to the LDP layer, which has no verifier handle of its own.
+        ldp.set_www_authenticate(auth.unauthenticated_challenge());
         Self {
             auth: Arc::new(auth),
             ldp: Arc::new(ldp),
@@ -76,23 +81,38 @@ where
         ldp.base_url.clone(),
     ));
 
+    // The full LDP method set, shared by the wildcard `/{*path}` route AND the explicit `/` (root)
+    // route. The `/{*path}` wildcard does NOT match the empty path, so the storage root needs its own
+    // route with the same handlers (Cluster-A #1) — otherwise `GET /` is a 404.
+    let ldp_methods = || {
+        get(get_handler::<S>)
+            .head(head_handler::<S>)
+            .put(put_handler::<S>)
+            .post(post_handler::<S>)
+            .delete(delete_handler::<S>)
+            .patch(patch_handler::<S>)
+            // OPTIONS advertises Allow / Accept-Post / Accept-Patch (and rides the CORS preflight).
+            .options(options_handler::<S>)
+    };
+
     // The protected LDP routes carry the LDP state.
+    //
+    // Layer order (axum/tower applies `.layer()` bottom-up, so the LAST one is OUTERMOST = runs
+    // first): the CORS layer is OUTERMOST. That means (a) a CORS preflight OPTIONS is answered by the
+    // CORS layer BEFORE auth runs (a browser preflight carries no credentials), and (b) the
+    // `Access-Control-*` headers ride on EVERY response — the auth 401, the anonymous-read 401, and
+    // the success — because they are added on the way back OUT through the outermost layer.
     let protected = Router::new()
-        .route(
-            "/{*path}",
-            get(get_handler::<S>)
-                .head(head_handler::<S>)
-                .put(put_handler::<S>)
-                .post(post_handler::<S>)
-                .delete(delete_handler::<S>)
-                .patch(patch_handler::<S>),
-        )
-        // The auth middleware carries the AuthContext as ITS state; it runs before the handler and
-        // injects the VerifiedToken into request extensions.
+        .route("/", ldp_methods())
+        .route("/{*path}", ldp_methods())
+        // INNER: the auth middleware authenticates a real (non-preflight) request and injects the
+        // VerifiedToken into request extensions.
         .layer(axum::middleware::from_fn_with_state(
             auth.clone(),
             auth_middleware::<J, R>,
         ))
+        // OUTER: CORS (preflight short-circuit + the Access-Control-* headers on every response).
+        .layer(axum::middleware::from_fn(cors_middleware))
         .with_state(ldp);
 
     // The AUTH-GATED subscribe route: behind the SAME DPoP middleware so the handler sees a
