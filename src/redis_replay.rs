@@ -41,6 +41,7 @@
 //! A TIGHT op/connect timeout (default 50 ms) turns a slow/unreachable Redis into a fast 503.
 
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use solid_oidc_verifier::replay::{
@@ -70,12 +71,20 @@ fn pool_acquire_timeout(op_timeout: Duration) -> Duration {
     (op_timeout * 4).max(POOL_ACQUIRE_TIMEOUT_FLOOR)
 }
 
-/// Default r2d2 connection-pool size. The dedicated worker thread serves `mark` jobs SERIALLY off a
-/// channel, so a small pool is plenty (the pool exists so a connection that errored can be replaced
-/// without re-dialing on the hot path, and to bound resource use). Kept low to limit Redis connections.
-const DEFAULT_POOL_SIZE: u32 = 8;
+/// Number of dedicated Redis worker threads draining the shared job channel CONCURRENTLY (roborev
+/// Medium: a single worker serialised all marks, so a slow Redis or bursty auth could queue requests
+/// behind one worker far longer than the 50 ms socket timeout, stalling the auth path). With N workers,
+/// up to N marks run their `SET NX PX` IN PARALLEL (each on its own pooled connection); the shared
+/// `Receiver` mutex is held ONLY for the brief `recv()`, never during the Redis op, so the op
+/// concurrency is genuinely N. Each op is still bounded by the tight socket timeout, so a slow Redis
+/// degrades to fast 503s rather than a pile-up.
+const DEFAULT_WORKERS: usize = 8;
 
-/// A `mark` job sent to the dedicated Redis worker thread: the `jti`, its TTL, and a reply channel.
+/// r2d2 connection-pool size — one connection per worker so all workers can hold a connection at once
+/// (a worker never waits on the pool for a peer's connection). Bounds total Redis connections.
+const DEFAULT_POOL_SIZE: u32 = DEFAULT_WORKERS as u32;
+
+/// A `mark` job sent to a Redis worker thread: the `jti`, its TTL, and a reply channel.
 type MarkJob = (
     String,
     Duration,
@@ -95,10 +104,11 @@ pub struct RedisReplayStore {
 impl RedisReplayStore {
     /// Connect to Redis at `url` (e.g. `redis://127.0.0.1:6379`) with the [`DEFAULT_OP_TIMEOUT`].
     ///
-    /// Builds an r2d2 pool of BLOCKING connections (so the dedicated worker thread does ordinary
-    /// blocking Redis I/O — never a Tokio runtime), spawns the worker thread that owns the pool, and
-    /// **eagerly validates one connection** so a misconfigured/unreachable Redis fails at boot
-    /// (fail-closed) rather than only on the first authenticated request.
+    /// Builds an r2d2 pool of BLOCKING connections (so the worker threads do ordinary blocking Redis I/O
+    /// — never a Tokio runtime), spawns [`DEFAULT_WORKERS`] worker threads that share the pool + a single
+    /// job channel (so up to N marks run their `SET NX PX` concurrently), and **eagerly validates one
+    /// connection** so a misconfigured/unreachable Redis fails at boot (fail-closed) rather than only on
+    /// the first authenticated request.
     pub fn connect(url: &str) -> Result<Self, ReplayBackendError> {
         Self::connect_with_timeout(url, DEFAULT_OP_TIMEOUT)
     }
@@ -126,27 +136,33 @@ impl RedisReplayStore {
             .connection_timeout(pool_acquire_timeout(op_timeout))
             .build_unchecked(client);
 
-        // The job channel: `mark` sends here; the worker thread drains it. A std channel (not Tokio):
-        // `mark` blocks on the REPLY channel, which is a plain recv (NOT a runtime entry), so calling
-        // it from inside the caller's async runtime is safe.
+        // The shared job channel: `mark` sends here; the N worker threads drain it concurrently. A std
+        // channel (not Tokio): `mark` blocks on the REPLY channel, which is a plain recv (NOT a runtime
+        // entry), so calling it from inside the caller's async runtime is safe. `Receiver` is
+        // single-consumer, so we share it across workers behind a `Mutex` — held ONLY for the brief
+        // `recv()`, never during the Redis op, so the N workers' Redis ops run genuinely in parallel.
         let (tx, rx) = std::sync::mpsc::channel::<MarkJob>();
-        // A oneshot to report worker-init status, so `connect` surfaces an unreachable Redis
-        // synchronously (fail-closed at boot) rather than silently and only at first `mark`.
-        let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let shared_rx = Arc::new(Mutex::new(rx));
 
-        std::thread::Builder::new()
-            .name("solid-redis-replay".to_string())
-            .spawn(move || run_worker(pool, rx, op_timeout, init_tx))
-            .map_err(|e| ReplayBackendError(format!("redis replay worker spawn failed: {e}")))?;
+        // ONE eager init validation (connect + PING) on the boot thread BEFORE spawning workers, so a
+        // misconfigured/unreachable Redis fails synchronously at boot (fail-closed) rather than silently
+        // and only at first `mark`. Doing it here (not per-worker) keeps boot a single round-trip.
+        validate_connection(&pool, op_timeout)?;
 
-        // Block on the worker's init report (fail-closed if it couldn't establish + PING a connection).
-        match init_rx.recv() {
-            Ok(Ok(())) => Ok(Self { tx }),
-            Ok(Err(msg)) => Err(ReplayBackendError(msg)),
-            Err(_) => Err(ReplayBackendError(
-                "redis replay worker exited before initialising".to_string(),
-            )),
+        // Spawn the worker pool. Each worker owns a clone of the pool handle (cheap `Arc`) + the shared
+        // receiver, and loops serving marks until the channel closes (all `tx` senders dropped).
+        for i in 0..DEFAULT_WORKERS {
+            let pool = pool.clone();
+            let rx = Arc::clone(&shared_rx);
+            std::thread::Builder::new()
+                .name(format!("solid-redis-replay-{i}"))
+                .spawn(move || run_worker(pool, rx, op_timeout))
+                .map_err(|e| {
+                    ReplayBackendError(format!("redis replay worker spawn failed: {e}"))
+                })?;
         }
+
+        Ok(Self { tx })
     }
 }
 
@@ -183,45 +199,48 @@ impl ReplayStore for RedisReplayStore {
     }
 }
 
-/// The dedicated worker thread's loop: own the r2d2 pool, PING once to validate (init), then serve
-/// `mark` jobs SERIALLY from the channel until every sender is dropped. All blocking Redis I/O happens
-/// HERE, off the Tokio runtime.
+/// Eagerly validate ONE connection (lease + bounded PING) so an unreachable/misconfigured Redis fails
+/// CLOSED at boot rather than only on the first authenticated request. Called once on the boot thread
+/// before the workers spawn.
+fn validate_connection(
+    pool: &r2d2::Pool<redis::Client>,
+    op_timeout: Duration,
+) -> Result<(), ReplayBackendError> {
+    let mut conn = pool
+        .get()
+        .map_err(|e| ReplayBackendError(format!("redis pool connect failed at init: {e}")))?;
+    apply_timeouts(&mut conn, op_timeout)
+        .map_err(|e| ReplayBackendError(format!("redis connection timeout setup failed: {e}")))?;
+    redis::cmd("PING")
+        .query::<()>(&mut *conn)
+        .map_err(|e| ReplayBackendError(format!("redis PING failed at init: {e}")))
+}
+
+/// A worker thread's loop: drain the SHARED job channel and serve each `mark` as one `SET NX PX`
+/// round-trip on a pooled connection, until the channel closes (all senders dropped). The receiver
+/// mutex is held ONLY for the brief `recv()` — NOT during the Redis op — so N workers' Redis ops run
+/// genuinely in parallel (no head-of-line blocking behind a slow op). All blocking Redis I/O happens
+/// HERE, off the Tokio runtime. A requester that has gone away just drops the result.
 fn run_worker(
     pool: r2d2::Pool<redis::Client>,
-    rx: Receiver<MarkJob>,
+    rx: Arc<Mutex<Receiver<MarkJob>>>,
     op_timeout: Duration,
-    init_tx: Sender<Result<(), String>>,
 ) {
-    // Eagerly validate one connection (connect + PING) so an unreachable/misconfigured Redis fails at
-    // boot (fail-closed) rather than only on the first authenticated request.
-    match pool.get() {
-        Ok(mut conn) => {
-            // Bound the PING by the op timeout, then a real PING round-trip.
-            if let Err(e) = apply_timeouts(&mut conn, op_timeout) {
-                let _ = init_tx.send(Err(format!("redis connection timeout setup failed: {e}")));
-                return;
+    loop {
+        // Lock ONLY to pull the next job, then release BEFORE the Redis op so peers can pull theirs and
+        // run concurrently. A poisoned mutex (a peer worker panicked mid-`recv`) ends this worker (the
+        // others, and boot-time validation, keep the fail-closed contract). `recv()` returns `Err` when
+        // the channel is closed (the store dropped) → the worker exits cleanly.
+        let job = match rx.lock() {
+            Ok(guard) => guard.recv(),
+            Err(_) => return,
+        };
+        match job {
+            Ok((jti, ttl, reply)) => {
+                let _ = reply.send(mark_one(&pool, &jti, ttl, op_timeout));
             }
-            let ping: redis::RedisResult<()> = redis::cmd("PING").query(&mut *conn);
-            match ping {
-                Ok(()) => {
-                    let _ = init_tx.send(Ok(()));
-                }
-                Err(e) => {
-                    let _ = init_tx.send(Err(format!("redis PING failed at init: {e}")));
-                    return;
-                }
-            }
+            Err(_) => return, // channel closed: store dropped, no more work.
         }
-        Err(e) => {
-            let _ = init_tx.send(Err(format!("redis pool connect failed at init: {e}")));
-            return;
-        }
-    }
-
-    // Serve jobs. Each `mark` is one `SET NX PX` round-trip on a pooled connection; the reply carries
-    // New/Replay or a backend error. A requester that has gone away just drops the result.
-    while let Ok((jti, ttl, reply)) = rx.recv() {
-        let _ = reply.send(mark_one(&pool, &jti, ttl, op_timeout));
     }
 }
 

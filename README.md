@@ -157,10 +157,11 @@ one-round-trip check-and-set: the `NX` reply IS the New/Replay signal). It is be
 and are byte-identical), selected at runtime by a Redis URL:
 
 ```bash
-cargo build --features redis-replay
+# `--features` is a Cargo BUILD flag — it is NOT a runtime argument to the binary.
+cargo build --release --features redis-replay
 SOLID_SERVER_REPLAY_REDIS_URL=redis://redis:6379 \
 SOLID_SERVER_BIND=0.0.0.0:3000 \
-  ./target/release/solid-server-rs --features redis-replay   # (build with the feature; run normally)
+  ./target/release/solid-server-rs
 ```
 
 ALL instances behind the load balancer MUST point at the SAME Redis. It is **fail-closed**: any

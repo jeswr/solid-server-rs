@@ -181,8 +181,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => solid_server_rs::redis_replay::BackendReplay::InMemory(in_memory_replay),
     };
+    // Without the `redis-replay` feature, the Redis backend is not compiled in. If an operator
+    // nonetheless set SOLID_SERVER_REPLAY_REDIS_URL (expecting the shared store), ABORT at boot rather
+    // than silently using the per-instance in-memory store — which, in a horizontally-scaled
+    // deployment, would recreate the very replay-protection gap this store exists to close. Fail-closed
+    // on the misconfiguration (roborev High): an explicit "rebuild with --features redis-replay" error,
+    // never a silent downgrade.
     #[cfg(not(feature = "redis-replay"))]
-    let inner_replay = in_memory_replay;
+    let inner_replay = {
+        if std::env::var("SOLID_SERVER_REPLAY_REDIS_URL")
+            .ok()
+            .is_some_and(|u| !u.trim().is_empty())
+        {
+            return Err("SOLID_SERVER_REPLAY_REDIS_URL is set but this binary was built WITHOUT the \
+                 `redis-replay` feature — refusing to start with the per-instance in-memory replay \
+                 store, which would silently disable cross-instance replay protection when scaled \
+                 horizontally. Rebuild with `cargo build --release --features redis-replay`, or unset \
+                 the variable to run single-instance."
+                .into());
+        }
+        in_memory_replay
+    };
 
     // Round-3 verified-access-token cache. Capture the proof policy from the SAME config the verifier
     // is built with (so the cache's hit-path proof verification enforces byte-identical semantics),
