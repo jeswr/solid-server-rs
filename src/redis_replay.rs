@@ -71,6 +71,21 @@ fn pool_acquire_timeout(op_timeout: Duration) -> Duration {
     (op_timeout * 4).max(POOL_ACQUIRE_TIMEOUT_FLOOR)
 }
 
+/// The caller-side END-TO-END deadline `mark` waits for a reply (roborev Medium): even with the worker
+/// pool, a burst larger than [`DEFAULT_WORKERS`] queues, so the calling (Tokio) thread must NOT block
+/// indefinitely on the reply. This bounds the WHOLE round-trip — queue wait + pool acquisition + the
+/// Redis op — so a saturated/slow backend fails CLOSED (`ReplayBackendError` → 503) promptly instead of
+/// stalling the auth path. It must be at least the worst-case single-op cost (pool-acquire + op) plus a
+/// margin for brief queueing; we use `pool_acquire_timeout + op_timeout`, floored, so it always exceeds
+/// a single op's own bound (a healthy op never trips the caller deadline) yet stays bounded under load.
+fn mark_deadline(op_timeout: Duration) -> Duration {
+    (pool_acquire_timeout(op_timeout) + op_timeout).max(MARK_DEADLINE_FLOOR)
+}
+
+/// Floor for the caller-side `mark` deadline, so even a tiny op timeout leaves room for queue + op
+/// before the caller gives up (fail-closed). Comfortably above the pool-acquire floor.
+const MARK_DEADLINE_FLOOR: Duration = Duration::from_millis(750);
+
 /// Number of dedicated Redis worker threads draining the shared job channel CONCURRENTLY (roborev
 /// Medium: a single worker serialised all marks, so a slow Redis or bursty auth could queue requests
 /// behind one worker far longer than the 50 ms socket timeout, stalling the auth path). With N workers,
@@ -97,8 +112,11 @@ type MarkJob = (
 /// every clone shares the one worker thread + pool. Implements [`ReplayStore`] so it drops into the
 /// SAME `SharedReplay`/verifier/cache wiring the in-memory store uses (`main.rs` swap only).
 pub struct RedisReplayStore {
-    /// Ship a `mark` job to the dedicated worker thread. Cloneable + `Send`/`Sync`, used from `&self`.
+    /// Ship a `mark` job to a worker thread. Cloneable + `Send`/`Sync`, used from `&self`.
     tx: Sender<MarkJob>,
+    /// The caller-side end-to-end deadline `mark` waits for a reply before failing closed (bounds the
+    /// auth path even under queue saturation; see [`mark_deadline`]).
+    mark_deadline: Duration,
 }
 
 impl RedisReplayStore {
@@ -162,7 +180,10 @@ impl RedisReplayStore {
                 })?;
         }
 
-        Ok(Self { tx })
+        Ok(Self {
+            tx,
+            mark_deadline: mark_deadline(op_timeout),
+        })
     }
 }
 
@@ -170,6 +191,7 @@ impl Clone for RedisReplayStore {
     fn clone(&self) -> Self {
         Self {
             tx: self.tx.clone(),
+            mark_deadline: self.mark_deadline,
         }
     }
 }
@@ -190,12 +212,23 @@ impl ReplayStore for RedisReplayStore {
             .send((jti.to_string(), ttl, reply_tx))
             .map_err(|_| ReplayBackendError("redis replay worker is not available".to_string()))?;
 
-        // Block on the reply (a plain channel recv — NOT a Tokio runtime entry, so safe inside the
-        // caller's async runtime). The Redis RTT happens on the worker thread, never on this one. A
-        // dropped reply (worker died mid-op) fails CLOSED.
-        reply_rx.recv().map_err(|_| {
-            ReplayBackendError("redis replay worker dropped the request".to_string())
-        })?
+        // Wait for the reply with a BOUNDED end-to-end deadline (a plain channel recv_timeout — NOT a
+        // Tokio runtime entry, so safe inside the caller's async runtime). The Redis RTT happens on a
+        // worker thread, never on this one. The deadline bounds the WHOLE round-trip (queue wait + pool
+        // acquire + op): under a burst larger than the worker pool, or a slow backend, the caller fails
+        // CLOSED promptly (→ 503) instead of blocking the auth path indefinitely (roborev Medium). A
+        // healthy op replies well within the deadline, so this never fires on the happy path. A timeout
+        // or a dropped reply (worker died mid-op) both fail CLOSED.
+        match reply_rx.recv_timeout(self.mark_deadline) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(ReplayBackendError(format!(
+                "redis replay mark exceeded the {} ms deadline (backend saturated/slow) — failing closed",
+                self.mark_deadline.as_millis()
+            ))),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(ReplayBackendError(
+                "redis replay worker dropped the request".to_string(),
+            )),
+        }
     }
 }
 
@@ -360,6 +393,40 @@ mod tests {
             format!("{JTI_KEY_PREFIX}{jti}"),
             "dpop:jti:abc.def-GHI_123~unusual"
         );
+    }
+
+    #[test]
+    fn mark_deadline_exceeds_a_single_op_bound() {
+        // The caller-side end-to-end deadline must ALWAYS exceed a single op's own worst-case bound
+        // (pool-acquire + op), so a healthy op never trips the caller deadline, yet it stays bounded
+        // (fail-closed) under saturation.
+        for op_ms in [10u64, 50, 100, 500] {
+            let op = Duration::from_millis(op_ms);
+            let deadline = mark_deadline(op);
+            let single_op_worst = pool_acquire_timeout(op) + op;
+            assert!(
+                deadline >= single_op_worst,
+                "mark deadline ({deadline:?}) must be >= a single op's worst case ({single_op_worst:?})"
+            );
+            assert!(
+                deadline >= MARK_DEADLINE_FLOOR,
+                "mark deadline must respect its floor"
+            );
+        }
+    }
+
+    #[test]
+    fn pool_acquire_timeout_exceeds_op_timeout() {
+        // Connection acquisition (cold connect + r2d2 overhead) is always given more headroom than the
+        // tight hot-path socket op bound.
+        for op_ms in [10u64, 50, 200, 1000] {
+            let op = Duration::from_millis(op_ms);
+            assert!(
+                pool_acquire_timeout(op) >= op,
+                "pool acquire timeout must be >= the op timeout"
+            );
+            assert!(pool_acquire_timeout(op) >= POOL_ACQUIRE_TIMEOUT_FLOOR);
+        }
     }
 
     #[test]
