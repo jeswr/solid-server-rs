@@ -40,7 +40,7 @@
 //! so it is safe to call from inside the caller's runtime and never parks a Tokio worker on socket I/O.
 //! A TIGHT op/connect timeout (default 50 ms) turns a slow/unreachable Redis into a fast 503.
 
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -99,6 +99,15 @@ const DEFAULT_WORKERS: usize = 8;
 /// (a worker never waits on the pool for a peer's connection). Bounds total Redis connections.
 const DEFAULT_POOL_SIZE: u32 = DEFAULT_WORKERS as u32;
 
+/// BOUNDED job-queue capacity (roborev Medium: an unbounded channel let timed-out callers drop their
+/// receivers while jobs kept accumulating → unbounded memory + stale marks executing long after the
+/// request failed closed). The queue is a `sync_channel(BOUNDED)`; `mark` uses `try_send`, so once the
+/// queue is full (the workers can't keep up) further marks fail CLOSED IMMEDIATELY (a fast 503,
+/// backpressure) rather than enqueuing into an ever-growing backlog. Sized to absorb a normal burst
+/// across the worker pool yet keep memory bounded (each queued job is a tiny `(String, Duration,
+/// Sender)`); when full it is a genuine overload signal — exactly when failing closed fast is correct.
+const DEFAULT_QUEUE_CAPACITY: usize = 1024;
+
 /// A `mark` job sent to a Redis worker thread: the `jti`, its TTL, and a reply channel.
 type MarkJob = (
     String,
@@ -112,8 +121,9 @@ type MarkJob = (
 /// every clone shares the one worker thread + pool. Implements [`ReplayStore`] so it drops into the
 /// SAME `SharedReplay`/verifier/cache wiring the in-memory store uses (`main.rs` swap only).
 pub struct RedisReplayStore {
-    /// Ship a `mark` job to a worker thread. Cloneable + `Send`/`Sync`, used from `&self`.
-    tx: Sender<MarkJob>,
+    /// Ship a `mark` job to a worker thread over a BOUNDED queue. Cloneable + `Send`/`Sync`, used from
+    /// `&self`. `try_send` fails CLOSED on a full queue (backpressure; see [`DEFAULT_QUEUE_CAPACITY`]).
+    tx: SyncSender<MarkJob>,
     /// The caller-side end-to-end deadline `mark` waits for a reply before failing closed (bounds the
     /// auth path even under queue saturation; see [`mark_deadline`]).
     mark_deadline: Duration,
@@ -154,12 +164,14 @@ impl RedisReplayStore {
             .connection_timeout(pool_acquire_timeout(op_timeout))
             .build_unchecked(client);
 
-        // The shared job channel: `mark` sends here; the N worker threads drain it concurrently. A std
-        // channel (not Tokio): `mark` blocks on the REPLY channel, which is a plain recv (NOT a runtime
-        // entry), so calling it from inside the caller's async runtime is safe. `Receiver` is
-        // single-consumer, so we share it across workers behind a `Mutex` — held ONLY for the brief
-        // `recv()`, never during the Redis op, so the N workers' Redis ops run genuinely in parallel.
-        let (tx, rx) = std::sync::mpsc::channel::<MarkJob>();
+        // The shared BOUNDED job channel: `mark` sends here; the N worker threads drain it concurrently.
+        // A std `sync_channel` (not Tokio): `mark` `try_send`s (fail-closed on a full queue) and then
+        // waits on the REPLY channel, which is a plain timed recv (NOT a runtime entry), so calling it
+        // from inside the caller's async runtime is safe. The bound caps memory under saturation (roborev
+        // Medium). `Receiver` is single-consumer, so we share it across workers behind a `Mutex` — held
+        // ONLY for the brief `recv()`, never during the Redis op, so the N workers' Redis ops run
+        // genuinely in parallel.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<MarkJob>(DEFAULT_QUEUE_CAPACITY);
         let shared_rx = Arc::new(Mutex::new(rx));
 
         // ONE eager init validation (connect + PING) on the boot thread BEFORE spawning workers, so a
@@ -206,11 +218,21 @@ impl ReplayStore for RedisReplayStore {
         }
 
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        // Ship the job to the dedicated worker. A send error means the worker thread is gone — fail
-        // CLOSED (never silently accept the proof because the backend is unavailable).
+        // Enqueue the job NON-BLOCKING onto the bounded queue. `try_send` fails CLOSED immediately when
+        // the queue is FULL (the workers can't keep up — a genuine overload signal; fast 503 +
+        // backpressure rather than growing an unbounded backlog of stale marks — roborev Medium) or when
+        // all workers are gone (Disconnected). We never silently accept a proof because the backend is
+        // unavailable/overloaded.
         self.tx
-            .send((jti.to_string(), ttl, reply_tx))
-            .map_err(|_| ReplayBackendError("redis replay worker is not available".to_string()))?;
+            .try_send((jti.to_string(), ttl, reply_tx))
+            .map_err(|e| match e {
+                TrySendError::Full(_) => ReplayBackendError(
+                    "redis replay queue is full (backend overloaded) — failing closed".to_string(),
+                ),
+                TrySendError::Disconnected(_) => {
+                    ReplayBackendError("redis replay workers are not available".to_string())
+                }
+            })?;
 
         // Wait for the reply with a BOUNDED end-to-end deadline (a plain channel recv_timeout — NOT a
         // Tokio runtime entry, so safe inside the caller's async runtime). The Redis RTT happens on a
