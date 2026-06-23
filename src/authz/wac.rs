@@ -116,12 +116,26 @@ impl<'a, S: Store> WacAuthorizer<'a, S> {
             }
         };
         // The public set: for an anonymous requester it EQUALS user (an anonymous requester IS the
-        // public); for an authenticated requester it is resolved independently against the public.
+        // public); for an authenticated requester it is resolved independently against the public —
+        // an ANONYMOUS IDENTITY (no WebID) but carrying THIS request's `origin`. Threading the Origin
+        // matters: an ORIGIN-SCOPED public grant (`acl:agentClass foaf:Agent` + `acl:origin <o>`)
+        // grants the public ONLY from a matching Origin. Resolving the public set with
+        // `Requester::anonymous()` (origin `None`) would always FAIL such an `acl:origin`-restricted
+        // public rule and so UNDER-REPORT `public=` even when the current request's Origin satisfies
+        // it. Using `Requester { web_id: None, origin }` reports exactly the public modes available
+        // from the request's own Origin (and still omits them when the Origin does not match / is
+        // absent — fail-closed in `matches_origin`).
         let public = if web_id.is_none() {
             user.clone()
         } else {
-            self.effective_modes(&protected, &Requester::anonymous())
-                .await?
+            self.effective_modes(
+                &protected,
+                &Requester {
+                    web_id: None,
+                    origin,
+                },
+            )
+            .await?
         };
         Ok(EffectivePermissions { user, public })
     }
@@ -662,6 +676,74 @@ mod tests {
             perms.public.is_empty(),
             "public must be empty: {:?}",
             perms.public
+        );
+    }
+
+    #[tokio::test]
+    async fn wac_allow_public_reflects_origin_scoped_grant_for_authenticated_request() {
+        // Finding 3: WAC-Allow `public=` for an AUTHENTICATED request must carry the CURRENT request's
+        // Origin when resolving the public set, so an ORIGIN-SCOPED public grant
+        // (`acl:agentClass foaf:Agent` + `acl:origin <o>`) is reported when the request Origin matches
+        // — and omitted when it does not / when no Origin is sent (fail-closed). Resolving the public
+        // set with `Requester::anonymous()` (origin None) would always omit it (the under-report bug).
+        const APP: &str = "https://app.example";
+        const OTHER: &str = "https://evil.example";
+        let s = store();
+        let resource = "https://pod.example/alice/test/scoped";
+        // Alice (owner) full control; the PUBLIC gets Read but ONLY from https://app.example.
+        put_acl(
+            &s,
+            "https://pod.example/alice/test/scoped.acl",
+            &format!(
+                r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+                @prefix foaf: <http://xmlns.com/foaf/0.1/>.
+                <#o> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <{resource}>; acl:mode acl:Read, acl:Write, acl:Control.
+                <#p> a acl:Authorization; acl:agentClass foaf:Agent; acl:origin <{APP}>; acl:accessTo <{resource}>; acl:mode acl:Read."#
+            ),
+        )
+        .await;
+        let wac = WacAuthorizer::new(&s, BASE);
+
+        // Authenticated (Alice) request FROM the trusted origin: public= must report the origin-scoped
+        // public Read.
+        let matched = wac
+            .effective_permissions(resource, Some(ALICE), Some(APP), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            matched.public,
+            [AccessMode::Read].into_iter().collect(),
+            "an origin-scoped public grant must be reported in public= when the request Origin matches"
+        );
+        // Alice herself still has her full set regardless of origin (her grant has no acl:origin).
+        assert_eq!(
+            matched.user,
+            [AccessMode::Read, AccessMode::Write, AccessMode::Control]
+                .into_iter()
+                .collect()
+        );
+
+        // Authenticated request from a DIFFERENT origin: the origin-scoped public grant must be OMITTED.
+        let other_origin = wac
+            .effective_permissions(resource, Some(ALICE), Some(OTHER), None)
+            .await
+            .unwrap();
+        assert!(
+            other_origin.public.is_empty(),
+            "an origin-scoped public grant must be omitted from public= for a non-matching Origin: {:?}",
+            other_origin.public
+        );
+
+        // Authenticated request with NO Origin: an origin-restricted public rule never matches
+        // (fail-closed) ⇒ public= empty.
+        let no_origin = wac
+            .effective_permissions(resource, Some(ALICE), None, None)
+            .await
+            .unwrap();
+        assert!(
+            no_origin.public.is_empty(),
+            "an origin-scoped public grant must be omitted from public= when no Origin is sent: {:?}",
+            no_origin.public
         );
     }
 

@@ -484,12 +484,21 @@ pub async fn put_handler<S: Store>(
     // EMIT (the single notification hook on the PUT path): a replace ⇒ Update, a create ⇒ Create. A
     // PUT-created resource also grows its container's membership, so pass the parent (the hub derives
     // the parent `Add`); a replace passes no parent (no membership change).
+    //
+    // EXCEPTION — an AUXILIARY `.acl` resource is NOT a contained child (it was stored via a plain
+    // `write`, with NO `ldp:contains` edge added to the parent above). So even on a CREATE its parent
+    // membership did NOT change: pass `None` for the emit parent so the hub does NOT derive a spurious
+    // container-membership `Add` for a resource the container does not actually contain.
     let activity = if existed {
         ActivityType::Update
     } else {
         ActivityType::Create
     };
-    let emit_parent = if existed { None } else { parent.clone() };
+    let emit_parent = if existed || crate::authz::is_acl_resource(&target.iri) {
+        None
+    } else {
+        parent.clone()
+    };
     state
         .notifications
         .notify(&target.iri, activity, emit_parent.as_deref())
@@ -729,16 +738,33 @@ pub async fn patch_handler<S: Store>(
 
     let origin = request_origin(&headers);
 
-    // Load the current representation (if any) FIRST — the authorization branch depends on whether the
-    // target exists (modify vs create-on-PATCH). Match the read result EXPLICITLY: ONLY a `NotFound`
-    // means "absent" (the create-on-PATCH path); ANY OTHER store error (a backend/blob inconsistency)
-    // PROPAGATES here, BEFORE any authorization branch — never collapse a storage failure into "missing"
-    // (that would fail OPEN by taking the create/authorize path on an inconsistent backend).
-    let current = match state.store.read(&target.iri).await {
-        Ok(r) => Some(r),
-        Err(ServerError::NotFound) => None,
-        Err(e) => return Err(e),
-    };
+    // Load the current representation FIRST — the authorization branch depends on whether the target
+    // exists (modify vs create-on-PATCH). Match the read result into THREE states EXPLICITLY:
+    //  - `Ok(r)`            → present (modify path);
+    //  - `Err(NotFound)`    → absent  (create-on-PATCH / delete-on-missing path);
+    //  - `Err(other)`       → a backend/blob inconsistency (a faulting store).
+    //
+    // A non-`NotFound` store error MUST NOT be propagated BEFORE authorization: doing so lets an
+    // UNAUTHORIZED caller receive a 500 (distinguishing a backend/blob inconsistency from a
+    // missing/normally-stored resource) instead of the uniform 401/403 — an existence/state oracle.
+    // So we CAPTURE the error here and surface it only AFTER the caller is authorized (below). We must
+    // ALSO preserve the round-1 fail-closed property: a faulting store must NEVER silently take the
+    // create path. We do that by treating a faulted read like "could be present" for the purpose of
+    // SELECTING the authorization branch — the TARGET-mode branch (NOT the parent-create branch) — so a
+    // genuinely-faulting store is authorized against the strictest applicable right and never routed
+    // through create-on-PATCH.
+    //
+    // `ServerError` is not `Clone`, so we keep the faulted error in `read_error` (the owned `Err`) and
+    // distinguish "present" / "absent" / "faulted" via `current` + `read_error`.
+    let (current, read_error): (Option<crate::store::Resource>, Option<ServerError>) =
+        match state.store.read(&target.iri).await {
+            Ok(r) => (Some(r), None),
+            Err(ServerError::NotFound) => (None, None),
+            // A non-NotFound error: remember it (to surface post-auth), but do NOT propagate it yet.
+            // It presents as "no current representation" (None) but is NOT the create path — the branch
+            // selection below routes it to the TARGET-mode authorization (fail-closed).
+            Err(e) => (None, Some(e)),
+        };
 
     // WAC for PATCH (Solid WAC write-access matrix):
     //  - **Modify** (target exists): an INSERT-ONLY patch (no `solid:deletes`) needs `acl:Append`; a
@@ -752,18 +778,35 @@ pub async fn patch_handler<S: Store>(
     //    create-authorized-then-409 (present) vs create-denied-403 (absent) split.
     //  - **Create-on-PATCH** (target absent, INSERT-ONLY): creation rights live on the PARENT container
     //    (same as PUT-create) — authorize `acl:Append` at the nearest existing ancestor.
+    //
+    // A FAULTED read (`read_error.is_some()`) takes the TARGET-mode branch (never the create branch):
+    // it is authorized against the strictest applicable right AND stays fail-closed (no create path on
+    // an inconsistent backend) — and only AFTER that authorization succeeds is the stored error
+    // surfaced, so an unauthorized caller still gets the uniform 401/403, not a 500.
     let has_deletes = !patch.deletes.is_empty();
     let required = if has_deletes {
         AccessMode::Write
     } else {
         AccessMode::Append
     };
-    if current.is_some() || has_deletes || crate::authz::is_acl_resource(&target.iri) {
+    if current.is_some()
+        || read_error.is_some()
+        || has_deletes
+        || crate::authz::is_acl_resource(&target.iri)
+    {
         state
             .authorize_mode(&target, required, &token, origin)
             .await?;
     } else {
         state.authorize_create(&target, &token, origin).await?;
+    }
+
+    // The caller IS authorized for the operation. NOW surface any captured non-NotFound store error
+    // (the backend/blob inconsistency) — it becomes the 500 it always was, but ONLY for an authorized
+    // caller. An unauthorized caller already returned the uniform 401/403 above, so the error never
+    // leaks the backend state to a caller who is not permitted to learn it.
+    if let Some(e) = read_error {
+        return Err(e);
     }
 
     // Apply preconditions against the current ETag.
@@ -848,12 +891,21 @@ pub async fn patch_handler<S: Store>(
 
     // EMIT (same shape as PUT): a patch that edited an existing resource ⇒ Update; a create-on-PATCH
     // ⇒ Create + a parent membership Add.
+    //
+    // EXCEPTION — an AUXILIARY `.acl` resource is NOT a contained child (create-on-PATCH stored it via
+    // a plain `write`, adding NO `ldp:contains` edge to the parent). So its parent membership did NOT
+    // change even on a create: pass `None` for the emit parent so the hub does NOT derive a spurious
+    // container-membership `Add` for a resource the container does not actually contain.
     let activity = if existed {
         ActivityType::Update
     } else {
         ActivityType::Create
     };
-    let emit_parent = if existed { None } else { parent.clone() };
+    let emit_parent = if existed || crate::authz::is_acl_resource(&target.iri) {
+        None
+    } else {
+        parent.clone()
+    };
     state
         .notifications
         .notify(&target.iri, activity, emit_parent.as_deref())
@@ -1628,7 +1680,10 @@ mod tests {
 
     // --- Finding 4: a non-NotFound read error must NOT collapse to "missing" (fail-CLOSED) --------
 
-    use crate::store::{DeleteOutcome, Resource, ResourceMeta};
+    use crate::store::{
+        CompositeStore, DeleteOutcome, InMemoryBlobStore, InMemorySparqClient, Resource,
+        ResourceMeta,
+    };
     use async_trait::async_trait;
     use axum::body::Bytes as AxBytes;
 
@@ -1689,10 +1744,15 @@ mod tests {
 
     #[tokio::test]
     async fn patch_propagates_non_notfound_read_error_does_not_treat_as_missing() {
-        // An INSERT-ONLY PATCH whose target `read` fails with a STORAGE error (not NotFound). With the
-        // fix, the handler propagates the error (→ 500) BEFORE any authorization/create branch; the
-        // faulty store panics if `write`/`create_in_container` is reached. The pre-fix `read().ok()`
-        // would have collapsed the error into `None` and taken the create-on-PATCH path (fail-OPEN).
+        // An INSERT-ONLY PATCH whose EVERY read (target AND `.acl`) fails with a STORAGE error (not
+        // NotFound). The handler must NEVER collapse the failed read into "missing" and take the
+        // create-on-PATCH path (the pre-fix `read().ok()` fail-OPEN bug): the faulty store PANICS if
+        // `write`/`create_in_container` is reached. With the fix, authorization runs first and its own
+        // `.acl` read faults (a non-NotFound ACL read propagates — fail-closed), so the storage error
+        // surfaces as a 500; either way the create path is never taken. (The narrower
+        // unauthorized-caller-must-not-get-500 property is pinned by
+        // `patch_unauthorized_caller_with_faulting_target_read_gets_uniform_denial_not_500`, where only
+        // the TARGET read faults so authorization can reach a real decision.)
         let state = Arc::new(LdpState::new(FaultyReadStore, "https://pod.example"));
         let token = VerifiedToken {
             web_id: Some("https://pod.example/alice/profile/card#me".into()),
@@ -1711,5 +1771,396 @@ mod tests {
             .expect_err("a non-NotFound read error must surface, not be treated as missing");
         // It must surface as the storage error (500), NOT a create-path 201 / a 403 / a 404.
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // --- Finding 2 (round-2): a PRE-AUTH storage error must not leak via 500 to an unauthorized caller.
+
+    const OWNER: &str = "https://pod.example/alice/profile/card#me";
+    const STRANGER: &str = "https://pod.example/bob/profile/card#me";
+
+    /// A [`Store`] that faults ONLY on the TARGET resource read (a simulated backend/blob
+    /// inconsistency on the resource itself) while serving a real, owner-only `.acl` so authorization
+    /// can reach a genuine allow/deny decision. This isolates the round-2 property: an UNAUTHORIZED
+    /// caller must get the uniform 401/403 (not a 500 distinguishing "faulting backend" from "missing /
+    /// normally-stored"), and an AUTHORIZED caller must get the 500 surfaced AFTER authorization.
+    ///
+    /// `read`:
+    ///  - the target IRI → a non-`NotFound` `Storage` error (the inconsistency);
+    ///  - the target's `.acl` → an owner-only ACL granting [`OWNER`] Read/Write/Control (so authz runs);
+    ///  - anything else (e.g. an ancestor `.acl`) → `NotFound` (no other ACL up the tree).
+    struct TargetFaultyAclStore {
+        target: String,
+    }
+
+    impl TargetFaultyAclStore {
+        fn new(target: &str) -> Self {
+            Self {
+                target: target.to_string(),
+            }
+        }
+        fn acl_body(&self) -> String {
+            format!(
+                r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#owner> a acl:Authorization;
+         acl:agent <{OWNER}>;
+         acl:accessTo <{}>;
+         acl:mode acl:Read, acl:Write, acl:Control."#,
+                self.target
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Store for TargetFaultyAclStore {
+        async fn read(&self, iri: &str) -> ServerResult<Resource> {
+            if iri == self.target {
+                // The inconsistency on the resource itself — a NON-NotFound error.
+                return Err(ServerError::Storage(
+                    "simulated backend inconsistency".into(),
+                ));
+            }
+            if iri == format!("{}.acl", self.target) {
+                // The target's OWN `.acl`: an owner-only authorization, served normally so authz works.
+                let body = AxBytes::from(self.acl_body());
+                let meta = ResourceMeta {
+                    content_type: "text/turtle".into(),
+                    blob_key: "k".into(),
+                    etag: "\"acl\"".into(),
+                };
+                return Ok(Resource { body, meta });
+            }
+            // No other ACL anywhere up the tree.
+            Err(ServerError::NotFound)
+        }
+        async fn meta(&self, _iri: &str) -> ServerResult<Option<ResourceMeta>> {
+            Ok(None)
+        }
+        async fn exists(&self, _iri: &str) -> ServerResult<bool> {
+            Ok(false)
+        }
+        async fn write(
+            &self,
+            _iri: &str,
+            _body: AxBytes,
+            _content_type: &str,
+        ) -> ServerResult<ResourceMeta> {
+            panic!("write must not be reached: the faulted target read must surface as 500 first");
+        }
+        async fn create_in_container(
+            &self,
+            _container: &str,
+            _child: &str,
+            _body: AxBytes,
+            _content_type: &str,
+        ) -> ServerResult<ResourceMeta> {
+            panic!("create_in_container must not be reached on a faulted target read");
+        }
+        async fn delete(&self, _iri: &str, _parent: Option<&str>) -> ServerResult<()> {
+            Ok(())
+        }
+        async fn delete_container_if_empty(
+            &self,
+            _iri: &str,
+            _parent: Option<&str>,
+        ) -> ServerResult<DeleteOutcome> {
+            Ok(DeleteOutcome::NotFound)
+        }
+        async fn list_children(&self, _container: &str) -> ServerResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// An INSERT-ONLY `text/n3` PATCH body targeting `subject`.
+    fn insert_only_patch(subject: &str) -> AxBytes {
+        AxBytes::from(format!(
+            "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
+             @prefix foaf: <http://xmlns.com/foaf/0.1/> .\n\
+             _:p solid:inserts {{ <{subject}> foaf:name \"X\" . }}.\n",
+        ))
+    }
+
+    fn n3_patch_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/n3"));
+        headers
+    }
+
+    #[tokio::test]
+    async fn patch_unauthorized_caller_with_faulting_target_read_gets_uniform_denial_not_500() {
+        // (a) An UNAUTHORIZED caller (a stranger, not the ACL's owner) PATCHing a resource whose target
+        // read faults must get the uniform authorization denial (403 authenticated), NOT a 500 — the
+        // backend inconsistency must never be observable to a caller who is not permitted the operation
+        // (an existence/state oracle). The store PANICS if any write is reached.
+        let target = "https://pod.example/alice/data";
+        let state = Arc::new(LdpState::new(
+            TargetFaultyAclStore::new(target),
+            "https://pod.example",
+        ));
+        let token = VerifiedToken {
+            web_id: Some(STRANGER.into()),
+            ..VerifiedToken::default()
+        };
+        let uri: axum::http::Uri = "/alice/data".parse().unwrap();
+        let err = patch_handler(
+            State(state),
+            Extension(token),
+            uri,
+            n3_patch_headers(),
+            insert_only_patch(&format!("{target}#me")),
+        )
+        .await
+        .expect_err("an unauthorized caller must be denied, never see the 500");
+        // 403 (authenticated-but-unauthorized) — the uniform denial, NOT the 500 the pre-fix leaked.
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn patch_anonymous_caller_with_faulting_target_read_gets_401_not_500() {
+        // Same as above but ANONYMOUS: the uniform denial is 401 (so the client authenticates), never a
+        // 500. An unauthenticated caller must not learn the backend is inconsistent either.
+        let target = "https://pod.example/alice/data";
+        let state = Arc::new(LdpState::new(
+            TargetFaultyAclStore::new(target),
+            "https://pod.example",
+        ));
+        let token = VerifiedToken::default(); // anonymous (web_id == None)
+        let uri: axum::http::Uri = "/alice/data".parse().unwrap();
+        let err = patch_handler(
+            State(state),
+            Extension(token),
+            uri,
+            n3_patch_headers(),
+            insert_only_patch(&format!("{target}#me")),
+        )
+        .await
+        .expect_err("an anonymous caller must be denied, never see the 500");
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn patch_authorized_caller_with_faulting_target_read_gets_500_surfaced_post_auth() {
+        // (b) An AUTHORIZED caller (the ACL owner) PATCHing the same resource MUST get the 500 — the
+        // backend error IS surfaced, but only after authorization succeeds (so it is not an oracle).
+        // The store PANICS if a write is reached, proving the error surfaced BEFORE the create path.
+        let target = "https://pod.example/alice/data";
+        let state = Arc::new(LdpState::new(
+            TargetFaultyAclStore::new(target),
+            "https://pod.example",
+        ));
+        let token = VerifiedToken {
+            web_id: Some(OWNER.into()),
+            ..VerifiedToken::default()
+        };
+        let uri: axum::http::Uri = "/alice/data".parse().unwrap();
+        let err = patch_handler(
+            State(state),
+            Extension(token),
+            uri,
+            n3_patch_headers(),
+            insert_only_patch(&format!("{target}#me")),
+        )
+        .await
+        .expect_err("an authorized caller must see the backend error surfaced post-auth");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn patch_authorized_caller_with_notfound_target_takes_normal_create_path() {
+        // (c) An AUTHORIZED caller PATCHing a GENUINELY-MISSING target (a real `NotFound`, not a fault)
+        // must take the normal create-on-PATCH path → 201 Created, proving the round-2 change did not
+        // regress the legitimate create path. Uses the real composite store with a seeded owner ACL.
+        let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        // Seed a root `.acl` granting the owner Read/Write/Control on the root + all descendants.
+        let root_acl = format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#owner> a acl:Authorization;
+         acl:agent <{OWNER}>;
+         acl:accessTo <https://pod.example/>;
+         acl:default <https://pod.example/>;
+         acl:mode acl:Read, acl:Write, acl:Control."#
+        );
+        store
+            .write(
+                "https://pod.example/.acl",
+                AxBytes::from(root_acl),
+                "text/turtle",
+            )
+            .await
+            .expect("seed root acl");
+        let state = Arc::new(LdpState::new(store, "https://pod.example"));
+        let token = VerifiedToken {
+            web_id: Some(OWNER.into()),
+            ..VerifiedToken::default()
+        };
+        let uri: axum::http::Uri = "/alice/note".parse().unwrap();
+        let resp = patch_handler(
+            State(state),
+            Extension(token),
+            uri,
+            n3_patch_headers(),
+            insert_only_patch("https://pod.example/alice/note#me"),
+        )
+        .await
+        .expect("a create-on-PATCH of a genuinely-missing target must succeed");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // --- Finding 1: an `.acl` (auxiliary) create must NOT emit a parent-containment Add ------------
+
+    /// Seed a root `.acl` granting `OWNER` full control over the root + all descendants, written
+    /// through the store as an auxiliary resource. Returns the store ready for handler use.
+    async fn store_with_owner_root_acl() -> CompositeStore<InMemorySparqClient, InMemoryBlobStore> {
+        let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        let root_acl = format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#owner> a acl:Authorization;
+         acl:agent <{OWNER}>;
+         acl:accessTo <https://pod.example/>;
+         acl:default <https://pod.example/>;
+         acl:mode acl:Read, acl:Write, acl:Control."#
+        );
+        store
+            .write(
+                "https://pod.example/.acl",
+                AxBytes::from(root_acl),
+                "text/turtle",
+            )
+            .await
+            .expect("seed root acl");
+        store
+    }
+
+    fn owner_token() -> VerifiedToken {
+        VerifiedToken {
+            web_id: Some(OWNER.into()),
+            ..VerifiedToken::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn put_create_of_acl_emits_no_parent_containment_add() {
+        // A PUT that CREATES an auxiliary `.acl` resource must NOT cause a container-membership `Add`
+        // notification on the parent — an `.acl` is NOT a contained child (no `ldp:contains` edge). A
+        // subscriber to the parent container must therefore receive NOTHING for the `.acl` create.
+        let hub = NotificationHub::new();
+        let store = store_with_owner_root_acl().await;
+        let state = Arc::new(LdpState::with_hub(
+            store,
+            "https://pod.example",
+            hub.clone(),
+        ));
+
+        let parent = "https://pod.example/alice/";
+        let mut parent_rx = hub.subscribe(parent).await;
+
+        // PUT the `.acl` for a resource in /alice/ — auth for `.acl` is Control (the owner has it).
+        let uri: axum::http::Uri = "/alice/doc.acl".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/turtle"),
+        );
+        let acl_body = AxBytes::from(format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#o> a acl:Authorization; acl:agent <{OWNER}>; acl:accessTo <https://pod.example/alice/doc>; acl:mode acl:Read, acl:Write, acl:Control."#
+        ));
+        let resp = put_handler(
+            State(state),
+            Extension(owner_token()),
+            uri,
+            headers,
+            acl_body,
+        )
+        .await
+        .expect("an owner PUT of an .acl must succeed");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // The parent container subscriber must have received NOTHING — no spurious membership Add.
+        assert!(
+            parent_rx.try_recv().is_err(),
+            "an .acl create must not emit a parent-containment Add notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_create_of_normal_resource_does_emit_parent_containment_add() {
+        // The control: a PUT that creates a NORMAL (non-`.acl`) resource DOES grow its parent's
+        // membership, so the parent subscriber MUST receive a membership `Add`. This guards against the
+        // finding-1 fix over-suppressing the legitimate notification.
+        let hub = NotificationHub::new();
+        let store = store_with_owner_root_acl().await;
+        let state = Arc::new(LdpState::with_hub(
+            store,
+            "https://pod.example",
+            hub.clone(),
+        ));
+
+        let parent = "https://pod.example/alice/";
+        let mut parent_rx = hub.subscribe(parent).await;
+
+        let uri: axum::http::Uri = "/alice/doc".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/turtle"),
+        );
+        let body = AxBytes::from(
+            "<https://pod.example/alice/doc#me> <http://xmlns.com/foaf/0.1/name> \"X\" .",
+        );
+        let resp = put_handler(State(state), Extension(owner_token()), uri, headers, body)
+            .await
+            .expect("an owner PUT of a normal resource must succeed");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // The parent container subscriber MUST see a membership Add naming the new child.
+        let frame = parent_rx
+            .try_recv()
+            .expect("a normal resource create must emit a parent-containment Add");
+        assert!(frame.contains("\"type\":\"Add\""), "{frame}");
+        assert!(
+            frame.contains("\"object\":\"https://pod.example/alice/doc\""),
+            "{frame}"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_create_of_acl_emits_no_parent_containment_add() {
+        // The PATCH-create path mirrors PUT-create: a create-on-PATCH of an auxiliary `.acl` must NOT
+        // emit a parent-containment Add either.
+        let hub = NotificationHub::new();
+        let store = store_with_owner_root_acl().await;
+        let state = Arc::new(LdpState::with_hub(
+            store,
+            "https://pod.example",
+            hub.clone(),
+        ));
+
+        let parent = "https://pod.example/alice/";
+        let mut parent_rx = hub.subscribe(parent).await;
+
+        // An INSERT-ONLY PATCH that CREATES the `.acl` (target absent → create-on-PATCH). Auth is
+        // Control (the owner has it). The inserted triple is a minimal authorization.
+        let uri: axum::http::Uri = "/alice/doc2.acl".parse().unwrap();
+        let patch_body = AxBytes::from(format!(
+            "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
+             @prefix acl: <http://www.w3.org/ns/auth/acl#> .\n\
+             _:p solid:inserts {{ <#o> a acl:Authorization; acl:agent <{OWNER}>; \
+             acl:accessTo <https://pod.example/alice/doc2>; acl:mode acl:Read . }}.\n",
+        ));
+        let resp = patch_handler(
+            State(state),
+            Extension(owner_token()),
+            uri,
+            n3_patch_headers(),
+            patch_body,
+        )
+        .await
+        .expect("an owner create-on-PATCH of an .acl must succeed");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        assert!(
+            parent_rx.try_recv().is_err(),
+            "an .acl create-on-PATCH must not emit a parent-containment Add notification"
+        );
     }
 }
