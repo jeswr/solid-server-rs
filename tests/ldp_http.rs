@@ -21,6 +21,34 @@ use tower::ServiceExt;
 const TURTLE: &str =
     "<https://pod.example/alice/data#me> <http://xmlns.com/foaf/0.1/name> \"Alice\" .";
 
+/// Seed a ROOT `<base>/.acl` granting `owner_webid` Read/Write/Control on the base root AND on all
+/// descendants (`acl:default`), so every resource these LDP tests touch inherits owner control under
+/// the now-enforced WAC engine. Written through the store as an auxiliary `.acl` resource (built as a
+/// Turtle string — a test fixture, not production RDF construction). This mirrors the pod-root
+/// owner-default the real conformance seed (`seed_conformance`) writes per user.
+async fn seed_root_owner_acl(
+    store: &CompositeStore<InMemorySparqClient, InMemoryBlobStore>,
+    base_url: &str,
+    owner_webid: &str,
+) {
+    use solid_server_rs::store::Store;
+    let base = base_url.trim_end_matches('/');
+    let root = format!("{base}/");
+    let acl_iri = format!("{root}.acl");
+    let acl_body = format!(
+        r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#owner> a acl:Authorization;
+         acl:agent <{owner_webid}>;
+         acl:accessTo <{root}>;
+         acl:default <{root}>;
+         acl:mode acl:Read, acl:Write, acl:Control."#
+    );
+    store
+        .write(&acl_iri, axum::body::Bytes::from(acl_body), "text/turtle")
+        .await
+        .expect("seed root acl");
+}
+
 /// One shared app (so a PUT and a later GET hit the same store), plus the keys to mint requests.
 struct Harness {
     app: axum::Router,
@@ -29,7 +57,7 @@ struct Harness {
 }
 
 impl Harness {
-    fn new() -> Self {
+    async fn new() -> Self {
         let issuer_key = KeyKit::generate();
         let client_key = KeyKit::generate();
         let config = VerifierConfig::new(vec![common::ISSUER.to_string()], BASE_URL);
@@ -37,6 +65,13 @@ impl Harness {
         let verifier = Verifier::new(config, jwks_provider(&issuer_key), replay).unwrap();
         let ctx = AuthContext::new(verifier, BASE_URL);
         let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        // WAC is now ENFORCED, so the test caller (Alice, `common::WEBID`) needs an effective ACL
+        // granting her access to every path these tests exercise. Seed a ROOT `.acl` granting Alice
+        // Read/Write/Control on the base root AND on all descendants (`acl:default`), so every
+        // resource under `https://pod.example/` inherits owner control — exactly the pod-root
+        // owner-default the real conformance seed (`seed_conformance`) writes per user. The ACL is
+        // written via the store directly (an auxiliary `.acl` resource).
+        seed_root_owner_acl(&store, BASE_URL, common::WEBID).await;
         let ldp = LdpState::new(store, BASE_URL);
         // Use `AppState::new` (not the struct literal) so the LDP layer's anonymous-401
         // `WWW-Authenticate` challenge is derived from the verifier (names the trusted issuer + algs).
@@ -130,7 +165,7 @@ impl Harness {
 
 #[tokio::test]
 async fn put_creates_then_get_reads_it_back() {
-    let h = Harness::new();
+    let h = Harness::new().await;
 
     // PUT a fresh resource → 201 Created with a Location + ETag.
     let put = h
@@ -158,7 +193,7 @@ async fn put_creates_then_get_reads_it_back() {
 
 #[tokio::test]
 async fn put_twice_is_a_replace_with_no_content() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     let first = h
         .request(
             "PUT",
@@ -183,7 +218,7 @@ async fn put_twice_is_a_replace_with_no_content() {
 
 #[tokio::test]
 async fn head_returns_headers_without_a_body() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.request(
         "PUT",
         "/alice/data",
@@ -206,7 +241,7 @@ async fn put_with_a_non_rdf_content_type_is_stored_as_a_binary_resource() {
     // The Solid Protocol stores ANY content type — a non-RDF type (here a text/plain blob) is stored
     // VERBATIM as an opaque binary resource (the CORS scenarios create text/plain resources). It is
     // NOT a 415: 415 is only for an unsupported PATCH language, not a write content type.
-    let h = Harness::new();
+    let h = Harness::new().await;
     let put = h
         .request(
             "PUT",
@@ -234,7 +269,7 @@ async fn put_with_a_non_rdf_content_type_is_stored_as_a_binary_resource() {
 async fn put_malformed_rdf_in_a_declared_rdf_type_is_400() {
     // An RDF content type IS validated — a malformed Turtle body is a 400 (only RDF types are parsed;
     // a binary type is stored unparsed).
-    let h = Harness::new();
+    let h = Harness::new().await;
     let resp = h
         .request(
             "PUT",
@@ -251,7 +286,7 @@ async fn unauthenticated_put_is_401_with_challenge_fail_closed() {
     // A write from a public/unauthenticated caller must be rejected — the pre-WAC posture answers a
     // 401 + `WWW-Authenticate` (so a client knows to obtain a token), not a bare 403, and never a
     // fail-open write.
-    let h = Harness::new();
+    let h = Harness::new().await;
     let resp = h
         .unauth_request(
             "PUT",
@@ -272,7 +307,7 @@ async fn unauthenticated_put_is_401_with_challenge_fail_closed() {
 
 #[tokio::test]
 async fn put_with_malformed_turtle_is_400() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     let resp = h
         .request(
             "PUT",
@@ -288,7 +323,7 @@ async fn put_with_malformed_turtle_is_400() {
 
 #[tokio::test]
 async fn get_negotiates_jsonld_from_stored_turtle() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.request(
         "PUT",
         "/alice/data",
@@ -320,7 +355,7 @@ async fn get_negotiates_jsonld_from_stored_turtle() {
 
 #[tokio::test]
 async fn get_with_unacceptable_accept_is_406() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.request(
         "PUT",
         "/alice/data",
@@ -344,7 +379,7 @@ async fn get_with_unacceptable_accept_is_406() {
 
 #[tokio::test]
 async fn get_with_a_range_returns_206_partial() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.request(
         "PUT",
         "/alice/data",
@@ -378,7 +413,7 @@ async fn get_with_a_range_returns_206_partial() {
 #[tokio::test]
 async fn head_with_a_range_is_200_not_206() {
     // Range is defined for GET; a HEAD with Range must NOT return 206.
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.request(
         "PUT",
         "/alice/data",
@@ -400,7 +435,7 @@ async fn head_with_a_range_is_200_not_206() {
 
 #[tokio::test]
 async fn get_with_an_unsatisfiable_range_is_416() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.request(
         "PUT",
         "/alice/data",
@@ -427,7 +462,7 @@ async fn get_with_an_unsatisfiable_range_is_416() {
 
 #[tokio::test]
 async fn put_if_none_match_star_blocks_overwrite() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     let first = h
         .request(
             "PUT",
@@ -453,7 +488,7 @@ async fn put_if_none_match_star_blocks_overwrite() {
 
 #[tokio::test]
 async fn put_if_match_with_wrong_etag_is_412() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.request(
         "PUT",
         "/alice/data",
@@ -475,7 +510,7 @@ async fn put_if_match_with_wrong_etag_is_412() {
 
 #[tokio::test]
 async fn put_if_match_with_correct_etag_succeeds() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     let first = h
         .request(
             "PUT",
@@ -508,7 +543,7 @@ async fn put_if_match_with_correct_etag_succeeds() {
 
 #[tokio::test]
 async fn post_creates_a_child_with_slug() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.make_container("/alice/").await;
     let resp = h
         .request_with(
@@ -536,7 +571,7 @@ async fn post_creates_a_child_with_slug() {
 
 #[tokio::test]
 async fn post_mints_a_uri_without_a_slug() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.make_container("/alice/").await;
     let resp = h
         .request(
@@ -563,7 +598,7 @@ async fn post_mints_a_uri_without_a_slug() {
 
 #[tokio::test]
 async fn post_to_a_non_container_target_is_404_or_405() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     // The target is a plain resource path (no trailing slash) that does not exist ⇒ 404 (per the
     // Solid Protocol `post-target-not-found` — POST is not a containment op on a non-container; the
     // accepted statuses are 404 when nothing is there / 405 when a resource is there).
@@ -598,7 +633,7 @@ async fn post_to_a_non_container_target_is_404_or_405() {
 
 #[tokio::test]
 async fn post_to_a_missing_container_is_404() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     // The container path is well-formed but was never created — must not create a child under it.
     let resp = h
         .request(
@@ -613,7 +648,7 @@ async fn post_to_a_missing_container_is_404() {
 
 #[tokio::test]
 async fn unauthenticated_post_is_401_with_challenge() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     let resp = h
         .unauth_request("POST", "/alice/", Some("text/turtle"), Body::from(TURTLE))
         .await;
@@ -627,7 +662,7 @@ async fn unauthenticated_post_is_401_with_challenge() {
 
 #[tokio::test]
 async fn delete_removes_a_resource() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.request(
         "PUT",
         "/alice/data",
@@ -647,17 +682,22 @@ async fn delete_removes_a_resource() {
 }
 
 #[tokio::test]
-async fn delete_a_missing_resource_is_404() {
-    let h = Harness::new();
+async fn delete_a_missing_resource_is_a_uniform_denial_not_404() {
+    // Under WAC, a DELETE of a non-existent target is reported through the SAME denial surface as a
+    // permission failure (401 anonymous / 403 authenticated), NOT a 404 — so a DELETE cannot be used
+    // as an existence side-channel (the WAC `write-access` matrix asserts `[401]`/`[403]` for missing
+    // `fictive` targets even when the requester would otherwise have had inherited write). The test
+    // caller is the authenticated owner, so the uniform denial is 403.
+    let h = Harness::new().await;
     let del = h
         .request("DELETE", "/alice/gone", None, Body::empty())
         .await;
-    assert_eq!(del.status(), StatusCode::NOT_FOUND);
+    assert_eq!(del.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
 async fn delete_a_non_empty_container_is_409() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     // The container must exist before a child can be POSTed into it.
     h.make_container("/alice/").await;
     // POST a child into the container so it has a member.
@@ -676,7 +716,7 @@ async fn delete_a_non_empty_container_is_409() {
 
 #[tokio::test]
 async fn delete_an_empty_container_succeeds() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.make_container("/alice/").await;
 
     // The empty container can be deleted (the spec choice: empty ⇒ allowed, non-empty ⇒ 409).
@@ -690,7 +730,7 @@ async fn delete_an_empty_container_succeeds() {
 
 #[tokio::test]
 async fn delete_a_container_after_emptying_it_succeeds() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.make_container("/alice/").await;
     // POST a child, then DELETE the child (emptying the container), then DELETE the container.
     let post = h
@@ -730,7 +770,7 @@ async fn delete_a_container_after_emptying_it_succeeds() {
 
 #[tokio::test]
 async fn unauthenticated_delete_is_401_with_challenge() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.request(
         "PUT",
         "/alice/data",
@@ -757,7 +797,7 @@ _:patch a solid:InsertDeletePatch;\n\
 
 #[tokio::test]
 async fn patch_inserts_and_deletes_triples() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.request(
         "PUT",
         "/alice/data",
@@ -789,7 +829,7 @@ async fn patch_inserts_and_deletes_triples() {
 
 #[tokio::test]
 async fn patch_with_an_unsupported_media_type_is_415() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.request(
         "PUT",
         "/alice/data",
@@ -812,7 +852,7 @@ async fn patch_with_an_unsupported_media_type_is_415() {
 #[tokio::test]
 async fn patch_with_sparql_update_insert_data_applies() {
     // The SPARQL-Update INSERT DATA subset is now supported (the containment scenario uses it).
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.request(
         "PUT",
         "/alice/data",
@@ -841,7 +881,7 @@ async fn patch_with_sparql_update_insert_data_applies() {
 
 #[tokio::test]
 async fn patch_deleting_an_absent_triple_is_409() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.request(
         "PUT",
         "/alice/data",
@@ -863,7 +903,7 @@ _:patch solid:deletes { <https://pod.example/alice/data#me> foaf:name \"NotThere
 /// with the new value.
 #[tokio::test]
 async fn patch_with_a_templated_where_renames() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.request(
         "PUT",
         "/alice/data",
@@ -895,7 +935,7 @@ _:patch solid:where   { <https://pod.example/alice/data#me> foaf:name ?n . };\n\
 /// exactly one mapping — it does not fan out per solution).
 #[tokio::test]
 async fn patch_with_a_multi_solution_where_is_409() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     // Two foaf:name triples on the same subject ⇒ the where binds ?n two ways ⇒ multiple solutions.
     let turtle =
         "<https://pod.example/alice/data#me> <http://xmlns.com/foaf/0.1/name> \"Alice\" .\n\
@@ -919,7 +959,7 @@ _:patch solid:where { <https://pod.example/alice/data#me> foaf:name ?n . };\n\
 
 #[tokio::test]
 async fn unauthenticated_patch_is_401_with_challenge() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.request(
         "PUT",
         "/alice/data",
@@ -965,7 +1005,7 @@ async fn raw(
 async fn options_is_not_405() {
     // read-method-support: OPTIONS must not be 405/501. The CORS layer answers every OPTIONS (200),
     // which satisfies the "OPTIONS is supported" requirement.
-    let h = Harness::new();
+    let h = Harness::new().await;
     let resp = raw(&h, "OPTIONS", "/alice/", &[]).await;
     assert_ne!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
     assert_ne!(resp.status(), StatusCode::NOT_IMPLEMENTED);
@@ -975,7 +1015,7 @@ async fn options_is_not_405() {
 async fn get_response_advertises_allow_accept_post_accept_patch() {
     // read-method-allow: a GET response on a container must carry `Allow` listing GET + HEAD; the
     // container also advertises `Accept-Post` + `Accept-Patch`.
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.make_container("/alice/").await;
     let get = h
         .request_with(
@@ -1007,7 +1047,7 @@ async fn get_response_advertises_allow_accept_post_accept_patch() {
 async fn container_get_renders_ldp_contains_listing() {
     // delete-remove-containment / writing-resource-containment: a container GET must render
     // ldp:BasicContainer + an ldp:contains triple per member.
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.make_container("/alice/").await;
     let post = h
         .request_with(
@@ -1070,7 +1110,7 @@ async fn container_get_merges_stored_rdf_with_containment_triples() {
     // itself AND the generated ldp:BasicContainer + ldp:contains triples — not synthesise only the
     // containment triples and drop the stored body. Round-trip: PUT RDF to the container, POST a
     // member, GET ⇒ the stored triple AND the containment triples are present.
-    let h = Harness::new();
+    let h = Harness::new().await;
     // PUT a container with a distinctive stored triple (relative <#c> resolves to …/alice/#c).
     let put = h
         .request(
@@ -1127,7 +1167,7 @@ async fn container_etag_changes_when_membership_changes() {
     // Regression (roborev Medium): the container body is generated from LIVE membership, so its ETag
     // must be derived from the rendered representation — adding/removing a child must change the ETag
     // (else conditional requests / caches break). Also: HEAD and GET must agree on the ETag.
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.make_container("/alice/").await;
 
     let etag = |resp: &axum::http::Response<Body>| -> String {
@@ -1221,7 +1261,7 @@ async fn root_route_is_served() {
     // Cluster-A #1: GET / must reach the handler (the /{*path} wildcard does not match the empty path).
     // With nothing seeded the root does not exist ⇒ 404 (not a routing 404 with no handler) — proving
     // the route is wired. After creating it, it reads back as a container.
-    let h = Harness::new();
+    let h = Harness::new().await;
     let get = h.request("GET", "/", None, Body::empty()).await;
     assert_eq!(get.status(), StatusCode::NOT_FOUND);
 
@@ -1258,7 +1298,7 @@ async fn root_route_is_served() {
 async fn cors_preflight_returns_acao_allow_methods_and_reflected_headers() {
     // cors-preflight-requests / cors-accept-acah: an OPTIONS with Origin + Access-Control-Request-*
     // returns ACAO == origin, Allow-Methods contains the method, Allow-Headers reflects the request.
-    let h = Harness::new();
+    let h = Harness::new().await;
     let resp = raw(
         &h,
         "OPTIONS",
@@ -1317,7 +1357,7 @@ async fn cors_preflight_returns_acao_allow_methods_and_reflected_headers() {
 async fn cors_simple_request_carries_acao_and_expose_headers_even_on_401() {
     // cors-simple-requests: an unauthenticated GET with Origin gets 401 BUT still carries
     // Access-Control-Allow-Origin == origin and a concrete (non-'*') Access-Control-Expose-Headers.
-    let h = Harness::new();
+    let h = Harness::new().await;
     let resp = raw(&h, "GET", "/alice/", &[("origin", "https://tester")]).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
@@ -1341,7 +1381,7 @@ async fn cors_simple_request_carries_acao_and_expose_headers_even_on_401() {
 #[tokio::test]
 async fn cors_authenticated_get_has_vary_origin() {
     // acao-vary: a credentialed GET with Origin returns ACAO + Vary: Origin.
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.request(
         "PUT",
         "/alice/data",
@@ -1383,7 +1423,7 @@ async fn cors_authenticated_get_has_vary_origin() {
 #[tokio::test]
 async fn put_creates_intermediate_containers_and_wires_membership() {
     // writing-resource-containment: PUT a grandchild ⇒ intermediate containers exist + list members.
-    let h = Harness::new();
+    let h = Harness::new().await;
     let put = h
         .request(
             "PUT",
@@ -1443,7 +1483,7 @@ async fn put_creates_intermediate_containers_and_wires_membership() {
 #[tokio::test]
 async fn put_without_content_type_is_400() {
     // content-type-reject: a write with no Content-Type is 400 (not 415).
-    let h = Harness::new();
+    let h = Harness::new().await;
     let resp = h
         .request("PUT", "/alice/data", None, Body::from(TURTLE))
         .await;
@@ -1453,7 +1493,7 @@ async fn put_without_content_type_is_400() {
 #[tokio::test]
 async fn slash_semantics_resource_and_container_cannot_coexist() {
     // slash-semantics-exclude: PUT a container, then a same-name resource ⇒ 409 (and vice versa).
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.make_container("/alice/").await;
 
     // Container /alice/foo/ then resource /alice/foo ⇒ conflict.
@@ -1500,7 +1540,7 @@ async fn slash_semantics_resource_and_container_cannot_coexist() {
 #[tokio::test]
 async fn patch_sparql_update_creates_intermediate_containers() {
     // containment.feature PATCH scenario: a create-on-PATCH with INSERT DATA wires containment.
-    let h = Harness::new();
+    let h = Harness::new().await;
     let patch = h
         .request(
             "PATCH",
@@ -1540,7 +1580,7 @@ async fn patch_sparql_update_creates_intermediate_containers() {
 async fn post_with_basic_container_link_creates_a_container_child() {
     // slash-semantics-exclude / LDP §5.2.3.4: a POST carrying
     // `Link: <ldp#BasicContainer>; rel="type"` creates a CONTAINER child — the Location ends in '/'.
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.make_container("/alice/").await;
     let resp = h
         .request_with(

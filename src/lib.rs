@@ -25,19 +25,26 @@
 //!   engine (`text/n3`, insert/delete plus the `solid:where` variable solver),
 //! - LDP target/URL parsing + Turtle/JSON-LD content handling ([`ldp::target`], [`ldp::content`]).
 //!
+//! Web Access Control authorization is implemented locally in [`authz`] (a semantic port of
+//! prod-solid-server `src/authz/`): per-resource `.acl` evaluation with own-ACL-(`acl:accessTo`)-else
+//! -nearest-ancestor-(`acl:default`) resolution, the four modes, the 401-vs-403 split, and the
+//! `WAC-Allow` header. It reads `.acl` documents through the [`store::Store`] seam; when the SPARQ
+//! access-control design lands the per-resource decision can move behind the same seam.
+//!
 //! Solid Notifications (WebSocketChannel2023) are implemented as a net-new, isolated [`notifications`]
 //! module: an in-process subscription registry + AS2.0 notification builder, an axum WebSocket receive
 //! endpoint, a subscribe endpoint, and discovery (storage description + `Link` rels). The LDP write
 //! path makes a single emit call after a successful mutation. Everything else network-facing (the live
 //! SPARQ HTTP client, live JWKS) and the parts of the Solid surface that need designs not yet written
-//! (full WAC authorization — incl. per-resource authorization of a subscription, the reconciler,
-//! multipart Range) are clearly marked `M2-next:` seams, not implemented. PATCH supports both the
-//! Solid N3 Patch and the `application/sparql-update` INSERT/DELETE-DATA subset. The Solid Protocol
-//! conformance suite passes 25/25 on the Protocol manifest (WAC is the remaining gap — see
-//! `conformance/SCORE.md`). The default impls used here are in-memory test doubles.
+//! (per-resource authorization of a subscription, the reconciler, multipart Range, `acl:agentGroup`
+//! resolution) are clearly marked `M2-next:` seams. PATCH supports both the Solid N3 Patch and the
+//! `application/sparql-update` INSERT/DELETE-DATA subset. The Solid conformance suite passes **41/41**
+//! (Protocol 25/25 + WAC 16/16) — see `conformance/SCORE.md`. The default impls used here are
+//! in-memory test doubles.
 
 pub mod app;
 pub mod auth;
+pub mod authz;
 pub mod error;
 pub mod ldp;
 pub mod notifications;

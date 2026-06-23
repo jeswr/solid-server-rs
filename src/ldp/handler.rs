@@ -7,22 +7,25 @@
 //! and the N3-Patch engine ([`crate::ldp::patch`]) are pure modules; the handler is the HTTP glue +
 //! the store call.
 //!
-//! ## The authorization seam (pre-WAC — Cluster B, gated on sparq#992)
+//! ## The authorization seam (real per-resource WAC)
 //!
-//! Full per-resource WAC authorization needs the SPARQ access-control design, which does not yet
-//! exist — so this slice does NOT evaluate `.acl` documents. Instead it runs a coarse, fail-closed
-//! PRE-WAC posture that is correct for the Solid Protocol authentication scenarios:
+//! Each handler runs the local in-Rust Web Access Control engine ([`crate::authz`]) BEFORE touching
+//! storage: the HTTP method + target maps to a required [`AccessMode`]
+//! ([`mode_for_operation`]); the [`WacAuthorizer`] resolves the effective `.acl` (the target's OWN
+//! `acl:accessTo` ACL, else the nearest ancestor's `acl:default`, child→root, fail-closed) and returns
+//! a [`Decision`]:
 //!
-//! - **Mutations (PUT/POST/DELETE/PATCH) require an authenticated caller.** An anonymous mutation is a
-//!   401 + `WWW-Authenticate` challenge (NOT a bare 403, NOT a fail-open write).
-//! - **Reads (GET/HEAD) also require an authenticated caller, EXCEPT a public WebID profile
-//!   document** (`…/profile/card`), which any Solid client (and the conformance harness) dereferences
-//!   UNAUTHENTICATED to find `pim:storage`/`solid:oidcIssuer`. Every other anonymous read is a 401 +
-//!   challenge.
+//! - **`Allow`** — the operation proceeds; on a permitted GET/HEAD the read response carries the
+//!   `WAC-Allow` header (the requester's + the public's effective modes).
+//! - **`Unauthenticated`** (the requester is anonymous and auth could plausibly grant) — **401** +
+//!   `WWW-Authenticate` challenge, so the client obtains a token.
+//! - **`Forbidden`** (authenticated but not authorized) — **403**.
 //!
-//! The `token` argument on each handler is the seam where the per-resource WAC
-//! `read`/`write`/`append`/`control` decision plugs in. See `require_auth` + `is_public_readable`;
-//! the WAC engine, when it lands, SUPERSEDES this coarse gate.
+//! Reading or writing a resource's OWN `.acl` requires `acl:Control` (encoded by
+//! [`mode_for_operation`]). Public-readable resources are exactly those whose effective ACL grants
+//! `foaf:Agent acl:Read` — the conformance seed sets up the WebID-profile + pod-root ACLs (see
+//! [`crate::seed`]). Authorization runs BEFORE the existence check, so a permitted read of a missing
+//! resource is a 404 while an UNauthorized/anonymous read of the same is a 403/401 (no existence leak).
 
 use std::sync::Arc;
 
@@ -35,6 +38,9 @@ use axum::Extension;
 use oxrdf::{NamedNode, Triple};
 
 use crate::auth::VerifiedToken;
+use crate::authz::wac::{Decision, WacAuthorizer};
+use crate::authz::wac_allow::wac_allow_header;
+use crate::authz::{mode_for_operation, AccessMode};
 use crate::error::ServerError;
 use crate::ldp::conditional::{self, evaluate as eval_preconditions};
 use crate::ldp::content::{
@@ -110,6 +116,115 @@ impl<S: Store> LdpState<S> {
             www_authenticate: self.www_authenticate.clone(),
         }
     }
+
+    /// Run Web Access Control for `target` + the `method`-derived required mode against `token`.
+    ///
+    /// On a permitted operation returns the FULL set of modes the requester holds over the target (so
+    /// a GET/HEAD can build `WAC-Allow` without re-walking the ACL hierarchy). On a denial returns the
+    /// spec-shaped error: a 401 + `WWW-Authenticate` when the requester is anonymous (so the client
+    /// authenticates), a 403 when authenticated-but-unauthorized.
+    async fn authorize(
+        &self,
+        method: &str,
+        target: &LdpTarget,
+        token: &VerifiedToken,
+    ) -> Result<std::collections::BTreeSet<AccessMode>, ServerError> {
+        let required = mode_for_operation(method, &target.iri, target.is_container);
+        self.authorize_mode(target, required, token).await
+    }
+
+    /// Run Web Access Control for `target` with an EXPLICIT required mode (used by PATCH, whose mode
+    /// depends on the patch CONTENT — an insert-only patch needs only `acl:Append`, a patch with any
+    /// delete needs `acl:Write`). For an `.acl` target the required mode is overridden to
+    /// [`AccessMode::Control`] regardless (managing access rules is always the Control privilege).
+    async fn authorize_mode(
+        &self,
+        target: &LdpTarget,
+        required: AccessMode,
+        token: &VerifiedToken,
+    ) -> Result<std::collections::BTreeSet<AccessMode>, ServerError> {
+        // An `.acl` resource is governed by Control regardless of the operation/content.
+        let required = if crate::authz::is_acl_resource(&target.iri) {
+            AccessMode::Control
+        } else {
+            required
+        };
+        let wac = WacAuthorizer::new(&self.store, &self.base_url);
+        match wac
+            .authorize(&target.iri, required, token.web_id.as_deref())
+            .await?
+        {
+            Decision::Allow(modes) => Ok(modes),
+            Decision::Unauthenticated => Err(self.unauthenticated()),
+            Decision::Forbidden => Err(ServerError::Forbidden),
+        }
+    }
+
+    /// Run WAC for an EXPLICIT (`target_iri`, mode), where `target_iri` may be a synthetic container
+    /// IRI (e.g. the parent of the resource being created/deleted, which is itself a valid container
+    /// path). Returns the granted modes on Allow, or the spec 401/403 on deny.
+    async fn authorize_iri(
+        &self,
+        target_iri: &str,
+        required: AccessMode,
+        token: &VerifiedToken,
+    ) -> Result<(), ServerError> {
+        let wac = WacAuthorizer::new(&self.store, &self.base_url);
+        match wac
+            .authorize(target_iri, required, token.web_id.as_deref())
+            .await?
+        {
+            Decision::Allow(_) => Ok(()),
+            Decision::Unauthenticated => Err(self.unauthenticated()),
+            Decision::Forbidden => Err(ServerError::Forbidden),
+        }
+    }
+
+    /// Authorize CREATION of a new resource at `target` — WAC creation grants live on the PARENT
+    /// container (a client may write `/c/new` if granted `acl:Append`/`acl:Write` on `/c/`), so this
+    /// authorizes `acl:Append` at the nearest EXISTING ancestor container (intermediate containers are
+    /// auto-created later, but their materialisation needs the same right at the nearest existing
+    /// ancestor — else an unauthorized agent could create containers for free). Mirrors
+    /// prod-solid-server `authorizeCreation`.
+    async fn authorize_create(
+        &self,
+        target: &LdpTarget,
+        token: &VerifiedToken,
+    ) -> Result<(), ServerError> {
+        let parent = self.nearest_existing_container(&target.iri).await?;
+        let container =
+            parent.unwrap_or_else(|| format!("{}/", self.base_url.trim_end_matches('/')));
+        self.authorize_iri(&container, AccessMode::Append, token)
+            .await
+    }
+
+    /// The nearest EXISTING container at or above `target` (its parent, then grandparent, … up to the
+    /// storage root), or `None` if none exists (not even the root).
+    async fn nearest_existing_container(
+        &self,
+        target_iri: &str,
+    ) -> Result<Option<String>, ServerError> {
+        let root = format!("{}/", self.base_url.trim_end_matches('/'));
+        // Start from the immediate parent: drop a container's own trailing slash first.
+        let mut current = target_iri.to_string();
+        if current.ends_with('/') {
+            current.pop();
+        }
+        loop {
+            let Some(slash) = current.rfind('/') else {
+                break;
+            };
+            let parent = current[..=slash].to_string();
+            if self.store.exists(&parent).await? {
+                return Ok(Some(parent));
+            }
+            if parent == root || parent.len() <= root.len() {
+                break;
+            }
+            current = parent[..parent.len() - 1].to_string();
+        }
+        Ok(None)
+    }
 }
 
 /// `GET /{path}` — read a resource, with `Accept`-driven content negotiation + `Range` support.
@@ -148,16 +263,15 @@ async fn serve_read<S: Store>(
 ) -> Result<Response, ServerError> {
     let target = parse_target(&state.base_url, uri.path())?;
 
-    // Pre-WAC read authorization (the 401-vs-anonymous posture, NOT full WAC — that is Cluster B,
-    // gated on sparq#992). A read needs an authenticated caller, EXCEPT a WebID profile document,
-    // which is public by design: the conformance harness (and any Solid client) dereferences a WebID
-    // UNAUTHENTICATED to find `pim:storage`/`solid:oidcIssuer`, so the profile card must stay readable
-    // anonymously. Everything else, when requested anonymously, answers 401 + `WWW-Authenticate` —
-    // matching the `authentication-header` + CORS-simple scenarios. (Once the WAC engine lands it
-    // SUPERSEDES this coarse gate with per-resource `acl:Read` decisions + the public-read class.)
-    if token.is_public() && !is_public_readable(&target.iri, &state.base_url) {
-        return Err(state.unauthenticated());
-    }
+    // WAC read authorization (real per-resource `.acl` evaluation). A GET/HEAD requires `acl:Read`
+    // (Control for an `.acl` target); the public-read class is whatever the effective ACL grants to
+    // `foaf:Agent`, so a WebID profile card with a public-read ACL stays anonymously readable while
+    // private data answers 401 (anonymous) / 403 (authenticated-but-unauthorized). Authorization runs
+    // BEFORE the existence check, so a permitted read of a missing resource is a 404, while an
+    // unauthorized read of the same is a 401/403 (no existence leak).
+    let user_modes = state
+        .authorize(if with_body { "GET" } else { "HEAD" }, &target, token)
+        .await?;
 
     let resource = state.store.read(&target.iri).await?;
 
@@ -225,9 +339,13 @@ async fn serve_read<S: Store>(
     // ACL discovery (`Link: <…>; rel="acl"`, Solid Protocol §4.3.1): every resource advertises the URL
     // of its access-control document (the conventional `<resource>.acl` / `<container>/.acl`). The
     // conformance harness reads this at bootstrap to locate where to write the test container's ACL.
-    // NB the ACL is NOT yet ENFORCED (WAC is gated on sparq#992) — advertising + storing the .acl
-    // document lets the harness proceed; the WAC scenarios still fail until the engine lands.
     add_acl_link(&mut out, &target);
+    // WAC-Allow (Solid Protocol): advertise the requester's + the public's effective access modes for
+    // this target. The `user` set was already resolved by the read authorization above (the FULL
+    // granted set, not just `read`), so we pass it through to avoid re-walking the ACL; the public set
+    // is resolved independently (== user when the requester is anonymous).
+    let wac_allow = wac_allow_value(state, &target, token, user_modes).await?;
+    set_str(&mut out, HeaderName::from_static("wac-allow"), &wac_allow);
 
     match outcome {
         RangeOutcome::Unsatisfiable => {
@@ -284,8 +402,22 @@ pub async fn put_handler<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ServerError> {
-    require_auth(&token, state.as_ref())?;
     let target = parse_target(&state.base_url, uri.path())?;
+
+    // WAC for PUT (Solid WAC write-access matrix):
+    //  - **Overwrite** (target exists): needs `acl:Write` on the TARGET — a grant of Write on the
+    //    resource (even with no parent grant) suffices.
+    //  - **Create** (target does not exist): needs `acl:Append`/`acl:Write` on the PARENT container —
+    //    creating a new member mutates the container, NOT the (absent) target.
+    //  - **`.acl` target**: routes to `acl:Control` on the protected resource (managing access rules).
+    // Resolve existence ONCE here and reuse it for both the authorization branch and the create path.
+    let current = state.store.meta(&target.iri).await?;
+    let existed = current.is_some();
+    if existed || crate::authz::is_acl_resource(&target.iri) {
+        state.authorize("PUT", &target, &token).await?;
+    } else {
+        state.authorize_create(&target, &token).await?;
+    }
 
     // Slash-semantics: a trailing-slash IRI (a container) and the same IRI without the slash (a plain
     // resource) MUST NOT co-exist (Solid Protocol — "with and without trailing slash cannot
@@ -302,7 +434,6 @@ pub async fn put_handler<S: Store>(
     let stored_type = validate_writable(&content_type, &body, &target.iri)?;
 
     // Conditional write: evaluate preconditions against the CURRENT representation's ETag.
-    let current = state.store.meta(&target.iri).await?;
     let current_etag = current.as_ref().map(|m| m.etag.as_str());
     conditional::require(eval_preconditions(
         header_str(&headers, header::IF_MATCH),
@@ -310,7 +441,6 @@ pub async fn put_handler<S: Store>(
         current_etag,
     ))?;
 
-    let existed = current.is_some();
     let parent = parent_container(&target);
 
     let meta = if existed {
@@ -364,8 +494,13 @@ pub async fn post_handler<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ServerError> {
-    require_auth(&token, state.as_ref())?;
     let container = parse_target(&state.base_url, uri.path())?;
+    // WAC: a POST to a container requires `acl:Append` on the container (a writer also satisfies it).
+    // Anonymous ⇒ 401, authenticated-but-unauthorized ⇒ 403. Authorize BEFORE the container-shape /
+    // existence checks so an unauthorized caller cannot probe existence (the read-access POST cases
+    // accept `[403]` for a real container and `[403, 404]` for a fictive one — authorize-first 403 is
+    // within both).
+    state.authorize("POST", &container, &token).await?;
 
     // POST creates a CHILD in a CONTAINER — the target must be a container (trailing-slash path).
     // A POST to a non-container target is NOT a containment operation: per the Solid Protocol
@@ -443,11 +578,49 @@ pub async fn delete_handler<S: Store>(
     uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Result<Response, ServerError> {
-    require_auth(&token, state.as_ref())?;
     let target = parse_target(&state.base_url, uri.path())?;
 
+    // WAC for DELETE (Solid WAC write-access matrix). Authorize BEFORE the existence check so an
+    // unauthorized caller cannot probe existence (a missing target below is reported as a denial, not
+    // a 404 — no existence side-channel). The required rights:
+    //  - on the TARGET: a CONTAINER needs `acl:Control` (the matrix uniformly forbids DELETE of a
+    //    container to a mere Write holder — only the Control holder, typically the owner, may delete
+    //    it); a DOCUMENT needs `acl:Write`; an `.acl` target needs `acl:Control` (and the parent-write
+    //    check below is skipped — deleting an ACL only restores the inherited ACL, not containment).
+    //  - PLUS `acl:Write` on the nearest existing PARENT container (DELETE mutates containment), unless
+    //    the target is an `.acl`.
+    let is_acl = crate::authz::is_acl_resource(&target.iri);
+    // An `.acl` target and a CONTAINER target both require `acl:Control`; a plain document requires
+    // `acl:Write`.
+    let target_mode = if is_acl || target.is_container {
+        AccessMode::Control
+    } else {
+        AccessMode::Write
+    };
+    state.authorize_mode(&target, target_mode, &token).await?;
+    if !is_acl {
+        let parent = state.nearest_existing_container(&target.iri).await?;
+        if let Some(p) = parent {
+            state.authorize_iri(&p, AccessMode::Write, &token).await?;
+        }
+    }
+
     let current = state.store.meta(&target.iri).await?;
-    let current = current.ok_or(ServerError::NotFound)?;
+    // A DELETE of a non-existent target is reported through the SAME denial surface as a permission
+    // failure (401 anonymous / 403 authenticated), NOT a 404 — so a DELETE cannot be used as an
+    // existence side-channel by a requester who could not otherwise learn the resource exists (the
+    // WAC matrix asserts `[401]`/`[403]` for `fictive` DELETE rows even where the requester would have
+    // had inherited write).
+    let current = match current {
+        Some(c) => c,
+        None => {
+            return Err(if token.web_id.is_none() {
+                state.unauthenticated()
+            } else {
+                ServerError::Forbidden
+            });
+        }
+    };
 
     // Conditional delete: honour If-Match / If-None-Match against the current ETag.
     conditional::require(eval_preconditions(
@@ -510,19 +683,43 @@ pub async fn patch_handler<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ServerError> {
-    require_auth(&token, state.as_ref())?;
     let target = parse_target(&state.base_url, uri.path())?;
 
     // Select the PATCH language from the Content-Type (ABSENT ⇒ 400, unsupported ⇒ 415) and parse the
     // document. `text/n3` is the Solid N3 Patch; `application/sparql-update` is the INSERT/DELETE DATA
     // subset. Both reduce to an `N3Patch` the shared engine applies.
+    //
+    // Parse BEFORE authorizing because the required WAC mode depends on the patch CONTENT: an
+    // INSERT-ONLY patch (no `solid:deletes`) needs only `acl:Append`; a patch with ANY delete needs
+    // `acl:Write` (a delete removes existing triples). Parsing is SSRF-safe + bounded RDF parsing, and
+    // the conformance deny cases accept `[403, 405, 415]`, so parse-then-authorize is correct.
     let patch = match classify_patch_media_type(header_str(&headers, header::CONTENT_TYPE))? {
         PatchKind::N3 => parse_n3_patch(&body, &target.iri)?,
         PatchKind::SparqlUpdate => parse_sparql_update(&body, &target.iri)?,
     };
 
-    // Load the current representation (if any) + apply preconditions.
+    // Load the current representation (if any) FIRST — the authorization branch depends on whether the
+    // target exists (modify vs create-on-PATCH).
     let current = state.store.read(&target.iri).await.ok();
+
+    // WAC for PATCH (Solid WAC write-access matrix):
+    //  - **Modify** (target exists): an INSERT-ONLY patch (no `solid:deletes`) needs `acl:Append`; a
+    //    patch with ANY delete needs `acl:Write`. (An `.acl` target needs `acl:Control` — handled by
+    //    `authorize_mode`.)
+    //  - **Create-on-PATCH** (target absent, insert-only): creation rights live on the PARENT
+    //    container (same as PUT-create) — authorize `acl:Append` at the nearest existing ancestor.
+    let required = if patch.deletes.is_empty() {
+        AccessMode::Append
+    } else {
+        AccessMode::Write
+    };
+    if current.is_some() || crate::authz::is_acl_resource(&target.iri) {
+        state.authorize_mode(&target, required, &token).await?;
+    } else {
+        state.authorize_create(&target, &token).await?;
+    }
+
+    // Apply preconditions against the current ETag.
     let current_etag = current.as_ref().map(|r| r.meta.etag.clone());
     conditional::require(eval_preconditions(
         header_str(&headers, header::IF_MATCH),
@@ -656,19 +853,6 @@ fn add_method_advertisement(headers: &mut HeaderMap, is_container: bool) {
 
 // --- helpers -----------------------------------------------------------------------------------
 
-/// Reject a request from a public/unauthenticated caller that requires authentication: a 401 with the
-/// server's `WWW-Authenticate` challenge (NOT a bare 403).
-///
-/// This is the pre-WAC posture (full per-resource WAC is Cluster B, gated on sparq#992): every
-/// mutation, and every read except a public WebID profile document, needs an authenticated caller.
-/// An anonymous caller gets a spec-shaped 401 + challenge so a client knows to obtain a token.
-fn require_auth<S: Store>(token: &VerifiedToken, state: &LdpState<S>) -> Result<(), ServerError> {
-    if token.is_public() {
-        return Err(state.unauthenticated());
-    }
-    Ok(())
-}
-
 /// Require a non-empty `Content-Type` on a write (Solid Protocol — `content-type-reject`). An ABSENT
 /// or empty Content-Type is a **400 Bad Request**. Distinguishing absent (400) from
 /// present-but-unsupported (handled by [`validate_writable`]) is the point of this helper.
@@ -706,92 +890,6 @@ fn validate_writable(
         Err(ServerError::UnsupportedMediaType(_)) => Ok(content_type.trim().to_string()),
         Err(e) => Err(e),
     }
-}
-
-/// Whether `iri` is PUBLIC-readable without authentication. Pre-WAC, the only public-read class is a
-/// **WebID profile document** (the `…/profile/card` the conformance harness — and any Solid client —
-/// dereferences UNAUTHENTICATED to find `pim:storage`/`solid:oidcIssuer`). Everything else requires a
-/// token until the WAC engine lands (which will replace this with per-resource `acl:Read` + the
-/// public-read agent class).
-///
-/// **The exception is the EXACT direct WebID-profile shape only** — `<base>/{user}/profile/card`,
-/// where `{user}` is a SINGLE top-level path segment (exactly two interior segments before the final
-/// `profile/card`: the user dir + `profile/card`). It is NOT a suffix/`ends_with` match: a nested
-/// `<base>/{user}/private/profile/card` (or any deeper `…/profile/card`) is private data and MUST
-/// require authentication — an `ends_with` test let any such nested path bypass the auth gate (the
-/// HIGH this closes). This whole posture is interim; the WAC engine (Cluster B) supersedes it with
-/// per-resource ACL.
-fn is_public_readable(iri: &str, base_url: &str) -> bool {
-    // ORIGIN-EXACT match, NOT a raw string prefix. A bare `strip_prefix(base)` on the full IRI is a
-    // string-prefix test with no authority boundary, so `https://localhost:3000evil/profile/card`
-    // string-matches the base `https://localhost:3000` (rest = `evil/profile/card`) — a different
-    // host that would be wrongly treated as ours. Instead split each IRI into (origin, path) where
-    // origin = `scheme://authority`, and require the IRI's origin to EQUAL the base's origin. The
-    // authority `localhost:3000evil` ≠ `localhost:3000`, so the spoof fails the origin check.
-    let Some((iri_origin, iri_path)) = split_origin_and_path(iri) else {
-        return false;
-    };
-    let Some((base_origin, _)) = split_origin_and_path(base_url) else {
-        return false;
-    };
-    if iri_origin != base_origin {
-        return false;
-    }
-    // The seeded WebID profile document is EXACTLY the PATH `/{user}/profile/card`. Match the precise
-    // shape — a single top-level `{user}` segment, then `profile`, then `card` — and nothing else.
-    // Splitting on '/' over the leading-slash-trimmed path yields exactly `["{user}", "profile",
-    // "card"]` for a direct profile card; a nested `…/private/profile/card` yields four+ segments and
-    // is rejected.
-    let segments: Vec<&str> = iri_path.trim_start_matches('/').split('/').collect();
-    matches!(segments.as_slice(), [user, "profile", "card"] if !user.is_empty())
-}
-
-/// Split an absolute `http`/`https` IRI into `(origin, path)` where `origin` is the case-insensitively
-/// normalised `scheme://authority` (scheme + host + optional `:port`) and `path` is everything from the
-/// first `/` after the authority (defaulting to `/`). Returns `None` for any non-`http(s)` or
-/// authority-less input. The origin is the security boundary: two IRIs are "same origin" iff their
-/// origins compare equal, so an authority like `localhost:3000evil` is distinct from `localhost:3000`.
-fn split_origin_and_path(iri: &str) -> Option<(String, &str)> {
-    // Scheme is matched case-insensitively per RFC 3986 §3.1; only http(s) carry a network authority.
-    // Determine the scheme + the `://`-terminated prefix length WITHOUT allocating, then slice the
-    // original (case-preserving) string so authority/path slices stay borrowed from `iri`.
-    // `get(..n)` is used (not `iri[..n]`) so a leading multibyte char that straddles index n yields
-    // `None` rather than panicking on a non-char-boundary slice.
-    let (proto, prefix_len) = if iri
-        .get(..8)
-        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
-    {
-        ("https", 8usize)
-    } else if iri
-        .get(..7)
-        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
-    {
-        ("http", 7usize)
-    } else {
-        return None;
-    };
-    let after_scheme = &iri[prefix_len..];
-    // The authority ends at the first '/', '?' or '#'. A path/query/fragment-less IRI is all authority.
-    let auth_end = after_scheme
-        .find(['/', '?', '#'])
-        .unwrap_or(after_scheme.len());
-    let authority = &after_scheme[..auth_end];
-    if authority.is_empty() {
-        return None;
-    }
-    // Path is the slice starting at the first '/' (if any); '?'/'#' terminate it; default "/".
-    let rest_after_auth = &after_scheme[auth_end..];
-    let path = if rest_after_auth.starts_with('/') {
-        let end = rest_after_auth
-            .find(['?', '#'])
-            .unwrap_or(rest_after_auth.len());
-        &rest_after_auth[..end]
-    } else {
-        "/"
-    };
-    // Host is case-insensitive; lowercase the authority so `LOCALHOST:3000` == `localhost:3000`.
-    let origin = format!("{proto}://{}", authority.to_ascii_lowercase());
-    Some((origin, path))
 }
 
 /// Synthesise a container's LDP representation and content-negotiate it.
@@ -1222,6 +1320,26 @@ fn acl_url_for(target: &LdpTarget) -> String {
     format!("{}.acl", target.iri)
 }
 
+/// Compute the `WAC-Allow` header VALUE (Solid Protocol) advertising the requester's + the public's
+/// effective access modes for `target`.
+///
+/// `user_modes` is the requester's already-resolved mode set (the FULL granted set returned by the
+/// read authorization), so the `user` audience need not re-walk the ACL. The `public` audience is
+/// resolved independently (it equals `user` for an anonymous requester). Format:
+/// `user="…",public="…"` — both keys always present (see [`wac_allow_header`]).
+async fn wac_allow_value<S: Store>(
+    state: &Arc<LdpState<S>>,
+    target: &LdpTarget,
+    token: &VerifiedToken,
+    user_modes: std::collections::BTreeSet<AccessMode>,
+) -> Result<String, ServerError> {
+    let wac = WacAuthorizer::new(&state.store, &state.base_url);
+    let perms = wac
+        .effective_permissions(&target.iri, token.web_id.as_deref(), Some(user_modes))
+        .await?;
+    Ok(wac_allow_header(&perms))
+}
+
 /// Whether `iri` is a storage-root container: a container that is a DIRECT child of the server base
 /// (`<base>/<segment>/`, exactly one interior path segment). The seeded per-user pods (`…/alice/`,
 /// `…/bob/`) are storage roots; deeper containers (`…/alice/profile/`) are not.
@@ -1357,162 +1475,6 @@ mod tests {
                 .any(|l| l.contains("/alice/test/.acl") && l.contains("rel=\"acl\"")),
             "the ACL-discovery Link rel=acl must be emitted: {links:?}"
         );
-    }
-
-    #[test]
-    fn only_webid_profile_documents_are_public_readable() {
-        let base = "https://localhost:3000";
-        // A WebID profile card is public (the harness/clients dereference it anonymously).
-        assert!(is_public_readable(
-            "https://localhost:3000/alice/profile/card",
-            base
-        ));
-        assert!(is_public_readable(
-            "https://localhost:3000/bob/profile/card",
-            base
-        ));
-        // Everything else requires auth pre-WAC.
-        assert!(!is_public_readable("https://localhost:3000/alice/", base));
-        assert!(!is_public_readable(
-            "https://localhost:3000/alice/profile/",
-            base
-        ));
-        assert!(!is_public_readable(
-            "https://localhost:3000/alice/test/data",
-            base
-        ));
-        assert!(!is_public_readable("https://localhost:3000/", base));
-        // A path that merely ENDS in profile/card but is outside the base is not matched.
-        assert!(!is_public_readable(
-            "https://evil.example/profile/card",
-            base
-        ));
-    }
-
-    /// REGRESSION (the HIGH): the public-read exception must match the EXACT direct profile-card shape
-    /// only — `<base>/{user}/profile/card` — and NOT any nested `…/profile/card`. A
-    /// `<base>/a/private/profile/card` is private data and must require auth; the old `ends_with`
-    /// test let it bypass the gate.
-    #[test]
-    fn nested_profile_card_path_is_not_public_readable() {
-        let base = "https://localhost:3000";
-        // The exact direct WebID-profile card stays public.
-        assert!(is_public_readable(
-            "https://localhost:3000/alice/profile/card",
-            base
-        ));
-        // A NESTED `…/profile/card` (one extra interior segment) MUST require auth — not a suffix match.
-        assert!(!is_public_readable(
-            "https://localhost:3000/a/private/profile/card",
-            base
-        ));
-        // Deeper nesting is likewise private.
-        assert!(!is_public_readable(
-            "https://localhost:3000/alice/private/profile/card",
-            base
-        ));
-        assert!(!is_public_readable(
-            "https://localhost:3000/alice/x/y/profile/card",
-            base
-        ));
-        // A trailing-slash container ending in `profile/card/` is not the profile document.
-        assert!(!is_public_readable(
-            "https://localhost:3000/alice/profile/card/",
-            base
-        ));
-    }
-
-    /// REGRESSION (the HIGH): the base match must be ORIGIN-EXACT (scheme + host + port), not a raw
-    /// string prefix. `https://localhost:3000evil/profile/card` string-PREFIX-matches the base
-    /// `https://localhost:3000` (rest = `evil/profile/card` → `[evil, profile, card]`) but is a
-    /// DIFFERENT host (`localhost:3000evil` ≠ `localhost:3000`), so it must NOT be public. The
-    /// previous fix tightened the path shape but left the loose prefix base match.
-    #[test]
-    fn origin_spoof_prefix_is_not_public_readable() {
-        let base = "https://localhost:3000";
-        // The exact in-origin profile card stays public.
-        assert!(is_public_readable(
-            "https://localhost:3000/alice/profile/card",
-            base
-        ));
-        // The authority-confusion spoof: a host that merely STARTS WITH the base authority string.
-        assert!(!is_public_readable(
-            "https://localhost:3000evil/profile/card",
-            base
-        ));
-        // The prior nested case stays closed.
-        assert!(!is_public_readable(
-            "https://localhost:3000/a/private/profile/card",
-            base
-        ));
-        // A different scheme is a different origin.
-        assert!(!is_public_readable(
-            "http://localhost:3000/alice/profile/card",
-            base
-        ));
-        // A different port is a different origin.
-        assert!(!is_public_readable(
-            "https://localhost:4000/alice/profile/card",
-            base
-        ));
-        // A different host is a different origin.
-        assert!(!is_public_readable(
-            "https://localhost.evil:3000/alice/profile/card",
-            base
-        ));
-        // A non-absolute / non-http(s) input has no origin and is never public.
-        assert!(!is_public_readable("/alice/profile/card", base));
-        assert!(!is_public_readable(
-            "ftp://localhost:3000/alice/profile/card",
-            base
-        ));
-        // Host case is insensitive: `LOCALHOST:3000` is the same origin as `localhost:3000`.
-        assert!(is_public_readable(
-            "https://LOCALHOST:3000/alice/profile/card",
-            base
-        ));
-        // A trailing-slash base normalises to the same origin (no path) and still matches.
-        assert!(is_public_readable(
-            "https://localhost:3000/alice/profile/card",
-            "https://localhost:3000/"
-        ));
-    }
-
-    #[test]
-    fn split_origin_and_path_parses_authority_and_path() {
-        assert_eq!(
-            split_origin_and_path("https://localhost:3000/a/b"),
-            Some(("https://localhost:3000".to_string(), "/a/b"))
-        );
-        // No path → defaults to "/".
-        assert_eq!(
-            split_origin_and_path("https://localhost:3000"),
-            Some(("https://localhost:3000".to_string(), "/"))
-        );
-        // Query/fragment terminate authority and path.
-        assert_eq!(
-            split_origin_and_path("https://h:1/p?q=1#f"),
-            Some(("https://h:1".to_string(), "/p"))
-        );
-        assert_eq!(
-            split_origin_and_path("https://h:1?q"),
-            Some(("https://h:1".to_string(), "/"))
-        );
-        // The spoof authority is captured whole — distinct from the base authority.
-        assert_eq!(
-            split_origin_and_path("https://localhost:3000evil/profile/card"),
-            Some(("https://localhost:3000evil".to_string(), "/profile/card"))
-        );
-        // Scheme is case-insensitive; authority is lowercased.
-        assert_eq!(
-            split_origin_and_path("HTTPS://Localhost:3000/X"),
-            Some(("https://localhost:3000".to_string(), "/X"))
-        );
-        // Non-http(s) and authority-less inputs yield None.
-        assert_eq!(split_origin_and_path("ftp://h/p"), None);
-        assert_eq!(split_origin_and_path("/a/b"), None);
-        assert_eq!(split_origin_and_path("https://"), None);
-        assert_eq!(split_origin_and_path("not-a-url"), None);
     }
 
     #[test]

@@ -35,7 +35,8 @@ struct Harness {
 }
 
 impl Harness {
-    fn new() -> Self {
+    async fn new() -> Self {
+        use solid_server_rs::store::Store;
         let issuer_key = KeyKit::generate();
         let client_key = KeyKit::generate();
         let config = VerifierConfig::new(vec![common::ISSUER.to_string()], BASE_URL);
@@ -43,6 +44,23 @@ impl Harness {
         let verifier = Verifier::new(config, jwks_provider(&issuer_key), replay).unwrap();
         let ctx = AuthContext::new(verifier, BASE_URL);
         let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        // WAC is enforced, so the authenticated test caller (Alice, `common::WEBID`) needs an effective
+        // ACL. Seed a ROOT `.acl` granting Alice Read/Write/Control on the base root + `acl:default`
+        // (every descendant inherits owner control) so PUT/GET on `/alice/data` are authorized.
+        let acl_iri = format!("{BASE_URL}/.acl");
+        let acl_body = format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#owner> a acl:Authorization;
+         acl:agent <{}>;
+         acl:accessTo <{BASE_URL}/>;
+         acl:default <{BASE_URL}/>;
+         acl:mode acl:Read, acl:Write, acl:Control."#,
+            common::WEBID
+        );
+        store
+            .write(&acl_iri, axum::body::Bytes::from(acl_body), "text/turtle")
+            .await
+            .expect("seed root owner acl");
         let ldp = LdpState::new(store, BASE_URL);
         let app = build_router(AppState {
             auth: Arc::new(ctx),
@@ -113,7 +131,7 @@ async fn body_string(resp: axum::http::Response<Body>) -> String {
 
 #[tokio::test]
 async fn well_known_solid_advertises_the_subscription_service() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     // Discovery is PUBLIC — no auth needed.
     let resp = h
         .anon_request("GET", "/.well-known/solid", None, Body::empty())
@@ -130,7 +148,7 @@ async fn well_known_solid_advertises_the_subscription_service() {
 
 #[tokio::test]
 async fn ldp_read_advertises_discovery_link_headers() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     // Create a resource, then GET it and inspect the Link headers.
     let put = h
         .auth_request(
@@ -160,7 +178,7 @@ async fn ldp_read_advertises_discovery_link_headers() {
 
 #[tokio::test]
 async fn subscribe_rejects_anonymous_caller() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     let body = serde_json::json!({
         "@context": "https://www.w3.org/ns/solid/notifications-context/v1",
         "type": WS_TYPE,
@@ -181,7 +199,7 @@ async fn subscribe_rejects_anonymous_caller() {
 
 #[tokio::test]
 async fn subscribe_authenticated_returns_receive_from() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     let body = serde_json::json!({
         "@context": "https://www.w3.org/ns/solid/notifications-context/v1",
         "type": WS_TYPE,
@@ -225,7 +243,7 @@ fn ws_upgrade_request(path_and_query: &str) -> Request<Body> {
 /// topic-only receive would have upgraded (101) here — so this test fails against the vulnerable code.
 #[tokio::test]
 async fn receive_without_token_is_rejected() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     let req = ws_upgrade_request(
         "/.notifications/WebSocketChannel2023/receive?topic=https://pod.example/alice/data",
     );
@@ -240,7 +258,7 @@ async fn receive_without_token_is_rejected() {
 /// An INVALID (never-minted) token is rejected.
 #[tokio::test]
 async fn receive_with_invalid_token_is_rejected() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     let req = ws_upgrade_request(
         "/.notifications/WebSocketChannel2023/receive?topic=https://pod.example/alice/data&token=bogus-token",
     );
@@ -252,7 +270,7 @@ async fn receive_with_invalid_token_is_rejected() {
 /// DIFFERENT topic B — the topic-binding is enforced end-to-end through the router.
 #[tokio::test]
 async fn receive_with_valid_token_for_wrong_topic_is_rejected() {
-    let h = Harness::new();
+    let h = Harness::new().await;
     // Subscribe (authenticated) to topic A to mint a real token.
     let topic_a = "https://pod.example/alice/data";
     let sub_body = serde_json::json!({ "type": WS_TYPE, "topic": topic_a }).to_string();
@@ -304,6 +322,25 @@ async fn bind_live_server() -> (String, KeyKit, KeyKit) {
     let verifier = Verifier::new(config, jwks_provider(&issuer_key), replay).unwrap();
     let ctx = AuthContext::new(verifier, base_url.clone());
     let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+    // WAC is enforced: seed a root owner ACL so the authenticated PUT/GET in the live test are allowed
+    // (the WebID is `common::WEBID`; the base is the bound address).
+    {
+        use solid_server_rs::store::Store;
+        let acl_iri = format!("{base_url}/.acl");
+        let acl_body = format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#owner> a acl:Authorization;
+         acl:agent <{}>;
+         acl:accessTo <{base_url}/>;
+         acl:default <{base_url}/>;
+         acl:mode acl:Read, acl:Write, acl:Control."#,
+            common::WEBID
+        );
+        store
+            .write(&acl_iri, axum::body::Bytes::from(acl_body), "text/turtle")
+            .await
+            .expect("seed live root owner acl");
+    }
     let ldp = LdpState::new(store, base_url.clone());
     let app = build_router(AppState {
         auth: Arc::new(ctx),

@@ -8,11 +8,10 @@
 # TestSubject for solid-server-rs (the EXPERIMENTAL parallel-track Rust server). `--target=solid-server-rs`
 # selects this node. It claims the LDP/Solid surface the Rust server implements today (LDP CRUD,
 # Turtle/JSON-LD content negotiation, conditional + Range requests, n3-patch PATCH, storage description +
-# /.well-known/solid discovery, WebSocketChannel2023 notifications) and runs the WAC suite too — WAC is
-# NOT yet implemented (gated on the SPARQ access-control design, sparq#992), so those scenarios are
-# EXPECTED to fail in this baseline. They are claimed (not skipped) deliberately, so the baseline
-# measures the WAC gap rather than hiding it. See conformance/README.md for the per-suite breakdown +
-# the ordered fix-list.
+# /.well-known/solid discovery, WebSocketChannel2023 notifications) AND the full Web Access Control
+# suite — WAC is now implemented locally (the in-Rust engine in src/authz, evaluating .acl documents
+# through the Store seam). The suite passes 41/41 (Protocol 25/25 + WAC 16/16). See
+# conformance/SCORE.md for the per-suite breakdown.
 <solid-server-rs>
     a earl:Software, earl:TestSubject ;
     doap:name "solid-server-rs" ;
@@ -25,8 +24,8 @@
     # ACP is not implemented — authorization is Web Access Control only (the maintainer's directive:
     # SPARQ does WAC eval). ACP is out of scope for the Rust track.
     solid-test:skip "acp" ;
-    # Group-based access (acl:agentGroup) resolution is a v1 follow-up; WAC itself is not yet wired
-    # (sparq#992), so group-membership scenarios would never grant.
+    # Group-based access (acl:agentGroup) resolution is a v1 follow-up; the WAC engine recognises the
+    # predicate but never grants on it (fail-closed), so group-membership scenarios are skipped.
     solid-test:skip "wac-agent-group" ;
     # `@http-redirect` CORS scenarios open `http://localhost:3000/...` (the harness substitutes
     # `^https:` → `http:` WITHOUT changing the port) and expect a 301/308. The conformance setup runs
@@ -35,7 +34,7 @@
     # unimplementable-in-this-setup pattern (matches the prod-solid-server TestSubject rationale).
     solid-test:skip "http-redirect" ;
 
-    rdfs:comment "EXPERIMENTAL Rust track. DPoP-bound tokens required (RFC 9449); tokens are RFC 9068 at+jwt with a mandatory audience (the server base URL). WAC is NOT yet implemented — WAC scenarios fail in this baseline by design (gated on sparq#992)."@en .
+    rdfs:comment "EXPERIMENTAL Rust track. DPoP-bound tokens required (RFC 9449); tokens are RFC 9068 at+jwt with a mandatory audience (the server base URL). Web Access Control is implemented (the local in-Rust engine in src/authz); the suite passes 41/41 (Protocol 25/25 + WAC 16/16)."@en .
 
 <solid-server-rs#release>
     doap:name "v0.1.0" ;

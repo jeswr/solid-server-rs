@@ -5,32 +5,41 @@
 > SPARQ) terminating TLS in-process and seeded with the conformance users. Re-run with
 > `./conformance/run.sh`; the authoritative numbers come from the EARL report (`reports/report.ttl`).
 
-## Headline — Cluster A landed: Protocol 25/25 (2026-06-23)
+## Headline — Cluster B landed: 41/41 (100%) (2026-06-23)
 
-**41 test cases · 26 passed · 15 failed · 0 skipped → 63% pass.** Protocol is now **25/25 (100%)**;
-the 15 remaining failures are the WAC suite (Cluster B, gated on sparq#992) minus the one WAC case
-that incidentally passes under the pre-WAC posture.
+**41 test cases · 41 passed · 0 failed · 0 skipped → 100% pass.** Protocol is **25/25 (100%)** AND
+the WAC suite is now **16/16 (100%)** — the local in-Rust Web Access Control engine
+(`conformance/wac-engine`) closed the entire remaining gap.
 
-The Cluster-A protocol-completeness work (branch `conformance/protocol-fixes`) took Protocol from
-9/25 → **25/25**: the root `/` route + a `ldp:contains` container listing rendered from
-`store.list_children` (via `oxrdf` triples, never hand-concatenated), a hand-rolled Solid CORS
-middleware (reflective ACAO + credentials, preflight, case-sensitive `Vary: Origin`,
-expose-headers on the preflight too), the OPTIONS/`Allow`/`Accept-Post`/`Accept-Patch`
-advertisement, a pre-WAC 401-vs-anonymous posture (anonymous → 401 + `WWW-Authenticate`, except a
-public WebID profile card), `content-type-reject` (absent Content-Type → 400), the
-trailing-slash co-existence guard, PUT/PATCH intermediate-container creation + membership wiring,
-opaque binary-resource writes (`text/plain` etc.), `application/sparql-update` INSERT/DELETE-DATA
-PATCH, and `Link: ldp:BasicContainer; rel="type"` container-POST.
+The Cluster-B WAC work added a local WAC engine (`src/authz/`: `mode`, `acl`, `wac`, `wac_allow`),
+a semantic port of prod-solid-server `src/authz/` (NOT a code copy). It evaluates `.acl` documents
+read THROUGH the `Store` seam (parsed via `oxttl`/`oxjsonld` into `oxrdf::Triple`s — never
+hand-parsed), with own-ACL-(`acl:accessTo`)-else-nearest-ancestor-(`acl:default`) resolution
+(child→root, fail-closed), the per-method required-mode mapping, the `WAC-Allow` response header,
+and the 401-vs-403 split. It SUPERSEDES the earlier interim "reads require auth except the WebID
+profile card" posture with real per-resource decisions. The conformance seed (`src/seed.rs`) now
+also provisions the pod-root owner-default ACL + the public-read profile-card ACL (mirroring
+prod-solid-server's provisioner) so the harness can bootstrap + manage test resources.
 
-The full DPoP-bound Solid-OIDC auth chain runs end-to-end (signature, `iss`, `aud`, DPoP
-`htu`/`htm`/`ath`, `cnf.jkt`). The remaining failures are WAC enforcement gaps, not auth or
-LDP-surface gaps.
+Load-bearing WAC semantics ported (each pinned by a unit test + the conformance matrix): `Write`
+subsumes `Append`; an INSERT-only N3 Patch needs only `acl:Append` (any delete needs `acl:Write`);
+CREATE (PUT/POST/PATCH-create) authorizes `acl:Append` on the PARENT container; DELETE of a DOCUMENT
+needs `acl:Write` on the target AND the parent container, DELETE of a CONTAINER needs `acl:Control`
+on the target (a mere Write holder cannot delete a container) + parent write; reading/writing an
+`.acl` needs `acl:Control`; a DELETE of a missing target is a uniform 401/403 denial (no existence
+side-channel).
+
+The Cluster-A protocol-completeness work (branch `conformance/protocol-fixes`) had already taken
+Protocol from 9/25 → 25/25; this branch maintains it at 25/25 (no regression). The full DPoP-bound
+Solid-OIDC auth chain runs end-to-end (signature, `iss`, `aud`, DPoP `htu`/`htm`/`ath`, `cnf.jkt`).
 
 | Suite | Cases | Passed | Failed | Skipped | Pass % |
 |---|---:|---:|---:|---:|---:|
 | **Protocol** | 25 | 25 | 0 | 0 | 100% |
-| **WAC** | 16 | 1 | 15 | 0 | 6% |
-| **Total** | **41** | **26** | **15** | **0** | **63%** |
+| **WAC** | 16 | 16 | 0 | 0 | 100% |
+| **Total** | **41** | **41** | **0** | **0** | **100%** |
+
+> `CONFORMANCE RESULT: passed=41 failed=0 untested=0 inapplicable=0 total=41 (harness exit code: 0)`
 
 (Skip tags applied in the TestSubject: `acp`, `wac-agent-group`, `http-redirect` — same as
 prod-solid-server. The conformance metric is the per-test-case EARL verdict above. Re-generate with
@@ -61,7 +70,7 @@ OPTIONS/`Allow`/`Accept-*` advertisement, the 401-vs-anonymous `WWW-Authenticate
 `content-type-reject`, the trailing-slash co-existence guard, intermediate-container creation +
 `ldp:contains` containment/removal, and `application/sparql-update` PATCH.
 
-### WAC — 15 FAIL, 1 PASS (Cluster B — WAC not implemented)
+### WAC — 16 PASS (all)
 
 `acl-object-none`, `acl-object-access-to`, `acl-object-default`, `acl-object-access-to-default`,
 `protected-operation-acl-propagation`, `read-access-public`, `read-access-agent`, `read-access-bob`,
@@ -69,13 +78,12 @@ OPTIONS/`Allow`/`Accept-*` advertisement, the 401-vs-anonymous `WWW-Authenticate
 `server-wac-allow-user-access-direct`, `server-wac-allow-user-access-indirect`,
 `server-wac-allow-public-access-direct`, `server-wac-allow-public-access-indirect`.
 
-**Root cause: WAC is not implemented** (gated on the SPARQ access-control design, sparq#992). The LDP
-layer runs a coarse PRE-WAC posture (anonymous → 401; an authenticated caller is permitted) with no
-per-resource ACL evaluation, no `WAC-Allow` header, and ACLs advertised (`Link rel="acl"`) + storable
-but **not enforced**. The WAC scenarios that require a per-ACL grant/deny decision (Bob vs Alice,
-public-vs-agent, `WAC-Allow`) therefore fail; one case (an anonymous-deny) incidentally passes under
-the pre-WAC 401 posture. These are claimed in the TestSubject (not skipped) deliberately, to measure
-the gap.
+The whole WAC surface conforms: own-ACL (`acl:accessTo`) vs inherited (`acl:default`) resolution
+(nearest-ACL-wins, child→root, fail-closed); public (`foaf:Agent`) / authenticated
+(`acl:AuthenticatedAgent`) / specific-agent (`acl:agent`) matching; the four modes; Control governs
+the `.acl`; the per-method required mode (insert-only PATCH → Append; create → parent Append; DELETE
+of a document → target+parent Write, of a container → target Control); the 401-vs-403 split; and the
+`WAC-Allow` header (user + public, accurate to the effective ACL).
 
 ## What was fixed to reach this score
 
@@ -103,27 +111,41 @@ RDF built via `oxrdf` triples + the server serializers (never hand-concatenated)
    intermediate containers + wire `ldp:contains`; `Link: ldp:BasicContainer; rel=type` container-POST.
 7. **`application/sparql-update` PATCH** (INSERT/DELETE DATA subset → the shared N3 apply engine).
 
+### Cluster B — WAC engine (branch `conformance/wac-engine`, 2026-06-23): WAC 1/16 → 16/16
+
+The local in-Rust WAC engine (`src/authz/`: `mode`, `acl`, `wac`, `wac_allow`) + the seed ACLs +
+the handler authorization rework, all evaluating `.acl` via `oxrdf` triples (parsed by
+`oxttl`/`oxjsonld` — never hand-parsed). Exhaustively unit-tested (the security-critical house rule)
+and validated by the WAC conformance matrix:
+
+1. **ACL resolution** (`src/authz/wac.rs`): own ACL (`<target>.acl`, `acl:accessTo`) else the nearest
+   ancestor's `acl:default` (child→root, first ACL wins, fail-closed on missing/malformed/no-ACL).
+2. **Rule matching** (`src/authz/acl.rs`): `acl:agent` / `agentClass foaf:Agent` (public) /
+   `AuthenticatedAgent`; the four `acl:mode`s; `acl:agentGroup` recognised but fail-closed (v1).
+3. **Required-mode mapping** (`src/authz/mode.rs` + the handler): GET/HEAD → Read; PUT/DELETE → Write;
+   POST-to-container → Append; insert-only PATCH → Append (any delete → Write); `.acl` → Control;
+   CREATE authorizes Append on the PARENT; DELETE of a document → target Write + parent Write, of a
+   container → target Control + parent Write.
+4. **Decision + status**: grant iff a matching rule grants the required mode; deny 401 (anonymous) /
+   403 (authenticated-but-unauthorized); a DELETE of a missing target is a uniform 401/403 (no leak).
+5. **`WAC-Allow` header** (`src/authz/wac_allow.rs`): `user="…",public="…"`, both keys always present.
+6. **Seed ACLs** (`src/seed.rs`): the pod-root owner-default ACL + the public-read profile-card ACL,
+   so the harness can bootstrap + manage test resources under the now-enforced engine.
+
 ### Bootstrap fixes (earlier baseline)
 
 Two fixes let the harness bootstrap at all: the storage-root `Link: <pim:Storage>; rel="type"` (+ LDP
-type links) and the `Link rel="acl"` ACL discovery on every resource (advertised + storable, NOT
-enforced). Plus the conformance seeding (`src/seed.rs`, `SOLID_SERVER_SEED_CONFORMANCE=1`).
+type links) and the `Link rel="acl"` ACL discovery on every resource. Plus the conformance seeding
+(`src/seed.rs`, `SOLID_SERVER_SEED_CONFORMANCE=1`).
 
 ## Ordered fix-list (independently dispatchable)
 
 **Cluster A — Protocol: ✅ DONE (25/25, branch `conformance/protocol-fixes`).** See "What was fixed".
 
-**Cluster B — WAC (the remaining 15 cases; needs the local WAC engine):**
-
-8. **Implement WAC authorization** (the remaining WAC cases). Per the maintainer's directive WAC eval is
-   SPARQ-authoritative (sparq#992) — the ACL graph in SPARQ is the source of truth and SPARQ does the
-   per-resource decision. Required pieces, in order: (a) read `.acl` documents (the
-   `acl:accessTo`/`acl:default`, `acl:mode`, `acl:agent`/`agentClass foaf:Agent`/`acl:agentGroup`
-   deferred); (b) the child→root ACL-resolution walk (nearest-acl-wins, fail-closed); (c) gate
-   read/write/append/control per the resolved decision; (d) the 401-vs-403 split + `WWW-Authenticate`;
-   (e) the `WAC-Allow` response header. House rule: parse/author `.acl` via typed accessors, never
-   hand-built triples. Prerequisite: Cluster-A #2 (container listing) for the container ACL tests.
-   This is the single largest item; it can be sub-split along (a)-(e), but they share the engine.
+**Cluster B — WAC: ✅ DONE (16/16, branch `conformance/wac-engine`).** See "What was fixed". The
+engine reads + evaluates `.acl` locally through the `Store` seam; when the SPARQ access-control design
+lands (`sparq#992`), the per-resource decision can move behind the same `WacAuthorizer` seam (ask
+SPARQ for the decision instead of reading the `.acl`) with no handler change.
 
 Cluster A is fully landed (Protocol 25/25). B (#8) is one coherent auth/authz workstream gated on the
 SPARQ design — the only remaining conformance gap.

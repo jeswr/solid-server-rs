@@ -9,7 +9,16 @@
 //! - the root container `/`,
 //! - per-user `/{u}/`, `/{u}/profile/`, `/{u}/test/` containers,
 //! - each user's WebID profile document `/{u}/profile/card` (the `#me` subject carries `pim:storage`
-//!   → the pod root and `solid:oidcIssuer` → the trusted realm, which is what the harness reads).
+//!   → the pod root and `solid:oidcIssuer` → the trusted realm, which is what the harness reads),
+//! - and the **Web Access Control ACLs** that make the pod owner-controlled: a pod-root ACL
+//!   `/{u}/.acl` granting the owner Read/Write/Control on the root AND on all descendants
+//!   (`acl:default`, so `/{u}/test/` etc. inherit owner control), plus a profile-card ACL granting
+//!   the public `acl:Read` (so the WebID dereferences anonymously) and the owner full control.
+//!
+//! These ACLs are LOAD-BEARING once the WAC engine is enforced (this branch): without the pod-root
+//! owner-default ACL, the owner could not create or manage ANY resource under their pod and the whole
+//! conformance suite (Protocol + WAC) would fail-closed. They mirror prod-solid-server's provisioner
+//! (`src/provisioning/provisioner.ts`).
 //!
 //! It is **dev/conformance only**, gated behind `SOLID_SERVER_SEED_CONFORMANCE=1` in [`main`]. It
 //! never runs against a real (SPARQ/S3) backend in production.
@@ -68,6 +77,35 @@ pub async fn seed_conformance<S: Store>(
                 &profile,
                 &card,
                 Bytes::from(body),
+                RdfFormat::Turtle.media_type(),
+            )
+            .await?;
+
+        // The pod-root ACL `/{u}/.acl`: owner Read/Write/Control on the pod root AND on all
+        // descendants (`acl:default`), so the whole pod is owner-controlled unless a descendant ACL
+        // overrides it. This is what lets the owner create + manage every test resource under
+        // `/{u}/test/` once WAC is enforced. Stored as a plain `.acl` resource (its own bytes), via
+        // `write` (it is an auxiliary resource, not a container child).
+        let pod_acl = format!("{pod}.acl");
+        let pod_acl_body = pod_root_acl_turtle(&pod, &webid)?;
+        store
+            .write(
+                &pod_acl,
+                Bytes::from(pod_acl_body),
+                RdfFormat::Turtle.media_type(),
+            )
+            .await?;
+
+        // The profile-card ACL `/{u}/profile/card.acl`: public `acl:Read` (so the WebID is
+        // world-dereferenceable, which the harness + every Solid client need to bootstrap) plus owner
+        // full control. Without this, an anonymous GET of the WebID card would be denied and the
+        // harness could not discover `pim:storage`.
+        let card_acl = format!("{card}.acl");
+        let card_acl_body = profile_card_acl_turtle(&card, &webid)?;
+        store
+            .write(
+                &card_acl,
+                Bytes::from(card_acl_body),
                 RdfFormat::Turtle.media_type(),
             )
             .await?;
@@ -143,6 +181,84 @@ fn webid_profile_turtle(webid: &str, pod_root: &str, issuer: &str) -> ServerResu
     serialize_triples(RdfFormat::Turtle, &triples)
 }
 
+// --- ACL vocabulary (built via oxrdf triples — never hand-concatenated, the house rule) -----------
+
+const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+const ACL_AUTHORIZATION: &str = "http://www.w3.org/ns/auth/acl#Authorization";
+const ACL_AGENT: &str = "http://www.w3.org/ns/auth/acl#agent";
+const ACL_AGENT_CLASS: &str = "http://www.w3.org/ns/auth/acl#agentClass";
+const ACL_ACCESS_TO: &str = "http://www.w3.org/ns/auth/acl#accessTo";
+const ACL_DEFAULT: &str = "http://www.w3.org/ns/auth/acl#default";
+const ACL_MODE: &str = "http://www.w3.org/ns/auth/acl#mode";
+const ACL_READ: &str = "http://www.w3.org/ns/auth/acl#Read";
+const ACL_WRITE: &str = "http://www.w3.org/ns/auth/acl#Write";
+const ACL_CONTROL: &str = "http://www.w3.org/ns/auth/acl#Control";
+const FOAF_AGENT: &str = "http://xmlns.com/foaf/0.1/Agent";
+
+/// A `NamedNode` from a server-constructed IRI (well-formed by construction; map an unexpected error
+/// to a storage error rather than panic).
+fn acl_nn(s: &str) -> ServerResult<NamedNode> {
+    NamedNode::new(s)
+        .map_err(|e| crate::error::ServerError::Storage(format!("invalid seed ACL IRI {s}: {e}")))
+}
+
+/// The pod-root ACL: the owner (`webid`) gets Read/Write/Control on the pod root (`acl:accessTo`) AND
+/// on all descendants (`acl:default`), so the whole pod is owner-controlled unless a descendant ACL
+/// overrides it. Authorization subject uses the conventional `<acl-doc>#owner` fragment.
+fn pod_root_acl_turtle(pod_root: &str, webid: &str) -> ServerResult<Vec<u8>> {
+    let acl_doc = format!("{pod_root}.acl");
+    let auth = acl_nn(&format!("{acl_doc}#owner"))?;
+    let root = acl_nn(pod_root)?;
+    let me = acl_nn(webid)?;
+    let triples = vec![
+        Triple::new(auth.clone(), acl_nn(RDF_TYPE)?, acl_nn(ACL_AUTHORIZATION)?),
+        Triple::new(auth.clone(), acl_nn(ACL_AGENT)?, me),
+        Triple::new(auth.clone(), acl_nn(ACL_ACCESS_TO)?, root.clone()),
+        Triple::new(auth.clone(), acl_nn(ACL_DEFAULT)?, root),
+        Triple::new(auth.clone(), acl_nn(ACL_MODE)?, acl_nn(ACL_READ)?),
+        Triple::new(auth.clone(), acl_nn(ACL_MODE)?, acl_nn(ACL_WRITE)?),
+        Triple::new(auth, acl_nn(ACL_MODE)?, acl_nn(ACL_CONTROL)?),
+    ];
+    serialize_triples(RdfFormat::Turtle, &triples)
+}
+
+/// The profile-document ACL: the document is publicly readable (`acl:agentClass foaf:Agent` →
+/// `acl:Read`) so the WebID dereferences for anyone; the owner additionally has Read/Write/Control.
+fn profile_card_acl_turtle(profile_doc: &str, webid: &str) -> ServerResult<Vec<u8>> {
+    let acl_doc = format!("{profile_doc}.acl");
+    let owner_auth = acl_nn(&format!("{acl_doc}#owner"))?;
+    let public_auth = acl_nn(&format!("{acl_doc}#public"))?;
+    let doc = acl_nn(profile_doc)?;
+    let me = acl_nn(webid)?;
+    let triples = vec![
+        // Owner: full control of the profile document.
+        Triple::new(
+            owner_auth.clone(),
+            acl_nn(RDF_TYPE)?,
+            acl_nn(ACL_AUTHORIZATION)?,
+        ),
+        Triple::new(owner_auth.clone(), acl_nn(ACL_AGENT)?, me),
+        Triple::new(owner_auth.clone(), acl_nn(ACL_ACCESS_TO)?, doc.clone()),
+        Triple::new(owner_auth.clone(), acl_nn(ACL_MODE)?, acl_nn(ACL_READ)?),
+        Triple::new(owner_auth.clone(), acl_nn(ACL_MODE)?, acl_nn(ACL_WRITE)?),
+        Triple::new(owner_auth, acl_nn(ACL_MODE)?, acl_nn(ACL_CONTROL)?),
+        // Public: read-only (a WebID must be world-readable).
+        Triple::new(
+            public_auth.clone(),
+            acl_nn(RDF_TYPE)?,
+            acl_nn(ACL_AUTHORIZATION)?,
+        ),
+        Triple::new(
+            public_auth.clone(),
+            acl_nn(ACL_AGENT_CLASS)?,
+            acl_nn(FOAF_AGENT)?,
+        ),
+        Triple::new(public_auth.clone(), acl_nn(ACL_ACCESS_TO)?, doc),
+        Triple::new(public_auth, acl_nn(ACL_MODE)?, acl_nn(ACL_READ)?),
+    ];
+    serialize_triples(RdfFormat::Turtle, &triples)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +306,63 @@ mod tests {
         assert!(body.contains("solid/terms#oidcIssuer"));
         assert!(body.contains("https://localhost:3000/alice/"));
         assert!(body.contains(issuer));
+    }
+
+    #[tokio::test]
+    async fn seeds_owner_acls_and_wac_grants_owner_full_control() {
+        use crate::authz::wac::{Decision, WacAuthorizer};
+        use crate::authz::AccessMode;
+
+        let s = store();
+        let base = "https://localhost:3000";
+        let issuer = "http://localhost:8080/realms/solid";
+        seed_conformance(&s, base, issuer).await.unwrap();
+
+        // The pod-root + profile-card ACLs exist.
+        assert!(s.exists("https://localhost:3000/alice/.acl").await.unwrap());
+        assert!(s
+            .exists("https://localhost:3000/alice/profile/card.acl")
+            .await
+            .unwrap());
+
+        let alice = "https://localhost:3000/alice/profile/card#me";
+        let bob = "https://localhost:3000/bob/profile/card#me";
+        let wac = WacAuthorizer::new(&s, base);
+
+        // Alice (owner) inherits Read/Write/Control over a resource she'd create under /alice/test/
+        // (via the pod-root `acl:default`).
+        let target = "https://localhost:3000/alice/test/data";
+        assert!(matches!(
+            wac.authorize(target, AccessMode::Write, Some(alice))
+                .await
+                .unwrap(),
+            Decision::Allow(_)
+        ));
+        // Bob is NOT granted on Alice's pod → 403.
+        assert_eq!(
+            wac.authorize(target, AccessMode::Read, Some(bob))
+                .await
+                .unwrap(),
+            Decision::Forbidden
+        );
+
+        // The WebID profile card is PUBLIC-readable (anonymous GET allowed) but NOT public-writable.
+        let card = "https://localhost:3000/alice/profile/card";
+        assert!(matches!(
+            wac.authorize(card, AccessMode::Read, None).await.unwrap(),
+            Decision::Allow(_)
+        ));
+        assert_eq!(
+            wac.authorize(card, AccessMode::Write, None).await.unwrap(),
+            Decision::Unauthenticated
+        );
+        // Alice fully controls her own card.
+        assert!(matches!(
+            wac.authorize(card, AccessMode::Control, Some(alice))
+                .await
+                .unwrap(),
+            Decision::Allow(_)
+        ));
     }
 
     #[tokio::test]

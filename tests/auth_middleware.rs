@@ -163,14 +163,16 @@ fn replayed_dpop_proof_jti_is_rejected() {
 #[tokio::test]
 async fn http_get_without_auth_injects_public_creds_and_the_ldp_layer_gates() {
     // End-to-end through the router: no Authorization ⇒ the middleware injects PUBLIC credentials and
-    // the handler runs (it does NOT 400/short-circuit). The pre-WAC read posture then decides:
-    //   - a PUBLIC WebID profile document (…/profile/card) is readable anonymously ⇒ reaches the
-    //     handler and 404s (nothing stored) — proving public creds were injected and the read ran;
-    //   - any OTHER resource requires auth ⇒ 401 + `WWW-Authenticate`.
+    // the handler runs (it does NOT 400/short-circuit). The WAC read gate then decides per the
+    // effective ACL:
+    //   - the WebID profile card has a public-read ACL (seeded by `test_app`) ⇒ anonymous read is
+    //     allowed and reaches the (empty) store → 404 (nothing stored) — proving public creds were
+    //     injected and the read ran;
+    //   - any OTHER resource has no ACL anywhere ⇒ anonymous read is denied 401 + `WWW-Authenticate`.
     let issuer_key = KeyKit::generate();
-    let app = test_app(&issuer_key);
+    let app = test_app(&issuer_key).await;
 
-    // A public profile document: anonymous read is allowed, so it reaches the (empty) store → 404.
+    // The public-read profile document: anonymous read is allowed, so it reaches the (empty) store → 404.
     let public = app
         .clone()
         .oneshot(
@@ -184,7 +186,7 @@ async fn http_get_without_auth_injects_public_creds_and_the_ldp_layer_gates() {
         .unwrap();
     assert_eq!(public.status(), StatusCode::NOT_FOUND);
 
-    // A non-public resource: anonymous read ⇒ 401 + challenge (the pre-WAC gate).
+    // A resource with no ACL anywhere: anonymous read ⇒ 401 + challenge (WAC fail-closed).
     let gated = app
         .oneshot(
             Request::builder()
@@ -204,7 +206,7 @@ async fn http_get_without_auth_injects_public_creds_and_the_ldp_layer_gates() {
 #[tokio::test]
 async fn http_get_with_a_bad_token_is_401_with_www_authenticate() {
     let issuer_key = KeyKit::generate();
-    let app = test_app(&issuer_key);
+    let app = test_app(&issuer_key).await;
 
     // A garbage token — the verifier rejects it, the middleware returns its 401 + challenge.
     let resp = app
@@ -231,7 +233,7 @@ async fn http_get_with_a_non_utf8_authorization_header_is_400_not_public() {
     // A present-but-unparseable Authorization header must NOT be silently downgraded to public
     // access (a fail-open). It is a 400, distinct from an absent header (which is public → 404 here).
     let issuer_key = KeyKit::generate();
-    let app = test_app(&issuer_key);
+    let app = test_app(&issuer_key).await;
 
     let resp = app
         .oneshot(
@@ -252,9 +254,31 @@ async fn http_get_with_a_non_utf8_authorization_header_is_400_not_public() {
 }
 
 /// Assemble the full app over the in-memory store + a verifier trusting `issuer_key`.
-fn test_app(issuer_key: &KeyKit) -> axum::Router {
+async fn test_app(issuer_key: &KeyKit) -> axum::Router {
+    use solid_server_rs::store::Store;
     let ctx = auth_context(issuer_key);
     let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+    // WAC is enforced, so a public read needs a public-read ACL. Seed `/alice/profile/card.acl`
+    // granting `foaf:Agent acl:Read` (the WebID-profile public-read class the real conformance seed
+    // writes), so an anonymous GET of the card is ALLOWED and reaches the (empty) store → 404; every
+    // other path has no ACL anywhere → anonymous read is denied with 401 (fail-closed).
+    let card_acl = format!("{BASE_URL}/alice/profile/card.acl");
+    let card_acl_body = format!(
+        r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+@prefix foaf: <http://xmlns.com/foaf/0.1/>.
+<#public> a acl:Authorization;
+          acl:agentClass foaf:Agent;
+          acl:accessTo <{BASE_URL}/alice/profile/card>;
+          acl:mode acl:Read."#
+    );
+    store
+        .write(
+            &card_acl,
+            axum::body::Bytes::from(card_acl_body),
+            "text/turtle",
+        )
+        .await
+        .expect("seed profile-card public-read acl");
     let ldp = LdpState::new(store, BASE_URL);
     // `AppState::new` wires the verifier-derived anonymous-401 challenge into the LDP layer.
     build_router(AppState::new(ctx, ldp))
