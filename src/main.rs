@@ -96,6 +96,13 @@ const ENV_SEED_CONFORMANCE: &str = "SOLID_SERVER_SEED_CONFORMANCE";
 /// `true` (or any non-integer) uses [`seed::BENCH_DEFAULT_CHILDREN`]. NEVER set against a real
 /// (SPARQ/S3) backend. Purely additive seeding — it changes no request-handling behaviour.
 const ENV_SEED_BENCH: &str = "SOLID_SERVER_SEED_BENCH";
+/// Dev/conformance ESCAPE HATCH: explicitly permit the dev seed flags
+/// ([`ENV_SEED_CONFORMANCE`] / [`ENV_SEED_BENCH`]) against a NON-`memory` backend. UNSET (the default)
+/// makes the startup seed-guard FAIL CLOSED when a seed flag is set on a `http`/`embedded` backend —
+/// so test fixtures can never be written into a live/durable store by accident. Set to `1`/`true`
+/// ONLY for an EPHEMERAL embedded test instance that the harness legitimately seeds (the
+/// conformance run.sh embedded leg sets it). NEVER set it against a real/persistent backend.
+const ENV_ALLOW_SEED_NONMEMORY: &str = "SOLID_SERVER_ALLOW_SEED_NONMEMORY";
 /// Round-3 verified-access-token cache capacity (distinct live access tokens). Unset =>
 /// [`DEFAULT_CACHE_CAPACITY`]. The cache removes the redundant per-request access-token *signature +
 /// claims* re-verify (the token is stable across a client's requests) while STILL fully verifying the
@@ -129,6 +136,57 @@ const ENV_SPARQ_ENDPOINT: &str = "SOLID_SERVER_SPARQ_ENDPOINT";
 /// unset ⇒ a fresh in-memory graph.
 #[cfg(feature = "embedded-sparq")]
 const ENV_SPARQ_DIR: &str = "SOLID_SERVER_SPARQ_DIR";
+
+/// Operational-safety: is the SELECTED SPARQ backend **durable / shared** (i.e. its index outlives a
+/// process restart and/or is shared across instances)?
+///
+/// - `http` — a shared SPARQ service: DURABLE/SHARED. ✔
+/// - `embedded` WITH a persistence dir (`SOLID_SERVER_SPARQ_DIR` set) — a directory-backed graph:
+///   DURABLE. ✔
+/// - `embedded` WITHOUT a persistence dir — a fresh in-memory graph: EPHEMERAL. ✘
+/// - `memory` (the in-memory double) — EPHEMERAL. ✘
+///
+/// `backend` is the already-lowercased `PSS_SPARQ_BACKEND` value; `sparq_dir_set` is whether
+/// `SOLID_SERVER_SPARQ_DIR` is set to a non-empty value.
+fn sparq_backend_is_durable(backend: &str, sparq_dir_set: bool) -> bool {
+    match backend {
+        "http" => true,
+        "embedded" => sparq_dir_set,
+        // "memory" / unknown — unknown backends abort later in dispatch; treat as non-durable here.
+        _ => false,
+    }
+}
+
+/// Startup guard #1 — a DURABLE/SHARED SPARQ index paired with an EPHEMERAL (in-memory) blob store is
+/// a byte/index INCONSISTENCY: a resource is indexed in SPARQ (survives restart / visible on another
+/// instance) but its bytes live only in this process's in-memory blob store (lost on restart / absent
+/// elsewhere). Reject that combination at boot.
+///
+/// Fires ONLY when the blob store is in-memory AND the SPARQ backend is durable/shared
+/// ([`sparq_backend_is_durable`]). The EPHEMERAL combinations are CONSISTENT and allowed:
+/// `memory` + in-mem-blob (both ephemeral — the conformance/test path) and `embedded`-without-dir +
+/// in-mem-blob (both ephemeral). The blob store is currently ALWAYS in-memory (the S3 blob is an
+/// unimplemented stub), so `blob_is_in_memory` is `true` today; the parameter keeps the predicate
+/// honest for when a durable BlobStore lands (the guard then simply stops firing).
+fn reject_durable_sparq_with_inmem_blob(
+    backend: &str,
+    sparq_dir_set: bool,
+    blob_is_in_memory: bool,
+) -> bool {
+    blob_is_in_memory && sparq_backend_is_durable(backend, sparq_dir_set)
+}
+
+/// Startup guard #2 — refuse to run the dev SEED flags ([`ENV_SEED_CONFORMANCE`] / [`ENV_SEED_BENCH`])
+/// against a NON-`memory` backend, so test fixtures are never written into a live `http`/`embedded`
+/// store by accident.
+///
+/// Fires when a seed flag is set AND the backend is not `memory` AND the explicit
+/// [`ENV_ALLOW_SEED_NONMEMORY`] override is NOT set. With the override set (an EPHEMERAL embedded test
+/// instance the harness legitimately seeds — the conformance run.sh embedded leg), seeding proceeds.
+/// Seeding the `memory` backend is ALWAYS allowed (it is the seed target by construction).
+fn reject_seed_on_nonmemory(seed_requested: bool, backend: &str, allow_override: bool) -> bool {
+    seed_requested && backend != "memory" && !allow_override
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -350,6 +408,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .map(|s| s.trim().to_ascii_lowercase())
         .unwrap_or_else(|| "memory".to_string());
+
+    // --- Startup operational-safety guards (fail-closed at boot, before any backend is built). -----
+    // The blob store is currently ALWAYS the in-memory double (the S3 blob is an unimplemented stub),
+    // so `blob_is_in_memory` is `true`. Read it from one place so the guard is honest when a durable
+    // BlobStore eventually lands (the guard then simply stops firing for the durable-blob case).
+    let blob_is_in_memory = true;
+    // Whether SOLID_SERVER_SPARQ_DIR is set to a non-empty value — read by its literal name so the
+    // guard works regardless of the `embedded-sparq` feature gate (an `embedded` backend without the
+    // feature aborts in dispatch anyway).
+    let sparq_dir_set = std::env::var("SOLID_SERVER_SPARQ_DIR")
+        .ok()
+        .is_some_and(|d| !d.trim().is_empty());
+
+    // GUARD #1 — a DURABLE/SHARED SPARQ index requires a DURABLE blob store. A persistent/shared index
+    // (http, or dir-backed embedded) over the EPHEMERAL in-memory blob store is a byte/index
+    // inconsistency: a resource is indexed in SPARQ but its bytes are lost on restart / absent on
+    // another instance. `memory` and `embedded`-without-dir are ephemeral on BOTH sides (consistent) —
+    // those still boot. Fail closed otherwise.
+    if reject_durable_sparq_with_inmem_blob(&backend, sparq_dir_set, blob_is_in_memory) {
+        return Err(format!(
+            "a durable/shared SPARQ index (PSS_SPARQ_BACKEND={backend}{}) requires a durable blob \
+             store; the in-memory blob store is ephemeral, so a resource indexed in SPARQ would lose \
+             its bytes on restart / be absent on another instance. Configure a durable BlobStore, or \
+             use PSS_SPARQ_BACKEND=memory (or PSS_SPARQ_BACKEND=embedded WITHOUT SOLID_SERVER_SPARQ_DIR \
+             for an ephemeral in-memory graph).",
+            if sparq_dir_set {
+                " with SOLID_SERVER_SPARQ_DIR"
+            } else {
+                ""
+            }
+        )
+        .into());
+    }
+
+    // GUARD #2 — refuse to seed test fixtures into a NON-`memory` backend. The dev seed flags
+    // (SOLID_SERVER_SEED_CONFORMANCE / SOLID_SERVER_SEED_BENCH) now run against WHATEVER backend is
+    // selected, so without this guard they could write conformance/bench fixtures into a live
+    // http/embedded store. Set SOLID_SERVER_ALLOW_SEED_NONMEMORY=1 to permit it ONLY for an ephemeral
+    // embedded test instance (the conformance run.sh embedded leg). Seeding `memory` is always allowed.
+    let seed_requested =
+        env_flag(ENV_SEED_CONFORMANCE) || bench_seed_count(ENV_SEED_BENCH).is_some();
+    if reject_seed_on_nonmemory(seed_requested, &backend, env_flag(ENV_ALLOW_SEED_NONMEMORY)) {
+        return Err(format!(
+            "refusing to seed test fixtures into a non-memory backend (PSS_SPARQ_BACKEND={backend}): \
+             SOLID_SERVER_SEED_CONFORMANCE / SOLID_SERVER_SEED_BENCH would write dev fixtures into a \
+             live store. Unset the seed flag(s), use PSS_SPARQ_BACKEND=memory, or — ONLY for an \
+             ephemeral test instance — set SOLID_SERVER_ALLOW_SEED_NONMEMORY=1."
+        )
+        .into());
+    }
+
     let app = match backend.as_str() {
         "memory" => {
             eprintln!("  STORAGE: SPARQ backend = MEMORY (in-memory double — boot-without-SPARQ; the conformance/test default).");
@@ -854,6 +963,86 @@ mod tests {
         with_env(key, Some("010"), || {
             assert_eq!(bench_seed_count(key), Some(10))
         });
+    }
+
+    // --- Startup guard predicates ---------------------------------------------------------------
+
+    #[test]
+    fn durable_classification_matches_the_backend_matrix() {
+        // http is always durable/shared (a dir flag is irrelevant to it).
+        assert!(sparq_backend_is_durable("http", false));
+        assert!(sparq_backend_is_durable("http", true));
+        // embedded is durable ONLY with a persistence dir; without it the graph is in-memory.
+        assert!(sparq_backend_is_durable("embedded", true));
+        assert!(!sparq_backend_is_durable("embedded", false));
+        // memory + unknown are never durable.
+        assert!(!sparq_backend_is_durable("memory", true));
+        assert!(!sparq_backend_is_durable("memory", false));
+        assert!(!sparq_backend_is_durable("bogus", true));
+    }
+
+    #[test]
+    fn guard1_rejects_durable_sparq_with_inmem_blob() {
+        // http + in-mem blob ⇒ REJECT (durable index, ephemeral bytes).
+        assert!(reject_durable_sparq_with_inmem_blob("http", false, true));
+        // dir-backed embedded + in-mem blob ⇒ REJECT.
+        assert!(reject_durable_sparq_with_inmem_blob("embedded", true, true));
+    }
+
+    #[test]
+    fn guard1_allows_ephemeral_combinations() {
+        // embedded WITHOUT a dir + in-mem blob ⇒ ALLOW (both ephemeral, consistent — the test path).
+        assert!(!reject_durable_sparq_with_inmem_blob(
+            "embedded", false, true
+        ));
+        // memory + in-mem blob ⇒ ALLOW (the conformance/test default — both ephemeral).
+        assert!(!reject_durable_sparq_with_inmem_blob("memory", false, true));
+        assert!(!reject_durable_sparq_with_inmem_blob("memory", true, true));
+    }
+
+    #[test]
+    fn guard1_does_not_fire_once_blob_is_durable() {
+        // When a durable BlobStore lands (`blob_is_in_memory == false`), the guard stops firing for
+        // EVERY backend — durable SPARQ + durable blob is the consistent production target.
+        assert!(!reject_durable_sparq_with_inmem_blob("http", false, false));
+        assert!(!reject_durable_sparq_with_inmem_blob(
+            "embedded", true, false
+        ));
+        assert!(!reject_durable_sparq_with_inmem_blob(
+            "embedded", false, false
+        ));
+        assert!(!reject_durable_sparq_with_inmem_blob(
+            "memory", false, false
+        ));
+    }
+
+    #[test]
+    fn guard2_rejects_seed_on_nonmemory_without_override() {
+        // seed + http/embedded + NO override ⇒ REJECT.
+        assert!(reject_seed_on_nonmemory(true, "http", false));
+        assert!(reject_seed_on_nonmemory(true, "embedded", false));
+    }
+
+    #[test]
+    fn guard2_allows_seed_on_nonmemory_with_override() {
+        // seed + non-memory + override ⇒ ALLOW (the ephemeral embedded test instance the harness seeds).
+        assert!(!reject_seed_on_nonmemory(true, "embedded", true));
+        assert!(!reject_seed_on_nonmemory(true, "http", true));
+    }
+
+    #[test]
+    fn guard2_always_allows_seed_on_memory() {
+        // Seeding memory is the seed target by construction — allowed with or without the override.
+        assert!(!reject_seed_on_nonmemory(true, "memory", false));
+        assert!(!reject_seed_on_nonmemory(true, "memory", true));
+    }
+
+    #[test]
+    fn guard2_does_not_fire_when_no_seed_requested() {
+        // No seed flag set ⇒ never fires, regardless of backend / override.
+        assert!(!reject_seed_on_nonmemory(false, "http", false));
+        assert!(!reject_seed_on_nonmemory(false, "embedded", false));
+        assert!(!reject_seed_on_nonmemory(false, "memory", false));
     }
 
     #[test]

@@ -56,6 +56,15 @@ AUDIENCE="https://localhost:3000"
 ISSUER="http://localhost:8080/realms/solid"
 FWD_NAME="srs-conformance-fwd"
 
+# Which SPARQ data-path backend to boot the server with. DEFAULT `memory` (the in-memory double — the
+# byte-identical conformance baseline). Set PSS_SPARQ_BACKEND=embedded to run the same conformance
+# suite against the IN-PROCESS engine over an EPHEMERAL in-memory graph (no SOLID_SERVER_SPARQ_DIR),
+# which requires a release build with `--features embedded-sparq`. The embedded leg seeds an ephemeral
+# test instance, so it sets SOLID_SERVER_ALLOW_SEED_NONMEMORY=1 to satisfy the startup seed-guard (the
+# guard otherwise refuses to seed a non-memory backend). The default memory leg is unaffected (seeding
+# memory is always allowed).
+SPARQ_BACKEND="${PSS_SPARQ_BACKEND:-memory}"
+
 # --- pre-flight ---------------------------------------------------------------------------------
 [ -x "$SERVER_BIN" ] || { echo "ERROR: server binary not found: $SERVER_BIN (run: cargo build --release)" >&2; exit 1; }
 [ -f "$CERT" ] && [ -f "$KEY" ] || { echo "ERROR: TLS cert/key missing in $HERE/tls/ (see conformance/README.md)" >&2; exit 1; }
@@ -83,6 +92,23 @@ EARL_REPORT="$REPORTS/report.ttl"
 # the server in its own session means a TERM delivered to the SCRIPT's group never reaches the server;
 # we tear it down explicitly in `cleanup`. (This is a harness-script robustness fix; the binary's
 # SIGTERM graceful-drain behaviour is correct and unchanged — it is exercised by the unit/IT tests.)
+# The embedded leg seeds an EPHEMERAL test instance, so it must opt past the startup seed-guard
+# (which refuses to seed a non-memory backend) with SOLID_SERVER_ALLOW_SEED_NONMEMORY=1. The default
+# memory leg leaves it unset (seeding memory is always allowed). NOTE the embedded leg deliberately
+# does NOT set SOLID_SERVER_SPARQ_DIR — it uses a fresh in-memory graph (ephemeral on BOTH the index
+# and the blob side), so the durable-SPARQ-needs-durable-blob guard does not fire either.
+# Export the seed-guard override for the embedded leg ONLY (an `export` is robust — unlike a
+# `${VAR:+ASSIGN}` env-prefix expansion, which bash parses as a COMMAND word, not an assignment). The
+# server process inherits it; `server_env` passes the backend selection itself. The default memory leg
+# leaves SOLID_SERVER_ALLOW_SEED_NONMEMORY UNSET, so seeding memory stays allowed without the override.
+if [ "$SPARQ_BACKEND" = "embedded" ]; then
+  export SOLID_SERVER_ALLOW_SEED_NONMEMORY=1
+  echo ">> SPARQ backend = EMBEDDED (in-process engine, ephemeral graph; seed-guard override set)."
+else
+  unset SOLID_SERVER_ALLOW_SEED_NONMEMORY
+  echo ">> SPARQ backend = ${SPARQ_BACKEND} (default conformance baseline)."
+fi
+
 echo ">> Booting solid-server-rs (in-memory doubles, TLS, seeded) at ${BASE_URL} ..."
 server_env() {
   SOLID_SERVER_BIND=0.0.0.0:3000 \
@@ -95,6 +121,7 @@ server_env() {
   SOLID_SERVER_TLS_CERT="$CERT" \
   SOLID_SERVER_TLS_KEY="$KEY" \
   SOLID_SERVER_RATE_LIMIT_PER_IP=off \
+  PSS_SPARQ_BACKEND="$SPARQ_BACKEND" \
   "$@"
 }
 # ^ SOLID_SERVER_RATE_LIMIT_PER_IP=off — disable the pre-crypto per-IP rate limiter for the harness run.
