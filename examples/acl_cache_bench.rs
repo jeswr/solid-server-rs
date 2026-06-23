@@ -187,9 +187,17 @@ async fn main() {
         "  cache ON  : {warm_reads} store.read calls (only the COLD-miss populate), {warm_metas} meta probes (the cheap etag check)"
     );
     let reads_eliminated = cold_reads.saturating_sub(warm_reads);
+    // Percentage of the OFF-path ACL byte-fetch+parse work that the cache removes. The base is the
+    // cache-OFF read count (the work actually performed without the cache), NOT `iterations` — the
+    // resolver may do != 1 counted read per resolve, so dividing by iterations would misrepresent the
+    // fraction eliminated. Zero-read / zero-iteration is handled explicitly (no divide-by-zero).
+    let eliminated_pct = if cold_reads == 0 {
+        0.0
+    } else {
+        100.0 * reads_eliminated as f64 / cold_reads as f64
+    };
     println!(
-        "  => the cache ELIMINATES {reads_eliminated} ACL byte-fetch+parse operations over {iterations} reads ({:.2}% of them), replacing each with one cheap meta etag probe + a HashMap lookup.",
-        100.0 * reads_eliminated as f64 / iterations as f64
+        "  => the cache ELIMINATES {reads_eliminated} ACL byte-fetch+parse operations over {iterations} reads ({eliminated_pct:.2}% of the {cold_reads} OFF-path reads), replacing each with one cheap meta etag probe + a HashMap lookup."
     );
 
     // --- ADVISORY (wall-clock, same-process back-to-back ratio — robust to contention). ---

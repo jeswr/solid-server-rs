@@ -15,10 +15,11 @@
 ## What changed (and why it is safe)
 
 Every anonymous AND authenticated `GET`/`HEAD` resolves the **effective ACL** of the target: a
-child→root walk that, at each step, does a per-`.acl` `store.read` (byte-fetch of the ACL document)
+child→root walk that, at each step, cheaply probes for an `.acl` (a `store.meta` etag/existence
+lookup), then for the **nearest** ACL it finds does a `store.read` (byte-fetch of the ACL document)
 followed by an `oxttl` parse into triples, then matches the WAC rules. For a **hot** resource whose
-ACL is unchanged between reads, that byte-fetch + parse is pure waste — the identical triples come
-out every time.
+ACL is unchanged between reads, that byte-fetch + parse of the nearest ACL is pure waste — the
+identical triples come out every time.
 
 Round 4 adds an **ETag-keyed parsed-ACL cache** (`src/acl_cache.rs`, wired in `src/authz/wac.rs` +
 `src/ldp/handler.rs` + `src/main.rs`) that caches the **parsed triples** keyed by `(acl-iri, etag)`:
@@ -61,16 +62,23 @@ cargo run --release --example acl_cache_bench
 
 | metric (over 200,000 repeated reads of an unchanged ACL) | cache OFF | cache ON |
 |---|---:|---:|
-| `store.read` (ACL **byte-fetch + `oxttl` parse**) | **200,000** | **2** |
-| `store.meta` (the cheap etag index probe) | *(unchanged — the cache path always does this)* | *(unchanged)* |
+| `store.read` (ACL **byte-fetch + `oxttl` parse**) | **200,000** | **1** |
+| `store.meta` (the cheap etag index probe) | **600,000** | **600,000** *(unchanged — the cache path always does this)* |
 
-- **cache OFF**: 200,000 `store.read` — one ACL byte-fetch + `oxttl` parse per resolve.
-- **cache ON**: **2** `store.read` — only the cold-miss populate (the resolver walks two `.acl` steps
-  on the first resolve, then every subsequent resolve is a warm hit). After warm-up, **0** further
+- **cache OFF**: 200,000 `store.read` — one ACL byte-fetch + `oxttl` parse per resolve (`iterations`
+  resolves × the single governing ACL the fixture exposes).
+- **cache ON**: **1** `store.read` — only the cold-miss populate. The fixture seeds exactly ONE ACL
+  document (the container's inherited owner-private `acl:default`); the read target has no own ACL, so
+  the child→root walk resolves to that single nearest ACL and byte-fetches+parses it ONCE on the
+  cold (cache-populating) miss. Every subsequent resolve is a warm hit. After warm-up, **0** further
   byte-fetch+parse operations.
-- ⇒ **100% of the ACL byte-fetch+parse work is eliminated** on repeated reads of an unchanged ACL,
-  each replaced by one cheap `store.meta` etag probe (the index lookup the cache path always does)
-  + a `HashMap` lookup.
+- The `store.meta` count (the cheap etag index probe) is **600,000 in BOTH** — 3 per resolve, the
+  child→root walk probing the three candidate ACL IRIs (target.acl → container.acl[found] → root) to
+  locate + etag-check the nearest one. It is unchanged OFF vs ON: the cache trades the expensive blob
+  read + parse for this already-present cheap probe, it does not add a round-trip.
+- ⇒ **100% of the ACL byte-fetch+parse work is eliminated** on repeated reads of an unchanged ACL
+  (OFF = `iterations` reads → ON = the single cold populate, then 0), each warm resolve replaced by
+  the cheap `store.meta` etag probe the walk already performs + a `HashMap` lookup.
 
 The `store.read` count is a **reproducible integer** — the deterministic substance of the
 optimisation, and the metric the perf-gate hard-gates. The `meta` etag-probe count is **unchanged**
@@ -82,9 +90,9 @@ expensive blob read + parse for that already-present cheap probe, it does not ad
 The harness also prints a same-process, back-to-back cold/warm wall-clock ratio, which is far more
 robust to contention than two separate HTTP runs:
 
-- warm resolve ≈ **2.94× faster** (1559.8 µs → 531.4 µs per resolve).
+- warm resolve ≈ **2.19× faster** (351.2 µs → 160.3 µs per resolve).
 
-This reading was taken on a **heavily loaded box (load-avg ≈ 40)**, so the **absolute µs are
+This reading was taken on a **heavily loaded box**, so the **absolute µs are
 advisory only** — they reflect contention, not steady-state latency. The deterministic `store.read`
 count above is the real evidence; the wall-clock ratio is the advisory timing companion (per the
 suite perf-gate rule: timing metrics are advisory because shared-box wall-clock variance exceeds any
