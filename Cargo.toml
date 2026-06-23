@@ -28,7 +28,10 @@ tokio = { version = "1", features = ["fs", "rt-multi-thread", "macros", "net", "
 # CTH asserts case-sensitive `Vary: Origin` + expose-headers on the preflight, which the layer does
 # not emit out of the box — so no `cors` feature is needed here.
 tower = "0.5"
-tower-http = { version = "0.7", features = ["trace"] }
+# `timeout` adds the request-timeout layer (504 on a stuck request — the overload/backpressure slice).
+# It only enables already-resolved deps (tokio/time is already on; http-body is in the tree), so it
+# adds NO new crate — just the layer code. `trace` is the existing tracing layer.
+tower-http = { version = "0.7", features = ["trace", "timeout"] }
 # TLS: rustls + aws-lc-rs (spike §4 — the house rule, FIPS-capable backend).
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
 # HTTPS serving: axum-server is the maintained, widely-used (26M+ downloads) axum/hyper TLS-serving

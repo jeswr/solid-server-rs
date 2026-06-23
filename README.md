@@ -117,6 +117,8 @@ cargo run                   # boot the experimental server (defaults to 127.0.0.
 #   SOLID_SERVER_ALLOW_LOOPBACK       dev/IT ONLY: permit http:/loopback IdP+WebID (default 0)
 #   SOLID_SERVER_TLS_CERT             PEM cert-chain file path; set WITH _TLS_KEY to terminate HTTPS
 #   SOLID_SERVER_TLS_KEY              PEM private-key file path; set WITH _TLS_CERT (both-or-neither)
+#   SOLID_SERVER_MAX_CONCURRENCY      max in-flight requests before load is shed (503); default 10000
+#   SOLID_SERVER_REQUEST_TIMEOUT_SECS per-request timeout ⇒ 504; default 30; 0 disables
 SOLID_SERVER_BIND=127.0.0.1:3000 \
 SOLID_SERVER_BASE_URL=https://pod.example \
 SOLID_SERVER_TRUSTED_ISSUER=https://idp.example/realms/solid \
@@ -184,6 +186,30 @@ cross-instance replay rejection, the fail-closed posture, and TTL expiry. Bring 
 with `docker compose up -d redis`. The Redis-outage failure mode + the async-replication-on-failover
 hazard + HA topology + cost are documented in
 [issue #1](https://github.com/jeswr/solid-server-rs/issues/1).
+
+### Overload protection — admission control + request timeout + graceful drain
+
+At saturation the server **sheds load gracefully** rather than collapsing. The router's OUTERMOST
+layer is admission control (`src/overload.rs`): it admits up to `SOLID_SERVER_MAX_CONCURRENCY`
+(default **10000**) concurrently in-flight requests via a non-blocking semaphore; excess requests get
+**`503 Service Unavailable` + a jittered `Retry-After`** (base 1s + 0–4s jitter, to break a retry
+stampede) and are NEVER run. A per-request timeout (`SOLID_SERVER_REQUEST_TIMEOUT_SECS`, default
+**30s**, `0` disables) returns **`504`** for a stuck request so it cannot pin resources forever.
+
+This is **fail-safe and security-correct by construction**: admission runs BEFORE auth/WAC/DPoP-crypto,
+so a shed request returns 503 and can never bypass authorization (it gets strictly less than it
+otherwise would) — and the expensive crypto is never spent on a request about to be rejected. The
+defaults are far above normal traffic OR the conformance run, so they never trip in practice.
+
+**Health probes `GET /livez` (liveness) + `GET /readyz` (readiness)** are mounted OUTSIDE the overload
+layers, so a load balancer's probe is **never shed/timed-out** (shedding a healthy node's readiness
+probe would amplify an overload into an outage). They are public, cheap, expose no state, and return
+`200`. The server also handles **SIGTERM** (not just SIGINT/Ctrl-C): on SIGTERM it drains in-flight
+requests within the shutdown window and exits, so an instance behind a load balancer deregisters
+cleanly — the graceful-drain half of the stateless-instances-behind-LB design. Observability counters
+(in-flight gauge + shed counter) are exposed on `AdmissionMetrics` for a future `/metrics` exporter;
+a shed event is logged today. The measured throughput cost of the layer is nil (a `try_acquire` is one
+atomic) and the h1-vs-h2 + before/after numbers are in [`bench/HTTP2-BACKPRESSURE.md`](bench/HTTP2-BACKPRESSURE.md).
 
 Auth is **real**: the server performs live OIDC discovery + JWKS fetch against the trusted issuer
 (over the DNS-pinned SSRF-guarded fetcher) and, by default, the strict bidirectional WebID↔issuer

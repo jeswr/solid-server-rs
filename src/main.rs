@@ -40,12 +40,13 @@ use solid_oidc_verifier::replay::InMemoryReplayStore;
 use solid_oidc_verifier::verifier::Verifier;
 use solid_oidc_verifier::webid::{BidirectionalMode, NetworkWebIdResolver};
 use solid_server_rs::acl_cache::{AclCache, DEFAULT_ACL_CACHE_CAPACITY};
-use solid_server_rs::app::{build_router, AppState};
+use solid_server_rs::app::{build_router_with_overload, AppState, OverloadConfig};
 use solid_server_rs::auth::AuthContext;
 use solid_server_rs::auth_cache::{
     ProofPolicy, SharedReplay, VerifiedTokenCache, DEFAULT_CACHE_CAPACITY,
 };
 use solid_server_rs::ldp::handler::LdpState;
+use solid_server_rs::overload::{self, AdmissionControl};
 use solid_server_rs::store::{CompositeStore, InMemoryBlobStore, InMemorySparqClient};
 use solid_server_rs::tls::{self, TlsMode};
 
@@ -302,7 +303,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     ldp.set_acl_cache(acl_cache);
 
-    let app = build_router(AppState::new(auth, ldp));
+    // --- Overload protection (admission control + request timeout). -------------------------------
+    // Admission control sheds excess load (503 + jittered Retry-After) at a configurable concurrency
+    // ceiling BEFORE auth/WAC/storage run (so a shed request never bypasses authorization). The
+    // request timeout (504) reclaims a stuck request. Both are env-tunable; the defaults are HIGH
+    // enough never to trip during normal use OR the conformance run. Health routes (/livez, /readyz)
+    // are overload-EXEMPT (built outside the layers in `build_router_with_overload`).
+    let max_concurrency = overload::max_concurrency_from_env();
+    let request_timeout = overload::request_timeout_from_env();
+    let admission = AdmissionControl::new(max_concurrency);
+    eprintln!(
+        "  OVERLOAD: admission control ENABLED (max in-flight {max_concurrency}; excess ⇒ 503 + \
+         Retry-After). request timeout: {}. health probes /livez + /readyz are shed-EXEMPT.",
+        match request_timeout {
+            Some(d) => format!("{}s (504 on expiry)", d.as_secs()),
+            None => "DISABLED".to_string(),
+        }
+    );
+    let overload_config = OverloadConfig {
+        admission,
+        request_timeout,
+    };
+
+    let app = build_router_with_overload(AppState::new(auth, ldp), overload_config);
 
     // Build the rustls config (reads + validates the PEM files) for TLS mode; `None` for plain mode.
     // Done after the router is assembled but before binding, so a bad cert/key fails at boot.
@@ -494,8 +517,46 @@ fn parse_bidirectional(raw: Option<&str>) -> BidirectionalMode {
     }
 }
 
+/// Resolve when EITHER Ctrl-C (SIGINT) OR SIGTERM is received, so the server drains gracefully on a
+/// container/orchestrator stop, not just an interactive Ctrl-C. SIGTERM is what a load balancer /
+/// k8s / systemd / Docker sends to ask an instance to stop: handling it means an instance behind an LB
+/// deregisters CLEANLY (finishes in-flight requests within the drain window, then exits) instead of
+/// having connections dropped — the graceful-drain half of the stateless-instances-behind-LB design.
+/// On non-Unix there is no SIGTERM, so only Ctrl-C is awaited (unchanged behaviour there).
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    {
+        let terminate = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut sig) => {
+                    sig.recv().await;
+                }
+                // If we cannot install the SIGTERM handler, fall back to never resolving on this arm
+                // (Ctrl-C still works) rather than aborting — a missing SIGTERM handler must not crash
+                // a running server.
+                Err(e) => {
+                    eprintln!(
+                        "  WARNING: could not install SIGTERM handler ({e}); Ctrl-C still drains."
+                    );
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        tokio::select! {
+            _ = ctrl_c => { eprintln!("  SHUTDOWN: SIGINT (Ctrl-C) received — draining."); }
+            _ = terminate => { eprintln!("  SHUTDOWN: SIGTERM received — draining (clean LB deregistration)."); }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await;
+        eprintln!("  SHUTDOWN: Ctrl-C received — draining.");
+    }
 }
 
 #[cfg(test)]

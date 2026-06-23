@@ -8,13 +8,30 @@
 //!
 //! M2 adds the tower-http middleware stack (CORS, security headers, request-id, trace, body-limit,
 //! timeout, rate-limit, load-shed — spike §4) around this, plus the discovery + notification routes.
+//!
+//! ## Overload protection (admission control + timeout) — the layer ORDER is security-critical
+//! [`build_router_with_overload`] wraps the application routes with two overload layers (the
+//! [`crate::overload`] backpressure layer):
+//! - the **admission-control** middleware ([`crate::overload::admission_middleware`]) is the
+//!   **OUTERMOST** layer — it sheds excess load (503 + jittered `Retry-After`) BEFORE auth/WAC/storage
+//!   ever run, so a shed request can never bypass authorization (it gets strictly LESS than it would
+//!   otherwise — a 503), and the expensive DPoP crypto is never spent on a request about to be
+//!   rejected; and
+//! - a **request timeout** layer (504 on a stuck request) just inside it.
+//!
+//! The **health/readiness routes are mounted OUTSIDE these layers** (their own router, merged last)
+//! so a load balancer's readiness probe is NEVER shed or timed out — shedding a healthy instance's
+//! probe would make the LB pull it, amplifying an overload into an outage.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::Router;
 use solid_oidc_verifier::config::JwksProvider;
 use solid_oidc_verifier::replay::ReplayStore;
+use tower_http::timeout::TimeoutLayer;
 
 use crate::auth::{auth_middleware, AuthContext};
 use crate::ldp::cors::cors_middleware;
@@ -26,7 +43,34 @@ use crate::notifications::ws::{
     receive_handler, storage_description_handler, subscribe_handler, NotifyState, RECEIVE_PATH,
     SUBSCRIPTION_PATH, WELL_KNOWN_SOLID_PATH,
 };
+use crate::overload::{admission_middleware, AdmissionControl};
 use crate::store::Store;
+
+/// Path of the liveness probe (process is up). Exempt from admission control + timeout.
+pub const LIVEZ_PATH: &str = "/livez";
+/// Path of the readiness probe (process is ready to serve). Exempt from admission control + timeout.
+pub const READYZ_PATH: &str = "/readyz";
+
+/// Overload-protection configuration for [`build_router_with_overload`]: the admission-control state
+/// (the concurrency ceiling + metrics) and the optional per-request timeout. `None` timeout disables
+/// the timeout layer.
+#[derive(Clone)]
+pub struct OverloadConfig {
+    /// The admission-control state (concurrency ceiling + in-flight/shed metrics).
+    pub admission: AdmissionControl,
+    /// The per-request timeout (504 on expiry). `None` ⇒ no timeout layer.
+    pub request_timeout: Option<Duration>,
+}
+
+impl OverloadConfig {
+    /// A config with admission control sized to `max_concurrency` and the given timeout.
+    pub fn new(max_concurrency: usize, request_timeout: Option<Duration>) -> Self {
+        Self {
+            admission: AdmissionControl::new(max_concurrency),
+            request_timeout,
+        }
+    }
+}
 
 /// The assembled application state — the auth context + the LDP state, each behind an [`Arc`].
 pub struct AppState<J: JwksProvider, R: ReplayStore, S: Store> {
@@ -66,7 +110,63 @@ where
 /// - `GET …/receive` (the WS upgrade) and `GET /.well-known/solid` (discovery) are PUBLIC: a browser
 ///   WebSocket cannot carry the DPoP header, and discovery is public like a storage description. The
 ///   receive-token + per-resource WAC seam (`sparq#992`) is documented in `notifications::ws`.
+///
+/// This is the no-overload-layer build (the existing default, used by the unit/integration tests). The
+/// binary uses [`build_router_with_overload`] to add admission control + a request timeout. The two
+/// share the route assembly via a private `build_app_routes` helper; this fn just merges those routes
+/// + the (always overload-exempt) health routes with no extra layers.
 pub fn build_router<J, R, S>(state: AppState<J, R, S>) -> Router
+where
+    J: JwksProvider + Send + Sync + 'static,
+    R: ReplayStore + Send + Sync + 'static,
+    S: Store + 'static,
+{
+    build_app_routes(state).merge(health_routes())
+}
+
+/// Build the router WITH overload protection (the binary's path): admission control (load shedding)
+/// as the OUTERMOST layer + an optional request timeout just inside it, wrapping the application
+/// routes — but NOT the health routes, which are merged OUTSIDE the layers so a load balancer's
+/// readiness probe is never shed/timed-out. See the module's "Overload protection" note for why the
+/// layer order is security-critical (a shed request 503s before auth/WAC/storage — never a bypass).
+pub fn build_router_with_overload<J, R, S>(
+    state: AppState<J, R, S>,
+    overload: OverloadConfig,
+) -> Router
+where
+    J: JwksProvider + Send + Sync + 'static,
+    R: ReplayStore + Send + Sync + 'static,
+    S: Store + 'static,
+{
+    let mut app = build_app_routes(state);
+
+    // INNER: the request timeout (504 on a stuck request) — applied first so it is INSIDE admission
+    // control (a timed-out request still holds its admission permit until it times out; that is
+    // correct — the permit models a genuinely in-flight request).
+    if let Some(timeout) = overload.request_timeout {
+        // tower-http's TimeoutLayer returns a 408 by default; we want 503-family semantics for a
+        // server-side stuck request, so use 504 GATEWAY_TIMEOUT (the request did not complete in time).
+        app = app.layer(TimeoutLayer::with_status_code(
+            StatusCode::GATEWAY_TIMEOUT,
+            timeout,
+        ));
+    }
+
+    // OUTERMOST: admission control. Runs FIRST on every request — sheds (503 + jittered Retry-After)
+    // before auth/WAC/storage when at capacity. Security-critical that this is outermost (see module
+    // docs): a shed request never reaches the inner stack, so it can never bypass authorization.
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        overload.admission,
+        admission_middleware,
+    ));
+
+    // Health routes are OUTSIDE the overload layers (merged last) — never shed/timed-out.
+    app.merge(health_routes())
+}
+
+/// The application routes (LDP + notifications), WITHOUT the overload layers or the health routes —
+/// the shared core of [`build_router`] and [`build_router_with_overload`].
+fn build_app_routes<J, R, S>(state: AppState<J, R, S>) -> Router
 where
     J: JwksProvider + Send + Sync + 'static,
     R: ReplayStore + Send + Sync + 'static,
@@ -136,4 +236,20 @@ where
         .merge(subscribe)
         .merge(public_notify)
         .merge(protected)
+}
+
+/// The health/readiness routes: `GET /livez` (process up) + `GET /readyz` (ready to serve). Both are
+/// cheap, public, and ALWAYS overload-EXEMPT (merged outside the admission/timeout layers), so a load
+/// balancer's probe is never shed/timed-out — shedding a healthy instance's readiness probe would make
+/// the LB pull a still-good node and amplify an overload into an outage.
+///
+/// `/livez` and `/readyz` return 200 + a tiny `text/plain` body. They are deliberately NOT auth-gated
+/// (a probe carries no credentials) and expose no state. They are kept distinct so an operator can map
+/// them to a k8s `livenessProbe` vs `readinessProbe`: today both are a static "the process is up";
+/// `/readyz` is the seam to add a real backend-reachability check (SPARQ/S3) when the live store lands
+/// — at which point a not-ready instance can 503 its `/readyz` to deregister cleanly behind the LB.
+fn health_routes() -> Router {
+    Router::new()
+        .route(LIVEZ_PATH, get(|| async { (StatusCode::OK, "live\n") }))
+        .route(READYZ_PATH, get(|| async { (StatusCode::OK, "ready\n") }))
 }

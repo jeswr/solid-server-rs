@@ -72,22 +72,49 @@ RUN_MARKER="$REPORTS/.run-start"
 : > "$RUN_MARKER"
 EARL_REPORT="$REPORTS/report.ttl"
 
-# --- boot the server (in-memory, TLS, seeded) ---------------------------------------------------
+# --- boot the server in its OWN session/process-group (load-bearing) -----------------------------
+# We launch the server DETACHED into a new session (`setsid` on Linux, an `os.setsid()` python
+# wrapper on macOS where `setsid` is absent) instead of a bare `&`. Why: the harness runs as
+# `docker run -i --network host …`, and on Docker Desktop that `-i` foreground attach can FORWARD a
+# SIGTERM to this script's process group when the container exits — which would reach the
+# same-process-group server and (now that the binary handles SIGTERM with a graceful drain — and even
+# before, since SIGTERM's default action is to TERMINATE the process) kill it MID-RUN, so the harness's
+# very first TLS request races a shutting-down server ("Remote host terminated the handshake"). Putting
+# the server in its own session means a TERM delivered to the SCRIPT's group never reaches the server;
+# we tear it down explicitly in `cleanup`. (This is a harness-script robustness fix; the binary's
+# SIGTERM graceful-drain behaviour is correct and unchanged — it is exercised by the unit/IT tests.)
 echo ">> Booting solid-server-rs (in-memory doubles, TLS, seeded) at ${BASE_URL} ..."
-SOLID_SERVER_BIND=0.0.0.0:3000 \
-SOLID_SERVER_BASE_URL="$BASE_URL" \
-SOLID_SERVER_AUDIENCE="$AUDIENCE" \
-SOLID_SERVER_ALLOW_LOOPBACK=1 \
-SOLID_SERVER_BIDIRECTIONAL=off \
-SOLID_SERVER_TRUSTED_ISSUER="$ISSUER" \
-SOLID_SERVER_SEED_CONFORMANCE=1 \
-SOLID_SERVER_TLS_CERT="$CERT" \
-SOLID_SERVER_TLS_KEY="$KEY" \
-"$SERVER_BIN" > "$REPORTS/server.log" 2>&1 &
-SERVER_PID=$!
+server_env() {
+  SOLID_SERVER_BIND=0.0.0.0:3000 \
+  SOLID_SERVER_BASE_URL="$BASE_URL" \
+  SOLID_SERVER_AUDIENCE="$AUDIENCE" \
+  SOLID_SERVER_ALLOW_LOOPBACK=1 \
+  SOLID_SERVER_BIDIRECTIONAL=off \
+  SOLID_SERVER_TRUSTED_ISSUER="$ISSUER" \
+  SOLID_SERVER_SEED_CONFORMANCE=1 \
+  SOLID_SERVER_TLS_CERT="$CERT" \
+  SOLID_SERVER_TLS_KEY="$KEY" \
+  "$@"
+}
+if command -v setsid >/dev/null 2>&1; then
+  server_env setsid "$SERVER_BIN" > "$REPORTS/server.log" 2>&1 &
+elif command -v python3 >/dev/null 2>&1; then
+  # macOS has no `setsid`; a 1-line python wrapper does the os.setsid()+exec.
+  server_env python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$SERVER_BIN" \
+    > "$REPORTS/server.log" 2>&1 &
+else
+  # Last resort: bare background (the original behaviour) — still works when no TERM is forwarded.
+  server_env "$SERVER_BIN" > "$REPORTS/server.log" 2>&1 &
+fi
+LAUNCH_PID=$!
 
 cleanup() {
-  kill "$SERVER_PID" 2>/dev/null || true
+  # Kill the whole server SESSION (negative PID ⇒ the process group), since the server is its own
+  # session leader; fall back to the launcher PID. `|| true` so cleanup never fails the run.
+  local srv
+  srv="$(pgrep -f "$SERVER_BIN" 2>/dev/null | head -1 || true)"
+  [ -n "$srv" ] && kill -TERM "-$srv" 2>/dev/null || true
+  kill "$LAUNCH_PID" 2>/dev/null || true
   docker rm -f "$FWD_NAME" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
