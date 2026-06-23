@@ -46,11 +46,13 @@ axum-server = { version = "0.8", default-features = false, features = ["tls-rust
 # stays issuer-agnostic + seam-based, so unit tests still drive the verification CORE via the
 # in-memory test doubles. Pinned to an exact rev (not the floating default branch) for reproducible,
 # security-reviewable builds; Cargo.lock is committed.
-# Pinned to `836899d` — the merged async-DNS + concurrent-resolver fix on verifier `main` that
-# unblocks authenticated requests (the prior blocking-DNS-in-async path manifested as worker
-# panics / `UND_ERR_SOCKET` on the first authed request).
+# Pinned to `242d812` — the replay-TTL fix on verifier `main`: the internal jti replay-cache TTL
+# now covers the full symmetric iat window (+1s inclusive-boundary margin), closing a latent DPoP
+# replay window, plus sharing JWKS as `Arc<[Jwk]>`. Supersedes `836899d` (async-DNS + concurrent
+# resolver). The widened replay window is inherited automatically; the iat acceptance window
+# (which the CTH's future-skewed proof relies on) is unchanged.
 # FOLLOW-UP: re-pin to a tagged release once the verifier cuts one.
-solid-oidc-verifier = { git = "https://github.com/jeswr/solid-oidc-verifier", rev = "836899dfea0b06d03b689d71e70d2e078be5224d", features = ["network"] }
+solid-oidc-verifier = { git = "https://github.com/jeswr/solid-oidc-verifier", rev = "242d8120476a6557670c7aacbb4db5dd08da2bc6", features = ["network"] }
 # RDF parse/serialise: oxttl (Turtle/N-Triples) + oxjsonld (JSON-LD ↔ RDF), via oxrdf model (spike §4).
 # oxttl 0.2 + oxjsonld 0.2 both pin `oxrdf =0.3.3`, so this is a coherent Oxigraph set.
 oxrdf = "0.3"
