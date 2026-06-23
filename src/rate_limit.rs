@@ -48,12 +48,29 @@
 //! without a concurrent-map dependency; each critical section is tiny (a map lookup + arithmetic, no
 //! I/O, no lock held across an `.await`).
 //!
-//! ## Sizing — the default MUST NOT trip the conformance run or normal use
+//! ## Sizing + the internal-IP exemption — the default MUST NOT trip the conformance run or normal use
 //! The default per-IP rate is DELIBERATELY GENEROUS (see [`DEFAULT_RATE_PER_IP`] /
-//! [`DEFAULT_BURST`]) — high enough that it never sheds a conformance-harness request (the CTH hammers
-//! from one IP) or normal use. As belt-and-suspenders, LOOPBACK source IPs are EXEMPT by default (the
-//! CTH's socat sidecar forwards from loopback), so the harness cannot trip the limiter regardless of
-//! the rate. The rate is env-tunable; a sentinel disables the layer entirely. See the env constants.
+//! [`DEFAULT_BURST`]) — high enough that it never sheds normal use. More importantly, **INTERNAL
+//! source IPs are EXEMPT by default** ([`ENV_EXEMPT_INTERNAL`] / [`is_internal_ip`]: loopback + RFC
+//! 1918 private + link-local + IPv6 ULA). This is BOTH a footgun guard and the conformance fix:
+//! - **Footgun guard:** behind a reverse proxy / docker-bridge / k8s service without a configured
+//!   [`ENV_TRUSTED_PROXY`], EVERY client shares ONE internal hop IP, so a per-IP bucket keyed on that
+//!   hop is meaningless (it throttles all clients together). Exempting internal IPs means a
+//!   misconfigured internal hop is simply not rate-limited (it proceeds to auth, which still gates it)
+//!   rather than mis-throttling everyone onto one bucket.
+//! - **Conformance:** the CTH reaches the server via a `--network host` socat sidecar forwarding from
+//!   `host.docker.internal` — a NON-loopback PRIVATE Docker-VM gateway IP. The narrower loopback-only
+//!   exemption did NOT cover it, so the WAC suite's parallel single-source bursts drained the bucket →
+//!   429s → failed features. The internal-range exemption covers it; and the conformance script ALSO
+//!   sets `SOLID_SERVER_RATE_LIMIT_PER_IP=off` as the explicit primary belt (the CTH is a trusted
+//!   single-source load generator — the limiter's real protection is validated by the unit + HTTP
+//!   tests, not the harness).
+//!
+//! 🔒 Security framing: with this default the limiter protects against **PUBLIC-internet per-source
+//! floods**, NOT a flood arriving via a trusted internal proxy hop — for THAT you set
+//! [`ENV_TRUSTED_PROXY`] so the real PUBLIC client IP is keyed (not the internal hop). Both the
+//! internal exemption and the loopback exemption are env-toggleable; the `off` sentinel on
+//! [`ENV_RATE_PER_IP`] disables the layer entirely. See the env constants.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -82,17 +99,46 @@ pub const ENV_BURST: &str = "SOLID_SERVER_RATE_LIMIT_BURST";
 
 /// Env var: the X-Forwarded-For trusted-proxy hop COUNT. Unset / empty / invalid / `0` ⇒ XFF is NOT
 /// trusted (the direct peer IP is used — the safe default, since an untrusted XFF is spoofable). A
-/// positive integer N ⇒ trust the LAST N hops as our own reverse proxies and take the
-/// `(N+1)`-th-from-the-right XFF entry as the client IP (standard XFF semantics). See
-/// [`parse_trusted_proxy_hops`] and [`client_ip_from_xff`].
+/// positive integer N ⇒ trust N reverse-proxy hops in front of us and take the **N-th XFF entry from
+/// the RIGHT** (0-based index `N-1`) as the client IP (standard XFF semantics — see
+/// [`client_ip_from_xff`] for the derivation). See [`parse_trusted_proxy_hops`] and
+/// [`client_ip_from_xff`].
 pub const ENV_TRUSTED_PROXY: &str = "SOLID_SERVER_TRUSTED_PROXY";
 
-/// Env var: whether to EXEMPT loopback source IPs from the limit. `0`/`false` disables the exemption;
-/// anything else / absent ⇒ exemption ON (the default). Loopback is exempt by default because the
-/// conformance harness's socat sidecar forwards from loopback, so a loopback exemption guarantees the
-/// CTH is never rate-limited regardless of the configured rate. An operator behind a loopback-bound
-/// reverse proxy who relies on XFF should turn this OFF (and configure [`ENV_TRUSTED_PROXY`]).
+/// Env var: whether to EXEMPT loopback source IPs from the limit. `0`/`false`/`no`/`off`
+/// (case-insensitive) disables the exemption; anything else / absent ⇒ exemption ON (the default).
+/// Loopback is exempt by default because the conformance harness's socat sidecar forwards from
+/// loopback, so a loopback exemption guarantees the CTH is never rate-limited regardless of the
+/// configured rate. An operator behind a loopback-bound reverse proxy who relies on XFF should turn
+/// this OFF (and configure [`ENV_TRUSTED_PROXY`]). NOTE: [`ENV_EXEMPT_INTERNAL`] is the broader knob
+/// that ALSO covers loopback — this narrower one stays for back-compat + the loopback-only case.
 pub const ENV_EXEMPT_LOOPBACK: &str = "SOLID_SERVER_RATE_LIMIT_EXEMPT_LOOPBACK";
+
+/// Env var: whether to EXEMPT all INTERNAL source IPs from the per-IP limit. `0`/`false`/`no`/`off`
+/// (case-insensitive) disables the exemption; anything else / absent ⇒ exemption ON (**the default**).
+///
+/// "Internal" = loopback (`127.0.0.0/8`, `::1`) + RFC 1918 private (`10/8`, `172.16/12`,
+/// `192.168/16`) + link-local (`169.254/16`, `fe80::/10`) + IPv6 unique-local (`fc00::/7`) — see
+/// [`is_internal_ip`]. This is ON by default for two load-bearing reasons:
+///  1. **It removes a footgun the per-IP design otherwise has.** When the server sits behind a
+///     reverse proxy / docker-bridge / k8s service WITHOUT a configured [`ENV_TRUSTED_PROXY`], EVERY
+///     client shares ONE internal hop IP as their peer — so a per-IP bucket keyed on that hop is
+///     meaningless (it throttles ALL clients together, or — worse — lets a flood from one real client
+///     exhaust the shared bucket for everyone). Exempting internal source IPs means a misconfigured
+///     internal hop is simply NOT rate-limited (it proceeds to auth, which still gates it) rather than
+///     mis-throttling. To actually rate-limit clients behind a TRUSTED proxy, set [`ENV_TRUSTED_PROXY`]
+///     so the real (public) client IP is keyed instead of the internal hop.
+///  2. **It covers the conformance harness's `host.docker.internal` hop** — the CTH's `--network host`
+///     socat sidecar forwards from the Docker-VM gateway, a NON-loopback PRIVATE IP, so the
+///     loopback-only exemption did not cover it and the WAC suite's parallel setup bursts (all one
+///     source IP) drained the bucket → 429s → failed features. Exempting the private range fixes it.
+///
+/// 🔒 Security framing (be explicit): with this default, the per-IP limiter protects against
+/// **PUBLIC-internet per-source floods**, NOT against a flood arriving via a trusted internal proxy
+/// hop (for that you MUST set [`ENV_TRUSTED_PROXY`] so the limiter keys the real public client IP).
+/// Turning this OFF rate-limits internal source IPs too (e.g. a directly-exposed internal network you
+/// genuinely want throttled per-hop).
+pub const ENV_EXEMPT_INTERNAL: &str = "SOLID_SERVER_RATE_LIMIT_EXEMPT_INTERNAL";
 
 /// The default sustained per-IP rate (requests/second). Chosen DELIBERATELY HIGH so it never trips
 /// during normal use OR the conformance run (which, while it hammers from one IP, stays well under
@@ -124,6 +170,18 @@ const NUM_SHARDS: usize = 64;
 /// this would have fully refilled anyway, so dropping it loses no throttling state — a returning IP
 /// just starts fresh at full burst, which is the correct (most-permissive-to-a-quiet-source) behaviour.
 const IDLE_TTL: Duration = Duration::from_secs(600);
+
+/// A HARD per-shard bucket cap — the RESIDENT-MEMORY CEILING (not just a GC trigger). The `IDLE_TTL`
+/// retain above only sweeps buckets idle past the TTL; under a sustained churn of DISTINCT source IPs
+/// faster than that, the resident map would still grow to ≈ `arrival_rate × IDLE_TTL` of buckets —
+/// attacker-influenceable memory. This cap bounds each shard's map to a fixed maximum: at the cap, a
+/// NEW IP first triggers the idle-GC, and if the shard is STILL full, the OLDEST-`last_seen` bucket
+/// (the coldest source) is EVICTED before inserting the newcomer. So total resident buckets are
+/// bounded by `NUM_SHARDS × MAX_BUCKETS_PER_SHARD` regardless of churn, and — load-bearing — a HOT IP
+/// (recently seen, hence NOT the coldest) is NEVER evicted in favour of a cold sprayed IP, so an
+/// attacker spraying distinct cold IPs cannot reset a throttled hot IP's bucket. `8192` per shard ×
+/// `64` shards = ~512k buckets max (~tens of MB), well above realistic legitimate peer cardinality.
+const MAX_BUCKETS_PER_SHARD: usize = 8192;
 
 /// Resolve the per-IP rate config from the env value into a [`RateConfig`].
 /// - the sentinel `off`/`OFF`/`Off`/`disabled` (case-insensitive) ⇒ [`RateConfig::Disabled`]
@@ -192,12 +250,79 @@ pub fn exempt_loopback_from_env() -> bool {
     parse_exempt_loopback(std::env::var(ENV_EXEMPT_LOOPBACK).ok())
 }
 
-/// Testable core of [`exempt_loopback_from_env`]. See that fn for the rules.
+/// Testable core of [`exempt_loopback_from_env`]. See that fn for the rules. The falsey set is matched
+/// **case-INSENSITIVELY** (`0`/`false`/`no`/`off` in ANY casing), so `OFF`/`No`/`FALSE` correctly
+/// DISABLE the exemption instead of silently slipping through to the on-by-default branch.
 pub fn parse_exempt_loopback(raw: Option<String>) -> bool {
-    !matches!(
-        raw.as_deref().map(str::trim),
-        Some("0") | Some("false") | Some("FALSE") | Some("False") | Some("no") | Some("off")
-    )
+    !is_falsey(raw.as_deref())
+}
+
+/// Shared case-insensitive falsey test for the boolean-ish exemption env knobs: `true` for `0` /
+/// `false` / `no` / `off` in ANY casing (trimmed); `false` for absent / empty / anything else (so the
+/// default for these knobs is ON). Single-sourced so [`parse_exempt_loopback`] and
+/// [`parse_exempt_internal`] agree on the falsey grammar (and fixes the prior casing gap where only
+/// specific casings were matched).
+fn is_falsey(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        Some(s) => {
+            s.eq_ignore_ascii_case("0")
+                || s.eq_ignore_ascii_case("false")
+                || s.eq_ignore_ascii_case("no")
+                || s.eq_ignore_ascii_case("off")
+        }
+        None => false,
+    }
+}
+
+/// Resolve whether INTERNAL source IPs are exempt (see [`ENV_EXEMPT_INTERNAL`]).
+/// `0`/`false`/`no`/`off` (case-insensitive) ⇒ NOT exempt; anything else / absent ⇒ exempt (the
+/// default).
+pub fn exempt_internal_from_env() -> bool {
+    parse_exempt_internal(std::env::var(ENV_EXEMPT_INTERNAL).ok())
+}
+
+/// Testable core of [`exempt_internal_from_env`]. See that fn for the rules.
+pub fn parse_exempt_internal(raw: Option<String>) -> bool {
+    !is_falsey(raw.as_deref())
+}
+
+/// Classify a source IP as INTERNAL (a host on a private / link-local / loopback / unique-local
+/// network) vs PUBLIC (a routable internet address). Used by the default exemption ([`ENV_EXEMPT_INTERNAL`]):
+/// an internal source IP is almost always a reverse-proxy / docker-bridge / k8s-internal hop, for which
+/// a per-IP bucket is meaningless (all clients share the one hop IP), so it is exempted by default and
+/// the operator keys the real public client via [`ENV_TRUSTED_PROXY`] instead.
+///
+/// Internal ⇔ any of:
+/// - **IPv4** loopback `127.0.0.0/8`, RFC 1918 private (`10/8`, `172.16/12`, `192.168/16`), or
+///   link-local `169.254.0.0/16`;
+/// - **IPv6** loopback `::1`, unique-local `fc00::/7`, link-local `fe80::/10`, OR an
+///   IPv4-mapped/-compatible address whose embedded IPv4 is itself internal (so a `::ffff:10.0.0.1`
+///   peer is still treated as internal — closing the trivial mapped-address bypass).
+pub fn is_internal_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_internal_v4(v4),
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return true;
+            }
+            // IPv4-mapped (`::ffff:a.b.c.d`) / IPv4-compatible (`::a.b.c.d`): classify by the embedded
+            // v4 so a mapped internal address can't masquerade as a "public" v6.
+            if let Some(v4) = v6.to_ipv4() {
+                return is_internal_v4(&v4);
+            }
+            let seg0 = v6.segments()[0];
+            // fc00::/7 (unique-local) ⇒ top 7 bits == 1111110. fe80::/10 (link-local) ⇒ top 10 bits
+            // == 1111111010. (`Ipv6Addr::is_unique_local`/`is_unicast_link_local` are unstable, so
+            // classify by the prefix directly — a stable, dependency-free check.)
+            (seg0 & 0xfe00) == 0xfc00 || (seg0 & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// IPv4 internal-range test: loopback `127/8`, RFC 1918 private (`10/8`, `172.16/12`, `192.168/16`),
+/// or link-local `169.254/16`. (`Ipv4Addr::is_private`/`is_link_local`/`is_loopback` are stable.)
+fn is_internal_v4(v4: &std::net::Ipv4Addr) -> bool {
+    v4.is_loopback() || v4.is_private() || v4.is_link_local()
 }
 
 /// The resolved rate config: either ENABLED at a sustained rate or DISABLED entirely.
@@ -276,14 +401,31 @@ pub struct RateLimiter {
     trusted_proxy_hops: usize,
     /// Whether loopback source IPs are exempt from the limit.
     exempt_loopback: bool,
+    /// Whether ALL internal source IPs (loopback + private + link-local + ULA) are exempt — the
+    /// default. See [`ENV_EXEMPT_INTERNAL`] / [`is_internal_ip`].
+    exempt_internal: bool,
+    /// The HARD per-shard bucket cap (resident-memory ceiling). Defaults to [`MAX_BUCKETS_PER_SHARD`];
+    /// the test-only [`Self::set_max_buckets_per_shard_for_test`] lowers it so the eviction path can be
+    /// exercised without spraying hundreds of thousands of IPs.
+    max_buckets_per_shard: usize,
     metrics: Arc<RateLimitMetrics>,
 }
 
 impl RateLimiter {
     /// Build a rate limiter. `rate` (tokens/s) and `capacity` (burst) are clamped to a small positive
     /// floor so the type is always safe to construct directly (e.g. in tests); the env parsers already
-    /// reject non-positive values, this just makes the constructor total.
-    pub fn new(rate: f64, capacity: f64, trusted_proxy_hops: usize, exempt_loopback: bool) -> Self {
+    /// reject non-positive values, this just makes the constructor total. `exempt_internal` exempts the
+    /// broader internal-IP set (loopback + private + link-local + ULA — see [`is_internal_ip`]) and is
+    /// the default-on footgun guard for a proxy/docker/k8s hop; `exempt_loopback` is the narrower
+    /// loopback-only knob (kept for back-compat). When `exempt_internal` is on it already covers
+    /// loopback, so the two compose (either exemption matching ⇒ exempt).
+    pub fn new(
+        rate: f64,
+        capacity: f64,
+        trusted_proxy_hops: usize,
+        exempt_loopback: bool,
+        exempt_internal: bool,
+    ) -> Self {
         let rate = if rate.is_finite() && rate > 0.0 {
             rate
         } else {
@@ -304,6 +446,8 @@ impl RateLimiter {
             capacity,
             trusted_proxy_hops,
             exempt_loopback,
+            exempt_internal,
+            max_buckets_per_shard: MAX_BUCKETS_PER_SHARD,
             metrics: Arc::new(RateLimitMetrics::default()),
         }
     }
@@ -331,29 +475,54 @@ impl RateLimiter {
     }
 
     /// Try to admit one request from `ip`. `true` ⇒ allowed (a token was available, or the IP is
-    /// loopback-exempt); `false` ⇒ rate-limited (the bucket was empty). Also GCs idle buckets in the
-    /// touched shard so the map cannot grow without bound under distinct-IP churn.
+    /// exempt); `false` ⇒ rate-limited (the bucket was empty). GCs idle buckets in the touched shard
+    /// AND enforces a HARD per-shard cap (evicting the coldest bucket when full) so the map's resident
+    /// memory is bounded regardless of distinct-IP churn.
     fn allow(&self, ip: IpAddr) -> bool {
-        // Loopback exemption (belt-and-suspenders for the CTH socat hop). Checked here, not in the
-        // middleware, so the exemption is part of the testable core.
+        // Source-IP exemptions (checked here, not in the middleware, so they are part of the testable
+        // core). `exempt_internal` (default-on) covers loopback + private + link-local + ULA — the
+        // footgun guard for a proxy/docker/k8s hop AND the CTH `host.docker.internal` private-IP hop;
+        // `exempt_loopback` is the narrower back-compat loopback-only knob. Either matching ⇒ exempt.
+        if self.exempt_internal && is_internal_ip(&ip) {
+            return true;
+        }
         if self.exempt_loopback && ip.is_loopback() {
             return true;
         }
         let now = Instant::now();
         let shard = self.shard_for(&ip);
-        // The critical section is tiny — a map lookup + arithmetic, NO I/O and NO `.await` held — so a
-        // plain Mutex per shard is fine. A poisoned lock (a panic while held) is recovered via
-        // `into_inner` so a single panicking request can never wedge the limiter for an IP shard.
+        // The critical section is tiny — a map lookup + arithmetic (+ at most one O(shard) GC/eviction
+        // pass), NO I/O and NO `.await` held — so a plain Mutex per shard is fine. A poisoned lock (a
+        // panic while held) is recovered via `into_inner` so a single panicking request can never wedge
+        // the limiter for an IP shard.
         let mut map = match shard.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
+
+        // HARD per-shard memory cap. If this is a NEW IP and the shard is at the cap, make room before
+        // inserting: first GC genuinely-idle buckets, and if STILL full, EVICT the coldest
+        // (oldest-`last_seen`) bucket. A HOT IP is the most-recently-seen, hence never the coldest, so
+        // it survives a spray of cold distinct IPs — its throttle is not reset by churn (the
+        // memory-exhaustion + hot-IP-eviction guard). We only do this work for a NEW key at the cap, so
+        // the steady-state hot path (an existing key) pays nothing.
+        if map.len() >= self.max_buckets_per_shard && !map.contains_key(&ip) {
+            map.retain(|_, b| now.saturating_duration_since(b.last_seen) < IDLE_TTL);
+            if map.len() >= self.max_buckets_per_shard {
+                if let Some(coldest) = map.iter().min_by_key(|(_, b)| b.last_seen).map(|(k, _)| *k)
+                {
+                    map.remove(&coldest);
+                }
+            }
+        }
+
         let bucket = map
             .entry(ip)
             .or_insert_with(|| Bucket::new(self.capacity, now));
         let allowed = bucket.try_take(self.rate, self.capacity, now);
         // Opportunistic GC of idle buckets in this shard (amortised — only the touched shard, and only
-        // when it has grown past a small threshold, so it is O(shard size) at most occasionally).
+        // when it has grown past a small threshold, so it is O(shard size) at most occasionally). This
+        // keeps the resident set small in the common case; the hard cap above is the worst-case ceiling.
         if map.len() > 1024 {
             map.retain(|_, b| now.saturating_duration_since(b.last_seen) < IDLE_TTL);
         }
@@ -364,6 +533,26 @@ impl RateLimiter {
     #[doc(hidden)]
     pub fn allow_for_test(&self, ip: IpAddr) -> bool {
         self.allow(ip)
+    }
+
+    /// The TOTAL number of resident buckets across all shards (for the memory-cap tests). Sums each
+    /// shard's map length under its lock — a poisoned lock is recovered so the count is always readable.
+    #[doc(hidden)]
+    pub fn bucket_count_for_test(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| match s.lock() {
+                Ok(g) => g.len(),
+                Err(p) => p.into_inner().len(),
+            })
+            .sum()
+    }
+
+    /// Lower the per-shard hard cap for the memory-cap tests, so the eviction path can be exercised
+    /// without spraying hundreds of thousands of distinct IPs. Clamped to >= 1. Test-only.
+    #[doc(hidden)]
+    pub fn set_max_buckets_per_shard_for_test(&mut self, cap: usize) {
+        self.max_buckets_per_shard = cap.max(1);
     }
 }
 
@@ -378,11 +567,14 @@ const XFF: HeaderName = HeaderName::from_static("x-forwarded-for");
 /// - `trusted_proxy_hops == 0` (the default) ⇒ ALWAYS use the direct `peer` IP and IGNORE any XFF. An
 ///   untrusted XFF is attacker-controlled and spoofable, so trusting it would let an attacker dodge the
 ///   per-IP limit by rotating a fake XFF on every request — a bypass. Fail-safe: ignore it by default.
-/// - `trusted_proxy_hops == N > 0` ⇒ we sit behind N reverse proxies that each APPEND the IP they saw.
-///   The rightmost N entries are then those proxies (incl. our direct one); the client IP is the
-///   `(N+1)`-th from the right. If XFF has FEWER than `N` entries (a malformed/short header, or a
-///   request that did not actually traverse N proxies), fall back to the direct peer IP — never trust a
-///   too-short XFF, which could otherwise be spoofed to inject an arbitrary "client" IP.
+/// - `trusted_proxy_hops == N > 0` ⇒ we sit behind N reverse proxies. **Standard XFF semantics:** a
+///   proxy appends the IP it RECEIVED the connection FROM; the DIRECT proxy in front of us is the TCP
+///   peer (`ConnectInfo`) and does NOT appear as an XFF entry it wrote about itself. So a request that
+///   traversed N proxies carries exactly N XFF entries, the rightmost of which is the client as seen by
+///   the OUTERMOST-from-us proxy — and the real client IP is the **N-th entry from the RIGHT** (0-based
+///   index `N-1`). If XFF has FEWER than `N` valid entries (a malformed/short header, or a request that
+///   did not actually traverse N proxies), fall back to the direct peer IP — never trust a too-short
+///   XFF, which could otherwise be spoofed to inject an arbitrary "client" IP.
 pub fn resolve_client_ip(peer: IpAddr, xff: Option<&str>, trusted_proxy_hops: usize) -> IpAddr {
     if trusted_proxy_hops == 0 {
         return peer; // XFF untrusted — direct peer only.
@@ -393,21 +585,36 @@ pub fn resolve_client_ip(peer: IpAddr, xff: Option<&str>, trusted_proxy_hops: us
     }
 }
 
-/// Parse the client IP from an `X-Forwarded-For` value given `trusted_proxy_hops` trusted hops. Returns
-/// the `(trusted_proxy_hops + 1)`-th entry from the RIGHT (standard XFF semantics: each proxy appends),
-/// or `None` if the header has fewer than `trusted_proxy_hops + 1` valid entries (so the caller falls
-/// back to the direct peer IP). Entries that don't parse as an IP are skipped from the right, so a
-/// proxy that wrote a junk token can't shift the index.
+/// Parse the client IP from an `X-Forwarded-For` value given `trusted_proxy_hops` (`N`) trusted hops.
+/// Returns the **N-th entry from the RIGHT (0-based index `N-1`)**, or `None` if the header has fewer
+/// than `N` valid entries (so the caller falls back to the direct peer IP). Entries that don't parse as
+/// an IP are skipped from the right, so a proxy that wrote a junk token can't shift the index.
+///
+/// ## Why index `N-1` (the off-by-one this corrects)
+/// Standard XFF: each proxy APPENDS the IP it received the connection from; the DIRECT proxy in front
+/// of us is our TCP peer ([`ConnectInfo`]) and writes NOTHING about itself into the header. So for `N`
+/// proxies the header has exactly `N` entries and the real client is the LEFTMOST (the first proxy's
+/// view of the client), i.e. the N-th from the right = 0-based index `N-1`:
+/// - `N = 1`, one trusted proxy receiving DIRECTLY from the client ⇒ header `XFF: <client>` ⇒ the
+///   client is the single RIGHTMOST entry = index `0` (`N-1`). (The earlier code used index `N` = `1`
+///   here, which is `None` ⇒ it wrongly fell back to the proxy peer, collapsing every client behind
+///   the proxy onto ONE bucket.)
+/// - `N = 2` ⇒ header `XFF: <client>, <proxy1>` ⇒ client = index `1` (`N-1`) from the right.
 pub fn client_ip_from_xff(xff: &str, trusted_proxy_hops: usize) -> Option<IpAddr> {
+    // A zero-hop call never trusts XFF (the caller short-circuits to the peer); guard here too so the
+    // `N-1` index can't underflow.
+    if trusted_proxy_hops == 0 {
+        return None;
+    }
     // Collect the right-to-left sequence of PARSEABLE IPs.
     let ips: Vec<IpAddr> = xff
         .split(',')
         .rev()
         .filter_map(|tok| tok.trim().parse::<IpAddr>().ok())
         .collect();
-    // The client is the (trusted_proxy_hops)-th index from the right (0-based): index 0 is our direct
-    // proxy, index 1 the one before it, … index `trusted_proxy_hops` is the real client.
-    ips.get(trusted_proxy_hops).copied()
+    // The client is the N-th entry from the right, 0-based index `N-1`: with `N` trusted proxies the
+    // header carries `N` client-appended entries and the real client is the leftmost of them.
+    ips.get(trusted_proxy_hops - 1).copied()
 }
 
 // --- The 429 response -----------------------------------------------------------------------------
@@ -604,14 +811,32 @@ mod tests {
 
     #[test]
     fn exempt_loopback_rules() {
-        // Default ON; explicit falsey values turn it off.
+        // Default ON; explicit falsey values (in ANY casing) turn it off.
         assert!(parse_exempt_loopback(None));
         assert!(parse_exempt_loopback(Some("1".into())));
         assert!(parse_exempt_loopback(Some("true".into())));
+        assert!(
+            parse_exempt_loopback(Some("  ".into())),
+            "blank ⇒ default ON"
+        );
         assert!(!parse_exempt_loopback(Some("0".into())));
         assert!(!parse_exempt_loopback(Some("false".into())));
         assert!(!parse_exempt_loopback(Some("no".into())));
         assert!(!parse_exempt_loopback(Some("off".into())));
+        // CASING FIX (was the Low): these MUST disable the exemption — the old code only matched
+        // specific casings, so `OFF`/`No`/`FALSE` silently slipped through to the on-by-default branch.
+        assert!(
+            !parse_exempt_loopback(Some("OFF".into())),
+            "OFF must disable"
+        );
+        assert!(!parse_exempt_loopback(Some("No".into())), "No must disable");
+        assert!(
+            !parse_exempt_loopback(Some("FALSE".into())),
+            "FALSE must disable"
+        );
+        assert!(!parse_exempt_loopback(Some("Off".into())));
+        assert!(!parse_exempt_loopback(Some("NO".into())));
+        assert!(!parse_exempt_loopback(Some(" off ".into())), "trimmed");
     }
 
     // --- token-bucket core tests ---
@@ -619,8 +844,8 @@ mod tests {
     #[test]
     fn burst_then_throttle_then_refill() {
         // capacity 3, rate "0" effectively (use a tiny rate so refill in the test window is negligible).
-        // We exempt-loopback OFF and drive a non-loopback IP.
-        let rl = RateLimiter::new(0.0001, 3.0, 0, false);
+        // We exempt-loopback AND exempt-internal OFF and drive a PUBLIC (TEST-NET) IP.
+        let rl = RateLimiter::new(0.0001, 3.0, 0, false, false);
         let ip = ipv4(203, 0, 113, 7);
         // The first `capacity` requests pass (the burst), the next is limited.
         assert!(rl.allow(ip), "burst 1");
@@ -631,20 +856,35 @@ mod tests {
 
     #[test]
     fn refill_grants_more_after_wait() {
-        // A high rate refills the bucket within a short sleep so a follow-up request passes.
-        let rl = RateLimiter::new(1000.0, 1.0, 0, false);
+        // DETERMINISTIC de-flake (was flaky at rate=1000/s: >1ms could elapse between the two
+        // back-to-back allow() calls on a loaded box and refill a full token before the
+        // "immediately exhausted" assertion, ~1-in-6 flake). The fix keeps what it PROVES
+        // (burst → exhaust → refill-grants-more) but removes the race:
+        //   - rate = 5/s, capacity 1: a token takes 200ms to refill. The microseconds between the two
+        //     consecutive allow() calls refill << 0.001 token — it CANNOT cross the 1.0 boundary even
+        //     if the box stalls for tens of ms between them — so "immediately exhausted" can't race.
+        //   - then sleep a GENEROUS 400ms (2× the 200ms refill period) so ≥1 token is unambiguously
+        //     refilled regardless of scheduler jitter, and the follow-up request passes.
+        let rl = RateLimiter::new(5.0, 1.0, 0, false, false);
         let ip = ipv4(203, 0, 113, 8);
-        assert!(rl.allow(ip), "first token");
-        assert!(!rl.allow(ip), "immediately exhausted (capacity 1)");
-        std::thread::sleep(Duration::from_millis(20)); // 1000/s ⇒ ~20 tokens refilled, clamp to 1
-        assert!(rl.allow(ip), "refilled after the wait");
+        assert!(rl.allow(ip), "first token (the single-capacity burst)");
+        assert!(
+            !rl.allow(ip),
+            "immediately exhausted (capacity 1; at 5/s the sub-ms inter-call refill is << 1 token, \
+             so this cannot race even under load)"
+        );
+        std::thread::sleep(Duration::from_millis(400)); // 5/s ⇒ a token every 200ms; 400ms ⇒ ≥1 refilled
+        assert!(
+            rl.allow(ip),
+            "a full token has refilled after the 400ms wait ⇒ allowed"
+        );
     }
 
     #[test]
     fn per_ip_isolation_a_floods_b_unaffected() {
         // MUTATION KILL (per-IP isolation): a shared/global bucket would let A's flood throttle B.
         // capacity 2, negligible refill. A exhausts its bucket; B in the SAME window is unaffected.
-        let rl = RateLimiter::new(0.0001, 2.0, 0, false);
+        let rl = RateLimiter::new(0.0001, 2.0, 0, false, false);
         let a = ipv4(198, 51, 100, 1);
         let b = ipv4(198, 51, 100, 2);
         assert!(rl.allow(a), "A 1");
@@ -664,7 +904,7 @@ mod tests {
         // A modest sequential burst under the DEFAULT config must never be limited (the conformance/
         // normal-use guarantee). DEFAULT_BURST is generous; loopback-exempt is irrelevant here (use a
         // public IP), the burst alone covers it.
-        let rl = RateLimiter::new(DEFAULT_RATE_PER_IP, DEFAULT_BURST, 0, false);
+        let rl = RateLimiter::new(DEFAULT_RATE_PER_IP, DEFAULT_BURST, 0, false, false);
         let ip = ipv4(192, 0, 2, 50);
         for i in 0..(DEFAULT_BURST as usize) {
             assert!(
@@ -676,19 +916,117 @@ mod tests {
 
     #[test]
     fn loopback_is_exempt_when_enabled_and_not_when_disabled() {
-        // Exempt ON (default): loopback never limited even past a tiny capacity.
-        let rl_exempt = RateLimiter::new(0.0001, 1.0, 0, true);
+        // Exempt-loopback ON (and exempt-internal OFF so the loopback-only knob is what's tested):
+        // loopback never limited even past a tiny capacity.
+        let rl_exempt = RateLimiter::new(0.0001, 1.0, 0, true, false);
         let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
         for _ in 0..10 {
             assert!(rl_exempt.allow(lo), "loopback exempt ⇒ always allowed");
         }
-        // Exempt OFF: loopback is subject to the bucket like any IP.
-        let rl_strict = RateLimiter::new(0.0001, 1.0, 0, false);
+        // BOTH exemptions OFF: loopback is subject to the bucket like any IP.
+        let rl_strict = RateLimiter::new(0.0001, 1.0, 0, false, false);
         assert!(rl_strict.allow(lo), "loopback 1 (capacity 1)");
         assert!(
             !rl_strict.allow(lo),
-            "loopback IS limited when exemption is off"
+            "loopback IS limited when both exemptions are off"
         );
+    }
+
+    #[test]
+    fn internal_exempt_covers_loopback_private_linklocal_ula() {
+        // Exempt-internal ON (the DEFAULT): every internal source IP is exempt regardless of the bucket,
+        // EVEN with the loopback-only knob OFF. This is the footgun guard + the CTH host.docker.internal
+        // (private-IP) hop fix. Tiny capacity so a non-exempt IP would be limited after one request.
+        let rl = RateLimiter::new(0.0001, 1.0, 0, false, true);
+        let internal = [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),    // 127.0.0.1 loopback
+            ipv4(10, 1, 2, 3),                  // RFC1918 10/8
+            ipv4(172, 16, 5, 6),                // RFC1918 172.16/12
+            ipv4(172, 31, 255, 254),            // RFC1918 172.16/12 (upper edge)
+            ipv4(192, 168, 0, 1),               // RFC1918 192.168/16
+            ipv4(169, 254, 10, 20),             // link-local 169.254/16
+            "::1".parse().unwrap(),             // IPv6 loopback
+            "fc00::1".parse().unwrap(),         // IPv6 unique-local fc00::/7
+            "fd12:3456::1".parse().unwrap(),    // IPv6 unique-local (fd in fc00::/7)
+            "fe80::1".parse().unwrap(),         // IPv6 link-local fe80::/10
+            "::ffff:10.0.0.1".parse().unwrap(), // IPv4-mapped internal ⇒ still internal
+        ];
+        for ip in internal {
+            for _ in 0..5 {
+                assert!(
+                    rl.allow(ip),
+                    "internal IP {ip} must be exempt under exempt_internal (never limited)"
+                );
+            }
+        }
+        // A PUBLIC IP (172.32.x is OUTSIDE the 172.16/12 private block) is NOT internal ⇒ still limited.
+        let public = ipv4(172, 32, 1, 1);
+        assert!(rl.allow(public), "public 1 (capacity 1)");
+        assert!(
+            !rl.allow(public),
+            "a PUBLIC IP is NOT exempt under exempt_internal ⇒ limited past its burst"
+        );
+    }
+
+    #[test]
+    fn is_internal_ip_classifies_ranges() {
+        // Positive: the full internal set.
+        for ip in [
+            "127.0.0.1",
+            "127.255.255.255",
+            "10.0.0.0",
+            "10.255.255.255",
+            "172.16.0.0",
+            "172.31.255.255",
+            "192.168.0.0",
+            "192.168.255.255",
+            "169.254.0.1",
+            "::1",
+            "fc00::1",
+            "fdff::1",
+            "fe80::1",
+            "febf::1",
+            "::ffff:192.168.1.1",
+        ] {
+            assert!(
+                is_internal_ip(&ip.parse().unwrap()),
+                "{ip} must classify as INTERNAL"
+            );
+        }
+        // Negative: public / boundary-just-outside addresses.
+        for ip in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "172.15.255.255", // just below 172.16/12
+            "172.32.0.0",     // just above 172.16/12
+            "192.167.255.255",
+            "192.169.0.0",
+            "9.255.255.255",
+            "11.0.0.0",
+            "169.253.255.255",
+            "169.255.0.0",
+            "2606:4700::1111", // public v6 (Cloudflare)
+            "fbff::1",         // just below fc00::/7
+            "fec0::1",         // just above fe80::/10
+            "::ffff:8.8.8.8",  // IPv4-mapped PUBLIC ⇒ public
+        ] {
+            assert!(
+                !is_internal_ip(&ip.parse().unwrap()),
+                "{ip} must classify as PUBLIC (not internal)"
+            );
+        }
+    }
+
+    #[test]
+    fn exempt_internal_rules() {
+        // Default ON; explicit falsey (any casing) turns it off.
+        assert!(parse_exempt_internal(None));
+        assert!(parse_exempt_internal(Some("1".into())));
+        assert!(parse_exempt_internal(Some("true".into())));
+        assert!(!parse_exempt_internal(Some("0".into())));
+        assert!(!parse_exempt_internal(Some("false".into())));
+        assert!(!parse_exempt_internal(Some("OFF".into())));
+        assert!(!parse_exempt_internal(Some("No".into())));
     }
 
     // --- XFF trust tests ---
@@ -704,7 +1042,7 @@ mod tests {
         assert_eq!(r1, peer, "XFF ignored when untrusted ⇒ direct peer");
         assert_eq!(r2, peer, "a rotated XFF still resolves to the same peer");
         // Drive it through a capacity-1 bucket: the second request (spoofing a new XFF) is still limited.
-        let rl = RateLimiter::new(0.0001, 1.0, 0, false);
+        let rl = RateLimiter::new(0.0001, 1.0, 0, false, false);
         assert!(rl.allow(r1), "first from the peer");
         assert!(
             !rl.allow(r2),
@@ -713,34 +1051,82 @@ mod tests {
     }
 
     #[test]
-    fn xff_used_when_trusted_proxy_configured() {
-        // trusted_proxy_hops=1: we trust ONE proxy (the rightmost entry is that proxy; the client is the
-        // 2nd-from-right). XFF "client, proxy" ⇒ client = the LEFT entry here.
-        let peer = ipv4(10, 0, 0, 1); // our reverse proxy's address (the direct peer)
-        let client = resolve_client_ip(peer, Some("198.51.100.5, 10.0.0.1"), 1);
+    fn xff_default_zero_hops_ignores_xff_entirely() {
+        // The SAFE DEFAULT (hops=0) is UNCHANGED by the off-by-one fix: XFF is ignored and the direct
+        // peer is always used. (`client_ip_from_xff` also returns None at hops=0 so the `N-1` index
+        // cannot underflow.)
+        let peer = ipv4(203, 0, 113, 1);
+        assert_eq!(resolve_client_ip(peer, Some("8.8.8.8"), 0), peer);
+        assert_eq!(resolve_client_ip(peer, Some("8.8.8.8, 9.9.9.9"), 0), peer);
+        assert_eq!(client_ip_from_xff("8.8.8.8", 0), None);
+    }
+
+    #[test]
+    fn xff_one_proxy_client_is_the_single_rightmost_entry() {
+        // THE CORRECTED COMMON CASE (the off-by-one fix). One trusted proxy receiving DIRECTLY from the
+        // client: the proxy is our TCP peer (and writes nothing about itself), the header is just
+        // `XFF: <client>`, so the client is the SINGLE rightmost entry = 0-based index N-1 = 0. The OLD
+        // code took index N=1 ⇒ None ⇒ wrongly fell back to the proxy peer, collapsing all clients onto
+        // one bucket.
+        let proxy = ipv4(10, 0, 0, 7); // our reverse proxy = the direct peer
+        let client = ipv4(198, 51, 100, 5);
         assert_eq!(
+            resolve_client_ip(proxy, Some("198.51.100.5"), 1),
             client,
-            ipv4(198, 51, 100, 5),
-            "client = (hops+1)-th from right"
+            "hops=1, XFF=<client> ⇒ client is the single rightmost entry"
         );
-        // With two real clients behind the same proxy, each gets its OWN bucket (keyed by client IP).
-        let rl = RateLimiter::new(0.0001, 1.0, 1, false);
-        let c1 = resolve_client_ip(peer, Some("198.51.100.5, 10.0.0.1"), 1);
-        let c2 = resolve_client_ip(peer, Some("198.51.100.6, 10.0.0.1"), 1);
+        assert_eq!(client_ip_from_xff("198.51.100.5", 1), Some(client));
+        // Two distinct clients behind the same proxy each get their OWN bucket (keyed by client IP) —
+        // the very behaviour the off-by-one broke (it had keyed them all on the shared proxy peer).
+        let rl = RateLimiter::new(0.0001, 1.0, 1, false, false);
+        let c1 = resolve_client_ip(proxy, Some("198.51.100.5"), 1);
+        let c2 = resolve_client_ip(proxy, Some("198.51.100.6"), 1);
         assert!(rl.allow(c1), "client 1 first");
-        assert!(rl.allow(c2), "client 2 unaffected (own bucket)");
-        assert!(!rl.allow(c1), "client 1 now limited");
+        assert!(
+            rl.allow(c2),
+            "client 2 unaffected (its OWN bucket — not the shared proxy bucket)"
+        );
+        assert!(
+            !rl.allow(c1),
+            "client 1 now limited (its own bucket exhausted)"
+        );
+    }
+
+    #[test]
+    fn xff_two_proxies_client_is_index_n_minus_one_from_right() {
+        // hops=2: the request traversed TWO proxies, so the header carries two entries
+        // `XFF: <client>, <proxy1>` (proxy1 appended its view = the client as IT saw it; the final proxy
+        // is our peer and writes nothing of itself). The client is the N-th from the right, 0-based
+        // index N-1 = 1 ⇒ the LEFTMOST entry here.
+        let final_proxy = ipv4(10, 0, 0, 1); // our direct peer (proxy2)
+        let client = ipv4(203, 0, 113, 200);
+        assert_eq!(
+            resolve_client_ip(final_proxy, Some("203.0.113.200, 192.0.2.50"), 2),
+            client,
+            "hops=2 ⇒ client = index N-1 = 1 from the right (the leftmost of the two entries)"
+        );
+        assert_eq!(
+            client_ip_from_xff("203.0.113.200, 192.0.2.50", 2),
+            Some(client)
+        );
     }
 
     #[test]
     fn xff_too_short_falls_back_to_peer() {
-        // A trusted-1-hop config but an XFF with no client entry (only the proxy, or empty) ⇒ fall back
-        // to the direct peer IP, never invent a client (fail-safe).
+        // A trusted-hops config but FEWER than N valid entries ⇒ fall back to the direct peer IP, never
+        // invent a client (fail-safe). With the corrected index N-1, "too short" means < N entries.
         let peer = ipv4(10, 0, 0, 1);
+        // hops=2 but only ONE entry present ⇒ index N-1 = 1 is out of range ⇒ fall back to peer.
         assert_eq!(
-            resolve_client_ip(peer, Some("10.0.0.1"), 1),
+            resolve_client_ip(peer, Some("198.51.100.9"), 2),
             peer,
-            "only the proxy hop present ⇒ fall back to peer"
+            "hops=2 with a single XFF entry is too short ⇒ fall back to peer"
+        );
+        // hops=1 but the only token is junk (no valid IP) ⇒ zero valid entries ⇒ fall back to peer.
+        assert_eq!(
+            resolve_client_ip(peer, Some("not-an-ip"), 1),
+            peer,
+            "hops=1 with no PARSEABLE entry ⇒ fall back to peer"
         );
         assert_eq!(
             resolve_client_ip(peer, Some(""), 1),
@@ -756,9 +1142,116 @@ mod tests {
 
     #[test]
     fn xff_skips_junk_tokens_from_the_right() {
-        // A proxy that wrote a junk token must not shift the client index — non-IP tokens are skipped.
-        let client = client_ip_from_xff("198.51.100.5, garbage, 10.0.0.1", 1);
-        assert_eq!(client, Some(ipv4(198, 51, 100, 5)));
+        // A proxy that wrote a junk token must not shift the client index — non-IP tokens are skipped
+        // before indexing. hops=2, junk between the two real entries ⇒ still resolves the client at the
+        // (now junk-free) index N-1 = 1.
+        let client = client_ip_from_xff("203.0.113.200, garbage, 192.0.2.50", 2);
+        assert_eq!(client, Some(ipv4(203, 0, 113, 200)));
+        // hops=1 with a trailing junk token after the client: junk skipped from the right ⇒ index 0 is
+        // the real client entry.
+        assert_eq!(
+            client_ip_from_xff("198.51.100.5, garbage", 1),
+            Some(ipv4(198, 51, 100, 5))
+        );
+    }
+
+    // --- memory-cap (FIX 5) tests ---
+
+    /// A distinct cold IP for the spray, derived from a counter so each lands somewhere in the shard
+    /// space. Uses 198.18.0.0/15 (RFC 2544 benchmarking range) expanded across two octets, plus a third,
+    /// to mint > cap*shards distinct addresses.
+    fn churn_ip(n: u32) -> IpAddr {
+        // 198.18.x.y over x,y gives 65k addresses — plenty above the test cap × shards.
+        let b = ((n >> 8) & 0xff) as u8;
+        let c = (n & 0xff) as u8;
+        ipv4(198, 18, b, c)
+    }
+
+    #[test]
+    fn resident_map_is_bounded_under_distinct_ip_churn() {
+        // The MEMORY CEILING: spraying FAR more distinct IPs than the cap allows must NOT grow the
+        // resident map without bound — the hard per-shard cap bounds total buckets to shards × cap.
+        // (Without the cap, the IDLE_TTL retain alone would let the map grow to ~arrival × 600s.)
+        let mut rl = RateLimiter::new(0.0001, 1.0, 0, false, false);
+        let cap = 4usize;
+        rl.set_max_buckets_per_shard_for_test(cap);
+
+        // Spray 20_000 distinct IPs — vastly more than NUM_SHARDS × cap (= 256).
+        for n in 0..20_000u32 {
+            let _ = rl.allow(churn_ip(n));
+        }
+
+        let total = rl.bucket_count_for_test();
+        let ceiling = NUM_SHARDS * cap;
+        assert!(
+            total <= ceiling,
+            "resident buckets {total} must stay <= shards×cap = {ceiling} under churn (got {total})"
+        );
+    }
+
+    #[test]
+    fn hot_ip_throttle_survives_a_spray_of_cold_ips() {
+        // THE VERIFIER'S EXACT PROBE: a HOT (actively-requesting) IP that is over its limit must STAY
+        // throttled after a spray of cold distinct IPs — an attacker spraying cold IPs must NOT evict
+        // the hot IP's exhausted bucket (which would reset it to full burst and dodge the limit). The
+        // eviction policy is LRU-by-`last_seen`, so a continuously-warm IP is never the coldest, hence
+        // never evicted. We model "actively requesting" by re-touching H after each cold IP.
+        let mut rl = RateLimiter::new(0.0001, 1.0, 0, false, false); // capacity 1 ⇒ H exhausts after 1
+        rl.set_max_buckets_per_shard_for_test(2); // a TIGHT cap so eviction fires constantly
+
+        let hot = ipv4(203, 0, 113, 250);
+        // Exhaust H's bucket: first request passes, H is now throttled.
+        assert!(
+            rl.allow(hot),
+            "hot IP's first request (the single-capacity burst)"
+        );
+        assert!(
+            !rl.allow(hot),
+            "hot IP is now throttled (capacity 1 exhausted)"
+        );
+
+        // Spray cold IPs, keeping H WARM by re-touching it after each — so H is always the most-recently
+        // seen in its shard and can never be the coldest (evicted) bucket.
+        for n in 0..5_000u32 {
+            let _ = rl.allow(churn_ip(n));
+            // Re-touch H: it stays throttled (still no token) AND refreshes its last_seen so the churn
+            // cannot evict it. The assertion is the load-bearing one — if H had been evicted, this would
+            // recreate H's bucket at FULL burst and return `true` (a reset throttle = the bypass).
+            assert!(
+                !rl.allow(hot),
+                "hot IP n={n}: must STAY throttled — its exhausted bucket survived the cold-IP spray \
+                 (not evicted+reset). A reset would let it pass, the exact eviction bypass."
+            );
+        }
+
+        // And the map stayed bounded throughout.
+        assert!(
+            rl.bucket_count_for_test() <= NUM_SHARDS * 2,
+            "map stayed bounded under the spray"
+        );
+    }
+
+    #[test]
+    fn new_ip_at_cap_is_tracked_after_evicting_the_coldest() {
+        // A brand-new IP arriving at a FULL shard is still TRACKED (it gets a bucket after the coldest
+        // is evicted) — so the limiter keeps protecting against the newcomer; we chose eviction (a) over
+        // fail-open-when-full (b) precisely so a not-tracked IP can't get a free pass. Verify a new IP
+        // that lands in a full shard is throttled on its SECOND request (its bucket persists).
+        let mut rl = RateLimiter::new(0.0001, 1.0, 0, false, false);
+        rl.set_max_buckets_per_shard_for_test(2);
+        // Fill the space with churn so shards reach the cap.
+        for n in 0..2_000u32 {
+            let _ = rl.allow(churn_ip(n));
+        }
+        // A fresh IP: first request passes (burst 1), second is throttled — proving it got + KEPT a
+        // bucket (it was tracked, not given a fail-open pass).
+        let fresh = ipv4(192, 0, 2, 200);
+        assert!(rl.allow(fresh), "fresh IP first request passes (its burst)");
+        assert!(
+            !rl.allow(fresh),
+            "fresh IP is tracked + throttled on its 2nd request even at the shard cap (eviction, not \
+             fail-open)"
+        );
     }
 
     #[test]

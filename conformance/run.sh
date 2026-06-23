@@ -94,8 +94,18 @@ server_env() {
   SOLID_SERVER_SEED_CONFORMANCE=1 \
   SOLID_SERVER_TLS_CERT="$CERT" \
   SOLID_SERVER_TLS_KEY="$KEY" \
+  SOLID_SERVER_RATE_LIMIT_PER_IP=off \
   "$@"
 }
+# ^ SOLID_SERVER_RATE_LIMIT_PER_IP=off — disable the pre-crypto per-IP rate limiter for the harness run.
+# The CTH reaches the server through a `--network host` socat sidecar that forwards from a SINGLE
+# NON-loopback Docker-VM gateway IP (host.docker.internal), so ALL harness traffic shares ONE source IP.
+# The WAC suite's rapid PARALLEL setup bursts (many common.feature callonce iterations + pool threads,
+# all one source) would otherwise drain that single IP's token bucket → 429s → false WAC failures. The
+# CTH is a TRUSTED single-source load generator, so exempting it is legitimate (the limiter's actual
+# per-IP protection is validated by the unit + tests/rate_limit_http.rs suites, NOT the harness). The
+# default-on internal-range exemption (SOLID_SERVER_RATE_LIMIT_EXEMPT_INTERNAL) ALSO covers this private
+# host.docker.internal hop as defence-in-depth; `off` here is the explicit primary belt.
 if command -v setsid >/dev/null 2>&1; then
   server_env setsid "$SERVER_BIN" > "$REPORTS/server.log" 2>&1 &
 elif command -v python3 >/dev/null 2>&1; then

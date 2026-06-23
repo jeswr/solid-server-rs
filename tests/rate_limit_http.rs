@@ -42,7 +42,9 @@ use tower::ServiceExt;
 /// Build a router with the FULL production layering (rate limiter OUTERMOST, then admission, then auth)
 /// over a real (in-memory) LDP+auth stack, with the rate limiter sized to `(rate, burst)` and the given
 /// `trusted_proxy_hops` / `exempt_loopback`. A generous admission ceiling (won't shed) so only the rate
-/// limiter is exercised.
+/// limiter is exercised. `exempt_internal` is set FALSE for these tests (they drive PUBLIC TEST-NET IPs
+/// through the bucket; with the default-on internal exemption those would be exempted and the bucket
+/// never exercised — the internal-exemption behaviour itself is unit-tested in `rate_limit.rs`).
 fn app_with_rate_limit(
     rate: f64,
     burst: f64,
@@ -65,6 +67,7 @@ fn app_with_rate_limit(
             burst,
             trusted_proxy_hops,
             exempt_loopback,
+            /* exempt_internal = */ false,
         )),
     };
     build_router_with_overload(AppState::new(ctx, ldp), overload)
@@ -323,17 +326,20 @@ async fn spoofed_rotating_xff_does_not_dodge_the_per_ip_limit() {
 
 #[tokio::test]
 async fn trusted_xff_keys_the_bucket_by_client_ip() {
-    // With trusted_proxy_hops=1, two distinct CLIENT IPs behind the same proxy peer each get their own
-    // bucket — keyed by the XFF client IP, not the shared proxy peer. capacity 1: each client's first
-    // request reaches auth (401), and a client's SECOND request is 429 (its own bucket exhausted),
-    // while the OTHER client is unaffected. This proves trusted XFF is honoured.
+    // With trusted_proxy_hops=1 and ONE proxy receiving DIRECTLY from the client, the header is
+    // `XFF: <client>` (the proxy is our TCP peer and writes nothing of itself), so the client is the
+    // SINGLE rightmost entry (the corrected off-by-one: index N-1 = 0). Two distinct CLIENT IPs behind
+    // the same proxy peer each get their OWN bucket — keyed by the XFF client IP, not the shared proxy
+    // peer. capacity 1: each client's first request reaches auth (401), the SECOND is 429 (own bucket
+    // exhausted), while the OTHER client is unaffected. This proves trusted XFF is honoured AND keyed by
+    // the real client (the bug had collapsed all clients onto the shared proxy bucket).
     let app = app_with_rate_limit(0.0001, 1.0, 1, false);
     let proxy = "10.0.0.1:1000"; // the direct peer is our trusted reverse proxy
 
-    // Client 198.51.100.5 — XFF "client, proxy" (proxy appended its view = the rightmost entry).
+    // Client 198.51.100.5 — XFF "<client>" (one proxy ⇒ a single entry = the client).
     let c1a = app
         .clone()
-        .oneshot(req_from(proxy, Some("198.51.100.5, 10.0.0.1")))
+        .oneshot(req_from(proxy, Some("198.51.100.5")))
         .await
         .unwrap();
     assert_eq!(
@@ -345,7 +351,7 @@ async fn trusted_xff_keys_the_bucket_by_client_ip() {
     // A DIFFERENT client behind the same proxy is unaffected (own bucket) ⇒ auth.
     let c2a = app
         .clone()
-        .oneshot(req_from(proxy, Some("198.51.100.6, 10.0.0.1")))
+        .oneshot(req_from(proxy, Some("198.51.100.6")))
         .await
         .unwrap();
     assert_eq!(
@@ -357,7 +363,7 @@ async fn trusted_xff_keys_the_bucket_by_client_ip() {
     // client1's SECOND request exhausts ITS bucket ⇒ 429.
     let c1b = app
         .clone()
-        .oneshot(req_from(proxy, Some("198.51.100.5, 10.0.0.1")))
+        .oneshot(req_from(proxy, Some("198.51.100.5")))
         .await
         .unwrap();
     assert_eq!(

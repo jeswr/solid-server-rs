@@ -333,9 +333,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let burst = rate_limit::burst_from_env();
             let trusted_hops = rate_limit::trusted_proxy_hops_from_env();
             let exempt_loopback = rate_limit::exempt_loopback_from_env();
+            let exempt_internal = rate_limit::exempt_internal_from_env();
             eprintln!(
                 "  RATE-LIMIT: per-IP token bucket ENABLED (rate {rate}/s, burst {burst}; excess ⇒ \
                  429 + Retry-After BEFORE auth/crypto). XFF trusted hops: {trusted_hops} ({}). \
+                 exempt-internal: {exempt_internal} (loopback+private+link-local+ULA — the default; \
+                 protects against PUBLIC-internet per-source floods, set SOLID_SERVER_TRUSTED_PROXY to \
+                 rate-limit clients behind a trusted proxy by their real public IP). \
                  loopback-exempt: {exempt_loopback}. health probes /livez + /readyz are EXEMPT.",
                 if trusted_hops == 0 {
                     "XFF untrusted — direct peer IP"
@@ -343,7 +347,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "client IP taken from X-Forwarded-For"
                 }
             );
-            Some(RateLimiter::new(rate, burst, trusted_hops, exempt_loopback))
+            Some(RateLimiter::new(
+                rate,
+                burst,
+                trusted_hops,
+                exempt_loopback,
+                exempt_internal,
+            ))
         }
         RateConfig::Disabled => {
             eprintln!(
