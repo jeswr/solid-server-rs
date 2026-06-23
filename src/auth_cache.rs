@@ -208,6 +208,16 @@ impl VerifiedTokenCache {
         Sha256::digest(access_token.as_bytes()).into()
     }
 
+    /// The DPoP `ath` value for a token whose SHA-256 digest is ALREADY computed: `base64url(digest)`.
+    /// Derived from the SAME 32-byte SHA-256 the cache key uses, so an authenticated hit hashes the
+    /// access token exactly ONCE per request (the key + the `ath` comparison share the digest) rather
+    /// than the two independent `Sha256::digest(token)` calls the old `key()` + `ath()` pair ran. The
+    /// produced string is byte-identical to the standalone `ath()` (same digest, same base64url-no-pad
+    /// encoding) so the security comparison `proof.ath == base64url(SHA-256(token))` is unchanged.
+    fn ath_from_digest(digest: &[u8; 32]) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+    }
+
     /// Attempt to authenticate a token-bearing request from the cache.
     ///
     /// - On a MISS (no live, unexpired entry) returns [`CacheDecision::Miss`] -- the caller runs the
@@ -267,16 +277,10 @@ impl VerifiedTokenCache {
 
         // --- HIT: the access token is trusted (it was fully verified when inserted, and is not yet
         // expired). Now FULLY verify the FRESH DPoP proof + replay + binding for THIS request. Nothing
-        // here is cached -- every check runs every request. ---
-        match self.verify_fresh_proof(
-            dpop_proof,
-            access_token,
-            &entry.cnf_jkt,
-            method,
-            url,
-            now,
-            replay,
-        ) {
+        // here is cached -- every check runs every request. The cache `key` already IS SHA-256(token);
+        // pass it through so the `ath` comparison reuses that digest instead of hashing the token a
+        // second time (the only `ath` input is `base64url` of this exact digest). ---
+        match self.verify_fresh_proof(dpop_proof, &key, &entry.cnf_jkt, method, url, now, replay) {
             Ok(()) => CacheDecision::Verified(entry.token),
             Err(e) => CacheDecision::Reject(e),
         }
@@ -340,7 +344,7 @@ impl VerifiedTokenCache {
     fn verify_fresh_proof(
         &self,
         dpop_proof: Option<&str>,
-        access_token: &str,
+        token_digest: &[u8; 32],
         cnf_jkt: &str,
         method: &str,
         url: &str,
@@ -363,9 +367,13 @@ impl VerifiedTokenCache {
             return Err(invalid_token_dpop("DPoP proof htm mismatch."));
         }
 
-        // (htu) normalised exact-URL match (query/fragment stripped, default ports normalised).
+        // (htu) normalised exact-URL match (query/fragment stripped, default ports normalised). Normalise
+        // the REQUEST url ONCE (one `url::Url::parse`) and compare against the normalised proof `htu` —
+        // the old code parsed `url` afresh inside the match arm, re-parsing the same string each call.
+        // Semantics unchanged: both sides go through the same `normalize_htu` before the string compare.
+        let normalized_url = normalize_htu(url);
         match claims.get("htu").and_then(Value::as_str) {
-            Some(h) if normalize_htu(h) == normalize_htu(url) => {}
+            Some(h) if normalize_htu(h) == normalized_url => {}
             _ => return Err(invalid_token_dpop("DPoP proof htu mismatch.")),
         }
 
@@ -395,19 +403,22 @@ impl VerifiedTokenCache {
 
         // (ath) base64url(SHA-256(access_token)). ath-compat ONLY when opted-in AND the proof omits
         // ath; a present-but-wrong ath is ALWAYS rejected (only absence is tolerated, exactly as the
-        // verifier routes).
+        // verifier routes). The expected value is base64url of the cache key's SHA-256 digest of the
+        // token (`ath_from_digest`) — byte-identical to the old `ath(access_token)` but reusing the
+        // already-computed digest, so the token is hashed once per request, not twice. Computed lazily
+        // (only when an `ath` comparison is actually needed) so the ath-compat-absent path skips it.
         let ath_compat = self.policy.allow_missing_ath && !proof_has_ath(proof);
         let require_ath = !ath_compat;
         let proof_ath = claims.get("ath").and_then(Value::as_str);
         if require_ath {
-            let expected = ath(access_token);
+            let expected = Self::ath_from_digest(token_digest);
             match proof_ath {
                 Some(a) if a == expected => {}
                 Some(_) => return Err(invalid_token_dpop("DPoP proof ath mismatch.")),
                 None => return Err(invalid_token_dpop("DPoP proof is missing ath.")),
             }
         } else if let Some(a) = proof_ath {
-            if a != ath(access_token) {
+            if a != Self::ath_from_digest(token_digest) {
                 return Err(invalid_token_dpop("DPoP proof ath mismatch."));
             }
         }
@@ -472,12 +483,6 @@ fn peek_jti(proof: &str) -> Option<String> {
     peek_claims(proof)
         .and_then(|c| c.get("jti").and_then(Value::as_str).map(str::to_string))
         .filter(|s| !s.is_empty())
-}
-
-/// base64url(SHA-256(token)) -- the DPoP `ath` value (matches the verifier's `ath`).
-fn ath(token: &str) -> String {
-    let digest = Sha256::digest(token.as_bytes());
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
 }
 
 /// Normalise an `htu` the way the verifier (and `oauth4webapi.validateDPoP`) does: strip query +
