@@ -172,7 +172,8 @@ op timeout, so a slow Redis becomes a fast 503, never a worker pile-up. The inte
 (`tests/redis_replay.rs`, behind the feature + the `PSS_IT_REDIS_URL` env gate) proves the
 cross-instance replay rejection, the fail-closed posture, and TTL expiry. Bring up the test Redis
 with `docker compose up -d redis`. The Redis-outage failure mode + the async-replication-on-failover
-hazard + HA topology are documented in the project issue tracker.
+hazard + HA topology + cost are documented in
+[issue #1](https://github.com/jeswr/solid-server-rs/issues/1).
 
 Auth is **real**: the server performs live OIDC discovery + JWKS fetch against the trusted issuer
 (over the DNS-pinned SSRF-guarded fetcher) and, by default, the strict bidirectional WebID↔issuer
