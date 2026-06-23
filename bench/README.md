@@ -44,9 +44,21 @@ brew install oha
 
 ## Scenarios
 
+`bench/run.sh` (auth-free `oha`) measures:
+
 - **(a) `public-doc`** — `GET /bench/public/doc`: the TLS/pipeline ceiling (no auth, no RDF render).
 - **(b) `listing`** — `GET /bench/listing/`: the RDF container-membership render path (N children).
-- **(c) authed private GET** — DEFERRED, see below.
+
+`bench/run-auth.sh` (the round-2 authenticated harness, see **"Authenticated benchmark"** below)
+measures the realistic **production** path:
+
+- **(c) `authed-private-doc`** — authenticated `GET` of an owner-private document over DPoP: the
+  auth-verify hot path (token verify + DPoP verify + JWKS-cache lookup + the single ACL read/parse).
+- **(d) `authed-listing`** — authenticated `GET` of an owner-private container listing: auth + RDF
+  render combined.
+
+It ALSO runs an anonymous comparison sweep (same client, no token) so the **auth overhead** is
+measured apples-to-apples on the same box/binary/run. Results → `bench/AUTH-BASELINE.md`.
 
 ## Tool
 
@@ -80,22 +92,80 @@ It is dev-only, additive, and identical in nature to the conformance seed (`seed
 ONLY writes resources and changes no request-handling code path. Conformance stays 41/41 (the gate is
 off during conformance runs). Never set `SOLID_SERVER_SEED_BENCH` against a real (SPARQ/S3) backend.
 
-## Authed follow-up (scenario c)
+## Authenticated benchmark (`bench/run-auth.sh`) — the round-2 auth path
 
-Measuring the **authenticated** GET (the DPoP/token-verify hot path) needs a DPoP-bound RFC 9068
-token from the conformance Keycloak `solid` realm — and a **fresh DPoP proof per request** (RFC 9449
-binds the proof to the method + URL + a unique `jti`, and the server enforces `ath`). `oha` cannot
-mint a per-request DPoP proof, so a static `-H "Authorization: …"` header would be rejected (replay /
-`ath` mismatch). The honest options for the follow-up round:
+Measuring the **authenticated** GET (the DPoP/token-verify hot path — the realistic production path)
+needs a DPoP-bound RFC 9068 token from the conformance Keycloak `solid` realm AND a **fresh DPoP proof
+per request** (RFC 9449 binds the proof to the method + URL + a unique `jti`, and the server enforces
+`ath`). `oha` cannot mint a per-request DPoP proof, so this is driven by a small **Rust load client**
+(`examples/auth_load.rs`) instead.
 
-1. a small Rust load client that mints a fresh DPoP proof per request (reuse the verifier crate's test
-   DPoP helpers) against the seeded `/bench/private/doc`; or
-2. extend the conformance Keycloak wiring (`conformance/`) to issue a token and drive a
-   lower-concurrency authed sweep where per-request proof minting is affordable.
+### Quick start
 
-Until then, authenticated throughput is recorded as an explicit TODO in `BASELINE.md`, **not** faked.
+```bash
+# Prereq: the SAME Keycloak `solid` realm prod-solid-server conformance uses, UP at
+# localhost:8080/realms/solid (`docker compose up -d` in prod-solid-server). NOTHING in it is modified.
+./bench/run-auth.sh
+```
+
+`run-auth.sh`:
+
+1. builds `--release` server + the `auth_load` example;
+2. boots the server in-memory over HTTPS, **conformance-seeded** (so alice's WebID + owner-controlled
+   pod exist) at `https://localhost:3000` (the base the realm tokens' `aud` expects), with
+   `ALLOW_LOOPBACK + http issuer + BIDIRECTIONAL=off` — the **exact auth env conformance/run.sh uses**
+   (the verify path is identical), plus the dev-only replay-capacity override (see below);
+3. the load client obtains a DPoP-bound token from the realm `conformance-alice` client-credentials
+   service account (REUSING `conformance/config/solid-server-rs.env`'s client id/secret/token
+   endpoint — no new auth flow invented), PUTs a private fixture document + N private listing children
+   into alice's pod, asserts a single **authed GET → 200** AND an **anonymous GET → 401** (genuinely
+   private) BEFORE the sweep (a misbuilt proof would otherwise measure the 401 path);
+4. sweeps concurrency for **(c) authed-private-doc** + **(d) authed-listing**, each request carrying a
+   freshly minted DPoP proof (`htu`=exact URL, `htm`=GET, unique `jti`, `ath`=base64url(SHA-256(token)));
+5. re-runs an **anonymous** comparison sweep (same client, no token) on the public bench doc, so the
+   auth overhead is measured apples-to-apples;
+6. writes `bench/results-auth/{authed,anon}.tsv` + per-level `*.json` (same shape as the `oha` JSON).
+
+### How the token + proof are built
+
+- **Token (once):** the realm requires a DPoP proof ON THE TOKEN REQUEST (DPoP-bound client
+  credentials), so the client mints a token-endpoint proof (htu=token endpoint, htm=POST, no `ath`),
+  POSTs `grant_type=client_credentials`, and receives a `cnf.jkt`-bound `at+jwt` whose `webid` is
+  alice + `aud` the server base URL.
+- **Proof (per request):** a fresh proof from the SAME ES256 key (htu=request URL, htm=GET/PUT, unique
+  `jti`, `ath` over the token). The `jti` carries a **per-process random nonce** so a fresh client run
+  against an already-running server never collides with a prior run's jtis in the replay store (which
+  would be rejected as replays). This was a real bug found while building the harness.
+
+### The DPoP replay-store capacity knob (dev/bench only, default-off)
+
+The in-memory jti replay store is capped at **100,000** live jtis within the proof-age TTL window
+(`DPOP_PROOF_MAX_AGE_SECS` 300 + clock tolerance 5 = **305 s**) and **fails closed** when full (it
+never evicts a live jti). A SUSTAINED high-RPS authed run fills 100k unique jtis in seconds and then —
+correctly — rejects every further proof (the single-instance safety bound). That is a real production
+behaviour (recorded as a round-3 finding in `AUTH-BASELINE.md`), but it would CONTAMINATE the
+steady-state verify-cost measurement. So the server gained a **default-off, conformance-neutral** env
+override `SOLID_SERVER_REPLAY_MAX_ENTRIES` (UNSET ⇒ 100_000 unchanged) that ONLY raises the capacity
+number — no request-handling logic changes; the fail-closed semantics are untouched; `0`/invalid keeps
+the default so a typo can never weaken replay protection. `run-auth.sh` raises it for the bench run so
+every level measures the genuine verify path at 100% success. **Never set it in production.**
+
+### Knobs (env overrides)
+
+| env | default | meaning |
+|---|---|---|
+| `AUTH_BENCH_PORT` | `3000` | server port (3000 == the conformance base the realm tokens' `aud` expects) |
+| `AUTH_DURATION_SECS` | `10` | measured window per concurrency level |
+| `AUTH_WARMUP_SECS` | `3` | discarded warm-up per scenario |
+| `AUTH_CONCURRENCY` | `1 8 16 32 64 128 256 512` | the concurrency sweep |
+| `AUTH_LISTING_CHILDREN` | `100` | owner-private children PUT into the authed-listing container (scenario d) |
+| `AUTH_CLIENT_ID` / `AUTH_CLIENT_SECRET` | `conformance-alice` / `…-secret` | the realm service-account client |
+| `AUTH_REPLAY_MAX_ENTRIES` | `5000000` | the dev/bench replay-cap override (see above) |
 
 ## Results
 
-See `bench/BASELINE.md` for the captured baseline table + the saturation/concurrency findings + the
-ranked hot-path optimization targets. Those numbers are generated by THIS harness — re-run to refresh.
+- `bench/BASELINE.md` — the **anonymous** baseline (the `oha` harness): public-doc ceiling + listing
+  render path + saturation/concurrency findings + ranked read-path targets.
+- `bench/AUTH-BASELINE.md` — the **authenticated** baseline (this harness): scenarios (c)+(d), the
+  auth-overhead-vs-anonymous delta, the replay-store saturation finding, and the ranked round-3
+  auth-path hot-path targets. Those numbers are generated by `run-auth.sh` — re-run to refresh.

@@ -107,10 +107,13 @@ rustls-pemfile = "2"
 # already transitively present (tokio-tungstenite + axum depend on it).
 tokio-tungstenite = "0.29"
 futures-util = "0.3"
-# The live WS test's HTTP client (subscribe POST + the PUT). reqwest is ALREADY in the resolved tree
-# (the verifier's `network` feature pulls it in for OIDC/JWKS/WebID fetches), so naming it here adds
-# NO new crate. Used ONLY in the default-`#[ignore]`d live test.
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# The live WS test's HTTP client (subscribe POST + the PUT) AND the round-2 authenticated load client
+# (`examples/auth_load.rs`). reqwest is ALREADY in the resolved tree (the verifier's `network` feature
+# pulls it in for OIDC/JWKS/WebID fetches with `rustls-tls`), so naming these features here adds NO new
+# crate — `rustls-tls` is already resolved. `rustls-tls` is required so the auth load client can speak
+# HTTPS to the bench server's self-signed localhost listener; `json` for the WS test. Used ONLY in
+# default-`#[ignore]`d tests + the auth-load example (never the server binary).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [features]
 default = []
