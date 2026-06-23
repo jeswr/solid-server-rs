@@ -39,6 +39,7 @@ use solid_oidc_verifier::config::{NetworkJwksProvider, VerifierConfig};
 use solid_oidc_verifier::replay::InMemoryReplayStore;
 use solid_oidc_verifier::verifier::Verifier;
 use solid_oidc_verifier::webid::{BidirectionalMode, NetworkWebIdResolver};
+use solid_server_rs::acl_cache::{AclCache, DEFAULT_ACL_CACHE_CAPACITY};
 use solid_server_rs::app::{build_router, AppState};
 use solid_server_rs::auth::AuthContext;
 use solid_server_rs::auth_cache::{
@@ -98,6 +99,13 @@ const ENV_SEED_BENCH: &str = "SOLID_SERVER_SEED_BENCH";
 /// would-be-401/403 into a 200. Set to `0` to DISABLE the cache (every authenticated request runs the
 /// full verifier -- the pre-round-3 path). Conformance-neutral. See [`solid_server_rs::auth_cache`].
 const ENV_TOKEN_CACHE_CAPACITY: &str = "SOLID_SERVER_TOKEN_CACHE_CAPACITY";
+/// ETag-keyed parsed-ACL cache capacity (distinct cached `.acl` resources). Unset =>
+/// [`DEFAULT_ACL_CACHE_CAPACITY`]. The cache reuses the PARSED triples of an UNCHANGED ACL across reads
+/// (keyed by `(acl-iri, etag)`), skipping the byte-fetch + `oxttl` re-parse on a hot resource — without
+/// ever changing a decision (it is never authoritative: a rotated/removed ACL forces a re-read via the
+/// etag/`meta` gate). Set to `0` to DISABLE the cache (every read re-reads + re-parses each ACL — the
+/// pre-cache path). Conformance-neutral. See [`solid_server_rs::acl_cache`].
+const ENV_ACL_CACHE_CAPACITY: &str = "SOLID_SERVER_ACL_CACHE_CAPACITY";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -272,7 +280,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let ldp = LdpState::new(store, base_url.clone());
+    let mut ldp = LdpState::new(store, base_url.clone());
+    // ETag-keyed parsed-ACL cache (read-path optimisation #3). Default-on; `=0` disables it (byte-
+    // identical pre-cache behaviour). A cache HIT reuses the parsed `.acl` triples of an UNCHANGED ACL
+    // across reads (keyed by `(acl-iri, etag)`) — it can never serve a rotated/removed ACL stale, so
+    // it never changes a decision. The validation TTL is bound by the JWKS cache TTL (same freshness
+    // window the auth caches use) so a misbehaving etag can never mask a change indefinitely.
+    let acl_cache_capacity = parse_cache_capacity_for(
+        std::env::var(ENV_ACL_CACHE_CAPACITY).ok(),
+        DEFAULT_ACL_CACHE_CAPACITY,
+    );
+    let acl_cache = if acl_cache_capacity == 0 {
+        eprintln!("  AUTHZ: ETag-keyed parsed-ACL cache DISABLED (re-read + re-parse every ACL).");
+        AclCache::disabled()
+    } else {
+        eprintln!(
+            "  AUTHZ: ETag-keyed parsed-ACL cache ENABLED (capacity {acl_cache_capacity} ACLs; \
+             reuses an UNCHANGED ACL's parse, never authoritative)."
+        );
+        AclCache::with_max_entry_ttl(acl_cache_capacity, jwks_cache_ttl.as_secs() as i64)
+    };
+    ldp.set_acl_cache(acl_cache);
 
     let app = build_router(AppState::new(auth, ldp));
 
@@ -372,9 +400,17 @@ fn env_flag(key: &str) -> bool {
 /// is an explicit `0` only) -- a fat-fingered value should not quietly drop the perf win, and the cache
 /// is fail-safe (a miss just re-verifies).
 fn parse_cache_capacity(raw: Option<String>) -> usize {
+    parse_cache_capacity_for(raw, DEFAULT_CACHE_CAPACITY)
+}
+
+/// As [`parse_cache_capacity`], but with an explicit `default` for the absent/empty/non-numeric case —
+/// shared by the token cache (`DEFAULT_CACHE_CAPACITY`) and the ACL cache
+/// ([`DEFAULT_ACL_CACHE_CAPACITY`]). `0` is the explicit DISABLE; a fat-fingered non-numeric value
+/// falls back to `default` (enabled) rather than silently dropping the perf win.
+fn parse_cache_capacity_for(raw: Option<String>, default: usize) -> usize {
     match raw.as_deref().map(str::trim) {
-        None | Some("") => DEFAULT_CACHE_CAPACITY,
-        Some(s) => s.parse::<usize>().unwrap_or(DEFAULT_CACHE_CAPACITY),
+        None | Some("") => default,
+        Some(s) => s.parse::<usize>().unwrap_or(default),
     }
 }
 

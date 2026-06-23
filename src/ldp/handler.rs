@@ -37,6 +37,7 @@ use axum::Extension;
 
 use oxrdf::{NamedNode, Triple};
 
+use crate::acl_cache::AclCache;
 use crate::auth::VerifiedToken;
 use crate::authz::wac::{Decision, ReadDecision, WacAuthorizer};
 use crate::authz::wac_allow::wac_allow_header;
@@ -76,6 +77,13 @@ pub struct LdpState<S: Store> {
     /// assembly ([`AppState::new`](crate::app::AppState::new)) so the LDP layer can answer 401 +
     /// challenge WITHOUT a handle to the verifier; a default Bearer/DPoP challenge is used if unset.
     pub www_authenticate: String,
+    /// The per-instance ETag-keyed parsed-ACL cache (read-path optimisation #3). Shared across all
+    /// requests (it lives in the server-lifetime `Arc<LdpState>`), so a hot resource's UNCHANGED `.acl`
+    /// is parsed once and reused — keyed by `(acl-iri, etag)`, never authoritative (see
+    /// [`crate::acl_cache`]). Default-on at [`AclCache::new`]`(`[`DEFAULT_ACL_CACHE_CAPACITY`]`)`;
+    /// `SOLID_SERVER_ACL_CACHE_CAPACITY=0` ([`AclCache::disabled`]) yields byte-identical pre-cache
+    /// behaviour. Configured at router assembly via [`set_acl_cache`](Self::set_acl_cache).
+    pub acl_cache: AclCache,
 }
 
 /// The fallback `WWW-Authenticate` challenge used when no verifier-derived one was injected (e.g. a
@@ -97,6 +105,9 @@ impl<S: Store> LdpState<S> {
             base_url: base_url.into(),
             notifications,
             www_authenticate: DEFAULT_WWW_AUTHENTICATE.to_string(),
+            // Default-on: the ACL cache is enabled at the default capacity. `main.rs` overrides this
+            // from `SOLID_SERVER_ACL_CACHE_CAPACITY` at router assembly (`=0` ⇒ disabled).
+            acl_cache: AclCache::new(crate::acl_cache::DEFAULT_ACL_CACHE_CAPACITY),
         }
     }
 
@@ -105,6 +116,22 @@ impl<S: Store> LdpState<S> {
     /// issuer(s)/algs as every other challenge.
     pub fn set_www_authenticate(&mut self, challenge: impl Into<String>) {
         self.www_authenticate = challenge.into();
+    }
+
+    /// Replace the ACL cache (called by `main.rs` at router assembly to apply the operator-configured
+    /// capacity / disable it). The default constructors already enable it at the default capacity.
+    pub fn set_acl_cache(&mut self, acl_cache: AclCache) {
+        self.acl_cache = acl_cache;
+    }
+
+    /// Invalidate the cached parse of an ACL resource after a successful WRITE / DELETE of it (belt-and-
+    /// braces — the `(acl-iri, etag)` gate already prevents serving a rotated ACL stale, but freeing the
+    /// slot on a mutation is cheap and makes a delete take effect immediately). A no-op for a
+    /// non-`.acl` target or a disabled cache.
+    fn invalidate_acl_if_acl(&self, target_iri: &str) {
+        if crate::authz::is_acl_resource(target_iri) {
+            self.acl_cache.invalidate(target_iri);
+        }
     }
 
     /// Build the 401 `Unauthorized` error (with the cached challenge) for an anonymous request to a
@@ -159,7 +186,7 @@ impl<S: Store> LdpState<S> {
         } else {
             mode_for_operation(method, &target.iri, target.is_container)
         };
-        let wac = WacAuthorizer::new(&self.store, &self.base_url);
+        let wac = WacAuthorizer::with_cache(&self.store, &self.base_url, &self.acl_cache);
         match wac
             .authorize_read(&target.iri, required, token.web_id.as_deref(), origin)
             .await?
@@ -187,7 +214,7 @@ impl<S: Store> LdpState<S> {
         } else {
             required
         };
-        let wac = WacAuthorizer::new(&self.store, &self.base_url);
+        let wac = WacAuthorizer::with_cache(&self.store, &self.base_url, &self.acl_cache);
         match wac
             .authorize(&target.iri, required, token.web_id.as_deref(), origin)
             .await?
@@ -208,7 +235,7 @@ impl<S: Store> LdpState<S> {
         token: &VerifiedToken,
         origin: Option<&str>,
     ) -> Result<(), ServerError> {
-        let wac = WacAuthorizer::new(&self.store, &self.base_url);
+        let wac = WacAuthorizer::with_cache(&self.store, &self.base_url, &self.acl_cache);
         match wac
             .authorize(target_iri, required, token.web_id.as_deref(), origin)
             .await?
@@ -543,6 +570,11 @@ pub async fn put_handler<S: Store>(
         .notify(&target.iri, activity, emit_parent.as_deref())
         .await;
 
+    // A PUT to an `.acl` resource changed the access rules: invalidate the cached parse so the NEXT
+    // read resolves against the new ACL immediately (belt-and-braces over the etag gate; see
+    // `invalidate_acl_if_acl`).
+    state.invalidate_acl_if_acl(&target.iri);
+
     Ok(write_response(existed, &meta, &target.iri))
 }
 
@@ -758,6 +790,10 @@ pub async fn delete_handler<S: Store>(
     } else {
         // A plain resource: the (non-atomic) removal is fine — there is no empty-check to race.
         state.store.delete(&target.iri, parent.as_deref()).await?;
+        // A DELETE of an `.acl` removed the access rules (the resource now inherits): invalidate the
+        // cached parse so the NEXT read no longer sees the deleted ACL's grants (the `meta` probe will
+        // now report it absent and the walk inherits — invalidating frees the slot at once).
+        state.invalidate_acl_if_acl(&target.iri);
         // EMIT: Delete on the resource + a derived Remove on its parent container.
         state
             .notifications
@@ -971,6 +1007,10 @@ pub async fn patch_handler<S: Store>(
         .notifications
         .notify(&target.iri, activity, emit_parent.as_deref())
         .await;
+
+    // A PATCH to an `.acl` resource edited the access rules: invalidate the cached parse so the NEXT
+    // read resolves against the patched ACL immediately.
+    state.invalidate_acl_if_acl(&target.iri);
 
     Ok(write_response(existed, &meta, &target.iri))
 }
@@ -1754,7 +1794,14 @@ mod tests {
             ))
         }
         async fn meta(&self, _iri: &str) -> ServerResult<Option<ResourceMeta>> {
-            Ok(None)
+            // CONSISTENT with `read`: a real store's `meta` and `read` share ONE authoritative
+            // (`get_meta`) source, so they can NOT disagree on presence/error. Since `read` faults with
+            // a non-`NotFound` `Storage` error, `meta` faults the SAME way — so the ACL-cache's cheap
+            // `meta` probe propagates the inconsistency (fail-closed), NEVER treats it as "absent ACL".
+            // (Returning `Ok(None)` here would model an impossible store and let the resolver fail OPEN.)
+            Err(ServerError::Storage(
+                "simulated backend inconsistency".into(),
+            ))
         }
         async fn exists(&self, _iri: &str) -> ServerResult<bool> {
             Ok(false)
@@ -1883,7 +1930,25 @@ mod tests {
             // No other ACL anywhere up the tree.
             Err(ServerError::NotFound)
         }
-        async fn meta(&self, _iri: &str) -> ServerResult<Option<ResourceMeta>> {
+        async fn meta(&self, iri: &str) -> ServerResult<Option<ResourceMeta>> {
+            // CONSISTENT with `read` (a real store's `meta`/`read` share one `get_meta` source):
+            //  - the target IRI → the SAME non-`NotFound` `Storage` fault `read` raises (the
+            //    inconsistency surfaces through the ACL-cache's cheap `meta` probe too, never as absent);
+            //  - the target's `.acl` → `Some` with the SAME etag `read` serves, so the cache MISSES then
+            //    `read`s + parses it (authz sees the owner-only ACL);
+            //  - anything else → `None` (absent), matching `read`'s `NotFound`.
+            if iri == self.target {
+                return Err(ServerError::Storage(
+                    "simulated backend inconsistency".into(),
+                ));
+            }
+            if iri == format!("{}.acl", self.target) {
+                return Ok(Some(ResourceMeta {
+                    content_type: "text/turtle".into(),
+                    blob_key: "k".into(),
+                    etag: "\"acl\"".into(),
+                }));
+            }
             Ok(None)
         }
         async fn exists(&self, _iri: &str) -> ServerResult<bool> {

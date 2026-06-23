@@ -42,6 +42,7 @@
 //! (Protocol 25/25 + WAC 16/16) — see `conformance/SCORE.md`. The default impls used here are
 //! in-memory test doubles.
 
+pub mod acl_cache;
 pub mod app;
 pub mod auth;
 pub mod auth_cache;

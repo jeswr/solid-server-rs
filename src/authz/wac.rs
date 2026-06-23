@@ -25,6 +25,7 @@
 
 use std::collections::BTreeSet;
 
+use crate::acl_cache::AclCache;
 use crate::error::ServerError;
 use crate::ldp::content::{classify, parse_to_triples, RdfFormat};
 use crate::store::Store;
@@ -92,16 +93,39 @@ impl ResolvedAcl {
 }
 
 /// The Web Access Control authorizer over a [`Store`] and the server base URL.
+///
+/// Optionally fronted by a per-instance [`AclCache`] (read-path optimisation #3): when present, the
+/// effective-ACL resolution reuses the PARSED triples of an UNCHANGED ACL across requests (keyed by
+/// `(acl-iri, etag)`), skipping the byte-fetch + `oxttl` re-parse — without ever changing the decision
+/// (the cache is never authoritative; see [`crate::acl_cache`]). When absent (`None`) the resolver
+/// reads + parses every ACL every time — the pre-cache behaviour, also exactly what the `=0` disabled
+/// cache yields.
 pub struct WacAuthorizer<'a, S: Store> {
     store: &'a S,
     base_url: String,
+    /// The shared, per-instance parsed-ACL cache (`None` ⇒ no caching, every ACL read+parsed afresh).
+    acl_cache: Option<&'a AclCache>,
 }
 
 impl<'a, S: Store> WacAuthorizer<'a, S> {
+    /// Build an authorizer with NO ACL cache — every effective-ACL resolution reads + parses each
+    /// candidate ACL afresh (the pre-cache path; used by unit tests and any caller without a cache).
     pub fn new(store: &'a S, base_url: impl Into<String>) -> Self {
         Self {
             store,
             base_url: base_url.into(),
+            acl_cache: None,
+        }
+    }
+
+    /// Build an authorizer fronted by the per-instance [`AclCache`]. The cache reuses the PARSED
+    /// triples of an unchanged ACL across requests (keyed by `(acl-iri, etag)`), never changing a
+    /// decision (see [`crate::acl_cache`]).
+    pub fn with_cache(store: &'a S, base_url: impl Into<String>, acl_cache: &'a AclCache) -> Self {
+        Self {
+            store,
+            base_url: base_url.into(),
+            acl_cache: Some(acl_cache),
         }
     }
 
@@ -314,20 +338,93 @@ impl<'a, S: Store> WacAuthorizer<'a, S> {
     /// the parser error being mapped to "no usable rules" — but here we propagate a parse error as a
     /// storage error is avoided: an unparseable ACL is treated as PRESENT-but-granting-nothing
     /// (fail-closed), NOT as absent (which would wrongly inherit the parent's grants).
+    ///
+    /// ## ETag-keyed parsed-ACL cache (read-path optimisation #3)
+    /// When an [`AclCache`] is attached, this:
+    ///  1. cheaply probes the ACL's CURRENT etag via [`Store::meta`] (an index lookup — NO blob
+    ///     byte-fetch, NO parse). An ABSENT ACL (`None`) is the `Ok(None)` "no own ACL, keep walking"
+    ///     case (unchanged), and the cache holds nothing for it (it can never fabricate a removed ACL);
+    ///  2. on a cache HIT for `(acl, etag)` returns the cached parse — the byte-fetch + `oxttl` parse
+    ///     are SKIPPED (the win);
+    ///  3. on a MISS reads the bytes + parses, then REFRESHES the entry under the etag of the bytes it
+    ///     ACTUALLY read (so the cached parse always corresponds to the cached etag — no TOCTOU stale).
+    ///
+    /// SECURITY: the cache only avoids the re-PARSE of an UNCHANGED ACL — the etag-equality gate
+    /// guarantees a cached parse is reused ONLY when the bytes are unchanged, so a rotated/removed ACL
+    /// can never be served stale and the resulting triples (hence the decision + `WAC-Allow`) are
+    /// byte-identical to the cold path. When NO cache is attached, the original single `store.read` +
+    /// parse path runs (no extra `meta` round-trip) — byte-identical to the pre-cache code AND to the
+    /// `=0` disabled-cache configuration.
     async fn read_acl(&self, acl: &str) -> Result<Option<Vec<oxrdf::Triple>>, ServerError> {
+        // No cache attached: the original path — ONE `store.read` (get_meta + blob.get) + parse. No
+        // extra `meta` probe, so cost is identical to the pre-cache code.
+        let Some(cache) = self.acl_cache else {
+            return self.read_and_parse_acl(acl).await;
+        };
+
+        // Cache attached: probe the ACL's current etag CHEAPLY (index get_meta — no bytes, no parse).
+        let meta = match self.store.meta(acl).await? {
+            Some(m) => m,
+            // Absent ACL → `Ok(None)` (the common "no own ACL here, keep walking" case). The cache
+            // cannot resurrect a removed ACL: there is no `get` for an absent IRI.
+            None => return Ok(None),
+        };
+        let now = Self::now_secs();
+        // HIT on `(acl, current-etag)`: reuse the cached parse — skip the byte-fetch + `oxttl` parse.
+        if let Some(triples) = cache.get(acl, &meta.etag, now) {
+            return Ok(Some(triples));
+        }
+        // MISS (no entry / rotated etag / TTL-stale): read the bytes + parse, then refresh the cache
+        // under the etag of the BYTES ACTUALLY READ (the authoritative etag for this parse). A
+        // concurrent rotation between the `meta` probe and this `read` just means we parse + cache the
+        // newer bytes — never a stale parse.
+        let resource = match self.store.read(acl).await {
+            Ok(r) => r,
+            // The ACL vanished between the `meta` probe and the read (a concurrent DELETE) → treat as
+            // absent: `Ok(None)`, exactly as a cold walk that found it gone would.
+            Err(ServerError::NotFound) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let triples = Self::parse_acl_body(&resource, acl);
+        cache.insert(acl, &resource.meta.etag, triples.clone(), now);
+        Ok(Some(triples))
+    }
+
+    /// The uncached read+parse of an ACL: ONE `store.read` (get_meta + blob.get) + the `oxttl` parse —
+    /// the exact pre-cache path, used when no cache is attached.
+    async fn read_and_parse_acl(
+        &self,
+        acl: &str,
+    ) -> Result<Option<Vec<oxrdf::Triple>>, ServerError> {
         let resource = match self.store.read(acl).await {
             Ok(r) => r,
             Err(ServerError::NotFound) => return Ok(None),
             Err(e) => return Err(e),
         };
+        Ok(Some(Self::parse_acl_body(&resource, acl)))
+    }
+
+    /// Parse an ACL resource's bytes into triples, mapping a PARSE error to an EMPTY triple set
+    /// (PRESENT-but-granting-nothing, fail-closed) — NOT to absent. A broken own-ACL must DENY, never
+    /// fall through to a parent's `acl:default`. The single home for the ACL parse + its fail-closed
+    /// error mapping, shared by the cached and uncached paths so they are byte-identical.
+    fn parse_acl_body(resource: &crate::store::Resource, acl: &str) -> Vec<oxrdf::Triple> {
         let format = classify(Some(&resource.meta.content_type)).unwrap_or(RdfFormat::Turtle);
-        match parse_to_triples(format, &resource.body, acl) {
-            Ok(triples) => Ok(Some(triples)),
-            // A PRESENT but malformed ACL grants nothing (fail-closed) — it is NOT absent. Returning an
-            // empty triple set (Some, not None) stops the inheritance walk: a broken own-ACL must DENY,
-            // never fall through to a parent's `acl:default`.
-            Err(_) => Ok(Some(Vec::new())),
-        }
+        // A PRESENT but malformed ACL grants nothing (fail-closed) — it is NOT absent. A parse error
+        // maps to an EMPTY triple set (NOT propagated, NOT treated as absent): the caller returns it as
+        // `Some(Vec::new())`, which stops the inheritance walk so a broken own-ACL DENIES rather than
+        // falling through to a parent's `acl:default`.
+        parse_to_triples(format, &resource.body, acl).unwrap_or_default()
+    }
+
+    /// Current epoch seconds for the ACL-cache freshness gate (the validation TTL). A clock error
+    /// (pre-1970, impossible in practice) yields 0 — the cache then treats every entry as old (a miss),
+    /// which is the SAFE direction (re-read + re-parse, never a stale hit).
+    fn now_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
     }
 
     /// The protected resource an `.acl` target governs: for an `.acl` IRI, strip the trailing `.acl`
@@ -1044,5 +1141,319 @@ mod tests {
         assert_read_matches_old_path(&wac, acl, AccessMode::Control, Some(ALICE), None).await;
         assert_read_matches_old_path(&wac, acl, AccessMode::Control, Some(BOB), None).await;
         assert_read_matches_old_path(&wac, acl, AccessMode::Control, None, None).await;
+    }
+
+    // --- Opt #3: the ETag-keyed parsed-ACL cache is decision-equivalent to the cold resolve ---------
+
+    use crate::acl_cache::AclCache;
+
+    /// A cached `authorize` must return the IDENTICAL [`Decision`] a NON-cached `authorize` does — on
+    /// the COLD pass (cache miss → populates) AND on the WARM pass (cache hit → reuses the parse). This
+    /// is the security-critical invariant: the cache only avoids the re-parse; it never changes the
+    /// decision. Asserts the warm pass equals the cold/uncached decision for the SAME inputs.
+    async fn assert_cached_authorize_matches_uncached(
+        store: &TestStore,
+        cache: &AclCache,
+        target: &str,
+        required: AccessMode,
+        web_id: Option<&str>,
+        origin: Option<&str>,
+    ) {
+        let uncached = WacAuthorizer::new(store, BASE)
+            .authorize(target, required, web_id, origin)
+            .await
+            .unwrap();
+        let cached = WacAuthorizer::with_cache(store, BASE, cache);
+        // COLD pass (cache miss → populate) must match the uncached decision.
+        let cold = cached
+            .authorize(target, required, web_id, origin)
+            .await
+            .unwrap();
+        assert_eq!(
+            cold, uncached,
+            "cold cached authorize must equal uncached for target={target} web_id={web_id:?} origin={origin:?}"
+        );
+        // WARM pass (cache hit → reuse the parse) must ALSO match — a hit cannot change the decision.
+        let warm = cached
+            .authorize(target, required, web_id, origin)
+            .await
+            .unwrap();
+        assert_eq!(
+            warm, uncached,
+            "warm (cache-hit) authorize must equal uncached for target={target} web_id={web_id:?} origin={origin:?}"
+        );
+    }
+
+    /// Same equivalence for `authorize_read` (the GET/HEAD WAC-Allow path): the cached COLD + WARM
+    /// [`ReadDecision`] (incl. the full `EffectivePermissions` on Allow) must equal the uncached one.
+    async fn assert_cached_read_matches_uncached(
+        store: &TestStore,
+        cache: &AclCache,
+        target: &str,
+        required: AccessMode,
+        web_id: Option<&str>,
+        origin: Option<&str>,
+    ) {
+        let uncached = WacAuthorizer::new(store, BASE)
+            .authorize_read(target, required, web_id, origin)
+            .await
+            .unwrap();
+        let cached = WacAuthorizer::with_cache(store, BASE, cache);
+        let cold = cached
+            .authorize_read(target, required, web_id, origin)
+            .await
+            .unwrap();
+        assert_eq!(
+            cold, uncached,
+            "cold cached authorize_read must equal uncached for {target}"
+        );
+        let warm = cached
+            .authorize_read(target, required, web_id, origin)
+            .await
+            .unwrap();
+        assert_eq!(warm, uncached, "warm cached authorize_read must equal uncached (hit cannot change WAC-Allow) for {target}");
+    }
+
+    /// The cache is decision-equivalent across EVERY ACL shape — public-read / private / no-ACL /
+    /// `.acl`-Control / origin match/non-match/absent / broken-ACL-fail-closed / inherited-default —
+    /// on BOTH a cold (populating) and a warm (hit) pass. Proves a hit returns the identical decision +
+    /// WAC-Allow as a cold resolve.
+    #[tokio::test]
+    async fn cached_resolve_is_decision_equivalent_across_shapes() {
+        const APP: &str = "https://app.example";
+        const OTHER: &str = "https://evil.example";
+        let s = store();
+        // public-read + owner-control + an origin-scoped public Append.
+        let public_doc = "https://pod.example/alice/test/doc";
+        put_acl(
+            &s,
+            "https://pod.example/alice/test/doc.acl",
+            &format!(
+                r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+                @prefix foaf: <http://xmlns.com/foaf/0.1/>.
+                <#o> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <{public_doc}>; acl:mode acl:Read, acl:Write, acl:Control.
+                <#p> a acl:Authorization; acl:agentClass foaf:Agent; acl:accessTo <{public_doc}>; acl:mode acl:Read.
+                <#s> a acl:Authorization; acl:agentClass foaf:Agent; acl:origin <{APP}>; acl:accessTo <{public_doc}>; acl:mode acl:Append."#
+            ),
+        )
+        .await;
+        // private (only Alice).
+        let secret = "https://pod.example/alice/test/secret";
+        put_acl(
+            &s,
+            "https://pod.example/alice/test/secret.acl",
+            &format!(
+                r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+                <#o> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <{secret}>; acl:mode acl:Read, acl:Write, acl:Control."#
+            ),
+        )
+        .await;
+        // inherited-default: /alice/.acl grants Alice control; /alice/inh/data has no own ACL.
+        put_acl(
+            &s,
+            "https://pod.example/alice/.acl",
+            &owner_default_acl("https://pod.example/alice/", ALICE),
+        )
+        .await;
+        let inherited = "https://pod.example/alice/inh/data";
+        // broken own-ACL (fail-closed): present-but-malformed.
+        let broken = "https://pod.example/alice/broken";
+        put_acl(
+            &s,
+            "https://pod.example/alice/broken.acl",
+            "@@@ not valid turtle <<< broken",
+        )
+        .await;
+        // no-ACL orphan anywhere.
+        let orphan = "https://pod.example/zzz/orphan";
+
+        let cache = AclCache::new(64);
+        // Run each (target, mode, web_id, origin) tuple through BOTH authorize + authorize_read,
+        // cold-then-warm, and assert decision-equivalence with the uncached resolve.
+        let cases: &[(&str, AccessMode, Option<&str>, Option<&str>)] = &[
+            (public_doc, AccessMode::Read, None, None),
+            (public_doc, AccessMode::Read, Some(ALICE), None),
+            (public_doc, AccessMode::Read, Some(ALICE), Some(APP)),
+            (public_doc, AccessMode::Read, Some(ALICE), Some(OTHER)),
+            (public_doc, AccessMode::Read, Some(BOB), Some(APP)),
+            (secret, AccessMode::Read, None, None),
+            (secret, AccessMode::Read, Some(BOB), None),
+            (secret, AccessMode::Read, Some(ALICE), None),
+            (inherited, AccessMode::Write, Some(ALICE), None),
+            (inherited, AccessMode::Read, Some(BOB), None),
+            (broken, AccessMode::Read, Some(ALICE), None),
+            (broken, AccessMode::Read, None, None),
+            (orphan, AccessMode::Read, None, None),
+            (orphan, AccessMode::Read, Some(BOB), None),
+            // The `.acl` document itself (Control-gated).
+            (
+                "https://pod.example/alice/test/doc.acl",
+                AccessMode::Control,
+                Some(ALICE),
+                None,
+            ),
+            (
+                "https://pod.example/alice/test/doc.acl",
+                AccessMode::Control,
+                Some(BOB),
+                None,
+            ),
+            (
+                "https://pod.example/alice/test/doc.acl",
+                AccessMode::Control,
+                None,
+                None,
+            ),
+        ];
+        for (target, mode, web_id, origin) in cases {
+            assert_cached_authorize_matches_uncached(&s, &cache, target, *mode, *web_id, *origin)
+                .await;
+            assert_cached_read_matches_uncached(&s, &cache, target, *mode, *web_id, *origin).await;
+        }
+    }
+
+    /// A WRITE to the ACL that CHANGES its rules must be seen by the NEXT cached read — no stale grant.
+    /// Two mechanisms guarantee this: (1) the rewritten ACL has DIFFERENT bytes ⇒ a DIFFERENT etag ⇒
+    /// the `(acl, etag)` gate misses and re-parses; (2) the handler also explicitly invalidates on an
+    /// `.acl` write. This test exercises (1) directly at the resolver: it populates the cache with a
+    /// permissive ACL, then rewrites the SAME `.acl` to a restrictive one and asserts the cached
+    /// resolve now DENIES (the new rules), proving the cache cannot serve a stale ALLOW after a change.
+    #[tokio::test]
+    async fn acl_write_is_seen_by_next_cached_read_no_stale_grant() {
+        let s = store();
+        let resource = "https://pod.example/alice/rot/data";
+        let acl = "https://pod.example/alice/rot/data.acl";
+        // Initially: BOB may read.
+        put_acl(
+            &s,
+            acl,
+            &format!(
+                r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+                <#b> a acl:Authorization; acl:agent <{BOB}>; acl:accessTo <{resource}>; acl:mode acl:Read."#
+            ),
+        )
+        .await;
+        let cache = AclCache::new(64);
+        let wac = WacAuthorizer::with_cache(&s, BASE, &cache);
+        // Populate the cache: Bob is allowed (cold), and a second read confirms the warm hit allows.
+        assert!(matches!(
+            wac.authorize(resource, AccessMode::Read, Some(BOB), None)
+                .await
+                .unwrap(),
+            Decision::Allow(_)
+        ));
+        assert!(
+            matches!(
+                wac.authorize(resource, AccessMode::Read, Some(BOB), None)
+                    .await
+                    .unwrap(),
+                Decision::Allow(_)
+            ),
+            "second read must still allow (this is the cache hit being populated/served)"
+        );
+        // ROTATE the ACL: now ONLY Alice may read — Bob is removed. Different bytes ⇒ different etag.
+        put_acl(
+            &s,
+            acl,
+            &format!(
+                r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+                <#a> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <{resource}>; acl:mode acl:Read."#
+            ),
+        )
+        .await;
+        // The NEXT cached read MUST see the new rules: Bob is now FORBIDDEN (no stale Allow), Alice now
+        // allowed. The etag changed, so the cache misses + re-parses the new ACL.
+        assert_eq!(
+            wac.authorize(resource, AccessMode::Read, Some(BOB), None).await.unwrap(),
+            Decision::Forbidden,
+            "a rotated ACL must DENY the now-removed agent — the cache must not serve a stale grant"
+        );
+        assert!(matches!(
+            wac.authorize(resource, AccessMode::Read, Some(ALICE), None)
+                .await
+                .unwrap(),
+            Decision::Allow(_)
+        ));
+    }
+
+    /// The `=0` disabled cache yields BYTE-IDENTICAL decisions to no cache at all (the off-switch). A
+    /// disabled cache never stores, so every read re-resolves — its decisions must equal the
+    /// uncached path exactly, across the same shapes.
+    #[tokio::test]
+    async fn disabled_cache_is_byte_identical_to_no_cache() {
+        let s = store();
+        let resource = "https://pod.example/alice/d/doc";
+        put_acl(
+            &s,
+            "https://pod.example/alice/d/doc.acl",
+            &format!(
+                r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+                @prefix foaf: <http://xmlns.com/foaf/0.1/>.
+                <#o> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <{resource}>; acl:mode acl:Read, acl:Write, acl:Control.
+                <#p> a acl:Authorization; acl:agentClass foaf:Agent; acl:accessTo <{resource}>; acl:mode acl:Read."#
+            ),
+        )
+        .await;
+        let disabled = AclCache::disabled();
+        for (web_id, origin) in [(None, None), (Some(ALICE), None), (Some(BOB), None)] {
+            let uncached = WacAuthorizer::new(&s, BASE)
+                .authorize_read(resource, AccessMode::Read, web_id, origin)
+                .await
+                .unwrap();
+            let off = WacAuthorizer::with_cache(&s, BASE, &disabled)
+                .authorize_read(resource, AccessMode::Read, web_id, origin)
+                .await
+                .unwrap();
+            assert_eq!(
+                off, uncached,
+                "disabled cache must equal no-cache for web_id={web_id:?}"
+            );
+        }
+        // A disabled cache never stored anything.
+        assert_eq!(disabled.len(), 0);
+    }
+
+    /// A removed ACL is NEVER resurrected by the cache: populate the cache with an ALLOW via an own
+    /// ACL, then DELETE that `.acl` so the resource has no governing ACL anywhere → the cached resolve
+    /// must now DENY (fail-closed), proving the cache cannot fabricate a deleted grant. The `meta`
+    /// probe returns `None` for the deleted ACL, so the resolver never even consults the cache for it.
+    #[tokio::test]
+    async fn deleted_acl_is_not_resurrected_by_cache() {
+        let s = store();
+        let resource = "https://pod.example/alice/del/data";
+        let acl = "https://pod.example/alice/del/data.acl";
+        put_acl(
+            &s,
+            acl,
+            &format!(
+                r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+                <#p> a acl:Authorization; acl:agentClass <http://xmlns.com/foaf/0.1/Agent>; acl:accessTo <{resource}>; acl:mode acl:Read."#
+            ),
+        )
+        .await;
+        let cache = AclCache::new(64);
+        let wac = WacAuthorizer::with_cache(&s, BASE, &cache);
+        // Cold + warm: anonymous read is ALLOWED (public) and the cache is populated.
+        assert!(matches!(
+            wac.authorize(resource, AccessMode::Read, None, None)
+                .await
+                .unwrap(),
+            Decision::Allow(_)
+        ));
+        assert!(matches!(
+            wac.authorize(resource, AccessMode::Read, None, None)
+                .await
+                .unwrap(),
+            Decision::Allow(_)
+        ));
+        // DELETE the own ACL — no ACL governs the resource anywhere now (no ancestor ACL either).
+        s.delete(acl, None).await.expect("delete acl");
+        // The cached resolve must now DENY (fail-closed: no ACL → 401 for anonymous). The deleted ACL
+        // is gone from the index, so the `meta` probe reports it absent and the walk inherits nothing.
+        assert_eq!(
+            wac.authorize(resource, AccessMode::Read, None, None).await.unwrap(),
+            Decision::Unauthenticated,
+            "a deleted ACL must NOT be served from cache — removing it must fail-close the resource"
+        );
     }
 }
