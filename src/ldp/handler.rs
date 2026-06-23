@@ -166,7 +166,14 @@ async fn serve_read<S: Store>(
     // resource, content-negotiate its stored bytes. Both honour the `Accept` header.
     let accept = header_str(req_headers, header::ACCEPT);
     let (body, content_type) = if target.is_container {
-        render_container(state, &target.iri, accept).await?
+        render_container(
+            state,
+            &target.iri,
+            &resource.body,
+            &resource.meta.content_type,
+            accept,
+        )
+        .await?
     } else {
         negotiate_body(
             &resource.body,
@@ -186,7 +193,19 @@ async fn serve_read<S: Store>(
 
     let mut out = HeaderMap::new();
     set_str(&mut out, header::CONTENT_TYPE, &content_type);
-    set_str(&mut out, header::ETAG, &resource.meta.etag);
+    // ETag: a CONTAINER's body is GENERATED from LIVE membership (the `ldp:contains` listing), so its
+    // validator MUST be derived from the FINAL RENDERED representation — not the stored-metadata ETag,
+    // which never changes when a child is added/removed (the stale-validator bug: the body would
+    // change while the ETag did not, breaking conditional requests / caches). A strong hash of the
+    // negotiated, serialised body changes whenever the membership/body or the negotiated format
+    // changes. GET and HEAD compute the SAME `body` here, so they agree on this validator. A plain
+    // resource keeps its stored-metadata ETag (its bytes ARE the stored representation).
+    let etag = if target.is_container {
+        representation_etag(&body)
+    } else {
+        resource.meta.etag.clone()
+    };
+    set_str(&mut out, header::ETAG, &etag);
     // Advertise byte-range support (RFC 9110 §14.3).
     set_str(&mut out, header::ACCEPT_RANGES, "bytes");
     // Method advertisement on the read response: `Allow` (the LDP verb set — `read-method-allow`
@@ -693,49 +712,96 @@ fn validate_writable(
 /// **WebID profile document** (the `…/profile/card` the conformance harness — and any Solid client —
 /// dereferences UNAUTHENTICATED to find `pim:storage`/`solid:oidcIssuer`). Everything else requires a
 /// token until the WAC engine lands (which will replace this with per-resource `acl:Read` + the
-/// public-read agent class). Matched on the conventional profile-card path under the base URL.
+/// public-read agent class).
+///
+/// **The exception is the EXACT direct WebID-profile shape only** — `<base>/{user}/profile/card`,
+/// where `{user}` is a SINGLE top-level path segment (exactly two interior segments before the final
+/// `profile/card`: the user dir + `profile/card`). It is NOT a suffix/`ends_with` match: a nested
+/// `<base>/{user}/private/profile/card` (or any deeper `…/profile/card`) is private data and MUST
+/// require authentication — an `ends_with` test let any such nested path bypass the auth gate (the
+/// HIGH this closes). This whole posture is interim; the WAC engine (Cluster B) supersedes it with
+/// per-resource ACL.
 fn is_public_readable(iri: &str, base_url: &str) -> bool {
     let base = base_url.trim_end_matches('/');
     let Some(rest) = iri.strip_prefix(base) else {
         return false;
     };
-    // The seeded WebID profile document is `/{user}/profile/card`. Treat any `…/profile/card` (no
-    // trailing slash) under the base as a public profile document.
-    rest.ends_with("/profile/card")
+    // The seeded WebID profile document is EXACTLY `/{user}/profile/card`. Match the precise shape —
+    // a single top-level `{user}` segment, then `profile`, then `card` — and nothing else. Splitting
+    // on '/' over the leading-slash-trimmed path yields exactly `["{user}", "profile", "card"]` for a
+    // direct profile card; a nested `…/private/profile/card` yields four+ segments and is rejected.
+    let segments: Vec<&str> = rest.trim_start_matches('/').split('/').collect();
+    matches!(segments.as_slice(), [user, "profile", "card"] if !user.is_empty())
 }
 
 /// Synthesise a container's LDP representation and content-negotiate it.
 ///
-/// The body is built from `oxrdf` triples (never hand-concatenated — the house rule) and serialised
-/// with the server's own RDF serialiser:
-/// - `<container> rdf:type ldp:Resource, ldp:Container, ldp:BasicContainer` ;
-/// - `<container> ldp:contains <child>` for each authoritative `store.list_children` member.
+/// The body MERGES two triple sources, built from `oxrdf` triples (never hand-concatenated — the
+/// house rule) and serialised with the server's own RDF serialiser:
+/// - **The container's OWN stored RDF** (whatever was PUT to the container, or POSTed as its body):
+///   parsed from `stored_body` in its stored format and carried through, so RDF written to a
+///   container stays retrievable on GET. A non-RDF / unparseable stored body contributes no triples
+///   (a container's body is conventionally RDF or empty).
+/// - **The generated LDP containment triples** — `<container> rdf:type ldp:Resource, ldp:Container,
+///   ldp:BasicContainer` and `<container> ldp:contains <child>` for each authoritative
+///   `store.list_children` member.
 ///
-/// The negotiated format defaults to Turtle (a container's stored bytes are empty), honouring the
-/// `Accept` header (Turtle / JSON-LD); an Accept that admits neither is a 406.
+/// The two sets are de-duplicated (a stored triple identical to a generated one is not repeated). The
+/// negotiated format honours the `Accept` header (Turtle / JSON-LD), defaulting to the container's
+/// stored format when it is RDF (else Turtle); an Accept that admits neither is a 406.
 async fn render_container<S: Store>(
     state: &Arc<LdpState<S>>,
     container_iri: &str,
+    stored_body: &Bytes,
+    stored_content_type: &str,
     accept: Option<&str>,
 ) -> Result<(Bytes, String), ServerError> {
-    let format = negotiate_accept(accept, RdfFormat::Turtle).ok_or(ServerError::NotAcceptable)?;
+    // The container's stored bytes default to a Turtle representation; if the stored type is RDF, use
+    // it as the conneg default (most faithful) and parse the stored body for its own triples.
+    let stored_format = classify(Some(stored_content_type)).ok();
+    let default_format = stored_format.unwrap_or(RdfFormat::Turtle);
+    let format = negotiate_accept(accept, default_format).ok_or(ServerError::NotAcceptable)?;
 
     let subject = NamedNode::new(container_iri)
         .map_err(|e| ServerError::Storage(format!("invalid container IRI {container_iri}: {e}")))?;
     let rdf_type = nn(RDF_TYPE_IRI)?;
     let contains = nn(LDP_CONTAINS_IRI)?;
 
-    let mut triples: Vec<Triple> = vec![
+    let mut triples: Vec<Triple> = Vec::new();
+
+    // 1) The container's OWN stored RDF (whatever was written to the container itself). Parse it in
+    // its stored format, resolving relative IRIs against the container IRI. If the stored body is
+    // non-RDF or unparseable, it contributes nothing (a container body is conventionally RDF/empty) —
+    // we never fail the listing over a stored body the server itself stored.
+    if let Some(fmt) = stored_format {
+        if let Ok(stored) = parse_to_triples(fmt, stored_body, container_iri) {
+            triples.extend(stored);
+        }
+    }
+
+    // 2) The generated LDP typing + containment triples (de-duped against the stored set so an
+    // identical triple is not repeated).
+    push_unique(
+        &mut triples,
         Triple::new(subject.clone(), rdf_type.clone(), nn(LDP_RESOURCE_IRI)?),
+    );
+    push_unique(
+        &mut triples,
         Triple::new(subject.clone(), rdf_type.clone(), nn(LDP_CONTAINER_IRI)?),
+    );
+    push_unique(
+        &mut triples,
         Triple::new(subject.clone(), rdf_type, nn(LDP_BASIC_CONTAINER_IRI)?),
-    ];
+    );
 
     for child in state.store.list_children(container_iri).await? {
         // A child IRI comes from the authoritative index; if it is somehow not a valid IRI, skip it
         // rather than fail the whole listing (defence-in-depth — the store mints valid IRIs).
         if let Ok(child_node) = NamedNode::new(&child) {
-            triples.push(Triple::new(subject.clone(), contains.clone(), child_node));
+            push_unique(
+                &mut triples,
+                Triple::new(subject.clone(), contains.clone(), child_node),
+            );
         }
     }
 
@@ -743,10 +809,37 @@ async fn render_container<S: Store>(
     Ok((Bytes::from(bytes), format.media_type().to_string()))
 }
 
+/// Push `triple` onto `triples` only if not already present (set-union semantics; the graphs are
+/// small per resource so a linear scan is correct and adequate — `oxrdf::Triple` is `Eq` but not
+/// `Ord`).
+fn push_unique(triples: &mut Vec<Triple>, triple: Triple) {
+    if !triples.contains(&triple) {
+        triples.push(triple);
+    }
+}
+
 /// A `NamedNode` from a server-constructed IRI (well-formed by construction; map an unexpected error
 /// to a storage error rather than panic).
 fn nn(iri: &str) -> Result<NamedNode, ServerError> {
     NamedNode::new(iri).map_err(|e| ServerError::Storage(format!("invalid IRI {iri}: {e}")))
+}
+
+/// A STRONG ETag computed from a rendered representation's BYTES — `"<len>-<hash>"`.
+///
+/// Used for a container response, whose body is generated from live membership (not stored bytes), so
+/// the validator must track the actual representation: it changes whenever the serialised body changes
+/// (a child added/removed, or the negotiated format differs). The same body computed for GET and HEAD
+/// yields the same validator, so the two methods agree. This is a non-cryptographic content hash
+/// (FNV-1a over the bytes), sufficient for a cache validator — collisions across distinct
+/// representations are vanishingly unlikely and the length prefix further disambiguates.
+fn representation_etag(body: &[u8]) -> String {
+    // FNV-1a 64-bit over the serialised representation.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in body {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("\"{}-{:x}\"", body.len(), hash)
 }
 
 /// Ensure every ANCESTOR container of `iri` exists, creating any that are missing and wiring each into
@@ -1232,6 +1325,39 @@ mod tests {
         // A path that merely ENDS in profile/card but is outside the base is not matched.
         assert!(!is_public_readable(
             "https://evil.example/profile/card",
+            base
+        ));
+    }
+
+    /// REGRESSION (the HIGH): the public-read exception must match the EXACT direct profile-card shape
+    /// only — `<base>/{user}/profile/card` — and NOT any nested `…/profile/card`. A
+    /// `<base>/a/private/profile/card` is private data and must require auth; the old `ends_with`
+    /// test let it bypass the gate.
+    #[test]
+    fn nested_profile_card_path_is_not_public_readable() {
+        let base = "https://localhost:3000";
+        // The exact direct WebID-profile card stays public.
+        assert!(is_public_readable(
+            "https://localhost:3000/alice/profile/card",
+            base
+        ));
+        // A NESTED `…/profile/card` (one extra interior segment) MUST require auth — not a suffix match.
+        assert!(!is_public_readable(
+            "https://localhost:3000/a/private/profile/card",
+            base
+        ));
+        // Deeper nesting is likewise private.
+        assert!(!is_public_readable(
+            "https://localhost:3000/alice/private/profile/card",
+            base
+        ));
+        assert!(!is_public_readable(
+            "https://localhost:3000/alice/x/y/profile/card",
+            base
+        ));
+        // A trailing-slash container ending in `profile/card/` is not the profile document.
+        assert!(!is_public_readable(
+            "https://localhost:3000/alice/profile/card/",
             base
         ));
     }

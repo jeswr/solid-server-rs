@@ -1065,6 +1065,158 @@ async fn container_get_renders_ldp_contains_listing() {
 }
 
 #[tokio::test]
+async fn container_get_merges_stored_rdf_with_containment_triples() {
+    // Regression (roborev Medium): a container GET must return BOTH the RDF stored ON the container
+    // itself AND the generated ldp:BasicContainer + ldp:contains triples — not synthesise only the
+    // containment triples and drop the stored body. Round-trip: PUT RDF to the container, POST a
+    // member, GET ⇒ the stored triple AND the containment triples are present.
+    let h = Harness::new();
+    // PUT a container with a distinctive stored triple (relative <#c> resolves to …/alice/#c).
+    let put = h
+        .request(
+            "PUT",
+            "/alice/",
+            Some("text/turtle"),
+            Body::from("<#c> <http://purl.org/dc/terms/title> \"My container\" ."),
+        )
+        .await;
+    assert_eq!(put.status(), StatusCode::CREATED);
+
+    // POST a member so there is a containment edge too.
+    let post = h
+        .request_with(
+            "POST",
+            "/alice/",
+            Some("text/turtle"),
+            &[("slug", "doc1")],
+            Body::from("<#it> <http://xmlns.com/foaf/0.1/name> \"D\" ."),
+        )
+        .await;
+    assert_eq!(post.status(), StatusCode::CREATED);
+
+    let get = h
+        .request_with(
+            "GET",
+            "/alice/",
+            None,
+            &[("accept", "text/turtle")],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(get.status(), StatusCode::OK);
+    let bytes = to_bytes(get.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    // The STORED triple must be retrievable.
+    assert!(
+        text.contains("dc/terms/title") && text.contains("My container"),
+        "the RDF stored on the container must be returned on GET: {text}"
+    );
+    // AND the generated containment triples must still be present.
+    assert!(
+        text.contains("ldp#BasicContainer"),
+        "container typing must still be present: {text}"
+    );
+    assert!(
+        text.contains("ldp#contains") && text.contains("https://pod.example/alice/doc1"),
+        "the containment listing must still be present: {text}"
+    );
+}
+
+#[tokio::test]
+async fn container_etag_changes_when_membership_changes() {
+    // Regression (roborev Medium): the container body is generated from LIVE membership, so its ETag
+    // must be derived from the rendered representation — adding/removing a child must change the ETag
+    // (else conditional requests / caches break). Also: HEAD and GET must agree on the ETag.
+    let h = Harness::new();
+    h.make_container("/alice/").await;
+
+    let etag = |resp: &axum::http::Response<Body>| -> String {
+        resp.headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    // Empty container ETag (GET) + the HEAD ETag must match the GET ETag for the same state.
+    let get0 = h
+        .request_with(
+            "GET",
+            "/alice/",
+            None,
+            &[("accept", "text/turtle")],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(get0.status(), StatusCode::OK);
+    let etag0 = etag(&get0);
+    assert!(!etag0.is_empty(), "a container GET must carry an ETag");
+
+    let head0 = h
+        .request_with(
+            "HEAD",
+            "/alice/",
+            None,
+            &[("accept", "text/turtle")],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(head0.status(), StatusCode::OK);
+    assert_eq!(
+        etag(&head0),
+        etag0,
+        "HEAD and GET must report the SAME container ETag for the same state"
+    );
+
+    // Add a member → the body changes → the ETag MUST change.
+    let post = h
+        .request_with(
+            "POST",
+            "/alice/",
+            Some("text/turtle"),
+            &[("slug", "doc1")],
+            Body::from("<#it> <http://xmlns.com/foaf/0.1/name> \"D\" ."),
+        )
+        .await;
+    assert_eq!(post.status(), StatusCode::CREATED);
+
+    let get1 = h
+        .request_with(
+            "GET",
+            "/alice/",
+            None,
+            &[("accept", "text/turtle")],
+            Body::empty(),
+        )
+        .await;
+    let etag1 = etag(&get1);
+    assert_ne!(
+        etag0, etag1,
+        "adding a child must change the container ETag (the body changed)"
+    );
+
+    // Remove the member → the body changes back → the ETag MUST change again.
+    let del = h
+        .request("DELETE", "/alice/doc1", None, Body::empty())
+        .await;
+    assert_eq!(del.status(), StatusCode::NO_CONTENT);
+    let get2 = h
+        .request_with(
+            "GET",
+            "/alice/",
+            None,
+            &[("accept", "text/turtle")],
+            Body::empty(),
+        )
+        .await;
+    let etag2 = etag(&get2);
+    assert_ne!(
+        etag1, etag2,
+        "removing a child must change the container ETag again"
+    );
+}
+
+#[tokio::test]
 async fn root_route_is_served() {
     // Cluster-A #1: GET / must reach the handler (the /{*path} wildcard does not match the empty path).
     // With nothing seeded the root does not exist ⇒ 404 (not a routing 404 with no handler) — proving

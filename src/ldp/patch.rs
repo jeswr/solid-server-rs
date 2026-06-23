@@ -623,10 +623,21 @@ pub fn parse_sparql_update(body: &[u8], base_iri: &str) -> Result<N3Patch, Serve
     let lower = text.to_ascii_lowercase();
     let mut cursor = 0usize;
     while cursor < text.len() {
-        // Skip whitespace.
+        // Skip whitespace, then an OPTIONAL `;` operation separator (SPARQL 1.1 Update separates
+        // operations with `;`, e.g. `DELETE DATA { … } ; INSERT DATA { … }`, and permits a trailing
+        // `;`). We accept and skip it between supported INSERT DATA / DELETE DATA operations — applied
+        // in order via the shared engine — and re-skip whitespace after it. (Without this, a standard
+        // semicolon-separated multi-op patch hit the unsupported-verb branch and 422'd.)
         let lo = &lower[cursor..];
         let ws = lo.len() - lo.trim_start().len();
         cursor += ws;
+        let lo = &lower[cursor..];
+        if let Some(rest) = lo.strip_prefix(';') {
+            cursor += lo.len() - rest.len(); // advance past the ';'
+            let lo = &lower[cursor..];
+            let ws = lo.len() - lo.trim_start().len();
+            cursor += ws;
+        }
         let lo = &lower[cursor..];
         if lo.is_empty() {
             break;
@@ -818,6 +829,44 @@ mod tests {
         assert!(patch.conditions.is_empty());
         assert_eq!(patch.deletes.len(), 1);
         assert_eq!(patch.inserts.len(), 1);
+    }
+
+    #[test]
+    fn sparql_update_accepts_semicolon_separated_multi_op() {
+        // Regression (roborev Medium): a standard `;`-separated multi-op patch must parse — the parser
+        // previously 422'd on the `;` between DELETE DATA and INSERT DATA. Both ops apply, in order.
+        let doc = "PREFIX foaf: <http://xmlns.com/foaf/0.1/>\n\
+            DELETE DATA { <#me> foaf:name \"Old\" . } ; INSERT DATA { <#me> foaf:name \"New\" . }\n";
+        let patch = parse_sparql_update(doc.as_bytes(), BASE).unwrap();
+        assert!(patch.conditions.is_empty());
+        assert_eq!(patch.deletes.len(), 1);
+        assert_eq!(patch.inserts.len(), 1);
+
+        // And it applies end-to-end through the shared engine: Old → New.
+        let existing = vec![triple(
+            "https://pod.example/alice/data#me",
+            "http://xmlns.com/foaf/0.1/name",
+            "Old",
+        )];
+        let result = apply_patch(&existing, &patch).unwrap();
+        assert_eq!(
+            result,
+            vec![triple(
+                "https://pod.example/alice/data#me",
+                "http://xmlns.com/foaf/0.1/name",
+                "New"
+            )]
+        );
+    }
+
+    #[test]
+    fn sparql_update_accepts_trailing_semicolon() {
+        // A trailing `;` after the last operation is also tolerated (SPARQL 1.1 permits it).
+        let doc = "PREFIX foaf: <http://xmlns.com/foaf/0.1/>\n\
+            INSERT DATA { <#me> foaf:name \"New\" . } ;\n";
+        let patch = parse_sparql_update(doc.as_bytes(), BASE).unwrap();
+        assert_eq!(patch.inserts.len(), 1);
+        assert!(patch.deletes.is_empty());
     }
 
     #[test]
