@@ -7,6 +7,11 @@
 //! whole stack is testable without a running SPARQ or S3.
 
 pub mod blob;
+// The in-process embedded SPARQ backend (opt-in `embedded-sparq` feature) — a THIRD `SparqClient`
+// impl alongside the HTTP client + the in-memory double. Off by default so the standard build
+// carries no sparq dependency. See [`embedded`] + decisions/0001-embed-sparq-in-process.md.
+#[cfg(feature = "embedded-sparq")]
+pub mod embedded;
 pub mod http;
 pub mod reconcile;
 pub mod sparq;
@@ -16,6 +21,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 pub use blob::{BlobEntry, BlobError, BlobStore, InMemoryBlobStore};
+#[cfg(feature = "embedded-sparq")]
+pub use embedded::EmbeddedSparqClient;
 pub use http::{HttpSparqClient, SparqHttpError};
 pub use reconcile::{
     reconcile_orphans, spawn_periodic, ReconcileError, ReconcileOptions, ReconcileReport,

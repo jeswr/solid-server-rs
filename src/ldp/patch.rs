@@ -406,6 +406,18 @@ fn instantiate(pat: &PatTriple, binding: &Binding) -> Result<Triple, ServerError
                 "a patch triple subject cannot be a literal".into(),
             ))
         }
+        // `oxrdf`'s `Term::Triple` (RDF 1.2 quoted triples) variant exists only when the `rdf-12`
+        // feature is enabled — which the embedded-sparq backend's `sparq-core`/`sparq-engine` deps
+        // turn on for the whole build via feature unification. Quoted triples are NOT part of N3
+        // Patch, so a subject that is a quoted triple is rejected as an unprocessable patch (422).
+        // The arm is `#[cfg]`-gated so it does not reference a non-existent variant in the DEFAULT
+        // (no-embedded-sparq) build, where `rdf-12` is off and the variant is absent.
+        #[cfg(feature = "embedded-sparq")]
+        Term::Triple(_) => {
+            return Err(ServerError::UnprocessablePatch(
+                "a patch triple subject cannot be a quoted triple".into(),
+            ))
+        }
     };
     let predicate = match resolve(&pat.predicate, binding)? {
         Term::NamedNode(n) => n,
@@ -531,6 +543,15 @@ fn pat_term(t: &N3Term, kind: FormulaKind, pos: Position) -> Result<PatTerm, Ser
             // always an IRI, so a predicate variable simply binds to an IRI during the join.
             Ok(PatTerm::Var(v.clone()))
         }
+        // `oxttl`'s `N3Term::Triple` (RDF 1.2 quoted triples) variant exists only when the `rdf-12`
+        // feature is enabled — which the embedded-sparq backend's deps turn on for the whole build
+        // via feature unification (see the `rdf-12` note above). Quoted triples are NOT part of N3
+        // Patch, so any position is rejected. The arm is `#[cfg]`-gated so it does not reference a
+        // non-existent variant in the DEFAULT (no-embedded-sparq) build where the variant is absent.
+        #[cfg(feature = "embedded-sparq")]
+        N3Term::Triple(_) => Err(ServerError::UnprocessablePatch(
+            "quoted triples are not allowed in an N3 Patch".into(),
+        )),
     }
 }
 

@@ -56,6 +56,20 @@ axum-server = { version = "0.8", default-features = false, features = ["tls-rust
 # (which the CTH's future-skewed proof relies on) is unchanged.
 # FOLLOW-UP: re-pin to a tagged release once the verifier cuts one.
 solid-oidc-verifier = { git = "https://github.com/jeswr/solid-oidc-verifier", rev = "242d8120476a6557670c7aacbb4db5dd08da2bc6", features = ["network"] }
+# EMBEDDED SPARQ (opt-in `embedded-sparq` feature): the SPARQ query engine consumed DIRECTLY as a
+# library (NOT over its HTTP service) for the in-process data path. `sparq-core` gives the
+# `Graph` store (`load_str`/`open`/`save`/`apply_delta`) and `sparq-engine` the query/update
+# entry points (`query_json`/`ask`/`update_in_place` with full named-graph `GRAPH <g> { … }`
+# support — the engine preserves named graphs, fixing the HTTP store's DEVIATION-1). Pinned to an
+# exact `jeswr/sparq` rev (git+https, NOT git+ssh) for reproducible, security-reviewable builds;
+# Cargo.lock is committed. OFF by default so the standard build, tests, and conformance are
+# byte-identical and carry NO sparq dependency unless an operator opts in. FOLLOW-UP: re-pin to a
+# tagged release once sparq cuts one.
+# `mmap` enables `Graph::open`/`save` (the directory-backed persistence seam — memory-mapped
+# on-disk indexes); without it only the in-memory path is available. The default `parallel` feature
+# rides along (parallel index build).
+sparq-core = { git = "https://github.com/jeswr/sparq", rev = "98259ecdd66ff87683bca482fbc8ee786c4328a8", features = ["mmap"], optional = true }
+sparq-engine = { git = "https://github.com/jeswr/sparq", rev = "98259ecdd66ff87683bca482fbc8ee786c4328a8", optional = true }
 # RDF parse/serialise: oxttl (Turtle/N-Triples) + oxjsonld (JSON-LD ↔ RDF), via oxrdf model (spike §4).
 # oxttl 0.2 + oxjsonld 0.2 both pin `oxrdf =0.3.3`, so this is a coherent Oxigraph set.
 oxrdf = "0.3"
@@ -149,3 +163,9 @@ default = []
 # and carry no extra dependency. Enable for a horizontally-scaled deployment that shares one replay set
 # across instances (set `SOLID_SERVER_REPLAY_REDIS_URL` at runtime to actually select it).
 redis-replay = ["dep:redis", "dep:r2d2"]
+# Opt-in: compile the IN-PROCESS embedded SPARQ data-path backend (`src/store/embedded.rs`) +
+# its `sparq-core`/`sparq-engine` git deps. OFF by default so the standard build, tests, and
+# conformance are byte-identical and carry NO sparq dependency. Enable to select the engine as a
+# library (PSS_SPARQ_BACKEND=embedded at runtime) instead of the HTTP service or the in-memory
+# double. See [`solid_server_rs::store::embedded`] and decisions/0001-embed-sparq-in-process.md.
+embedded-sparq = ["dep:sparq-core", "dep:sparq-engine"]

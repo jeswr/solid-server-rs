@@ -35,8 +35,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use solid_oidc_verifier::config::{NetworkJwksProvider, VerifierConfig};
-use solid_oidc_verifier::replay::InMemoryReplayStore;
+use solid_oidc_verifier::config::{JwksProvider, NetworkJwksProvider, VerifierConfig};
+use solid_oidc_verifier::replay::{InMemoryReplayStore, ReplayStore};
 use solid_oidc_verifier::verifier::Verifier;
 use solid_oidc_verifier::webid::{BidirectionalMode, NetworkWebIdResolver};
 use solid_server_rs::acl_cache::{AclCache, DEFAULT_ACL_CACHE_CAPACITY};
@@ -48,7 +48,9 @@ use solid_server_rs::auth_cache::{
 use solid_server_rs::ldp::handler::LdpState;
 use solid_server_rs::overload::{self, AdmissionControl};
 use solid_server_rs::rate_limit::{self, RateConfig, RateLimiter};
-use solid_server_rs::store::{CompositeStore, InMemoryBlobStore, InMemorySparqClient};
+use solid_server_rs::store::{
+    CompositeStore, HttpSparqClient, InMemoryBlobStore, InMemorySparqClient, Store,
+};
 use solid_server_rs::tls::{self, TlsMode};
 
 // --- Environment configuration keys ----------------------------------------------------------------
@@ -108,6 +110,25 @@ const ENV_TOKEN_CACHE_CAPACITY: &str = "SOLID_SERVER_TOKEN_CACHE_CAPACITY";
 /// etag/`meta` gate). Set to `0` to DISABLE the cache (every read re-reads + re-parses each ACL — the
 /// pre-cache path). Conformance-neutral. See [`solid_server_rs::acl_cache`].
 const ENV_ACL_CACHE_CAPACITY: &str = "SOLID_SERVER_ACL_CACHE_CAPACITY";
+/// Select the SPARQ data-path backend (the authoritative-RDF [`SparqClient`] impl):
+/// - `memory` (DEFAULT) — the in-memory [`InMemorySparqClient`] double: boots without SPARQ/S3 and
+///   is what conformance + the unit/integration suites run against. UNCHANGED default.
+/// - `http` — the live [`HttpSparqClient`] over a SPARQ `/sparql` endpoint (the shared-service
+///   deployment). Requires `SOLID_SERVER_SPARQ_ENDPOINT`.
+/// - `embedded` — the IN-PROCESS [`solid_server_rs::store::embedded::EmbeddedSparqClient`]: the SPARQ
+///   query engine consumed as a LIBRARY (no HTTP hop), default-OFF, requires the `embedded-sparq`
+///   build feature. With `SOLID_SERVER_SPARQ_DIR` set it opens a directory-backed graph; otherwise a
+///   fresh in-memory graph. See decisions/0001-embed-sparq-in-process.md.
+///
+/// `CompositeStore<S>` / `AppState<J,R,S>` / the router are all generic over the SparqClient `S`, so
+/// each arm monomorphizes the SAME wiring — no consumer code changes between backends.
+const ENV_SPARQ_BACKEND: &str = "PSS_SPARQ_BACKEND";
+/// The SPARQ `/sparql` endpoint URL for `PSS_SPARQ_BACKEND=http`.
+const ENV_SPARQ_ENDPOINT: &str = "SOLID_SERVER_SPARQ_ENDPOINT";
+/// Optional on-disk directory for `PSS_SPARQ_BACKEND=embedded` (a previously-saved graph snapshot);
+/// unset ⇒ a fresh in-memory graph.
+#[cfg(feature = "embedded-sparq")]
+const ENV_SPARQ_DIR: &str = "SOLID_SERVER_SPARQ_DIR";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -252,58 +273,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // --- Storage. SPARQ authoritative for metadata; object_store backup-only for bytes. -----------
-    // The binary still boots the in-memory doubles so it runs without SPARQ / S3; wiring the live
-    // HttpSparqClient + object_store blob store is the next storage slice.
-    let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
-
-    // Dev/conformance seeding (gated, in-memory only): write the test users' WebID profiles + the
-    // container tree the Solid CTH dereferences to bootstrap. Done BEFORE the store is moved into the
-    // LDP state; a seeding failure aborts boot (better than a half-seeded store).
-    if env_flag(ENV_SEED_CONFORMANCE) {
-        solid_server_rs::seed::seed_conformance(&store, &base_url, &issuer)
-            .await
-            .map_err(|e| format!("conformance seeding failed: {e:?}"))?;
-        eprintln!(
-            "  SEEDED conformance users {:?} (WebID profiles + container tree) — DEV/CONFORMANCE ONLY.",
-            solid_server_rs::seed::SEED_USERS
-        );
-    }
-
-    // Dev/benchmark seeding (gated, in-memory only): purely additive fixtures for the HTTPS load
-    // benchmark. Like the conformance seed it only writes resources; it changes no request handling.
-    if let Some(child_count) = bench_seed_count(ENV_SEED_BENCH) {
-        let fixtures = solid_server_rs::seed::seed_bench(&store, &base_url, child_count)
-            .await
-            .map_err(|e| format!("bench seeding failed: {e:?}"))?;
-        eprintln!(
-            "  SEEDED bench fixtures — DEV/BENCH ONLY: public_doc={} listing={} ({} children) private_doc={}",
-            fixtures.public_doc, fixtures.listing, fixtures.child_count, fixtures.private_doc
-        );
-    }
-
-    let mut ldp = LdpState::new(store, base_url.clone());
-    // ETag-keyed parsed-ACL cache (read-path optimisation #3). Default-on; `=0` disables it (byte-
-    // identical pre-cache behaviour). A cache HIT reuses the parsed `.acl` triples of an UNCHANGED ACL
-    // across reads (keyed by `(acl-iri, etag)`) — it can never serve a rotated/removed ACL stale, so
-    // it never changes a decision. The validation TTL is bound by the JWKS cache TTL (same freshness
-    // window the auth caches use) so a misbehaving etag can never mask a change indefinitely.
-    let acl_cache_capacity = parse_cache_capacity_for(
-        std::env::var(ENV_ACL_CACHE_CAPACITY).ok(),
-        DEFAULT_ACL_CACHE_CAPACITY,
-    );
-    let acl_cache = if acl_cache_capacity == 0 {
-        eprintln!("  AUTHZ: ETag-keyed parsed-ACL cache DISABLED (re-read + re-parse every ACL).");
-        AclCache::disabled()
-    } else {
-        eprintln!(
-            "  AUTHZ: ETag-keyed parsed-ACL cache ENABLED (capacity {acl_cache_capacity} ACLs; \
-             reuses an UNCHANGED ACL's parse, never authoritative)."
-        );
-        AclCache::with_max_entry_ttl(acl_cache_capacity, jwks_cache_ttl.as_secs() as i64)
-    };
-    ldp.set_acl_cache(acl_cache);
-
     // --- Overload protection (admission control + request timeout). -------------------------------
     // Admission control sheds excess load (503 + jittered Retry-After) at a configurable concurrency
     // ceiling BEFORE auth/WAC/storage run (so a shed request never bypasses authorization). The
@@ -370,7 +339,99 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate_limiter,
     };
 
-    let app = build_router_with_overload(AppState::new(auth, ldp), overload_config);
+    // --- SPARQ data-path backend selection. -------------------------------------------------------
+    // `CompositeStore<S>` / `AppState<J,R,S>` / the router are generic over the SparqClient `S`, so
+    // each arm monomorphizes the SAME downstream wiring (`build_app_for_store`): seed → LdpState →
+    // ACL cache → AppState → router. Exactly ONE arm runs, so `auth` + `overload_config` (consumed
+    // once) move into the chosen arm. DEFAULT = `memory` (the in-memory double — boot-without-SPARQ +
+    // conformance byte-identical). `http` wires the live HttpSparqClient; `embedded` (opt-in feature)
+    // wires the in-process engine. See decisions/0001-embed-sparq-in-process.md.
+    let backend = std::env::var(ENV_SPARQ_BACKEND)
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "memory".to_string());
+    let app = match backend.as_str() {
+        "memory" => {
+            eprintln!("  STORAGE: SPARQ backend = MEMORY (in-memory double — boot-without-SPARQ; the conformance/test default).");
+            let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+            build_app_for_store(
+                store,
+                &base_url,
+                &issuer,
+                jwks_cache_ttl,
+                auth,
+                overload_config,
+            )
+            .await?
+        }
+        "http" => {
+            let endpoint = std::env::var(ENV_SPARQ_ENDPOINT).map_err(|_| {
+                format!(
+                    "PSS_SPARQ_BACKEND=http requires {ENV_SPARQ_ENDPOINT} (the SPARQ /sparql URL)"
+                )
+            })?;
+            eprintln!("  STORAGE: SPARQ backend = HTTP (live SPARQL endpoint {endpoint}).");
+            let store =
+                CompositeStore::new(HttpSparqClient::new(endpoint), InMemoryBlobStore::new());
+            build_app_for_store(
+                store,
+                &base_url,
+                &issuer,
+                jwks_cache_ttl,
+                auth,
+                overload_config,
+            )
+            .await?
+        }
+        #[cfg(feature = "embedded-sparq")]
+        "embedded" => {
+            // The IN-PROCESS engine over a fresh in-memory Graph, or a directory-backed one when a
+            // persistence dir is configured. A construction failure aborts boot (fail-closed).
+            let sparq = match std::env::var(ENV_SPARQ_DIR)
+                .ok()
+                .filter(|d| !d.trim().is_empty())
+            {
+                Some(dir) => {
+                    eprintln!("  STORAGE: SPARQ backend = EMBEDDED (in-process engine; directory-backed graph at {dir}).");
+                    solid_server_rs::store::embedded::EmbeddedSparqClient::open(
+                        std::path::Path::new(&dir),
+                    )
+                    .map_err(|e| format!("failed to open the embedded SPARQ graph at {dir}: {e}"))?
+                }
+                None => {
+                    eprintln!("  STORAGE: SPARQ backend = EMBEDDED (in-process engine; fresh in-memory graph).");
+                    solid_server_rs::store::embedded::EmbeddedSparqClient::in_memory()
+                        .map_err(|e| format!("failed to init the embedded SPARQ graph: {e}"))?
+                }
+            };
+            let store = CompositeStore::new(sparq, InMemoryBlobStore::new());
+            build_app_for_store(
+                store,
+                &base_url,
+                &issuer,
+                jwks_cache_ttl,
+                auth,
+                overload_config,
+            )
+            .await?
+        }
+        #[cfg(not(feature = "embedded-sparq"))]
+        "embedded" => {
+            return Err(
+                "PSS_SPARQ_BACKEND=embedded requires the `embedded-sparq` build feature — \
+                 rebuild with `cargo build --release --features embedded-sparq`, or use \
+                 PSS_SPARQ_BACKEND=memory|http."
+                    .into(),
+            );
+        }
+        other => {
+            return Err(format!(
+                "unknown {ENV_SPARQ_BACKEND}={other:?} — expected `memory` (default), `http`, or \
+                 `embedded` (with the `embedded-sparq` feature)."
+            )
+            .into());
+        }
+    };
 
     // Build the rustls config (reads + validates the PEM files) for TLS mode; `None` for plain mode.
     // Done after the router is assembled but before binding, so a bad cert/key fails at boot.
@@ -457,6 +518,85 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Build the application router for a chosen, already-constructed [`Store`] backend — the SAME
+/// downstream wiring for EVERY `PSS_SPARQ_BACKEND` arm (memory / http / embedded).
+///
+/// Generic over `S: Store` (the `CompositeStore<SparqClient, BlobStore>` the chosen backend
+/// monomorphizes) and `J/R` (the auth's JWKS provider + replay store). Each backend arm in `main`
+/// calls this with its own `S`, so there is ONE seed → `LdpState` → ACL-cache → `AppState` → router
+/// sequence, not three. Keeping it generic is what makes adding the embedded backend a one-arm change
+/// with no consumer-code duplication (the maintainer's "generic-over-S seam = one-line swap").
+///
+/// The dev/conformance + dev/bench seeding is gated exactly as before; it runs against whatever `S`
+/// is selected (the conformance/bench seeds are still in-memory-only in practice — they are gated by
+/// their own env flags and only ever set against the memory backend).
+#[allow(clippy::too_many_arguments)]
+async fn build_app_for_store<S, J, R>(
+    store: S,
+    base_url: &str,
+    issuer: &str,
+    jwks_cache_ttl: Duration,
+    auth: AuthContext<J, R>,
+    overload_config: OverloadConfig,
+) -> Result<axum::Router, Box<dyn std::error::Error>>
+where
+    S: Store + 'static,
+    J: JwksProvider + Send + Sync + 'static,
+    R: ReplayStore + Send + Sync + 'static,
+{
+    // Dev/conformance seeding (gated): write the test users' WebID profiles + the container tree the
+    // Solid CTH dereferences to bootstrap. Done BEFORE the store is moved into the LDP state; a seeding
+    // failure aborts boot (better than a half-seeded store).
+    if env_flag(ENV_SEED_CONFORMANCE) {
+        solid_server_rs::seed::seed_conformance(&store, base_url, issuer)
+            .await
+            .map_err(|e| format!("conformance seeding failed: {e:?}"))?;
+        eprintln!(
+            "  SEEDED conformance users {:?} (WebID profiles + container tree) — DEV/CONFORMANCE ONLY.",
+            solid_server_rs::seed::SEED_USERS
+        );
+    }
+
+    // Dev/benchmark seeding (gated): purely additive fixtures for the HTTPS load benchmark. Like the
+    // conformance seed it only writes resources; it changes no request handling.
+    if let Some(child_count) = bench_seed_count(ENV_SEED_BENCH) {
+        let fixtures = solid_server_rs::seed::seed_bench(&store, base_url, child_count)
+            .await
+            .map_err(|e| format!("bench seeding failed: {e:?}"))?;
+        eprintln!(
+            "  SEEDED bench fixtures — DEV/BENCH ONLY: public_doc={} listing={} ({} children) private_doc={}",
+            fixtures.public_doc, fixtures.listing, fixtures.child_count, fixtures.private_doc
+        );
+    }
+
+    let mut ldp = LdpState::new(store, base_url.to_string());
+    // ETag-keyed parsed-ACL cache (read-path optimisation #3). Default-on; `=0` disables it (byte-
+    // identical pre-cache behaviour). A cache HIT reuses the parsed `.acl` triples of an UNCHANGED ACL
+    // across reads (keyed by `(acl-iri, etag)`) — it can never serve a rotated/removed ACL stale, so
+    // it never changes a decision. The validation TTL is bound by the JWKS cache TTL (same freshness
+    // window the auth caches use) so a misbehaving etag can never mask a change indefinitely.
+    let acl_cache_capacity = parse_cache_capacity_for(
+        std::env::var(ENV_ACL_CACHE_CAPACITY).ok(),
+        DEFAULT_ACL_CACHE_CAPACITY,
+    );
+    let acl_cache = if acl_cache_capacity == 0 {
+        eprintln!("  AUTHZ: ETag-keyed parsed-ACL cache DISABLED (re-read + re-parse every ACL).");
+        AclCache::disabled()
+    } else {
+        eprintln!(
+            "  AUTHZ: ETag-keyed parsed-ACL cache ENABLED (capacity {acl_cache_capacity} ACLs; \
+             reuses an UNCHANGED ACL's parse, never authoritative)."
+        );
+        AclCache::with_max_entry_ttl(acl_cache_capacity, jwks_cache_ttl.as_secs() as i64)
+    };
+    ldp.set_acl_cache(acl_cache);
+
+    Ok(build_router_with_overload(
+        AppState::new(auth, ldp),
+        overload_config,
+    ))
 }
 
 /// Read a boolean-ish env flag: `1` / `true` (case-insensitive) ⇒ true; anything else / absent ⇒ false.

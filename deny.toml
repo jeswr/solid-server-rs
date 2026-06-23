@@ -45,4 +45,12 @@ unknown-git = "warn"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # The DPoP/Solid-OIDC verifier is consumed as a git dependency (its crates.io publish is deferred —
 # spike §12 / its own suite.json). M2: pin to a tag/rev once it cuts a release.
-allow-git = ["https://github.com/jeswr/solid-oidc-verifier"]
+# `jeswr/sparq` is consumed as a git dependency by the OPT-IN `embedded-sparq` feature (the in-process
+# SPARQ engine data-path backend — `sparq-core`/`sparq-engine`; see
+# decisions/0001-embed-sparq-in-process.md). git+https, pinned to an exact rev; re-pin to a tag once
+# SPARQ cuts a release. It introduces NO new rejected license (the only rejection — webpki-roots
+# CDLA-Permissive-2.0 — pre-exists via reqwest→hyper-rustls, unrelated to sparq).
+allow-git = [
+  "https://github.com/jeswr/solid-oidc-verifier",
+  "https://github.com/jeswr/sparq",
+]
