@@ -53,9 +53,40 @@ impl AccessMode {
 /// The `.acl` auxiliary-resource suffix (`<resource>.acl`, `<container>/.acl`).
 pub const ACL_SUFFIX: &str = ".acl";
 
+/// The `.meta` auxiliary-resource suffix (`<resource>.meta`, `<container>/.meta`) — the conventional
+/// Solid description-resource suffix. It is treated as load-bearing alongside `.acl` so the
+/// POST-mint guard ([`is_auxiliary_suffix`]) is robust the moment any metadata-auxiliary handling is
+/// added, NOT only for the `.acl` hole exploited today.
+pub const META_SUFFIX: &str = ".meta";
+
 /// Whether an IRI names an ACL auxiliary resource (ends in `.acl`).
+///
+/// This is the predicate the WAC resolver and the handler use to gate ACL access at Control; it
+/// stays EXACT-CASE on purpose because the resolver only ever derives a lowercase `…/x.acl`
+/// (`acl_for` = `format!("{resource}.acl")`), so an exact-case match is what governs access. The
+/// broader, case-insensitive [`is_auxiliary_suffix`] is what the create/mint chokepoint uses to
+/// fail closed against any case/suffix variant.
 pub fn is_acl_resource(iri: &str) -> bool {
     iri.ends_with(ACL_SUFFIX)
+}
+
+/// Whether an IRI's FINAL path segment ends in a load-bearing auxiliary suffix (`.acl` or `.meta`),
+/// matched CASE-INSENSITIVELY.
+///
+/// This is the create/mint-side guard, NOT the access-side predicate. It is deliberately broader and
+/// case-insensitive so an Append-only POST can NEVER mint a resource that the WAC resolver (or any
+/// future metadata path) will later consult as another resource's load-bearing auxiliary — even via
+/// a case variant (`secret.ACL`) or a future-treated suffix (`.meta`). The check is applied to the
+/// final path segment (after the last `/`) so a `.acl` appearing only mid-path cannot false-positive,
+/// while both `…/secret.acl` (a resource) and `…/.acl` (a container's own ACL) are caught.
+pub fn is_auxiliary_suffix(iri: &str) -> bool {
+    // The final path segment: everything after the last '/'. For a container child IRI ending in a
+    // trailing '/', the segment before that slash is what was minted; strip one trailing slash so a
+    // `Slug: foo.acl` requesting a CONTAINER child (`…/foo.acl/`) is still caught.
+    let trimmed = iri.strip_suffix('/').unwrap_or(iri);
+    let segment = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    let lower = segment.to_ascii_lowercase();
+    lower.ends_with(ACL_SUFFIX) || lower.ends_with(META_SUFFIX)
 }
 
 /// Map an HTTP method + target to the single WAC [`AccessMode`] the operation requires.
@@ -110,6 +141,40 @@ mod tests {
         assert!(is_acl_resource("https://pod.example/a/.acl"));
         assert!(!is_acl_resource("https://pod.example/a/b"));
         assert!(!is_acl_resource("https://pod.example/a/"));
+    }
+
+    #[test]
+    fn is_auxiliary_suffix_catches_acl_and_meta_case_insensitively() {
+        // The exact-case `.acl` the resolver consults.
+        assert!(is_auxiliary_suffix("https://pod.example/a/secret.acl"));
+        assert!(is_auxiliary_suffix("https://pod.example/a/.acl"));
+        // The conventional metadata auxiliary suffix.
+        assert!(is_auxiliary_suffix("https://pod.example/a/secret.meta"));
+        assert!(is_auxiliary_suffix("https://pod.example/a/.meta"));
+        // Case variants MUST be caught at the mint chokepoint (defence-in-depth, even though the
+        // resolver itself only derives lowercase `.acl`).
+        assert!(is_auxiliary_suffix("https://pod.example/a/secret.ACL"));
+        assert!(is_auxiliary_suffix("https://pod.example/a/secret.Acl"));
+        assert!(is_auxiliary_suffix("https://pod.example/a/secret.META"));
+        // A CONTAINER child minted with an auxiliary-suffixed slug (trailing slash) is caught too.
+        assert!(is_auxiliary_suffix("https://pod.example/a/secret.acl/"));
+        assert!(is_auxiliary_suffix("https://pod.example/a/secret.ACL/"));
+    }
+
+    #[test]
+    fn is_auxiliary_suffix_allows_benign_names() {
+        // Plain resources / containers are NOT auxiliary.
+        assert!(!is_auxiliary_suffix("https://pod.example/a/secret"));
+        assert!(!is_auxiliary_suffix("https://pod.example/a/secret/"));
+        assert!(!is_auxiliary_suffix("https://pod.example/a/note.ttl"));
+        assert!(!is_auxiliary_suffix("https://pod.example/a/photo.jpg"));
+        // A `.acl` / `.meta` appearing only MID-path (not the final segment) must NOT false-positive
+        // — only the leaf segment is what gets minted/consulted.
+        assert!(!is_auxiliary_suffix("https://pod.example/x.acl/child"));
+        assert!(!is_auxiliary_suffix("https://pod.example/x.meta/child"));
+        // A name that merely CONTAINS "acl" but does not END in the suffix is fine.
+        assert!(!is_auxiliary_suffix("https://pod.example/a/aclremap"));
+        assert!(!is_auxiliary_suffix("https://pod.example/a/metadata"));
     }
 
     #[test]

@@ -560,6 +560,20 @@ pub async fn post_handler<S: Store>(
     let slug = header_str(&headers, HeaderName::from_static("slug"));
     let child_iri = mint_child_iri(&state.store, &container.iri, slug, wants_container).await?;
 
+    // SECURITY (privilege-escalation guard): a POST authorizes only `acl:Append`/`Write` on the
+    // CONTAINER — never `acl:Control`. Yet `sanitise_slug` keeps `.`, so a `Slug: secret.acl` would
+    // mint `…/secret.acl`, which the WAC resolver then reads as the OWN ACL of `…/secret` (overriding
+    // inheritance). That lets an Append-only caller author an ACL granting itself Control over a
+    // sibling resource — a full read + ACL-ownership bypass. A create of a `.acl`/`.meta` is a
+    // Control operation; the Append-only POST chokepoint MUST refuse it (a Control-gated PUT/PATCH of
+    // an `.acl` is the only legitimate path to author one). Reject rather than silently rename — a
+    // silently-renamed `.acl` is surprising and could still confuse a client. The check is on the
+    // MINTED IRI (covering Slug AND any generated-name edge) and is case-insensitive
+    // (`is_auxiliary_suffix`) so no case/suffix variant slips through.
+    if crate::authz::is_auxiliary_suffix(&child_iri) {
+        return Err(ServerError::Forbidden);
+    }
+
     // Validate + select the stored media type, resolving relative IRIs against the MINTED child IRI.
     // RDF is parse-validated; a non-RDF type is stored verbatim as an opaque binary resource. A
     // container's body is conventionally empty/RDF; we still validate whatever was sent.
@@ -2162,5 +2176,275 @@ mod tests {
             parent_rx.try_recv().is_err(),
             "an .acl create-on-PATCH must not emit a parent-containment Add notification"
         );
+    }
+
+    // --- HIGH: POST-Slug auxiliary-resource privilege-escalation bypass ----------------------------
+    //
+    // The exploit (execution-proved by adversarial verification): a POST to a container authorizes
+    // only `acl:Append`, but `sanitise_slug` keeps `.`, so `Slug: secret.acl` survives and mints
+    // `…/secret.acl`. With NO `.acl`/Control re-check, the create wrote an attacker-controlled
+    // `…/secret.acl` that the WAC resolver then reads as the OWN ACL of `…/secret`, overriding
+    // inheritance — letting an Append-only agent grant itself Control over a sibling private resource.
+
+    const ALICE: &str = OWNER; // the container owner (private resource is hers)
+    const BOB: &str = STRANGER; // the Append-only attacker
+
+    /// Build a store where `/alice/c/` exists, Alice owns it (default Read/Write/Control over the
+    /// container + its members), and Bob holds ONLY `acl:Append` on the container itself. The child
+    /// `/alice/c/secret` is therefore Alice-private by inheritance (no own ACL).
+    async fn store_alice_container_bob_append_only(
+    ) -> CompositeStore<InMemorySparqClient, InMemoryBlobStore> {
+        let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        // The container must EXIST for a POST to it to proceed (the handler's existence check).
+        store
+            .write(
+                "https://pod.example/alice/c/",
+                AxBytes::from(String::new()),
+                "text/turtle",
+            )
+            .await
+            .expect("seed container");
+        // The container `.acl`: Alice gets default Read/Write/Control (so `secret` inherits
+        // Alice-private); Bob gets ONLY Append on the container itself (he can POST a member, but
+        // cannot read/control the container or its members).
+        let acl = format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#alice> a acl:Authorization;
+         acl:agent <{ALICE}>;
+         acl:accessTo <https://pod.example/alice/c/>;
+         acl:default <https://pod.example/alice/c/>;
+         acl:mode acl:Read, acl:Write, acl:Control.
+<#bob> a acl:Authorization;
+       acl:agent <{BOB}>;
+       acl:accessTo <https://pod.example/alice/c/>;
+       acl:mode acl:Append."#
+        );
+        store
+            .write(
+                "https://pod.example/alice/c/.acl",
+                AxBytes::from(acl),
+                "text/turtle",
+            )
+            .await
+            .expect("seed container acl");
+        store
+    }
+
+    fn bob_token() -> VerifiedToken {
+        VerifiedToken {
+            web_id: Some(BOB.into()),
+            ..VerifiedToken::default()
+        }
+    }
+
+    /// A POST body that, if it landed as `…/secret.acl`, would grant Bob `acl:Control` over
+    /// `…/secret` — the escalation payload.
+    fn bob_self_control_acl_body() -> AxBytes {
+        AxBytes::from(format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#pwn> a acl:Authorization;
+       acl:agent <{BOB}>;
+       acl:accessTo <https://pod.example/alice/c/secret>;
+       acl:mode acl:Read, acl:Write, acl:Control."#
+        ))
+    }
+
+    fn post_turtle_headers_with_slug(slug: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/turtle"),
+        );
+        headers.insert(
+            HeaderName::from_static("slug"),
+            HeaderValue::from_str(slug).unwrap(),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn post_slug_dot_acl_is_denied_and_grants_attacker_nothing() {
+        // THE EXPLOIT, ported as a regression test driving the REAL post_handler + get_handler.
+        let store = store_alice_container_bob_append_only().await;
+        let state = Arc::new(LdpState::new(store, "https://pod.example"));
+
+        // (1) Bob (Append-only) POSTs `Slug: secret.acl` with a self-Control body → MUST be denied
+        //     (403). The auxiliary-mint guard refuses to let an Append-only POST create a `.acl`.
+        let uri: axum::http::Uri = "/alice/c/".parse().unwrap();
+        let err = post_handler(
+            State(state.clone()),
+            Extension(bob_token()),
+            uri,
+            post_turtle_headers_with_slug("secret.acl"),
+            bob_self_control_acl_body(),
+        )
+        .await
+        .expect_err("POST Slug: secret.acl by an Append-only caller MUST be denied");
+        assert_eq!(
+            err.status(),
+            StatusCode::FORBIDDEN,
+            "the auxiliary-mint escalation must be a 403"
+        );
+
+        // (1b) The malicious `.acl` must NOT exist — the create never happened.
+        assert!(
+            !state
+                .store
+                .exists("https://pod.example/alice/c/secret.acl")
+                .await
+                .unwrap(),
+            "no attacker-controlled .acl may have been written"
+        );
+
+        // (2) Bob then tries to GET the sibling `…/secret` — he gained NOTHING. `secret` is
+        //     Alice-private by inheritance and has no (attacker-planted) own ACL, so Bob is denied.
+        let get_uri: axum::http::Uri = "/alice/c/secret".parse().unwrap();
+        let get_err = get_handler(
+            State(state),
+            Extension(bob_token()),
+            get_uri,
+            HeaderMap::new(),
+        )
+        .await
+        .expect_err("Bob must not be able to read Alice's private resource");
+        // 403 — Bob is authenticated but unauthorized (he inherits no Read from the Alice-only default).
+        assert_eq!(
+            get_err.status(),
+            StatusCode::FORBIDDEN,
+            "Bob must gain no read access to the sibling private resource"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_slug_dot_acl_case_variant_is_also_denied() {
+        // Defence-in-depth: a case-variant Slug (`secret.ACL`) must ALSO be rejected at the mint
+        // chokepoint — `sanitise_slug` keeps it verbatim, so without a case-insensitive guard it would
+        // sail through (and a case-insensitive filesystem/resolver later could make it load-bearing).
+        let store = store_alice_container_bob_append_only().await;
+        let state = Arc::new(LdpState::new(store, "https://pod.example"));
+        let uri: axum::http::Uri = "/alice/c/".parse().unwrap();
+        let err = post_handler(
+            State(state.clone()),
+            Extension(bob_token()),
+            uri,
+            post_turtle_headers_with_slug("secret.ACL"),
+            bob_self_control_acl_body(),
+        )
+        .await
+        .expect_err("a case-variant .acl slug must also be denied");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !state
+                .store
+                .exists("https://pod.example/alice/c/secret.ACL")
+                .await
+                .unwrap(),
+            "no case-variant auxiliary resource may have been written"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_slug_dot_meta_is_also_denied() {
+        // The guard also covers `.meta` (the conventional metadata auxiliary suffix) so the moment any
+        // metadata-auxiliary handling exists, an Append-only POST cannot plant a load-bearing `.meta`.
+        let store = store_alice_container_bob_append_only().await;
+        let state = Arc::new(LdpState::new(store, "https://pod.example"));
+        let uri: axum::http::Uri = "/alice/c/".parse().unwrap();
+        let err = post_handler(
+            State(state.clone()),
+            Extension(bob_token()),
+            uri,
+            post_turtle_headers_with_slug("secret.meta"),
+            AxBytes::from("<https://pod.example/alice/c/secret> <p> <o> ."),
+        )
+        .await
+        .expect_err("a .meta slug must be denied at the mint chokepoint");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        assert!(!state
+            .store
+            .exists("https://pod.example/alice/c/secret.meta")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn post_benign_slug_still_works_no_regression() {
+        // The control: an Append-only Bob POSTing a BENIGN slug into the container still succeeds —
+        // the fix must not break legitimate container appends.
+        let store = store_alice_container_bob_append_only().await;
+        let state = Arc::new(LdpState::new(store, "https://pod.example"));
+        let uri: axum::http::Uri = "/alice/c/".parse().unwrap();
+        let resp = post_handler(
+            State(state.clone()),
+            Extension(bob_token()),
+            uri,
+            post_turtle_headers_with_slug("note"),
+            AxBytes::from(
+                "<https://pod.example/alice/c/note#me> <http://xmlns.com/foaf/0.1/name> \"N\" .",
+            ),
+        )
+        .await
+        .expect("a benign Append POST must still succeed");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        // The child was created under the expected name.
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .expect("Location header")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(loc, "https://pod.example/alice/c/note");
+        assert!(state.store.exists(&loc).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn post_slug_dot_acl_denied_even_for_a_controller() {
+        // A POST is an Append/Write operation on the CONTAINER, never a Control op — so even a caller
+        // who DOES hold Control over the container (Alice) must not be able to mint a `.acl` via the
+        // POST-Slug path. The legitimate way to author an `.acl` is a Control-gated PUT/PATCH of the
+        // exact `.acl` IRI; the POST chokepoint uniformly refuses to mint an auxiliary child. Consistent
+        // behaviour: reject for everyone (no privilege-dependent fork at the mint point — that keeps the
+        // chokepoint simple and impossible to confuse). Alice can still PUT `/alice/c/secret.acl`
+        // directly, which IS Control-gated and which she passes.
+        let store = store_alice_container_bob_append_only().await;
+        let state = Arc::new(LdpState::new(store, "https://pod.example"));
+
+        // Alice (controller) POSTs Slug: secret.acl → still 403 at the mint chokepoint.
+        let uri: axum::http::Uri = "/alice/c/".parse().unwrap();
+        let err = post_handler(
+            State(state.clone()),
+            Extension(owner_token()),
+            uri,
+            post_turtle_headers_with_slug("secret.acl"),
+            AxBytes::from(format!(
+                r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#a> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <https://pod.example/alice/c/secret>; acl:mode acl:Control."#
+            )),
+        )
+        .await
+        .expect_err("POST-Slug minting an .acl is refused for everyone, controllers included");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+
+        // But Alice CAN author it the legitimate, Control-gated way: a direct PUT of the .acl IRI.
+        let put_uri: axum::http::Uri = "/alice/c/secret.acl".parse().unwrap();
+        let mut put_headers = HeaderMap::new();
+        put_headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/turtle"),
+        );
+        let resp = put_handler(
+            State(state),
+            Extension(owner_token()),
+            put_uri,
+            put_headers,
+            AxBytes::from(format!(
+                r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#a> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <https://pod.example/alice/c/secret>; acl:mode acl:Read, acl:Write, acl:Control."#
+            )),
+        )
+        .await
+        .expect("a controller may PUT an .acl directly (Control-gated)");
+        assert_eq!(resp.status(), StatusCode::CREATED);
     }
 }
