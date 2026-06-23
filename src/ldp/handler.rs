@@ -27,7 +27,7 @@
 //! [`crate::seed`]). Authorization runs BEFORE the existence check, so a permitted read of a missing
 //! resource is a 404 while an UNauthorized/anonymous read of the same is a 403/401 (no existence leak).
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -62,6 +62,54 @@ const LDP_RESOURCE_IRI: &str = "http://www.w3.org/ns/ldp#Resource";
 const LDP_CONTAINER_IRI: &str = "http://www.w3.org/ns/ldp#Container";
 const LDP_BASIC_CONTAINER_IRI: &str = "http://www.w3.org/ns/ldp#BasicContainer";
 const LDP_CONTAINS_IRI: &str = "http://www.w3.org/ns/ldp#contains";
+
+/// The five vocabulary IRIs above are server CONSTANTS — fixed strings, RFC-3987-valid by
+/// construction. Validating them through `NamedNode::new` (oxiri RFC-3987 parse) on every container
+/// render is pure waste: the same five strings re-parse identically every time. Validate each ONCE
+/// per process via `new_unchecked` behind a `LazyLock` and clone the cached `NamedNode` on the hot
+/// path. `new_unchecked` is sound here precisely because the inputs are compile-time constants; a
+/// `debug_assert!` re-validates each in debug builds so a typo'd constant fails a test, never ships.
+static RDF_TYPE_NODE: LazyLock<NamedNode> = LazyLock::new(|| unchecked_const_iri(RDF_TYPE_IRI));
+static LDP_RESOURCE_NODE: LazyLock<NamedNode> =
+    LazyLock::new(|| unchecked_const_iri(LDP_RESOURCE_IRI));
+static LDP_CONTAINER_NODE: LazyLock<NamedNode> =
+    LazyLock::new(|| unchecked_const_iri(LDP_CONTAINER_IRI));
+static LDP_BASIC_CONTAINER_NODE: LazyLock<NamedNode> =
+    LazyLock::new(|| unchecked_const_iri(LDP_BASIC_CONTAINER_IRI));
+static LDP_CONTAINS_NODE: LazyLock<NamedNode> =
+    LazyLock::new(|| unchecked_const_iri(LDP_CONTAINS_IRI));
+
+/// Build a `NamedNode` from a COMPILE-TIME-CONSTANT IRI without the per-call RFC-3987 re-parse.
+/// Confined to the five `*_IRI` server constants above (validated once, at first use). The
+/// `debug_assert!` re-runs the checked parse in debug/test builds so a malformed constant is caught
+/// by the test suite rather than silently producing an invalid node.
+fn unchecked_const_iri(iri: &str) -> NamedNode {
+    debug_assert!(
+        NamedNode::new(iri).is_ok(),
+        "server-constant IRI must be RFC-3987 valid: {iri}"
+    );
+    NamedNode::new_unchecked(iri)
+}
+
+/// CHEAP (O(len), no allocation) structural guard for a child IRI that is about to be wrapped in a
+/// `NamedNode::new_unchecked` and serialised into a Turtle/N-Triples `<...>` term. It is NOT a full
+/// RFC-3987 validator (the fast path deliberately skips oxiri's parse) — it rejects ONLY the
+/// characters RFC-3987 forbids INSIDE an IRI reference and that would corrupt the serialised term:
+/// the C0/C1 control range and DEL, the space, and the ASCII delimiters `< > " { } | ^ \` `\` `.
+/// An empty IRI is also rejected. Every IRI the store mints passes this (it is RFC-3987-valid on
+/// write); the guard exists so a hypothetically-malformed backend row is OMITTED from the listing
+/// rather than silently producing an invalid RDF term (defence-in-depth, matching the prior
+/// skip-on-`NamedNode::new`-error behaviour).
+fn iri_chars_serialisable(iri: &str) -> bool {
+    if iri.is_empty() {
+        return false;
+    }
+    !iri.chars().any(|c| {
+        c.is_control()
+            || c == ' '
+            || matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\')
+    })
+}
 
 /// Shared state for the LDP handlers: the store + the server's public base URL + the notification hub.
 ///
@@ -1136,10 +1184,8 @@ async fn render_container<S: Store>(
 
     let subject = NamedNode::new(container_iri)
         .map_err(|e| ServerError::Storage(format!("invalid container IRI {container_iri}: {e}")))?;
-    let rdf_type = nn(RDF_TYPE_IRI)?;
-    let contains = nn(LDP_CONTAINS_IRI)?;
-
-    let mut triples: Vec<Triple> = Vec::new();
+    let rdf_type = RDF_TYPE_NODE.clone();
+    let contains = LDP_CONTAINS_NODE.clone();
 
     // 1) The container's OWN stored RDF (whatever was written to the container itself). Parse it in
     // its stored format, resolving relative IRIs against the container IRI. If the stored body is
@@ -1149,67 +1195,138 @@ async fn render_container<S: Store>(
     // The stored set is carried through VERBATIM (no intra-set de-dup) — exactly as before — so a
     // container body that literally repeats a triple keeps both occurrences (the serialised bytes,
     // and hence the representation ETag, stay identical to the prior linear-scan render).
-    if let Some(fmt) = stored_format {
-        if let Ok(stored) = parse_to_triples(fmt, stored_body, container_iri) {
-            triples.extend(stored);
-        }
-    }
+    let stored_triples: Vec<Triple> = match stored_format {
+        Some(fmt) => parse_to_triples(fmt, stored_body, container_iri).unwrap_or_default(),
+        None => Vec::new(),
+    };
 
-    // De-dup index for the GENERATED triples ONLY. The old `push_unique` scanned the WHOLE `triples`
-    // vec (stored + already-generated) per push → O(N²) once the N `ldp:contains` triples are added.
-    // A `HashSet` membership check makes each generated push O(1) → the whole render O(N).
+    // Build the output Vec DIRECTLY — no whole-graph `HashSet<Triple>` clone-dedup. The previous code
+    // seeded a `HashSet` from `stored_triples.iter().cloned()` and clone-inserted every generated
+    // triple; both are pure allocation that the structure of the data renders unnecessary:
     //
-    // CORRECTNESS — byte-identical output: the generated triples are pushed in the SAME order as
-    // before (the three `rdf:type` triples, then one `ldp:contains` per `list_children` member), and
-    // each is suppressed under EXACTLY the old predicate "already present in `triples`": `seen` is
-    // seeded from the stored set, then each generated triple is checked-and-inserted. The three type
-    // triples are mutually distinct and the `ldp:contains` triples are distinct from one another (the
-    // index lists each child once — unique by construction: an RDF graph holds a containment triple at
-    // most once, and both store impls enforce a child appears once), so the only suppression `seen`
-    // can ever trigger is a generated triple that DUPLICATES a stored one — the same case the old
-    // `push_unique` caught. Insertion order + which triples appear are therefore unchanged, so the
-    // serialiser emits the same bytes and `representation_etag` is preserved.
-    let mut seen: std::collections::HashSet<Triple> = triples.iter().cloned().collect();
-    let mut push_generated = |triples: &mut Vec<Triple>, triple: Triple| {
-        if seen.insert(triple.clone()) {
-            triples.push(triple);
+    //   * the three `rdf:type` triples are mutually distinct, and
+    //   * the `ldp:contains` triples are distinct from one another (the index lists each child once —
+    //     unique by construction: an RDF graph holds a containment edge at most once, both store impls
+    //     enforce a child appears once),
+    //
+    // so the ONLY suppression the old dedup could ever fire was a GENERATED triple that duplicates a
+    // STORED one (exactly the `BasicContainer`-in-stored-body case the byte-identity test pins). We
+    // preserve that — and only that — with a membership check against ONLY the stored set, which is
+    // empty for the overwhelmingly common empty/typing-free container body, so the hot path does zero
+    // membership work. Insertion order + which triples appear are unchanged, so the serialiser emits
+    // the same bytes and `representation_etag` is preserved byte-for-byte.
+    let children = state.store.list_children(container_iri).await?;
+    let stored_len = stored_triples.len();
+
+    // Suppress ONLY a GENERATED triple that duplicates a STORED one. There are exactly `3 + N`
+    // generated triples to probe against the stored set, so the membership structure is chosen by the
+    // stored-body size to avoid BOTH a per-render `HashSet` allocation on the common path AND an
+    // O(stored_len * (3 + N)) cliff on a pathological large-stored-body-plus-many-children container:
+    //   * empty stored body (the overwhelmingly common case)  → no membership work at all;
+    //   * SMALL stored body (≤ DEDUP_HASHSET_THRESHOLD triples) → a zero-allocation linear `contains`
+    //     scan of the stored slice (cheaper than building+hashing a set for a handful of triples);
+    //   * LARGE stored body                                    → build a borrowing `HashSet<&Triple>`
+    //     of `stored_triples` ONCE (no clones — references into the still-owned Vec) and probe it O(1),
+    //     capping the worst case at O(stored_len + (3 + N)) as the old whole-graph HashSet did.
+    // All three branches suppress EXACTLY the same triples (a generated triple present in the stored
+    // set), so the output bytes + `representation_etag` are identical regardless of which path runs.
+    //
+    // The generated triples are collected into their own Vec FIRST (so the membership probe can borrow
+    // the still-owned `stored_triples`); the final `triples` is then `stored ++ generated`, preserving
+    // the prior "stored set verbatim, then generated in order" layout the byte-identity test pins.
+    const DEDUP_HASHSET_THRESHOLD: usize = 16;
+    let stored_set: Option<std::collections::HashSet<&Triple>> =
+        (stored_len > DEDUP_HASHSET_THRESHOLD).then(|| stored_triples.iter().collect());
+    let mut generated: Vec<Triple> = Vec::with_capacity(3 + children.len());
+    let push_generated = |generated: &mut Vec<Triple>, triple: Triple| {
+        let in_stored = match &stored_set {
+            // Large stored body: O(1) hashed membership against the borrowed stored set.
+            Some(set) => set.contains(&triple),
+            // Empty/small stored body: linear scan of the stored slice (zero allocation).
+            None => stored_len != 0 && stored_triples.contains(&triple),
+        };
+        if !in_stored {
+            generated.push(triple);
         }
     };
 
     // 2) The generated LDP typing triples.
     push_generated(
-        &mut triples,
-        Triple::new(subject.clone(), rdf_type.clone(), nn(LDP_RESOURCE_IRI)?),
+        &mut generated,
+        Triple::new(subject.clone(), rdf_type.clone(), LDP_RESOURCE_NODE.clone()),
     );
     push_generated(
-        &mut triples,
-        Triple::new(subject.clone(), rdf_type.clone(), nn(LDP_CONTAINER_IRI)?),
+        &mut generated,
+        Triple::new(
+            subject.clone(),
+            rdf_type.clone(),
+            LDP_CONTAINER_NODE.clone(),
+        ),
     );
     push_generated(
-        &mut triples,
-        Triple::new(subject.clone(), rdf_type, nn(LDP_BASIC_CONTAINER_IRI)?),
+        &mut generated,
+        Triple::new(subject.clone(), rdf_type, LDP_BASIC_CONTAINER_NODE.clone()),
     );
 
-    // 3) The generated `ldp:contains` membership triples (one per authoritative child).
-    for child in state.store.list_children(container_iri).await? {
-        // A child IRI comes from the authoritative index; if it is somehow not a valid IRI, skip it
-        // rather than fail the whole listing (defence-in-depth — the store mints valid IRIs).
-        if let Ok(child_node) = NamedNode::new(&child) {
-            push_generated(
-                &mut triples,
-                Triple::new(subject.clone(), contains.clone(), child_node),
-            );
+    // 3) The generated `ldp:contains` membership triples (one per authoritative child). The child IRIs
+    // come from the authoritative index and are server-CONSTRUCTED — every stored IRI is
+    // `format!("{base}{path}")` for the server's own validated `base_url` and a `path` that already
+    // passed `ldp::target::parse_target` (absolute, no `?`/`#`, no `..`/`.`, no `//`). They are
+    // therefore structurally well-formed by construction, so this fast path skips the FULL per-IRI
+    // `NamedNode::new` oxiri RFC-3987 re-parse (the per-child cost this optimisation removes).
+    //
+    // Two layers still protect the serialiser, so this is NOT a blind `new_unchecked`:
+    //   * debug/test: the FULL checked `NamedNode::new` runs behind a `debug_assert!`, so if the store
+    //     ever yielded a non-RFC-3987 child IRI it fails the suite rather than shipping; and
+    //   * release: a CHEAP O(len) structural guard (`iri_chars_serialisable`) rejects exactly the
+    //     characters RFC-3987 forbids INSIDE an IRI and that would CORRUPT a Turtle `<...>` term
+    //     (controls, space/whitespace, the `<>"{}|^\`+backslash delimiters) — a malformed child is
+    //     OMITTED from the listing, exactly as the old `NamedNode::new(&child)` skip-on-`Err` did, and
+    //     can never produce a corrupt term or break the document.
+    //
+    // ACCEPTED TRADEOFF (roborev Medium, triaged): the cheap guard does NOT catch an
+    // invalid-but-serialisable IRI (e.g. a bad percent-escape) the way the full parse would. That
+    // residual is bounded and deliberate: (a) such an IRI is NOT reachable through the LDP write path
+    // (the `parse_target` construction above), so it requires a store-layer bug, which the
+    // `debug_assert!` catches in test; (b) were one to slip through in release it serialises as a
+    // syntactically well-formed but slightly-non-conformant `<...>` term — no corruption, no parse
+    // break, no security impact, in ONE membership triple; and (c) restoring the full `NamedNode::new`
+    // per child would give back exactly the per-child RFC-3987 parse this optimisation exists to
+    // remove (the measured ~2x at N=500). The store-invariant enforcement belongs at the
+    // `list_children` boundary, not on this hot render path — tracked as a follow-up, not a blocker.
+    for child in children {
+        debug_assert!(
+            NamedNode::new(&child).is_ok(),
+            "store yielded a non-RFC-3987 child IRI: {child}"
+        );
+        if !iri_chars_serialisable(&child) {
+            // Defence-in-depth: a malformed child IRI is omitted from the listing (as the prior
+            // `NamedNode::new(&child)` skip-on-Err did), never serialised as a corrupt term.
+            continue;
         }
+        push_generated(
+            &mut generated,
+            // SAFETY/validity: `child` passed the structural guard above (and the store's write-time
+            // RFC-3987 guarantee), so `new_unchecked` produces a well-formed term without the full
+            // oxiri re-parse.
+            Triple::new(
+                subject.clone(),
+                contains.clone(),
+                NamedNode::new_unchecked(child),
+            ),
+        );
     }
+
+    // Assemble `stored ++ generated` — the prior layout (stored set verbatim, then the generated set
+    // in order). `stored_set` (which borrowed `stored_triples`) is dropped here, so the owned
+    // `stored_triples` can now be moved into the output without a clone.
+    drop(stored_set);
+    let mut triples: Vec<Triple> = Vec::with_capacity(stored_len + generated.len());
+    triples.extend(stored_triples);
+    triples.extend(generated);
 
     let bytes = serialize_triples(format, &triples)?;
     Ok((Bytes::from(bytes), format.media_type().to_string()))
-}
-
-/// A `NamedNode` from a server-constructed IRI (well-formed by construction; map an unexpected error
-/// to a storage error rather than panic).
-fn nn(iri: &str) -> Result<NamedNode, ServerError> {
-    NamedNode::new(iri).map_err(|e| ServerError::Storage(format!("invalid IRI {iri}: {e}")))
 }
 
 /// A STRONG ETag computed from a rendered representation's BYTES — `"<len>-<hash>"`.
@@ -2582,6 +2699,44 @@ mod tests {
         n
     }
 
+    #[test]
+    fn iri_chars_serialisable_accepts_valid_rejects_corrupting() {
+        // The cheap structural guard the listing fast path runs before `new_unchecked`. It must ACCEPT
+        // every well-formed IRI (the store mints only these) and REJECT exactly the characters that
+        // RFC-3987 forbids in an IRI and that would corrupt a serialised `<...>` term — so a
+        // hypothetically-malformed backend row is OMITTED rather than producing an invalid RDF term.
+        // Accept: ordinary http(s) IRIs incl. percent-encoding, fragments, and non-ASCII (ucschar).
+        for ok in [
+            "https://pod.example/c/a",
+            "https://pod.example/c/a#me",
+            "https://pod.example/c/a%20b",
+            "https://pod.example/c/café",
+            "urn:uuid:12345678-1234-1234-1234-123456789abc",
+        ] {
+            assert!(iri_chars_serialisable(ok), "must accept valid IRI: {ok}");
+        }
+        // Reject: empty, space, controls (incl. newline/tab/DEL), and the term-delimiter set.
+        assert!(!iri_chars_serialisable(""), "empty must be rejected");
+        for bad in [
+            "https://pod.example/c/a b",      // space
+            "https://pod.example/c/a\nb",     // newline (control)
+            "https://pod.example/c/a\tb",     // tab (control)
+            "https://pod.example/c/a\u{7f}b", // DEL (control)
+            "https://pod.example/c/<a>",      // angle brackets (would close the term)
+            "https://pod.example/c/\"a",      // quote
+            "https://pod.example/c/a{b}",     // braces
+            "https://pod.example/c/a|b",      // pipe
+            "https://pod.example/c/a^b",      // caret
+            "https://pod.example/c/a`b",      // backtick
+            "https://pod.example/c/a\\b",     // backslash
+        ] {
+            assert!(
+                !iri_chars_serialisable(bad),
+                "must reject corrupting IRI: {bad:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn render_container_lists_every_child_once_with_typing() {
         // A multi-child container renders the three ldp typing triples + EXACTLY ONE `ldp:contains`
@@ -2672,5 +2827,77 @@ mod tests {
             1,
             "the stored+generated BasicContainer triple must appear once: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn render_container_dedups_large_stored_body_via_hashset_branch() {
+        // A LARGE stored body (> DEDUP_HASHSET_THRESHOLD triples) that ALSO asserts a generated triple
+        // (the ldp:BasicContainer typing) must dedup the overlap via the HASHSET branch — the same
+        // contract as the small/linear branch (overlap appears once). This guards the threshold-gated
+        // path roborev flagged: the large-stored-body case must not double the generated triple, and
+        // must not introduce or drop any membership edge.
+        let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        let container = "https://pod.example/c/";
+        // 30 distinct stored triples (> the 16 threshold → HashSet branch) — one of which is exactly a
+        // GENERATED triple (the BasicContainer typing), the rest unrelated `ex:p_i ex:o_i` assertions.
+        let mut body = String::from(
+            "<https://pod.example/c/> a <http://www.w3.org/ns/ldp#BasicContainer> .\n",
+        );
+        for i in 0..29 {
+            body.push_str(&format!(
+                "<https://pod.example/c/> <https://ex.example/p{i}> <https://ex.example/o{i}> .\n"
+            ));
+        }
+        let stored_body = AxBytes::from(body);
+        store
+            .write(container, stored_body.clone(), "text/turtle")
+            .await
+            .expect("mint container with large stored body");
+        let children = [
+            "https://pod.example/c/x",
+            "https://pod.example/c/y",
+            "https://pod.example/c/z",
+        ];
+        for child in children {
+            store
+                .create_in_container(container, child, AxBytes::new(), "text/turtle")
+                .await
+                .expect("add child");
+        }
+        let state = Arc::new(LdpState::new(store, "https://pod.example"));
+
+        let (body_out, _ct) = render_container(
+            &state,
+            container,
+            &stored_body,
+            "text/turtle",
+            Some("text/turtle"),
+        )
+        .await
+        .expect("render");
+        let text = String::from_utf8(body_out.to_vec()).unwrap();
+        // The overlapping BasicContainer typing is de-duped to ONE occurrence (HashSet branch).
+        assert_eq!(
+            count_occurrences(&text, "ldp#BasicContainer"),
+            1,
+            "large-stored overlap must dedup to once: {text}"
+        );
+        // Every child still renders exactly once (no membership edge dropped or doubled).
+        for child in children {
+            assert_eq!(
+                count_occurrences(&text, child),
+                1,
+                "child {child} must appear exactly once on the HashSet branch: {text}"
+            );
+        }
+        // The unrelated stored triples are all carried through verbatim. Match the FULL IRI term
+        // (trailing `>`) so e.g. `o1` does not substring-match `o10`..`o19`.
+        for i in 0..29 {
+            assert_eq!(
+                count_occurrences(&text, &format!("https://ex.example/o{i}>")),
+                1,
+                "stored triple o{i} must be carried through once: {text}"
+            );
+        }
     }
 }
