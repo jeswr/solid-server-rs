@@ -38,7 +38,7 @@ use axum::Extension;
 use oxrdf::{NamedNode, Triple};
 
 use crate::auth::VerifiedToken;
-use crate::authz::wac::{Decision, WacAuthorizer};
+use crate::authz::wac::{Decision, ReadDecision, WacAuthorizer};
 use crate::authz::wac_allow::wac_allow_header;
 use crate::authz::{mode_for_operation, AccessMode};
 use crate::error::ServerError;
@@ -132,6 +132,42 @@ impl<S: Store> LdpState<S> {
     ) -> Result<std::collections::BTreeSet<AccessMode>, ServerError> {
         let required = mode_for_operation(method, &target.iri, target.is_container);
         self.authorize_mode(target, required, token, origin).await
+    }
+
+    /// Single-pass READ authorization (Optimization #2): authorize a GET/HEAD AND resolve the
+    /// `WAC-Allow` audiences (`user` + `public`) from ONE effective-ACL resolution.
+    ///
+    /// Replaces the read path's prior `authorize(...)` + `wac_allow_value(...)` pair, which built a
+    /// fresh [`WacAuthorizer`] and re-resolved the protected resource (and, for an authenticated
+    /// requester, re-walked + re-read + re-parsed the SAME `.acl`) a SECOND time. The required mode is
+    /// the `method`-derived read mode, overridden to [`AccessMode::Control`] for an `.acl` target
+    /// (managing access rules is always Control) — IDENTICAL to [`authorize`](Self::authorize) /
+    /// [`authorize_mode`](Self::authorize_mode). On a permitted read returns the
+    /// [`EffectivePermissions`] for `WAC-Allow`; on a denial the SAME spec error (401 + challenge when
+    /// anonymous, 403 when authenticated-but-unauthorized).
+    async fn authorize_read(
+        &self,
+        method: &str,
+        target: &LdpTarget,
+        token: &VerifiedToken,
+        origin: Option<&str>,
+    ) -> Result<crate::authz::EffectivePermissions, ServerError> {
+        // The required read mode, with the `.acl`→Control override (an `.acl` is governed by Control
+        // regardless of the operation) — matching `authorize`/`authorize_mode` exactly.
+        let required = if crate::authz::is_acl_resource(&target.iri) {
+            AccessMode::Control
+        } else {
+            mode_for_operation(method, &target.iri, target.is_container)
+        };
+        let wac = WacAuthorizer::new(&self.store, &self.base_url);
+        match wac
+            .authorize_read(&target.iri, required, token.web_id.as_deref(), origin)
+            .await?
+        {
+            ReadDecision::Allow(perms) => Ok(perms),
+            ReadDecision::Unauthenticated => Err(self.unauthenticated()),
+            ReadDecision::Forbidden => Err(ServerError::Forbidden),
+        }
     }
 
     /// Run Web Access Control for `target` with an EXPLICIT required mode (used by PATCH, whose mode
@@ -273,9 +309,13 @@ async fn serve_read<S: Store>(
     // private data answers 401 (anonymous) / 403 (authenticated-but-unauthorized). Authorization runs
     // BEFORE the existence check, so a permitted read of a missing resource is a 404, while an
     // unauthorized read of the same is a 401/403 (no existence leak).
+    // SINGLE-PASS read authorization (Optimization #2): resolve the effective ACL ONCE and derive
+    // BOTH the access decision (Allow / 401 / 403) AND the `WAC-Allow` audiences (`user` + `public`)
+    // from that one resolution. (Previously the decision and the `WAC-Allow` header each resolved the
+    // ACL independently.) `perms` is reused below to emit `WAC-Allow` with no further ACL work.
     let origin = request_origin(req_headers);
-    let user_modes = state
-        .authorize(
+    let perms = state
+        .authorize_read(
             if with_body { "GET" } else { "HEAD" },
             &target,
             token,
@@ -351,10 +391,9 @@ async fn serve_read<S: Store>(
     // conformance harness reads this at bootstrap to locate where to write the test container's ACL.
     add_acl_link(&mut out, &target);
     // WAC-Allow (Solid Protocol): advertise the requester's + the public's effective access modes for
-    // this target. The `user` set was already resolved by the read authorization above (the FULL
-    // granted set, not just `read`), so we pass it through to avoid re-walking the ACL; the public set
-    // is resolved independently (== user when the requester is anonymous).
-    let wac_allow = wac_allow_value(state, &target, token, origin, user_modes).await?;
+    // this target. Both audiences were resolved by `authorize_read` above in the SAME pass as the
+    // access decision (no second ACL walk/read/parse) — `perms` is serialised directly.
+    let wac_allow = wac_allow_header(&perms);
     set_str(&mut out, HeaderName::from_static("wac-allow"), &wac_allow);
 
     match outcome {
@@ -1066,32 +1105,57 @@ async fn render_container<S: Store>(
     // its stored format, resolving relative IRIs against the container IRI. If the stored body is
     // non-RDF or unparseable, it contributes nothing (a container body is conventionally RDF/empty) —
     // we never fail the listing over a stored body the server itself stored.
+    //
+    // The stored set is carried through VERBATIM (no intra-set de-dup) — exactly as before — so a
+    // container body that literally repeats a triple keeps both occurrences (the serialised bytes,
+    // and hence the representation ETag, stay identical to the prior linear-scan render).
     if let Some(fmt) = stored_format {
         if let Ok(stored) = parse_to_triples(fmt, stored_body, container_iri) {
             triples.extend(stored);
         }
     }
 
-    // 2) The generated LDP typing + containment triples (de-duped against the stored set so an
-    // identical triple is not repeated).
-    push_unique(
+    // De-dup index for the GENERATED triples ONLY. The old `push_unique` scanned the WHOLE `triples`
+    // vec (stored + already-generated) per push → O(N²) once the N `ldp:contains` triples are added.
+    // A `HashSet` membership check makes each generated push O(1) → the whole render O(N).
+    //
+    // CORRECTNESS — byte-identical output: the generated triples are pushed in the SAME order as
+    // before (the three `rdf:type` triples, then one `ldp:contains` per `list_children` member), and
+    // each is suppressed under EXACTLY the old predicate "already present in `triples`": `seen` is
+    // seeded from the stored set, then each generated triple is checked-and-inserted. The three type
+    // triples are mutually distinct and the `ldp:contains` triples are distinct from one another (the
+    // index lists each child once — unique by construction: an RDF graph holds a containment triple at
+    // most once, and both store impls enforce a child appears once), so the only suppression `seen`
+    // can ever trigger is a generated triple that DUPLICATES a stored one — the same case the old
+    // `push_unique` caught. Insertion order + which triples appear are therefore unchanged, so the
+    // serialiser emits the same bytes and `representation_etag` is preserved.
+    let mut seen: std::collections::HashSet<Triple> = triples.iter().cloned().collect();
+    let mut push_generated = |triples: &mut Vec<Triple>, triple: Triple| {
+        if seen.insert(triple.clone()) {
+            triples.push(triple);
+        }
+    };
+
+    // 2) The generated LDP typing triples.
+    push_generated(
         &mut triples,
         Triple::new(subject.clone(), rdf_type.clone(), nn(LDP_RESOURCE_IRI)?),
     );
-    push_unique(
+    push_generated(
         &mut triples,
         Triple::new(subject.clone(), rdf_type.clone(), nn(LDP_CONTAINER_IRI)?),
     );
-    push_unique(
+    push_generated(
         &mut triples,
         Triple::new(subject.clone(), rdf_type, nn(LDP_BASIC_CONTAINER_IRI)?),
     );
 
+    // 3) The generated `ldp:contains` membership triples (one per authoritative child).
     for child in state.store.list_children(container_iri).await? {
         // A child IRI comes from the authoritative index; if it is somehow not a valid IRI, skip it
         // rather than fail the whole listing (defence-in-depth — the store mints valid IRIs).
         if let Ok(child_node) = NamedNode::new(&child) {
-            push_unique(
+            push_generated(
                 &mut triples,
                 Triple::new(subject.clone(), contains.clone(), child_node),
             );
@@ -1100,15 +1164,6 @@ async fn render_container<S: Store>(
 
     let bytes = serialize_triples(format, &triples)?;
     Ok((Bytes::from(bytes), format.media_type().to_string()))
-}
-
-/// Push `triple` onto `triples` only if not already present (set-union semantics; the graphs are
-/// small per resource so a linear scan is correct and adequate — `oxrdf::Triple` is `Eq` but not
-/// `Ord`).
-fn push_unique(triples: &mut Vec<Triple>, triple: Triple) {
-    if !triples.contains(&triple) {
-        triples.push(triple);
-    }
 }
 
 /// A `NamedNode` from a server-constructed IRI (well-formed by construction; map an unexpected error
@@ -1453,32 +1508,6 @@ fn add_acl_link(headers: &mut HeaderMap, target: &LdpTarget) {
 /// suffix yields both.
 fn acl_url_for(target: &LdpTarget) -> String {
     format!("{}.acl", target.iri)
-}
-
-/// Compute the `WAC-Allow` header VALUE (Solid Protocol) advertising the requester's + the public's
-/// effective access modes for `target`.
-///
-/// `user_modes` is the requester's already-resolved mode set (the FULL granted set returned by the
-/// read authorization), so the `user` audience need not re-walk the ACL. The `public` audience is
-/// resolved independently (it equals `user` for an anonymous requester). Format:
-/// `user="…",public="…"` — both keys always present (see [`wac_allow_header`]).
-async fn wac_allow_value<S: Store>(
-    state: &Arc<LdpState<S>>,
-    target: &LdpTarget,
-    token: &VerifiedToken,
-    origin: Option<&str>,
-    user_modes: std::collections::BTreeSet<AccessMode>,
-) -> Result<String, ServerError> {
-    let wac = WacAuthorizer::new(&state.store, &state.base_url);
-    let perms = wac
-        .effective_permissions(
-            &target.iri,
-            token.web_id.as_deref(),
-            origin,
-            Some(user_modes),
-        )
-        .await?;
-    Ok(wac_allow_header(&perms))
 }
 
 /// Whether `iri` is a storage-root container: a container that is a DIRECT child of the server base
@@ -2470,5 +2499,113 @@ mod tests {
         .await
         .expect("a controller may PUT an .acl directly (Control-gated)");
         assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // --- container listing render (Optimization #1: O(N) de-dup, byte-identical output) -----------
+
+    /// Count occurrences of `needle` in `hay` (a tiny substring counter for the listing-body asserts).
+    fn count_occurrences(hay: &str, needle: &str) -> usize {
+        if needle.is_empty() {
+            return 0;
+        }
+        let mut n = 0;
+        let mut from = 0;
+        while let Some(i) = hay[from..].find(needle) {
+            n += 1;
+            from += i + needle.len();
+        }
+        n
+    }
+
+    #[tokio::test]
+    async fn render_container_lists_every_child_once_with_typing() {
+        // A multi-child container renders the three ldp typing triples + EXACTLY ONE `ldp:contains`
+        // per member, with no duplicates — the contract the O(N) de-dup must preserve.
+        let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        let container = "https://pod.example/c/";
+        // Mint the container, then add several distinct children through the authoritative path.
+        store
+            .write(container, AxBytes::new(), "text/turtle")
+            .await
+            .expect("mint container");
+        let children = [
+            "https://pod.example/c/a",
+            "https://pod.example/c/b",
+            "https://pod.example/c/c",
+            "https://pod.example/c/d",
+        ];
+        for child in children {
+            store
+                .create_in_container(container, child, AxBytes::new(), "text/turtle")
+                .await
+                .expect("add child");
+        }
+        let state = Arc::new(LdpState::new(store, "https://pod.example"));
+
+        let (body, ct) = render_container(
+            &state,
+            container,
+            &AxBytes::new(),
+            "text/turtle",
+            Some("text/turtle"),
+        )
+        .await
+        .expect("render");
+        assert_eq!(ct, "text/turtle");
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        // The three ldp typing triples are present.
+        assert!(text.contains("ldp#Resource"), "body: {text}");
+        assert!(text.contains("ldp#Container"), "body: {text}");
+        assert!(text.contains("ldp#BasicContainer"), "body: {text}");
+        // The containment predicate is rendered (the Turtle serialiser abbreviates the four objects
+        // onto ONE `ldp:contains` predicate via `,`-lists, so the predicate string itself appears
+        // once — the per-child count below is the real "exactly one containment edge per child" check).
+        assert!(text.contains("ldp#contains"), "body: {text}");
+        // Each child IRI appears EXACTLY ONCE — no duplicate containment edge, none missing. (Each
+        // child IRI is distinct and is not a substring of the container subject or another child.)
+        for child in children {
+            assert_eq!(
+                count_occurrences(&text, child),
+                1,
+                "child {child} must appear exactly once: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn render_container_dedups_generated_against_stored_body_byte_identical() {
+        // A stored container body that ALREADY asserts a generated triple (the ldp:BasicContainer
+        // typing) must NOT have it repeated by the generated set — the de-dup catches the overlap.
+        // This is the one place the HashSet de-dup actually suppresses anything; it must match the
+        // old `push_unique` behaviour exactly (the overlapping triple appears ONCE).
+        let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        let container = "https://pod.example/c/";
+        let stored_body = AxBytes::from(
+            "<https://pod.example/c/> a <http://www.w3.org/ns/ldp#BasicContainer> .".to_string(),
+        );
+        store
+            .write(container, stored_body.clone(), "text/turtle")
+            .await
+            .expect("mint container with stored body");
+        let state = Arc::new(LdpState::new(store, "https://pod.example"));
+
+        let (body, _ct) = render_container(
+            &state,
+            container,
+            &stored_body,
+            "text/turtle",
+            Some("text/turtle"),
+        )
+        .await
+        .expect("render");
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        // The BasicContainer typing appears exactly once despite being in BOTH the stored body and the
+        // generated set (the overlap is de-duped — matching the prior render).
+        assert_eq!(
+            count_occurrences(&text, "ldp#BasicContainer"),
+            1,
+            "the stored+generated BasicContainer triple must appear once: {text}"
+        );
     }
 }

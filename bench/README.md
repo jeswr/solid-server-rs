@@ -35,7 +35,7 @@ brew install oha
 | env | default | meaning |
 |---|---|---|
 | `BENCH_PORT` | `3210` | server port |
-| `BENCH_CHILDREN` | `100` | children seeded into the listing container (`SOLID_SERVER_SEED_BENCH`) |
+| `BENCH_CHILDREN` | `100` | children seeded into the listing container (`SOLID_SERVER_SEED_BENCH`). Use `>=2` for an explicit count: `1` is the bare-truthy "enable with the DEFAULT count" form (= the default, not one child) so it doubles as the on-switch — a one-child listing is not a meaningful render benchmark. |
 | `BENCH_DURATION` | `10s` | `oha -z` per concurrency level |
 | `BENCH_WARMUP` | `3s` | discarded warm-up before each scenario's sweep |
 | `BENCH_CONCURRENCY` | `1 8 16 32 64 128 256 512` | space-separated `oha -c` levels |

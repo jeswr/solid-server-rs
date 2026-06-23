@@ -247,20 +247,38 @@ fn env_flag(key: &str) -> bool {
     )
 }
 
-/// Resolve the bench-seed child count from `key`. Returns `None` when the var is absent/empty/`0`/
-/// `false` (bench seeding OFF), else `Some(n)`: an integer value is used directly, and a truthy-but-
-/// non-integer value (`1`/`true`) falls back to [`seed::BENCH_DEFAULT_CHILDREN`].
+/// Resolve the bench-seed child count from `key`. Returns `None` when bench seeding is OFF
+/// (the var is absent / empty / `false` / numerically `0`), else `Some(n)` children:
+///
+/// - **A NUMERIC value is interpreted by its INTEGER VALUE** (after trimming, so leading zeros do not
+///   change meaning — `0`/`00` ⇒ OFF, `1`/`01` ⇒ the default count, `>1` ⇒ that literal count):
+///   - `0` ⇒ OFF (`None`);
+///   - `1` ⇒ enable with the DEFAULT count ([`seed::BENCH_DEFAULT_CHILDREN`]) — `1` means "switch
+///     bench seeding ON", NOT "seed exactly one child", matching the documented default behaviour;
+///   - `>1` ⇒ that literal child count (`10`, `100`, …).
+/// - **Non-numeric tokens**: `false` (case-insensitive) ⇒ OFF; `true` / `yes` (case-insensitive) ⇒
+///   enable with the DEFAULT count; any other truthy-but-non-numeric value also uses the default.
+///
+/// (Roborev: parse the numeric value FIRST so padded forms like `00` / `01` are handled by their
+/// integer value, not a string-equality special-case that `00`/`01` would bypass.)
 fn bench_seed_count(key: &str) -> Option<usize> {
     let raw = std::env::var(key).ok()?;
     let raw = raw.trim();
-    if raw.is_empty() || raw.eq_ignore_ascii_case("false") || raw == "0" {
+    // Empty / explicit `false` ⇒ OFF.
+    if raw.is_empty() || raw.eq_ignore_ascii_case("false") {
         return None;
     }
-    // An explicit integer is the child count; a truthy non-integer uses the default.
-    Some(
-        raw.parse::<usize>()
-            .unwrap_or(solid_server_rs::seed::BENCH_DEFAULT_CHILDREN),
-    )
+    // A NUMERIC value is decided by its integer VALUE (so `0`/`00` ⇒ OFF, `1`/`01` ⇒ default, >1 ⇒
+    // literal) — never by the raw string, which would let `00`/`01` slip past a `== "0"`/`== "1"` test.
+    if let Ok(n) = raw.parse::<usize>() {
+        return match n {
+            0 => None,
+            1 => Some(solid_server_rs::seed::BENCH_DEFAULT_CHILDREN),
+            _ => Some(n),
+        };
+    }
+    // Non-numeric truthy tokens: `true` / `yes` (and any other non-OFF value) ⇒ enable, default count.
+    Some(solid_server_rs::seed::BENCH_DEFAULT_CHILDREN)
 }
 
 /// Parse the bidirectional-check mode env value. Default (absent/unknown) is `Strict` — the secure
@@ -276,4 +294,109 @@ fn parse_bidirectional(raw: Option<&str>) -> BidirectionalMode {
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Set `key` to `val` (or remove it when `None`), run `f`, then restore the prior value. Each
+    /// test uses a UNIQUE key so concurrent test threads never read the same process-global env var.
+    fn with_env(key: &str, val: Option<&str>, f: impl FnOnce()) {
+        let prev = std::env::var(key).ok();
+        match val {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        f();
+        match prev {
+            Some(p) => std::env::set_var(key, p),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn bench_seed_off_tokens_disable_seeding() {
+        for tok in ["", "0", "false", "False", "FALSE"] {
+            let key = format!("SSR_TEST_BENCH_OFF_{}", tok.len());
+            with_env(&key, Some(tok), || {
+                assert_eq!(bench_seed_count(&key), None, "token {tok:?} must disable");
+            });
+        }
+        // Absent var ⇒ off.
+        assert_eq!(bench_seed_count("SSR_TEST_BENCH_ABSENT_VAR"), None);
+    }
+
+    #[test]
+    fn bench_seed_bare_truthy_uses_default_count() {
+        // `1` / `true` / `yes` mean "enable with the DEFAULT count" — NOT "seed exactly one child".
+        for tok in ["1", "true", "TRUE", "True", "yes", "YES"] {
+            let key = format!("SSR_TEST_BENCH_TRUTHY_{tok}");
+            with_env(&key, Some(tok), || {
+                assert_eq!(
+                    bench_seed_count(&key),
+                    Some(solid_server_rs::seed::BENCH_DEFAULT_CHILDREN),
+                    "bare-truthy {tok:?} must mean the default child count, not a literal count"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn bench_seed_explicit_count_is_literal() {
+        for (tok, want) in [("2", 2usize), ("10", 10), ("100", 100), ("250", 250)] {
+            let key = format!("SSR_TEST_BENCH_COUNT_{tok}");
+            with_env(&key, Some(tok), || {
+                assert_eq!(
+                    bench_seed_count(&key),
+                    Some(want),
+                    "numeric {tok:?} (>1) must be the literal child count"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn bench_seed_truthy_non_numeric_falls_back_to_default() {
+        let key = "SSR_TEST_BENCH_GARBAGE";
+        with_env(key, Some("on"), || {
+            // "on" is truthy (not an OFF token) but not numeric/recognised ⇒ default count.
+            assert_eq!(
+                bench_seed_count(key),
+                Some(solid_server_rs::seed::BENCH_DEFAULT_CHILDREN)
+            );
+        });
+    }
+
+    #[test]
+    fn bench_seed_whitespace_is_trimmed() {
+        let key = "SSR_TEST_BENCH_WS";
+        with_env(key, Some("  1  "), || {
+            assert_eq!(
+                bench_seed_count(key),
+                Some(solid_server_rs::seed::BENCH_DEFAULT_CHILDREN)
+            );
+        });
+        with_env(key, Some("  10  "), || {
+            assert_eq!(bench_seed_count(key), Some(10));
+        });
+    }
+
+    #[test]
+    fn bench_seed_leading_zeros_are_decided_by_integer_value() {
+        // Padded numeric forms are interpreted by their VALUE, not the raw string: `00`/`000` ⇒ OFF,
+        // `01` ⇒ default count, `010` ⇒ 10 — so a leading zero can never bypass the 0/1 special-cases.
+        let key = "SSR_TEST_BENCH_PADDED";
+        with_env(key, Some("00"), || assert_eq!(bench_seed_count(key), None));
+        with_env(key, Some("000"), || assert_eq!(bench_seed_count(key), None));
+        with_env(key, Some("01"), || {
+            assert_eq!(
+                bench_seed_count(key),
+                Some(solid_server_rs::seed::BENCH_DEFAULT_CHILDREN)
+            )
+        });
+        with_env(key, Some("010"), || {
+            assert_eq!(bench_seed_count(key), Some(10))
+        });
+    }
 }

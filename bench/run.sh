@@ -35,7 +35,11 @@ BASE_URL="https://localhost:${PORT}"
 # BASE_URL stays `localhost` (the DPoP `htu`/audience identity) — only the dial target differs.
 CONNECT_HOST="${BENCH_CONNECT_HOST:-127.0.0.1}"
 CONNECT_BASE="https://${CONNECT_HOST}:${PORT}"
-CHILDREN="${BENCH_CHILDREN:-100}"             # children in the listing container
+CHILDREN="${BENCH_CHILDREN:-100}"             # children in the listing container (>=2; see note)
+# NOTE on `BENCH_CHILDREN`: it is forwarded verbatim as `SOLID_SERVER_SEED_BENCH`, whose parser treats
+# the bare-truthy `1` as "enable with the DEFAULT count" (= 100), NOT a literal one child (so `1`
+# doubles as the on-switch). Use `BENCH_CHILDREN>=2` for an explicit count — a one-child container is
+# not a meaningful listing benchmark anyway (the render cost the sweep measures scales with N).
 DURATION="${BENCH_DURATION:-10s}"             # oha -z per concurrency level (best-of-N over time)
 WARMUP_DURATION="${BENCH_WARMUP:-3s}"         # discarded warm-up before the measured sweep
 # The concurrency sweep. Override with a space-separated list, e.g. BENCH_CONCURRENCY="1 16 64".
@@ -49,10 +53,13 @@ RESULTS="$HERE/results"
 command -v oha >/dev/null 2>&1 || { echo "ERROR: 'oha' not found on PATH. Install: brew install oha (a local dev tool, NOT a project dep)." >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 required (to parse oha JSON)." >&2; exit 1; }
 
-if [ ! -x "$SERVER_BIN" ]; then
-  echo ">> Release binary missing — building (cargo build --release) ..."
-  ( cd "$REPO" && cargo build --release )
-fi
+# ALWAYS (re)build the release binary before benching. A stale binary is the single most insidious
+# way to corrupt a before/after delta — measuring code that is NOT the code you just changed. `cargo
+# build --release` is a no-op when the binary is already current (cargo's own freshness check), so
+# this is cheap on a warm tree and authoritative on a changed one. (Fix for the roborev Medium: the
+# old `[ ! -x ]` guard only built when the binary was MISSING, so an edited `src/` benched stale.)
+echo ">> Building release binary (cargo build --release; a no-op if already current) ..."
+( cd "$REPO" && cargo build --release )
 
 bash "$HERE/gen-cert.sh"
 
