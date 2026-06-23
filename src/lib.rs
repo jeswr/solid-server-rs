@@ -49,6 +49,10 @@ pub mod authz;
 pub mod error;
 pub mod ldp;
 pub mod notifications;
+/// The distributed (shared) Redis-backed DPoP-`jti` replay store — the horizontal-scaling enabler.
+/// Behind the opt-in `redis-replay` feature (OFF by default → byte-identical default build/conformance).
+#[cfg(feature = "redis-replay")]
+pub mod redis_replay;
 pub mod seed;
 pub mod store;
 pub mod tls;

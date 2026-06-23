@@ -146,6 +146,34 @@ fast with a clear message. No auto-cert / ACME this slice (a future seam: an ACM
 produce the same in-memory rustls config, addable behind a third env var without reshaping the
 serve path); supply cert files yourself or front the server with a proxy that does ACME.
 
+### Horizontal scaling — the distributed Redis DPoP-`jti` replay store (opt-in)
+
+The default DPoP-`jti` replay store is **per-instance** (an in-memory set): correct for a single
+node, but if the server is scaled horizontally behind a load balancer, a `jti` consumed on instance
+A is invisible to instance B, so a captured DPoP proof could be replayed against a different instance
+within its freshness window. The fix is a **shared** replay set in Redis (`SET NX PX` — an atomic
+one-round-trip check-and-set: the `NX` reply IS the New/Replay signal). It is behind the opt-in
+`redis-replay` build feature (so the default build, tests, and conformance carry no Redis dependency
+and are byte-identical), selected at runtime by a Redis URL:
+
+```bash
+cargo build --features redis-replay
+SOLID_SERVER_REPLAY_REDIS_URL=redis://redis:6379 \
+SOLID_SERVER_BIND=0.0.0.0:3000 \
+  ./target/release/solid-server-rs --features redis-replay   # (build with the feature; run normally)
+```
+
+ALL instances behind the load balancer MUST point at the SAME Redis. It is **fail-closed**: any
+Redis error (unreachable, timeout, command failure) makes the verifier return 503 — it NEVER fails
+open (a fail-open outage would be a global replay-protection bypass). An unreachable Redis fails the
+server at boot rather than running with silently-disabled replay protection. Redis I/O runs on a
+dedicated thread (off the async runtime, mirroring the verifier's `net.rs` pattern) with a tight
+op timeout, so a slow Redis becomes a fast 503, never a worker pile-up. The integration test
+(`tests/redis_replay.rs`, behind the feature + the `PSS_IT_REDIS_URL` env gate) proves the
+cross-instance replay rejection, the fail-closed posture, and TTL expiry. Bring up the test Redis
+with `docker compose up -d redis`. The Redis-outage failure mode + the async-replication-on-failover
+hazard + HA topology are documented in the project issue tracker.
+
 Auth is **real**: the server performs live OIDC discovery + JWKS fetch against the trusted issuer
 (over the DNS-pinned SSRF-guarded fetcher) and, by default, the strict bidirectional WebID↔issuer
 check. So an authenticated request needs a DPoP-bound token signed by the trusted IdP. For a local

@@ -73,6 +73,14 @@ const ENV_BIDIRECTIONAL: &str = "SOLID_SERVER_BIDIRECTIONAL";
 /// NEVER raise it in production to dodge the cap — the cap is a real single-instance safety bound (the
 /// shared-Redis ReplayStore is the horizontal-scaling seam). See bench/AUTH-BASELINE.md.
 const ENV_REPLAY_MAX_ENTRIES: &str = "SOLID_SERVER_REPLAY_MAX_ENTRIES";
+/// Select the DISTRIBUTED Redis-backed DPoP-`jti` replay store (the horizontal-scaling backend): a
+/// Redis connection URL (e.g. `redis://redis:6379`). Requires the `redis-replay` build feature; UNSET
+/// (or feature-off) keeps the per-instance in-memory store (the default — single-instance posture). A
+/// connect failure at boot ABORTS startup (fail-closed): the server never runs with a silently-broken
+/// shared replay set. ALL instances behind a load balancer MUST point at the same Redis, or replay
+/// protection is per-instance again. See [`solid_server_rs::redis_replay`].
+#[cfg(feature = "redis-replay")]
+const ENV_REPLAY_REDIS_URL: &str = "SOLID_SERVER_REPLAY_REDIS_URL";
 /// Dev/conformance ONLY: when `1`/`true`, seed the in-memory store with the conformance test users'
 /// WebID profiles + container tree (the Solid CTH bootstraps by dereferencing those WebIDs). NEVER
 /// set against a real (SPARQ/S3) backend. See [`solid_server_rs::seed`].
@@ -148,16 +156,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // RAISES it (a value <= the default is ignored, so it can only ever raise — see the const's doc).
     // The override exists solely so the auth benchmark can measure steady-state verify cost without the
     // cap's fail-closed path firing mid-sweep. Unset ⇒ byte-identical to before (conformance-neutral).
-    let inner_replay = match parse_replay_max_entries(std::env::var(ENV_REPLAY_MAX_ENTRIES).ok()) {
-        Some(max_entries) => {
+    let in_memory_replay = build_in_memory_replay(config.replay_ttl());
+
+    // Backend selection. When the `redis-replay` feature is compiled in AND
+    // `SOLID_SERVER_REPLAY_REDIS_URL` is set, build a DISTRIBUTED Redis-backed replay store shared by
+    // every instance (so a jti consumed on instance A is seen by B — the horizontal-scaling fix); a
+    // Redis connect failure aborts boot (fail-closed). Otherwise (the DEFAULT) wrap the per-instance
+    // in-memory store. Either way `inner_replay` is ONE concrete `ReplayStore`, so the verifier + cache
+    // + AppState wiring below is unchanged. Without the feature, `inner_replay` IS the in-memory store —
+    // byte-identical to before, conformance-neutral.
+    #[cfg(feature = "redis-replay")]
+    let inner_replay = match std::env::var(ENV_REPLAY_REDIS_URL)
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+    {
+        Some(url) => {
+            let store = solid_server_rs::redis_replay::RedisReplayStore::connect(url.trim())
+                .map_err(|e| format!("failed to connect the Redis replay store: {}", e.0))?;
             eprintln!(
-                "  DEV/BENCH: DPoP replay-store capacity RAISED to {max_entries} live jtis \
-                 (production default is {REPLAY_PRODUCTION_DEFAULT}) — NEVER set this in production."
+                "  AUTH: DISTRIBUTED Redis DPoP-jti replay store ENABLED (shared SET NX PX across \
+                 instances — the horizontal-scaling backend). Fail-closed on any Redis error."
             );
-            InMemoryReplayStore::new(max_entries, config.replay_ttl())
+            solid_server_rs::redis_replay::BackendReplay::Redis(store)
         }
-        None => InMemoryReplayStore::with_window(config.replay_ttl()),
+        None => solid_server_rs::redis_replay::BackendReplay::InMemory(in_memory_replay),
     };
+    #[cfg(not(feature = "redis-replay"))]
+    let inner_replay = in_memory_replay;
 
     // Round-3 verified-access-token cache. Capture the proof policy from the SAME config the verifier
     // is built with (so the cache's hit-path proof verification enforces byte-identical semantics),
@@ -384,6 +409,23 @@ const REPLAY_PRODUCTION_DEFAULT: u64 = 100_000;
 fn parse_replay_max_entries(raw: Option<String>) -> Option<u64> {
     raw.and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n > REPLAY_PRODUCTION_DEFAULT)
+}
+
+/// Build the per-instance in-memory DPoP-replay store at the production default capacity, RAISED only by
+/// the dev/bench-only `ENV_REPLAY_MAX_ENTRIES` override (which can only ever raise — see
+/// [`parse_replay_max_entries`]). Extracted so both the default path and the Redis-feature path
+/// construct the in-memory store identically. `replay_ttl` is the verifier's `max_age + tolerance`.
+fn build_in_memory_replay(replay_ttl: Duration) -> InMemoryReplayStore {
+    match parse_replay_max_entries(std::env::var(ENV_REPLAY_MAX_ENTRIES).ok()) {
+        Some(max_entries) => {
+            eprintln!(
+                "  DEV/BENCH: DPoP replay-store capacity RAISED to {max_entries} live jtis \
+                 (production default is {REPLAY_PRODUCTION_DEFAULT}) — NEVER set this in production."
+            );
+            InMemoryReplayStore::new(max_entries, replay_ttl)
+        }
+        None => InMemoryReplayStore::with_window(replay_ttl),
+    }
 }
 
 /// Parse the bidirectional-check mode env value. Default (absent/unknown) is `Strict` — the secure

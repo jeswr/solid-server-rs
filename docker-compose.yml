@@ -1,0 +1,26 @@
+# AUTHORED-BY Claude Opus 4.8
+# solid-server-rs integration-test stack.
+#
+# `redis` backs the distributed DPoP-`jti` replay-store integration test (`tests/redis_replay.rs`,
+# behind the opt-in `redis-replay` build feature). The store uses `SET NX PX` for an atomic, shared,
+# per-instance-spanning replay set — see `src/redis_replay.rs`. Bring it up with
+# `docker compose up -d redis`, then run the live IT:
+#
+#   PSS_IT_REDIS_URL=redis://127.0.0.1:6379 \
+#     cargo test --features redis-replay --test redis_replay -- --ignored
+#
+# The Keycloak/SPARQ services the conformance harness needs live in the sibling `prod-solid-server`
+# compose stack (the conformance `run.sh` documents that dependency); this file provides ONLY the
+# extra service solid-server-rs's own ITs need.
+services:
+  redis:
+    image: redis:7.4.1-alpine
+    # No persistence: the replay set is ephemeral by design (keys are TTL'd per the proof window).
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5

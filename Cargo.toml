@@ -91,6 +91,16 @@ getrandom = "0.2"
 sha2 = "0.10"
 base64 = "0.22"
 url = "2"
+# Distributed (shared) DPoP `jti` replay store — the horizontal-scaling enabler (`src/redis_replay.rs`).
+# Behind the OPT-IN `redis-replay` feature so the DEFAULT build/conformance is byte-identical and adds
+# NO new crate unless an operator wants the shared store. We use the SYNCHRONOUS (blocking) `redis`
+# client + its `r2d2` connection-pool feature on purpose: `ReplayStore::mark` is a sync trait method
+# called from inside the axum runtime, so we run all Redis I/O on a DEDICATED OS THREAD (mirroring the
+# verifier's `net.rs` off-runtime pattern) — a blocking client + blocking pool fits that thread with no
+# "runtime within a runtime" hazard. `redis` is BSD-3-Clause (allowed by deny.toml). No async runtime
+# features are enabled (default-features = false), keeping the dep surface to the blocking client + r2d2.
+redis = { version = "1", default-features = false, features = ["r2d2"], optional = true }
+r2d2 = { version = "0.8", optional = true }
 
 [dev-dependencies]
 # Mint test JWS access tokens + DPoP proofs for the auth-middleware unit tests (mirrors the
@@ -126,3 +136,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 
 [features]
 default = []
+# Opt-in: compile the distributed Redis-backed DPoP-`jti` replay store (`src/redis_replay.rs`) + its
+# `redis`/`r2d2` deps. OFF by default so the standard build, tests, and conformance are byte-identical
+# and carry no extra dependency. Enable for a horizontally-scaled deployment that shares one replay set
+# across instances (set `SOLID_SERVER_REPLAY_REDIS_URL` at runtime to actually select it).
+redis-replay = ["dep:redis", "dep:r2d2"]

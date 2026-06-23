@@ -27,6 +27,11 @@ allow = [
   "MPL-2.0",
   "CC0-1.0",
   "OpenSSL",
+  # Boost Software License — OSI-approved, permissive (MIT-equivalent terms). Pulled in transitively by
+  # `xxhash-rust` (a non-optional dep of the `redis` crate behind the opt-in `redis-replay` feature for
+  # the distributed DPoP-jti replay store). BSL-1.0 imposes no copyleft and no source-disclosure
+  # obligation, so it is compatible with the MIT-OR-Apache-2.0 crate.
+  "BSL-1.0",
 ]
 confidence-threshold = 0.8
 
