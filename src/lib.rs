@@ -51,6 +51,7 @@ pub mod error;
 pub mod ldp;
 pub mod notifications;
 pub mod overload;
+pub mod rate_limit;
 /// The distributed (shared) Redis-backed DPoP-`jti` replay store — the horizontal-scaling enabler.
 /// Behind the opt-in `redis-replay` feature (OFF by default → byte-identical default build/conformance).
 #[cfg(feature = "redis-replay")]

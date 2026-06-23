@@ -48,6 +48,7 @@ fn app_with_admission(max_concurrency: usize) -> (axum::Router, AdmissionControl
     let overload = OverloadConfig {
         admission: admission.clone(),
         request_timeout: None,
+        rate_limiter: None,
     };
     let app = build_router_with_overload(AppState::new(ctx, ldp), overload);
     (app, admission)

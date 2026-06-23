@@ -44,6 +44,7 @@ use crate::notifications::ws::{
     SUBSCRIPTION_PATH, WELL_KNOWN_SOLID_PATH,
 };
 use crate::overload::{admission_middleware, AdmissionControl};
+use crate::rate_limit::{rate_limit_middleware, RateLimiter};
 use crate::store::Store;
 
 /// Path of the liveness probe (process is up). Exempt from admission control + timeout.
@@ -60,14 +61,20 @@ pub struct OverloadConfig {
     pub admission: AdmissionControl,
     /// The per-request timeout (504 on expiry). `None` ⇒ no timeout layer.
     pub request_timeout: Option<Duration>,
+    /// The pre-crypto per-IP rate limiter (429 before auth/crypto on a per-source flood). `None` ⇒ no
+    /// rate-limit layer (the `off` sentinel). When present it is the OUTERMOST application layer — see
+    /// [`build_router_with_overload`].
+    pub rate_limiter: Option<RateLimiter>,
 }
 
 impl OverloadConfig {
-    /// A config with admission control sized to `max_concurrency` and the given timeout.
+    /// A config with admission control sized to `max_concurrency` and the given timeout, and NO rate
+    /// limiter (back-compat for callers/tests that don't exercise the rate-limit layer).
     pub fn new(max_concurrency: usize, request_timeout: Option<Duration>) -> Self {
         Self {
             admission: AdmissionControl::new(max_concurrency),
             request_timeout,
+            rate_limiter: None,
         }
     }
 }
@@ -152,15 +159,34 @@ where
         ));
     }
 
-    // OUTERMOST: admission control. Runs FIRST on every request — sheds (503 + jittered Retry-After)
-    // before auth/WAC/storage when at capacity. Security-critical that this is outermost (see module
-    // docs): a shed request never reaches the inner stack, so it can never bypass authorization.
-    let app = app.layer(axum::middleware::from_fn_with_state(
+    // ADMISSION: admission control. Sheds (503 + jittered Retry-After) before auth/WAC/storage when at
+    // capacity. Applied here so it is OUTSIDE auth but INSIDE the rate limiter (below). Security-
+    // critical that this is outside the inner stack (see module docs): a shed request never reaches it,
+    // so it can never bypass authorization.
+    let mut app = app.layer(axum::middleware::from_fn_with_state(
         overload.admission,
         admission_middleware,
     ));
 
-    // Health routes are OUTSIDE the overload layers (merged last) — never shed/timed-out.
+    // OUTERMOST: the pre-crypto per-IP rate limiter. Applied LAST, so (axum applies layers bottom-up)
+    // it is the OUTERMOST application layer — it runs FIRST on every request, BEFORE admission control,
+    // auth, WAC, and the expensive DPoP crypto. A per-source flood gets a cheap 429 and NEVER reaches
+    // the verifier, so attacker traffic cannot make every bogus proof pay the ES256 verify cost.
+    //
+    // 🔒 Security: this layer ONLY rejects earlier. A 429 is strictly LESS access than auth would
+    // grant, so it can never be a bypass; the limiter has zero authority to ADMIT a request (a
+    // limiter bug/missing-ConnectInfo FAILS OPEN to the normal auth stack, which still gates it — see
+    // `rate_limit`). It wraps the APP routes only — health routes are added OUTSIDE it (below), and
+    // the middleware also skips /livez + /readyz by path as defence-in-depth.
+    if let Some(rate_limiter) = overload.rate_limiter {
+        app = app.layer(axum::middleware::from_fn_with_state(
+            rate_limiter,
+            rate_limit_middleware,
+        ));
+    }
+
+    // Health routes are OUTSIDE the overload + rate-limit layers (merged last) — never shed, timed-out,
+    // or rate-limited.
     app.merge(health_routes())
 }
 

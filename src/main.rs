@@ -47,6 +47,7 @@ use solid_server_rs::auth_cache::{
 };
 use solid_server_rs::ldp::handler::LdpState;
 use solid_server_rs::overload::{self, AdmissionControl};
+use solid_server_rs::rate_limit::{self, RateConfig, RateLimiter};
 use solid_server_rs::store::{CompositeStore, InMemoryBlobStore, InMemorySparqClient};
 use solid_server_rs::tls::{self, TlsMode};
 
@@ -320,9 +321,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => "DISABLED".to_string(),
         }
     );
+    // --- Pre-crypto per-IP rate limiter. ---------------------------------------------------------
+    // A per-source token bucket OUTSIDE auth/WAC/crypto: a per-IP flood gets a cheap 429 and NEVER
+    // reaches the DPoP verifier (the ~hundreds-of-µs ES256 verify is the #1 per-request cost), so
+    // attacker traffic from one source cannot make every bogus proof pay the crypto. Default-ON with a
+    // GENEROUS per-IP rate + loopback exemption so it never sheds a conformance-harness or normal-use
+    // request; the `off` sentinel on SOLID_SERVER_RATE_LIMIT_PER_IP disables it entirely. XFF is NOT
+    // trusted unless SOLID_SERVER_TRUSTED_PROXY is set (an untrusted XFF is a spoofable bypass).
+    let rate_limiter = match rate_limit::rate_per_ip_from_env() {
+        RateConfig::Enabled(rate) => {
+            let burst = rate_limit::burst_from_env();
+            let trusted_hops = rate_limit::trusted_proxy_hops_from_env();
+            let exempt_loopback = rate_limit::exempt_loopback_from_env();
+            eprintln!(
+                "  RATE-LIMIT: per-IP token bucket ENABLED (rate {rate}/s, burst {burst}; excess ⇒ \
+                 429 + Retry-After BEFORE auth/crypto). XFF trusted hops: {trusted_hops} ({}). \
+                 loopback-exempt: {exempt_loopback}. health probes /livez + /readyz are EXEMPT.",
+                if trusted_hops == 0 {
+                    "XFF untrusted — direct peer IP"
+                } else {
+                    "client IP taken from X-Forwarded-For"
+                }
+            );
+            Some(RateLimiter::new(rate, burst, trusted_hops, exempt_loopback))
+        }
+        RateConfig::Disabled => {
+            eprintln!(
+                "  RATE-LIMIT: per-IP rate limiter DISABLED (SOLID_SERVER_RATE_LIMIT_PER_IP=off) — \
+                 every request proceeds to auth."
+            );
+            None
+        }
+    };
+
     let overload_config = OverloadConfig {
         admission,
         request_timeout,
+        rate_limiter,
     };
 
     let app = build_router_with_overload(AppState::new(auth, ldp), overload_config);
@@ -390,17 +425,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
             });
 
+            // `into_make_service_with_connect_info::<SocketAddr>()` (NOT plain `into_make_service`) so
+            // each request carries `ConnectInfo<SocketAddr>` in its extensions — the pre-crypto rate
+            // limiter reads the direct peer IP from it. axum-server supports the connect-info make
+            // service. Without this the limiter would see no peer IP and FAIL OPEN (proceed to auth).
             axum_server::from_tcp_rustls(std_listener, config)?
                 .handle(handle)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await?;
         }
         // Plain TCP (unchanged dev/test behaviour). Graceful shutdown on Ctrl-C.
         None => {
             let listener = tokio::net::TcpListener::bind(&bind).await?;
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal())
-                .await?;
+            // Same as the TLS path: serve WITH connect-info so the rate limiter sees the peer IP.
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
         }
     }
     Ok(())
