@@ -231,13 +231,29 @@ where
     let protected = Router::new()
         .route("/", ldp_methods())
         .route("/{*path}", ldp_methods())
-        // INNER: the auth middleware authenticates a real (non-preflight) request and injects the
+        // INNERMOST: the auth middleware authenticates a real (non-preflight) request and injects the
         // VerifiedToken into request extensions.
         .layer(axum::middleware::from_fn_with_state(
             auth.clone(),
             auth_middleware::<J, R>,
         ))
-        // OUTER: CORS (preflight short-circuit + the Access-Control-* headers on every response).
+        // PRE-CRYPTO PUBLIC-READ SKIP (skip-crypto opt 3, `decisions/0002`): a cheap, identity-
+        // independent fast-path BEFORE crypto, in the SAME slot as the rate-limit / overload layers —
+        // just INSIDE CORS, just OUTSIDE auth. For a GET/HEAD that carries NO `Authorization`/`DPoP`
+        // header it constructs a public token and delegates STRAIGHT to the same `serve_read` the
+        // handler uses (one anonymous WAC pass): a PUBLIC read → 200, an anonymous denial → the same
+        // 401 + challenge, a malformed target → the canonical 400 — all byte-identical to the full
+        // anonymous path. A CREDENTIALED request (Authorization OR DPoP header present), a mutation, or
+        // any other verb FALLS THROUGH (`next.run`) to the unchanged auth path. It carries the LDP
+        // state (store + base + ACL cache) so the served read uses the SAME `serve_read`.
+        // Security-critical (see `crate::ldp::public_read_skip`): it NEVER handles a credentialed
+        // request (so an authenticated owner's WAC-Allow user= modes are correct and a forged proof is
+        // rejected, not served), NEVER fires for a mutation, and NEVER reads the unverified WebID.
+        .layer(axum::middleware::from_fn_with_state(
+            ldp.clone(),
+            crate::ldp::public_read_skip::public_read_skip_middleware::<S>,
+        ))
+        // OUTERMOST: CORS (preflight short-circuit + the Access-Control-* headers on every response).
         .layer(axum::middleware::from_fn(cors_middleware))
         .with_state(ldp);
 

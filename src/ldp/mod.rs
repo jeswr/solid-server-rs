@@ -22,5 +22,6 @@ pub mod content;
 pub mod cors;
 pub mod handler;
 pub mod patch;
+pub mod public_read_skip;
 pub mod range;
 pub mod target;

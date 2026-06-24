@@ -7,7 +7,10 @@
 # Conformance harness generated reports (EARL/HTML/log) — regenerate with conformance/run.sh
 /conformance/reports/
 
-# Bench harness DEV artifacts (regenerate with bench/run.sh / bench/run-auth.sh)
+# Bench harness DEV artifacts (regenerate with bench/run.sh / bench/run-auth.sh / bench/run-skip-crypto.sh)
 /bench/tls/
 /bench/results/
 /bench/results-auth/
+/bench/results-skip/
+/bench/results-after*/
+/bench/results-before*/

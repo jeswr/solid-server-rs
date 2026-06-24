@@ -167,6 +167,17 @@ struct Config {
     /// pre-flight then asserts 200 anonymously (a public resource) instead of the authed 200/anon-401
     /// privacy assertion. Used by run-auth.sh's apples-to-apples auth-overhead comparison sweep.
     anon: bool,
+    /// AUTHED-PUBLIC mode (EXPLORATORY only — `decisions/0002`): send a DPoP-bound token but target a
+    /// PUBLIC resource. This INVERTS the privacy assertion — the pre-flight asserts the target IS
+    /// public (anonymous GET 200) — so the sweep measures a PROOF-CARRYING GET of a public document.
+    ///
+    /// NOTE: the implemented opt-3 skip does NOT short-circuit this path — the middleware falls through
+    /// whenever an `Authorization`/`DPoP` header is present (the credentialed variant is unsafe:
+    /// `WAC-Allow user=` is identity-dependent and a forged proof is indistinguishable from an owner's;
+    /// see `decisions/0002`). So this mode measures the UNCHANGED proof-carrying auth path; it is
+    /// retained ONLY to demonstrate that the ES256 verify is the cost, NOT as a shippable result. The
+    /// scenario is named `authed-public-doc`. Ignored in `anon` mode (the path opt-3 actually changes).
+    expect_public: bool,
     duration: Duration,
     warmup: Duration,
     concurrency: Vec<usize>,
@@ -217,6 +228,10 @@ impl Config {
             listing_children: env_or("AUTH_LISTING_CHILDREN", "0").parse().unwrap_or(0),
             anon: matches!(
                 env_or("AUTH_ANON", "0").trim(),
+                "1" | "true" | "TRUE" | "True"
+            ),
+            expect_public: matches!(
+                env_or("AUTH_EXPECT_PUBLIC", "0").trim(),
                 "1" | "true" | "TRUE" | "True"
             ),
             duration,
@@ -564,7 +579,7 @@ async fn main() -> Result<(), String> {
             if cfg.anon { "anonymous" } else { "authed" }
         );
     }
-    if !cfg.anon {
+    if !cfg.anon && !cfg.expect_public {
         // PRIVACY ASSERTION: the authed target MUST be 401 anonymously, else we are measuring a
         // PUBLIC resource (the wrong path). An anonymous GET (no Authorization/DPoP) must be rejected.
         let (_, anon_ok) = authed_get(&http, &key, None, &target_htu, &target_dial).await;
@@ -577,11 +592,30 @@ async fn main() -> Result<(), String> {
         eprintln!(
             ">> Privacy OK: anonymous GET {target_htu} → not-200 (resource is owner-private)."
         );
+    } else if cfg.expect_public {
+        // AUTHED-PUBLIC mode (EXPLORATORY — NOT the implemented skip path): the INVERSE assertion —
+        // the target MUST be 200 anonymously (a genuinely public resource), so the proof-carrying sweep
+        // measures the UNCHANGED auth path (the middleware never skips a credentialed read).
+        let (_, anon_ok) = authed_get(&http, &key, None, &target_htu, &target_dial).await;
+        if !anon_ok {
+            return Err(format!(
+                "PUBLIC CHECK FAILED: anonymous GET {target_htu} was not 200 (expected a public \
+                 resource). AUTH_EXPECT_PUBLIC=1 measures a PROOF-CARRYING GET of a PUBLIC document."
+            ));
+        }
+        eprintln!(
+            ">> Public OK: anonymous GET {target_htu} → 200 (resource is public; measuring the \
+             EXPLORATORY proof-carrying authed-public path — NOT skipped by the middleware)."
+        );
     }
 
     // Scenario naming: authed vs anon prefix so the two runs' JSON files never collide in one out dir.
+    // `authed-public-doc` is the EXPLORATORY proof-carrying public read (the middleware does NOT skip
+    // a credentialed request — see decisions/0002); `anon-public-doc` is the path opt-3 implements.
     let doc_name = if cfg.anon {
         "anon-public-doc"
+    } else if cfg.expect_public {
+        "authed-public-doc"
     } else {
         "authed-private-doc"
     };

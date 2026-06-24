@@ -369,7 +369,12 @@ pub async fn head_handler<S: Store>(
 }
 
 /// Shared GET/HEAD read path. `with_body` distinguishes GET (send bytes) from HEAD (headers only).
-async fn serve_read<S: Store>(
+///
+/// `pub(crate)` so the pre-crypto public-read skip middleware ([`crate::ldp::public_read_skip`]) can
+/// serve a PUBLIC read AS anonymous (token = [`VerifiedToken::public`]) over the SAME code path the
+/// handler uses — guaranteeing a skipped public read is byte-identical to a genuinely anonymous one
+/// (INV-1). The middleware never passes a non-public token here.
+pub(crate) async fn serve_read<S: Store>(
     state: &Arc<LdpState<S>>,
     token: &VerifiedToken,
     uri: &axum::http::Uri,
@@ -1691,7 +1696,11 @@ fn header_str(headers: &HeaderMap, name: HeaderName) -> Option<&str> {
 /// a matching Origin (and a request with no Origin never satisfies such a rule — fail-closed). A bare
 /// `Origin: null` is treated as a present-but-non-matching opaque origin (kept verbatim — it will only
 /// match a literal `acl:origin <null>`, which is not a real grant).
-fn request_origin(headers: &HeaderMap) -> Option<&str> {
+///
+/// `pub(crate)` so the pre-crypto public-read skip middleware reads the request Origin EXACTLY as the
+/// handler does (same trim/empty-filter) — the skip's origin input is byte-identical to the read
+/// path's, preserving `acl:origin` fail-closed semantics (INV-6).
+pub(crate) fn request_origin(headers: &HeaderMap) -> Option<&str> {
     header_str(headers, header::ORIGIN)
         .map(str::trim)
         .filter(|o| !o.is_empty())
