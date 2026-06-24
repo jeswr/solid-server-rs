@@ -390,7 +390,7 @@ fn apply_delete_container_modify(store: &mut MockStore, op: &str) {
     let empty = store
         .children
         .get(&container)
-        .map_or(true, |kids| kids.is_empty()); // MSRV 1.81: not `is_none_or`.
+        .is_none_or(|kids| kids.is_empty()); // `is_none_or` (stable 1.82) — MSRV is now 1.88.
     if !(exists && empty) {
         // Guard fails ⇒ NOTHING in this op runs (neither DELETE nor INSERT) — the safety invariant.
         return;
@@ -895,7 +895,7 @@ async fn delete_modify_writes_the_marker_but_a_two_statement_form_does_not() {
             .unwrap()
             .delete_markers
             .get(CONTAINER)
-            .map_or(true, |v| !v.contains(&"op-buggy".to_string())),
+            .is_none_or(|v| !v.contains(&"op-buggy".to_string())),
         "the two-statement form must NOT write the marker (DELETE empties the graph before the \
          INSERT's WHERE re-evaluates) — the mutation-check proving the test is non-vacuous"
     );
