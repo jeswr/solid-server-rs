@@ -59,6 +59,7 @@ pub mod redis_replay;
 pub mod seed;
 pub mod store;
 pub mod tls;
+pub mod transport;
 
 pub use app::{build_router, AppState};
 pub use error::{ServerError, ServerResult};

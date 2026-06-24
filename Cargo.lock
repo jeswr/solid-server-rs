@@ -2268,6 +2268,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "getrandom 0.2.17",
+ "h2",
  "http",
  "http-body-util",
  "hyper",

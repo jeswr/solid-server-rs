@@ -97,7 +97,12 @@ http = "1"
 # the verifier pull them in), so this adds NO new crates, only enables already-resolved client
 # features. Plain HTTP to a trusted internal endpoint; TLS is an M3-next adapter behind the same type.
 hyper = { version = "1", features = ["client", "http1"] }
-hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+# `server-auto` + `server-graceful` name the `hyper_util::server::conn::auto::Builder` + `TokioTimer`
+# the transport DoS-hardening (`transport.rs`) configures (HTTP/2 max-concurrent-streams + rapid-reset
+# cap, the slowloris header-read timeout, keep-alive). These features are ALREADY resolved in the tree
+# (axum + axum-server pull `server-auto`), so naming them here adds NO new crate — it only makes the
+# already-compiled builder + timer nameable from this crate's serve path.
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio", "server-auto", "server-graceful"] }
 http-body-util = "0.1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
@@ -166,6 +171,13 @@ futures-util = "0.3"
 # `hyper-util/http2` are all in the tree via axum-server), so it adds NO new crate. Used ONLY in
 # default-`#[ignore]`d tests + the auth-load example (never the server binary).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
+# The (default-`#[ignore]`d) transport DoS-hardening regression tests (`tests/transport_dos.rs`) drive
+# RAW HTTP/2 frames — opening streams and bursting RST_STREAM (the CVE-2023-44487 rapid-reset attack) —
+# which a high-level client (reqwest) cannot express. `h2` is the canonical low-level HTTP/2 client and
+# is ALREADY in the resolved tree (pulled in by reqwest/hyper's http2), so naming it as a dev-dependency
+# adds NO new crate to the build. `bytes` (its body buffer type) is likewise already resolved. Used ONLY
+# in the default-`#[ignore]`d adversarial tests, never the server binary.
+h2 = "0.4"
 
 [features]
 default = []

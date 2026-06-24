@@ -52,6 +52,7 @@ use solid_server_rs::store::{
     CompositeStore, HttpSparqClient, InMemoryBlobStore, InMemorySparqClient, Store,
 };
 use solid_server_rs::tls::{self, TlsMode};
+use solid_server_rs::transport::{ConnectionLimiter, TransportConfig};
 
 // --- Environment configuration keys ----------------------------------------------------------------
 const ENV_BASE_URL: &str = "SOLID_SERVER_BASE_URL";
@@ -397,6 +398,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate_limiter,
     };
 
+    // --- Transport-layer DoS hardening (HTTP/2 caps + slowloris timeout + connection cap). --------
+    // These configure the hyper connection BELOW the application layers (admission/rate-limit see only
+    // a parsed request; a rapid-reset or slow-header-trickle never produces one). The h2/header knobs
+    // apply to the production TLS serve path (via axum-server's http_builder); the connection cap
+    // applies to BOTH paths (via an accept-time permit). All defaults are deliberately lenient so they
+    // never trip the conformance harness. See `solid_server_rs::transport`.
+    let transport_config = TransportConfig::from_env();
+    let connection_limiter = ConnectionLimiter::new(transport_config.max_connections);
+    eprintln!(
+        "  TRANSPORT: HTTP/2 max_concurrent_streams={}, rapid-reset cap (CVE-2023-44487)={} (hyper \
+         default 20 unless overridden), slowloris header-read timeout={}, max concurrent connections={}, \
+         idle keep-alive timeout={}.",
+        transport_config.h2_max_concurrent_streams,
+        match transport_config.h2_max_pending_reset_streams {
+            Some(n) => format!("{n} (override)"),
+            None => "hyper default".to_string(),
+        },
+        match transport_config.header_read_timeout {
+            Some(d) => format!("{}s", d.as_secs()),
+            None => "DISABLED".to_string(),
+        },
+        connection_limiter.max_connections(),
+        match transport_config.keep_alive_timeout {
+            Some(d) => format!("{}s", d.as_secs()),
+            None => "DISABLED".to_string(),
+        },
+    );
+
     // --- SPARQ data-path backend selection. -------------------------------------------------------
     // `CompositeStore<S>` / `AppState<J,R,S>` / the router are generic over the SparqClient `S`, so
     // each arm monomorphizes the SAME downstream wiring (`build_app_for_store`): seed → LdpState →
@@ -605,18 +634,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
             });
 
+            // Build the axum-server, then:
+            //  (a) `.map(..)` wraps the RustlsAcceptor with the connection-cap acceptor so each served
+            //      connection holds a permit for its lifetime (the slowloris connection-flood bound),
+            //  (b) `.http_builder()` applies the HTTP/2 (max_concurrent_streams + rapid-reset cap) +
+            //      HTTP/1.1 (slowloris header-read timeout, keep-alive) knobs to the SAME hyper
+            //      `auto::Builder` axum-server serves with — preserving rustls TLS + h2/http1.1 ALPN
+            //      exactly (the rustls config owns ALPN; we touch only the hyper protocol knobs).
+            let mut server = axum_server::from_tcp_rustls(std_listener, config)?
+                .handle(handle)
+                .map(|acceptor| connection_limiter.wrap_acceptor(acceptor));
+            transport_config.apply_to_builder(server.http_builder());
+
             // `into_make_service_with_connect_info::<SocketAddr>()` (NOT plain `into_make_service`) so
             // each request carries `ConnectInfo<SocketAddr>` in its extensions — the pre-crypto rate
             // limiter reads the direct peer IP from it. axum-server supports the connect-info make
             // service. Without this the limiter would see no peer IP and FAIL OPEN (proceed to auth).
-            axum_server::from_tcp_rustls(std_listener, config)?
-                .handle(handle)
+            server
                 .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await?;
         }
-        // Plain TCP (unchanged dev/test behaviour). Graceful shutdown on Ctrl-C.
+        // Plain TCP (dev/test behaviour). Graceful shutdown on Ctrl-C.
+        //
+        // The transport-layer knobs (HTTP/2 stream/reset caps, slowloris header-read timeout, the
+        // connection cap) are NOT applied on this path: `axum::serve` builds its hyper `auto::Builder`
+        // internally and exposes neither it nor a connection-cap hook, and an axum `Listener` wrapper
+        // cannot carry the `ConnectInfo<SocketAddr>` the pre-crypto rate limiter needs (axum's
+        // `Connected` impls are orphan-locked to `TcpListener`/`TapIo`). Plain HTTP is the DEV/TEST /
+        // TLS-at-a-reverse-proxy posture; in production the in-process TLS path (fully hardened above)
+        // or a fronting reverse proxy terminates HTTP/2 and caps connections. The application-layer
+        // defences (admission control, the per-IP rate limiter, the request timeout) DO apply here.
         None => {
             let listener = tokio::net::TcpListener::bind(&bind).await?;
+            // `connection_limiter` is unused on this path (see above); a fronting proxy / the TLS path
+            // owns the connection cap in production. Drop it explicitly so the intent is clear.
+            drop(connection_limiter);
             // Same as the TLS path: serve WITH connect-info so the rate limiter sees the peer IP.
             axum::serve(
                 listener,
