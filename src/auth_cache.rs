@@ -108,6 +108,14 @@ impl<R: ReplayStore> ReplayStore for SharedReplay<R> {
     fn mark(&self, jti: &str, ttl: Duration) -> Result<MarkResult, ReplayBackendError> {
         self.0.mark(jti, ttl)
     }
+
+    /// READ-ONLY existence probe — delegates verbatim to the shared inner store, so the verifier
+    /// (cache-miss path) and the token cache (cache-hit path) probe the ONE shared jti set, exactly like
+    /// `mark`. Non-mutating (the inner store's `contains` contract). NOTE: not yet wired into the auth
+    /// path here — present to satisfy the trait + carry the opt-4 jti-precheck seam.
+    fn contains(&self, jti: &str) -> Result<bool, ReplayBackendError> {
+        self.0.contains(jti)
+    }
 }
 
 /// The config the hit-path proof verification needs -- the SAME knobs the verifier was built with, so

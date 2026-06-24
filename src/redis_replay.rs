@@ -115,17 +115,30 @@ type MarkJob = (
     Sender<Result<MarkResult, ReplayBackendError>>,
 );
 
+/// A job sent to a Redis worker thread. Either a `mark` (atomic `SET NX PX` check-and-set) or a
+/// READ-ONLY `contains` probe (`EXISTS`). Sharing the one worker pool + queue keeps the off-runtime
+/// blocking-I/O discipline (no `mark` and no `contains` ever runs on the caller's async runtime) and a
+/// single backpressure/fail-closed path for BOTH op kinds.
+enum ReplayJob {
+    /// Atomic check-and-set: `SET dpop:jti:<jti> 1 NX PX <ttl_ms>` → New/Replay. The authoritative op.
+    Mark(MarkJob),
+    /// READ-ONLY existence probe: `EXISTS dpop:jti:<jti>` → bool. NEVER mutates (no SET) — the
+    /// optimization-hint pre-check seam (`ReplayStore::contains`). Reply carries `bool`.
+    Contains(String, Sender<Result<bool, ReplayBackendError>>),
+}
+
 /// A distributed DPoP-`jti` replay store backed by a shared Redis (`SET NX PX`).
 ///
 /// Construct with [`RedisReplayStore::connect`]. Cloning is cheap (the channel sender is cloneable);
 /// every clone shares the one worker thread + pool. Implements [`ReplayStore`] so it drops into the
 /// SAME `SharedReplay`/verifier/cache wiring the in-memory store uses (`main.rs` swap only).
 pub struct RedisReplayStore {
-    /// Ship a `mark` job to a worker thread over a BOUNDED queue. Cloneable + `Send`/`Sync`, used from
-    /// `&self`. `try_send` fails CLOSED on a full queue (backpressure; see [`DEFAULT_QUEUE_CAPACITY`]).
-    tx: SyncSender<MarkJob>,
-    /// The caller-side end-to-end deadline `mark` waits for a reply before failing closed (bounds the
-    /// auth path even under queue saturation; see [`mark_deadline`]).
+    /// Ship a replay job (`mark` or `contains`) to a worker thread over a BOUNDED queue. Cloneable +
+    /// `Send`/`Sync`, used from `&self`. `try_send` fails CLOSED on a full queue (backpressure; see
+    /// [`DEFAULT_QUEUE_CAPACITY`]).
+    tx: SyncSender<ReplayJob>,
+    /// The caller-side end-to-end deadline `mark`/`contains` wait for a reply before failing closed
+    /// (bounds the auth path even under queue saturation; see [`mark_deadline`]).
     mark_deadline: Duration,
 }
 
@@ -171,7 +184,7 @@ impl RedisReplayStore {
         // Medium). `Receiver` is single-consumer, so we share it across workers behind a `Mutex` — held
         // ONLY for the brief `recv()`, never during the Redis op, so the N workers' Redis ops run
         // genuinely in parallel.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<MarkJob>(DEFAULT_QUEUE_CAPACITY);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<ReplayJob>(DEFAULT_QUEUE_CAPACITY);
         let shared_rx = Arc::new(Mutex::new(rx));
 
         // ONE eager init validation (connect + PING) on the boot thread BEFORE spawning workers, so a
@@ -208,6 +221,49 @@ impl Clone for RedisReplayStore {
     }
 }
 
+impl RedisReplayStore {
+    /// Enqueue a [`ReplayJob`] NON-BLOCKING onto the bounded queue, sharing the SAME backpressure /
+    /// fail-closed posture for every op kind: `try_send` fails CLOSED immediately when the queue is FULL
+    /// (the workers can't keep up — a genuine overload signal; fast error + backpressure rather than an
+    /// unbounded backlog — roborev Medium) or when all workers are gone (Disconnected). The op never
+    /// silently succeeds because the backend is unavailable/overloaded. `op` names the op for the error
+    /// text.
+    fn enqueue(&self, job: ReplayJob, op: &str) -> Result<(), ReplayBackendError> {
+        self.tx.try_send(job).map_err(|e| match e {
+            TrySendError::Full(_) => ReplayBackendError(format!(
+                "redis replay queue is full (backend overloaded) — failing closed ({op})"
+            )),
+            TrySendError::Disconnected(_) => {
+                ReplayBackendError(format!("redis replay workers are not available ({op})"))
+            }
+        })
+    }
+
+    /// Wait for a worker's reply with the BOUNDED end-to-end deadline (a plain channel `recv_timeout` —
+    /// NOT a Tokio runtime entry, so safe inside the caller's async runtime). The Redis RTT happens on a
+    /// worker thread, never on this one. The deadline bounds the WHOLE round-trip (queue wait + pool
+    /// acquire + op): under a burst larger than the worker pool, or a slow backend, the caller fails
+    /// CLOSED promptly instead of blocking the auth path indefinitely (roborev Medium). A healthy op
+    /// replies well within the deadline, so this never fires on the happy path. A timeout or a dropped
+    /// reply (worker died mid-op) both fail CLOSED. `op` names the op for the error text.
+    fn await_reply<T>(
+        &self,
+        reply_rx: Receiver<Result<T, ReplayBackendError>>,
+        op: &str,
+    ) -> Result<T, ReplayBackendError> {
+        match reply_rx.recv_timeout(self.mark_deadline) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(ReplayBackendError(format!(
+                "redis replay {op} exceeded the {} ms deadline (backend saturated/slow) — failing closed",
+                self.mark_deadline.as_millis()
+            ))),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(ReplayBackendError(format!(
+                "redis replay worker dropped the request ({op})"
+            ))),
+        }
+    }
+}
+
 impl ReplayStore for RedisReplayStore {
     fn mark(&self, jti: &str, ttl: Duration) -> Result<MarkResult, ReplayBackendError> {
         // A non-positive TTL means the proof is already past its freshness window: mirror the in-memory
@@ -218,39 +274,21 @@ impl ReplayStore for RedisReplayStore {
         }
 
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        // Enqueue the job NON-BLOCKING onto the bounded queue. `try_send` fails CLOSED immediately when
-        // the queue is FULL (the workers can't keep up — a genuine overload signal; fast 503 +
-        // backpressure rather than growing an unbounded backlog of stale marks — roborev Medium) or when
-        // all workers are gone (Disconnected). We never silently accept a proof because the backend is
-        // unavailable/overloaded.
-        self.tx
-            .try_send((jti.to_string(), ttl, reply_tx))
-            .map_err(|e| match e {
-                TrySendError::Full(_) => ReplayBackendError(
-                    "redis replay queue is full (backend overloaded) — failing closed".to_string(),
-                ),
-                TrySendError::Disconnected(_) => {
-                    ReplayBackendError("redis replay workers are not available".to_string())
-                }
-            })?;
+        self.enqueue(ReplayJob::Mark((jti.to_string(), ttl, reply_tx)), "mark")?;
+        self.await_reply(reply_rx, "mark")
+    }
 
-        // Wait for the reply with a BOUNDED end-to-end deadline (a plain channel recv_timeout — NOT a
-        // Tokio runtime entry, so safe inside the caller's async runtime). The Redis RTT happens on a
-        // worker thread, never on this one. The deadline bounds the WHOLE round-trip (queue wait + pool
-        // acquire + op): under a burst larger than the worker pool, or a slow backend, the caller fails
-        // CLOSED promptly (→ 503) instead of blocking the auth path indefinitely (roborev Medium). A
-        // healthy op replies well within the deadline, so this never fires on the happy path. A timeout
-        // or a dropped reply (worker died mid-op) both fail CLOSED.
-        match reply_rx.recv_timeout(self.mark_deadline) {
-            Ok(result) => result,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(ReplayBackendError(format!(
-                "redis replay mark exceeded the {} ms deadline (backend saturated/slow) — failing closed",
-                self.mark_deadline.as_millis()
-            ))),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(ReplayBackendError(
-                "redis replay worker dropped the request".to_string(),
-            )),
-        }
+    /// READ-ONLY existence probe → a single Redis `EXISTS dpop:jti:<jti>` on a worker thread. NEVER a
+    /// `SET`/`SET NX` (it must not mark) — the authoritative, mutating check-and-set is [`mark`]. Same
+    /// fail-closed-on-error posture as `mark`: a queue-full / disconnect / timeout / Redis error all map
+    /// to a `ReplayBackendError`, NEVER a false `Ok(false)` ("not seen") that could mask a replay. This
+    /// is an OPTIMIZATION-hint seam (the held opt-4 jti-precheck) and is NOT wired into the auth path in
+    /// this server today — but it matches `mark`'s error semantics so a future consumer can treat a probe
+    /// error conservatively. Goes through the SAME worker pool/queue (off-runtime blocking I/O).
+    fn contains(&self, jti: &str) -> Result<bool, ReplayBackendError> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.enqueue(ReplayJob::Contains(jti.to_string(), reply_tx), "contains")?;
+        self.await_reply(reply_rx, "contains")
     }
 }
 
@@ -278,7 +316,7 @@ fn validate_connection(
 /// HERE, off the Tokio runtime. A requester that has gone away just drops the result.
 fn run_worker(
     pool: r2d2::Pool<redis::Client>,
-    rx: Arc<Mutex<Receiver<MarkJob>>>,
+    rx: Arc<Mutex<Receiver<ReplayJob>>>,
     op_timeout: Duration,
 ) {
     loop {
@@ -291,8 +329,11 @@ fn run_worker(
             Err(_) => return,
         };
         match job {
-            Ok((jti, ttl, reply)) => {
+            Ok(ReplayJob::Mark((jti, ttl, reply))) => {
                 let _ = reply.send(mark_one(&pool, &jti, ttl, op_timeout));
+            }
+            Ok(ReplayJob::Contains(jti, reply)) => {
+                let _ = reply.send(contains_one(&pool, &jti, op_timeout));
             }
             Err(_) => return, // channel closed: store dropped, no more work.
         }
@@ -344,6 +385,37 @@ fn mark_one(
     }
 }
 
+/// Perform ONE READ-ONLY `EXISTS dpop:jti:<jti>` on a pooled blocking connection → `Ok(true)` iff the
+/// key is currently present (a still-live, already-marked `jti`), `Ok(false)` otherwise (incl. an
+/// expired key, which Redis has already evicted — consistent with `mark` treating an expired `jti` as
+/// fresh). 🔒 NEVER a `SET`/`SET NX`: this MUST NOT mark, insert, refresh, or evict any replay state
+/// (the [`ReplayStore::contains`] INV-4 read-only contract). Any pool/connection/command error returns
+/// a [`ReplayBackendError`] (fail-closed, mirroring [`mark_one`]) — never a false `Ok(false)`. The full
+/// `jti` is the key (namespaced, never hashed), matching `mark_one`.
+fn contains_one(
+    pool: &r2d2::Pool<redis::Client>,
+    jti: &str,
+    op_timeout: Duration,
+) -> Result<bool, ReplayBackendError> {
+    let mut conn = pool
+        .get()
+        .map_err(|e| ReplayBackendError(format!("redis pool get failed: {e}")))?;
+
+    apply_timeouts(&mut conn, op_timeout)
+        .map_err(|e| ReplayBackendError(format!("redis connection timeout setup failed: {e}")))?;
+
+    let key = format!("{JTI_KEY_PREFIX}{jti}");
+    // `EXISTS key` → 1 if present, 0 if absent (or expired — Redis evicts before reporting). A strictly
+    // non-mutating read: it records nothing, so two requests racing a fresh jti can both observe false
+    // here (only `mark`'s atomic `SET NX` resolves the race — exactly one New).
+    let exists: redis::RedisResult<i64> = redis::cmd("EXISTS").arg(&key).query(&mut *conn);
+
+    match exists {
+        Ok(n) => Ok(n > 0),
+        Err(e) => Err(ReplayBackendError(format!("redis EXISTS failed: {e}"))),
+    }
+}
+
 /// Convert a positive `ttl` to whole milliseconds, clamped to AT LEAST 1 (so a sub-millisecond but
 /// positive ttl never produces `PX 0`, which Redis rejects) and saturated to `u64::MAX` on overflow.
 /// `mark` already returned early for a non-positive ttl, so this only ever sees `ttl > 0`.
@@ -385,6 +457,15 @@ impl ReplayStore for BackendReplay {
         match self {
             BackendReplay::InMemory(s) => s.mark(jti, ttl),
             BackendReplay::Redis(s) => s.mark(jti, ttl),
+        }
+    }
+
+    /// READ-ONLY existence probe — delegates verbatim to the selected backend's `contains` (the
+    /// in-memory `EXISTS`-equivalent map read, or the Redis `EXISTS`). Non-mutating on both arms.
+    fn contains(&self, jti: &str) -> Result<bool, ReplayBackendError> {
+        match self {
+            BackendReplay::InMemory(s) => s.contains(jti),
+            BackendReplay::Redis(s) => s.contains(jti),
         }
     }
 }

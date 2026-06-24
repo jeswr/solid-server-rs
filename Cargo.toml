@@ -49,13 +49,18 @@ axum-server = { version = "0.8", default-features = false, features = ["tls-rust
 # stays issuer-agnostic + seam-based, so unit tests still drive the verification CORE via the
 # in-memory test doubles. Pinned to an exact rev (not the floating default branch) for reproducible,
 # security-reviewable builds; Cargo.lock is committed.
-# Pinned to `242d812` — the replay-TTL fix on verifier `main`: the internal jti replay-cache TTL
-# now covers the full symmetric iat window (+1s inclusive-boundary margin), closing a latent DPoP
-# replay window, plus sharing JWKS as `Arc<[Jwk]>`. Supersedes `836899d` (async-DNS + concurrent
-# resolver). The widened replay window is inherited automatically; the iat acceptance window
-# (which the CTH's future-skewed proof relies on) is unchanged.
+# Pinned to `5ab600e` — verifier `main`. Delivers (a) the `ReplayStore::contains()` read-only
+# existence probe (a new REQUIRED trait method — every impl here must provide it) and (b) the
+# `mark()`/`contains()` STALE-NOW security fix: both now sample the clock AFTER acquiring the lock,
+# closing a lock-contention window where a pre-lock `now` mis-read an already-expired entry as live
+# (a spurious replay rejection) and computed the new expiry too early (shortening replay retention).
+# The default in-memory replay path inherits this fix automatically. Supersedes `242d812` (the
+# replay-TTL widening, still inherited) and `836899d` (async-DNS + concurrent resolver). The iat
+# acceptance window (which the CTH's future-skewed proof relies on) is unchanged.
+# `contains()` is an OPTIMIZATION-only seam for the (separately-held) opt-4 jti-precheck; it is NOT
+# yet wired into this server's auth path — implemented to satisfy the trait + land the security fix.
 # FOLLOW-UP: re-pin to a tagged release once the verifier cuts one.
-solid-oidc-verifier = { git = "https://github.com/jeswr/solid-oidc-verifier", rev = "242d8120476a6557670c7aacbb4db5dd08da2bc6", features = ["network"] }
+solid-oidc-verifier = { git = "https://github.com/jeswr/solid-oidc-verifier", rev = "5ab600efa1a212abdc06abbac0b4cc984498a367", features = ["network"] }
 # EMBEDDED SPARQ (opt-in `embedded-sparq` feature): the SPARQ query engine consumed DIRECTLY as a
 # library (NOT over its HTTP service) for the in-process data path. `sparq-core` gives the
 # `Graph` store (`load_str`/`open`/`save`/`apply_delta`) and `sparq-engine` the query/update

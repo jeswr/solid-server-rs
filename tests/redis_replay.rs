@@ -29,6 +29,8 @@ use std::time::Duration;
 use solid_oidc_verifier::replay::{MarkResult, ReplayStore};
 use solid_server_rs::redis_replay::RedisReplayStore;
 
+const ONE_MINUTE: Duration = Duration::from_secs(60);
+
 /// The live-Redis URL, or `None` to skip (the IT is `#[ignore]`d, so it only runs with `--ignored`).
 fn redis_url() -> Option<String> {
     match std::env::var("PSS_IT_REDIS_URL") {
@@ -248,5 +250,78 @@ fn nonpositive_ttl_is_new() {
         store.mark(&jti, Duration::ZERO).expect("zero-ttl mark ok"),
         MarkResult::New,
         "a non-positive ttl must be treated as New without storing"
+    );
+}
+
+/// (d) `contains()` is a READ-ONLY probe — `false` for an UNSEEN `jti`, `true` AFTER `mark`, and it
+/// MUST NOT itself mark: a `contains()` followed by a FRESH `mark()` of the SAME `jti` must see `New`
+/// (proving the probe recorded nothing — the [`ReplayStore::contains`] INV-4 read-only contract, and
+/// the Redis `EXISTS`-never-`SET` discipline). This is the optimization-hint seam for the held opt-4
+/// jti-precheck; it is NOT wired into the auth path yet, so this test is its only coverage of the
+/// non-mutating guarantee against a live Redis.
+#[test]
+#[ignore = "needs a live Redis (set PSS_IT_REDIS_URL); run with --ignored"]
+fn contains_is_read_only_false_then_true_after_mark_and_does_not_mark() {
+    let Some(url) = redis_url() else { return };
+    let store = RedisReplayStore::connect(&url).expect("connects to Redis");
+
+    // --- An UNSEEN jti reads false (EXISTS → 0). ---
+    let unseen = unique_jti("contains-unseen");
+    assert!(
+        !store.contains(&unseen).expect("contains(unseen) ok"),
+        "contains() must return false for a jti that has never been marked"
+    );
+
+    // --- contains() must NOT itself mark: probing an unseen jti, then a FRESH mark of the SAME jti, ---
+    // --- must see New (the probe recorded nothing — a SET would have made the mark a Replay). ---------
+    let probe_then_mark = unique_jti("contains-no-mark");
+    assert!(
+        !store
+            .contains(&probe_then_mark)
+            .expect("contains(probe) ok"),
+        "an unseen jti must read false before any mark"
+    );
+    // A second probe still false — repeated reads never record state either.
+    assert!(
+        !store
+            .contains(&probe_then_mark)
+            .expect("contains(probe-again) ok"),
+        "repeated contains() probes must remain non-mutating (still false)"
+    );
+    assert_eq!(
+        store
+            .mark(&probe_then_mark, ONE_MINUTE)
+            .expect("mark after probe ok"),
+        MarkResult::New,
+        "a fresh mark after contains() probes MUST be New — contains() must never mark (no SET)"
+    );
+
+    // --- AFTER a mark, contains() reads true (EXISTS → 1) for that still-live jti. ---
+    let marked = unique_jti("contains-after-mark");
+    assert!(
+        !store.contains(&marked).expect("contains(pre-mark) ok"),
+        "contains() must be false before the mark"
+    );
+    assert_eq!(
+        store.mark(&marked, ONE_MINUTE).expect("mark ok"),
+        MarkResult::New,
+        "first mark of a jti must be New"
+    );
+    assert!(
+        store.contains(&marked).expect("contains(post-mark) ok"),
+        "contains() must return true for a still-live, already-marked jti"
+    );
+    // And contains() STILL does not mark — the authoritative mark of `marked` is already a Replay, but
+    // probing it repeatedly must not change anything (it stays a Replay, not flip to New).
+    assert!(
+        store
+            .contains(&marked)
+            .expect("contains(post-mark-again) ok"),
+        "a repeated probe of a marked jti stays true (still non-mutating)"
+    );
+    assert_eq!(
+        store.mark(&marked, ONE_MINUTE).expect("re-mark ok"),
+        MarkResult::Replay,
+        "re-marking an already-marked jti is a Replay, regardless of intervening contains() probes"
     );
 }
