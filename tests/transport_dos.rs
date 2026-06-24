@@ -83,11 +83,14 @@ async fn boot_hardened_server(
     let limiter = ConnectionLimiter::new(transport.max_connections);
     let handle = axum_server::Handle::new();
     let server_handle = handle.clone();
+    let handshake_timeout = transport.handshake_timeout;
     tokio::spawn(async move {
         let mut server = axum_server::from_tcp_rustls(std_listener, rustls_config)
             .expect("from_tcp_rustls")
             .handle(server_handle)
-            .map(move |acceptor| limiter.wrap_acceptor(acceptor));
+            .map(move |acceptor| {
+                limiter.wrap_acceptor_with_handshake_timeout(acceptor, handshake_timeout)
+            });
         transport.apply_to_builder(server.http_builder());
         let _ = server
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
@@ -135,6 +138,7 @@ async fn rapid_reset_burst_is_bounded_by_goaway() {
         header_read_timeout: Some(Duration::from_secs(15)),
         max_connections: 10_000,
         keep_alive_timeout: Some(Duration::from_secs(60)),
+        handshake_timeout: Some(Duration::from_secs(10)),
     };
     let (addr, handle) = boot_hardened_server(transport).await;
 
@@ -223,6 +227,7 @@ async fn slowloris_header_trickle_is_dropped_after_timeout() {
         header_read_timeout: Some(header_timeout),
         max_connections: 10_000,
         keep_alive_timeout: Some(Duration::from_secs(60)),
+        handshake_timeout: Some(Duration::from_secs(10)),
     };
     let (addr, handle) = boot_hardened_server(transport).await;
 
@@ -284,6 +289,9 @@ async fn connection_cap_bounds_concurrent_served_connections() {
         header_read_timeout: None, // disable so a parked-mid-request connection is not header-timed-out
         max_connections: 2,
         keep_alive_timeout: None,
+        // No handshake timeout here: the held connections complete their handshake fast; the cap test
+        // is about post-handshake permit holding, and a short handshake bound could race the test.
+        handshake_timeout: None,
     };
     let (addr, handle) = boot_hardened_server(transport).await;
 

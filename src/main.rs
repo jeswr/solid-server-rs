@@ -400,31 +400,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Transport-layer DoS hardening (HTTP/2 caps + slowloris timeout + connection cap). --------
     // These configure the hyper connection BELOW the application layers (admission/rate-limit see only
-    // a parsed request; a rapid-reset or slow-header-trickle never produces one). The h2/header knobs
-    // apply to the production TLS serve path (via axum-server's http_builder); the connection cap
-    // applies to BOTH paths (via an accept-time permit). All defaults are deliberately lenient so they
-    // never trip the conformance harness. See `solid_server_rs::transport`.
+    // a parsed request; a rapid-reset or slow-header-trickle never produces one). They are applied ONLY
+    // on the in-process TLS serve path (via axum-server's http_builder + the connection-cap acceptor);
+    // the plain-HTTP path cannot configure them (axum::serve exposes neither). All defaults are
+    // deliberately lenient so they never trip the conformance harness. See `solid_server_rs::transport`.
     let transport_config = TransportConfig::from_env();
     let connection_limiter = ConnectionLimiter::new(transport_config.max_connections);
-    eprintln!(
-        "  TRANSPORT: HTTP/2 max_concurrent_streams={}, rapid-reset cap (CVE-2023-44487)={} (hyper \
-         default 20 unless overridden), slowloris header-read timeout={}, max concurrent connections={}, \
-         idle keep-alive timeout={}.",
-        transport_config.h2_max_concurrent_streams,
-        match transport_config.h2_max_pending_reset_streams {
-            Some(n) => format!("{n} (override)"),
-            None => "hyper default".to_string(),
-        },
-        match transport_config.header_read_timeout {
-            Some(d) => format!("{}s", d.as_secs()),
-            None => "DISABLED".to_string(),
-        },
-        connection_limiter.max_connections(),
-        match transport_config.keep_alive_timeout {
-            Some(d) => format!("{}s", d.as_secs()),
-            None => "DISABLED".to_string(),
-        },
-    );
+    // Log honestly per serve mode (roborev Low): the transport caps are ACTIVE only when terminating
+    // TLS in-process. In plain-HTTP mode they are NOT enforced — say so, so an operator behind a
+    // reverse proxy does not believe the in-process caps are on.
+    if matches!(tls_mode, TlsMode::Tls { .. }) {
+        eprintln!(
+            "  TRANSPORT (TLS path, ACTIVE): HTTP/2 max_concurrent_streams={}, rapid-reset cap \
+             (CVE-2023-44487)={} (hyper default 20 unless overridden), slowloris header-read \
+             timeout={}, max concurrent connections={}, handshake timeout={}, h2 keep-alive \
+             ping={} (reclaims a DEAD-peer connection, not a live-idle one).",
+            transport_config.h2_max_concurrent_streams,
+            match transport_config.h2_max_pending_reset_streams {
+                Some(n) => format!("{n} (override)"),
+                None => "hyper default".to_string(),
+            },
+            fmt_opt_secs(transport_config.header_read_timeout),
+            connection_limiter.max_connections(),
+            fmt_opt_secs(transport_config.handshake_timeout),
+            fmt_opt_secs(transport_config.keep_alive_timeout),
+        );
+    } else {
+        eprintln!(
+            "  TRANSPORT (plain-HTTP path): the in-process HTTP/2 stream/reset caps, slowloris \
+             header-read timeout, connection cap, and handshake timeout are NOT applied — \
+             axum::serve does not expose the hyper builder. Terminate TLS in-process (set \
+             SOLID_SERVER_TLS_CERT + _KEY) to enable them, or rely on a fronting reverse proxy to \
+             cap connections + terminate HTTP/2. The application-layer defences (admission control, \
+             per-IP rate limit, request timeout) DO apply on this path."
+        );
+    }
 
     // --- SPARQ data-path backend selection. -------------------------------------------------------
     // `CompositeStore<S>` / `AppState<J,R,S>` / the router are generic over the SparqClient `S`, so
@@ -641,9 +651,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             //      HTTP/1.1 (slowloris header-read timeout, keep-alive) knobs to the SAME hyper
             //      `auto::Builder` axum-server serves with — preserving rustls TLS + h2/http1.1 ALPN
             //      exactly (the rustls config owns ALPN; we touch only the hyper protocol knobs).
+            let handshake_timeout = transport_config.handshake_timeout;
             let mut server = axum_server::from_tcp_rustls(std_listener, config)?
                 .handle(handle)
-                .map(|acceptor| connection_limiter.wrap_acceptor(acceptor));
+                .map(|acceptor| {
+                    connection_limiter
+                        .wrap_acceptor_with_handshake_timeout(acceptor, handshake_timeout)
+                });
             transport_config.apply_to_builder(server.http_builder());
 
             // `into_make_service_with_connect_info::<SocketAddr>()` (NOT plain `into_make_service`) so
@@ -758,6 +772,15 @@ where
         AppState::new(auth, ldp),
         overload_config,
     ))
+}
+
+/// Format an optional seconds-duration for a startup log line: `Some(d)` ⇒ `"<n>s"`, `None` ⇒
+/// `"DISABLED"`. Used for the transport-hardening timeout knobs.
+fn fmt_opt_secs(d: Option<Duration>) -> String {
+    match d {
+        Some(d) => format!("{}s", d.as_secs()),
+        None => "DISABLED".to_string(),
+    }
 }
 
 /// Read a boolean-ish env flag: `1` / `true` (case-insensitive) ⇒ true; anything else / absent ⇒ false.

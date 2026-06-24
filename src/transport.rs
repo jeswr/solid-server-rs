@@ -80,11 +80,21 @@ pub const ENV_HEADER_READ_TIMEOUT_SECS: &str = "SOLID_SERVER_HEADER_READ_TIMEOUT
 /// silently brick the server on a typo).
 pub const ENV_MAX_CONNECTIONS: &str = "SOLID_SERVER_MAX_CONNECTIONS";
 
-/// Env var: the idle keep-alive timeout in seconds — an HTTP/1.1 keep-alive connection (or an h2
-/// connection, via a keep-alive ping) that is idle this long is closed, so a parked connection cannot
-/// hold a connection slot forever. Unset / invalid ⇒ [`DEFAULT_KEEP_ALIVE_TIMEOUT_SECS`]; `0` ⇒
-/// DISABLED (no idle reclaim — not advised).
+/// Env var: the HTTP/2 keep-alive ping interval+ack-timeout in seconds. hyper sends a keep-alive PING
+/// every interval and DROPS the connection if the ack does not arrive within the timeout — this
+/// reclaims a connection whose peer has gone away (a dead/half-open h2 connection holding a permit),
+/// NOT a merely-idle one (a live client that keeps acking pings is not closed by this). Combined with
+/// the connection cap + the bounded handshake timeout, it bounds the dead-peer leak. Unset / invalid ⇒
+/// [`DEFAULT_KEEP_ALIVE_TIMEOUT_SECS`]; `0` ⇒ DISABLED (no h2 keep-alive ping).
 pub const ENV_KEEP_ALIVE_TIMEOUT_SECS: &str = "SOLID_SERVER_KEEP_ALIVE_TIMEOUT_SECS";
+
+/// Env var: the accept/handshake timeout in seconds — the maximum time the TLS handshake (the inner
+/// accept) may take while HOLDING a connection permit. A client that opens a TCP connection and STALLS
+/// the TLS handshake (never completing it) would otherwise pin a permit until the underlying acceptor's
+/// own handshake timeout; bounding it HERE releases the permit promptly so a slow-handshake flood
+/// cannot exhaust the connection cap before the HTTP-layer `header_read_timeout` can apply. Unset /
+/// invalid ⇒ [`DEFAULT_HANDSHAKE_TIMEOUT_SECS`]; `0` ⇒ DISABLED (rely on the acceptor's own bound).
+pub const ENV_HANDSHAKE_TIMEOUT_SECS: &str = "SOLID_SERVER_HANDSHAKE_TIMEOUT_SECS";
 
 // --- Defaults -------------------------------------------------------------------------------------
 
@@ -106,10 +116,16 @@ pub const DEFAULT_HEADER_READ_TIMEOUT_SECS: u64 = 15;
 /// are cheaper than admitted requests, so an equal ceiling is conservative.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 
-/// Default idle keep-alive timeout (seconds). Long enough not to churn a normal client's reused
-/// connection, short enough to reclaim a parked/abandoned one. Applies to HTTP/1.1 (header-read +
-/// idle) and h2 (as a keep-alive ping-ack timeout).
+/// Default HTTP/2 keep-alive ping interval+ack-timeout (seconds). Long enough not to churn a healthy
+/// reused connection, short enough to reclaim a DEAD-peer one (one whose host vanished without a FIN).
+/// This detects a dead peer, NOT a live-but-idle client — see [`ENV_KEEP_ALIVE_TIMEOUT_SECS`].
 pub const DEFAULT_KEEP_ALIVE_TIMEOUT_SECS: u64 = 60;
+
+/// Default accept/handshake timeout (seconds). Generous enough for a legitimate TLS handshake on a
+/// slow link, short enough that a stalled-handshake connection releases its permit promptly. Matches
+/// the spirit of axum-server's own 10s handshake-timeout default, but is owned + tested here and
+/// releases the CONNECTION PERMIT (not just the handshake) on expiry.
+pub const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 
 // --- Resolved config ------------------------------------------------------------------------------
 
@@ -126,8 +142,13 @@ pub struct TransportConfig {
     pub header_read_timeout: Option<Duration>,
     /// Concurrent-connection cap (always set — a `0` env value falls back to the default, never 0).
     pub max_connections: usize,
-    /// Idle keep-alive timeout. `None` ⇒ disabled (no idle reclaim).
+    /// HTTP/2 keep-alive ping interval+ack-timeout — reclaims a DEAD-peer connection (not a live-idle
+    /// one). `None` ⇒ disabled (no h2 keep-alive ping).
     pub keep_alive_timeout: Option<Duration>,
+    /// Accept/handshake timeout: the max time the inner accept (TLS handshake) may take while holding a
+    /// connection permit, after which the permit is released. `None` ⇒ disabled (rely on the underlying
+    /// acceptor's own handshake bound).
+    pub handshake_timeout: Option<Duration>,
 }
 
 impl TransportConfig {
@@ -149,6 +170,10 @@ impl TransportConfig {
                 std::env::var(ENV_KEEP_ALIVE_TIMEOUT_SECS).ok(),
                 DEFAULT_KEEP_ALIVE_TIMEOUT_SECS,
             ),
+            handshake_timeout: parse_optional_secs(
+                std::env::var(ENV_HANDSHAKE_TIMEOUT_SECS).ok(),
+                DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+            ),
         }
     }
 
@@ -156,7 +181,9 @@ impl TransportConfig {
     /// paths use). This sets:
     /// - h2 `max_concurrent_streams` (the owned ceiling),
     /// - h2 `max_pending_accept_reset_streams` when overridden (else hyper's secure default 20 stands),
-    /// - the h1 + h2 keep-alive idle reclaim,
+    /// - the h2 keep-alive PING (interval + ack-timeout) — reclaims a DEAD-peer h2 connection (one
+    ///   whose host vanished without a FIN); it does NOT close a live-but-idle client (that holds a
+    ///   permit until it disconnects — bounded instead by the connection cap),
     /// - the h1 header-read (slowloris) timeout — which REQUIRES a [`TokioTimer`], so we install one
     ///   on both the h1 and h2 sub-builders whenever a timeout-bearing knob is active (hyper PANICS if
     ///   `header_read_timeout` is set without a timer).
@@ -191,10 +218,13 @@ impl TransportConfig {
             .http1()
             .header_read_timeout(self.header_read_timeout);
 
-        // Idle keep-alive reclaim. For h2 this is a keep-alive PING/ack timeout, gated on an interval —
-        // set both so an idle h2 connection that stops acking pings is dropped. For h1, hyper reclaims
-        // an idle keep-alive connection on the header-read timeout of the NEXT request, so the
-        // header-read timeout above already bounds an idle h1 keep-alive; the h2 ping covers h2.
+        // h2 keep-alive PING (interval + ack-timeout): hyper sends a PING every `ka` and DROPS the
+        // connection if the ack does not arrive within `ka` — so a DEAD-peer h2 connection (host gone
+        // without a FIN) is reclaimed, freeing its permit. NOTE this detects a dead peer, NOT a
+        // live-but-idle client (one that keeps acking pings is NOT closed — it holds its permit until
+        // it disconnects; the connection CAP is what bounds that). For h1, hyper reclaims an idle
+        // keep-alive connection on the header-read timeout of the NEXT request, so the header-read
+        // timeout above already bounds a dead/idle h1 keep-alive head.
         if let Some(ka) = self.keep_alive_timeout {
             builder.http2().keep_alive_interval(ka);
             builder.http2().keep_alive_timeout(ka);
@@ -252,12 +282,26 @@ impl ConnectionLimiter {
     }
 
     /// Wrap an `axum-server` acceptor so each accepted connection holds a connection permit for its
-    /// lifetime — the connection-cap for the TLS serve path. Use via
-    /// `server.map(|inner| limiter.wrap_acceptor(inner))`.
+    /// lifetime — the connection-cap for the TLS serve path, with NO handshake timeout (rely on the
+    /// underlying acceptor's own bound). Prefer [`wrap_acceptor_with_handshake_timeout`].
     pub fn wrap_acceptor<A>(&self, inner: A) -> ConnectionLimitAcceptor<A> {
+        self.wrap_acceptor_with_handshake_timeout(inner, None)
+    }
+
+    /// As [`wrap_acceptor`](Self::wrap_acceptor), but bounding the inner accept (TLS handshake) by
+    /// `handshake_timeout`: a connection that stalls the handshake longer than this has its permit
+    /// RELEASED (the accept resolves to an error, so axum-server drops it), so a slow-handshake flood
+    /// cannot pin the connection cap before the HTTP-layer header-read timeout can apply. `None` ⇒ no
+    /// added bound (the underlying acceptor's own handshake timeout still applies).
+    pub fn wrap_acceptor_with_handshake_timeout<A>(
+        &self,
+        inner: A,
+        handshake_timeout: Option<Duration>,
+    ) -> ConnectionLimitAcceptor<A> {
         ConnectionLimitAcceptor {
             inner,
             limiter: self.clone(),
+            handshake_timeout,
         }
     }
 }
@@ -265,14 +309,16 @@ impl ConnectionLimiter {
 /// An [`Accept`] wrapper that bounds concurrently-served connections via a [`ConnectionLimiter`]. It
 /// acquires a permit (FAIL-FAST — without blocking) BEFORE running the inner accept (TLS handshake);
 /// over the cap it REFUSES the connection with an error so `axum-server` drops it and reclaims the
-/// socket at once, rather than queueing it. On admission it hands back a [`PermittedStream`] holding
-/// the permit for the connection's lifetime — so no more than `max_connections` served connections
-/// exist at once, AND a flood over the cap is shed immediately (not parked as pending tasks holding
-/// accepted sockets — roborev Medium).
+/// socket at once, rather than queueing it. The inner accept is bounded by an optional
+/// `handshake_timeout` so a stalled handshake cannot pin a permit. On admission it hands back a
+/// [`PermittedStream`] holding the permit for the connection's lifetime — so no more than
+/// `max_connections` served connections exist at once, AND a flood over the cap (or stalled
+/// handshakes) is shed promptly (not parked as pending tasks holding accepted sockets — roborev).
 #[derive(Clone)]
 pub struct ConnectionLimitAcceptor<A> {
     inner: A,
     limiter: ConnectionLimiter,
+    handshake_timeout: Option<Duration>,
 }
 
 impl<A, I, S> Accept<I, S> for ConnectionLimitAcceptor<A>
@@ -306,10 +352,26 @@ where
             }
         };
         let inner = self.inner.clone();
+        let handshake_timeout = self.handshake_timeout;
         Box::pin(async move {
-            // Run the inner accept (e.g. the TLS handshake). The permit is held across it and moved
-            // into the returned stream, so it stays held for the whole connection lifetime.
-            let (io_stream, svc) = inner.accept(stream, service).await?;
+            // Run the inner accept (e.g. the TLS handshake), BOUNDED by `handshake_timeout` when set —
+            // a stalled handshake must not pin the permit. On timeout the inner accept future is
+            // dropped (cancelling the handshake) and we return an error; `permit` is dropped with this
+            // future, RELEASING the connection slot at once. The permit is held across a SUCCESSFUL
+            // accept and moved into the returned stream, so it stays held for the connection lifetime.
+            let accept_fut = inner.accept(stream, service);
+            let (io_stream, svc) = match handshake_timeout {
+                Some(to) => match tokio::time::timeout(to, accept_fut).await {
+                    Ok(result) => result?,
+                    Err(_elapsed) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "TLS handshake exceeded the accept timeout — refusing connection",
+                        ));
+                    }
+                },
+                None => accept_fut.await?,
+            };
             Ok((PermittedStream::new(io_stream, permit), svc))
         })
     }
@@ -540,6 +602,7 @@ mod tests {
             ENV_HEADER_READ_TIMEOUT_SECS,
             ENV_MAX_CONNECTIONS,
             ENV_KEEP_ALIVE_TIMEOUT_SECS,
+            ENV_HANDSHAKE_TIMEOUT_SECS,
         ];
         let saved: Vec<(&str, Option<String>)> =
             keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
@@ -561,6 +624,7 @@ mod tests {
                 header_read_timeout: Some(Duration::from_secs(DEFAULT_HEADER_READ_TIMEOUT_SECS)),
                 max_connections: DEFAULT_MAX_CONNECTIONS,
                 keep_alive_timeout: Some(Duration::from_secs(DEFAULT_KEEP_ALIVE_TIMEOUT_SECS)),
+                handshake_timeout: Some(Duration::from_secs(DEFAULT_HANDSHAKE_TIMEOUT_SECS)),
             }
         );
     }
@@ -579,6 +643,7 @@ mod tests {
                 header_read_timeout: Some(Duration::from_secs(15)),
                 max_connections: 10_000,
                 keep_alive_timeout: Some(Duration::from_secs(60)),
+                handshake_timeout: Some(Duration::from_secs(10)),
             };
             let mut builder = Builder::new(hyper_util::rt::TokioExecutor::new());
             cfg.apply_to_builder(&mut builder);
@@ -636,6 +701,61 @@ mod tests {
     }
 
     #[test]
+    fn acceptor_releases_permit_when_handshake_stalls() {
+        // The handshake-timeout fix (roborev Medium): a stalled inner accept (TLS handshake) must NOT
+        // pin a connection permit. With a mock acceptor whose `accept` NEVER resolves and a short
+        // handshake timeout, the wrapped acceptor's future must resolve to Err WITHIN the timeout AND
+        // RELEASE the permit (so the cap recovers). Deterministic, no sockets.
+        use std::future::pending;
+
+        // A mock `Accept` whose accept future never completes (models a stalled TLS handshake).
+        #[derive(Clone)]
+        struct StallingAcceptor;
+        impl Accept<(), ()> for StallingAcceptor {
+            // `TcpStream` is only NAMED as the associated Stream type (a connection is never produced —
+            // the accept future never resolves), so no socket is opened. Using it avoids needing the
+            // `io-util` feature a `DuplexStream` would require.
+            type Stream = tokio::net::TcpStream;
+            type Service = ();
+            type Future =
+                Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
+            fn accept(&self, _stream: (), _service: ()) -> Self::Future {
+                // Never resolves — the handshake stalls forever.
+                Box::pin(async { pending::<io::Result<(Self::Stream, Self::Service)>>().await })
+            }
+        }
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let limiter = ConnectionLimiter::new(1);
+            assert_eq!(limiter.available_permits(), 1);
+            let acceptor = limiter.wrap_acceptor_with_handshake_timeout(
+                StallingAcceptor,
+                Some(Duration::from_millis(100)),
+            );
+
+            // The accept future holds the permit while it awaits the (never-completing) handshake, then
+            // must time out → Err. While in flight the permit is taken.
+            let accept_fut = acceptor.accept((), ());
+            let result = tokio::time::timeout(Duration::from_secs(2), accept_fut)
+                .await
+                .expect(
+                    "the wrapped accept must itself time out (not hang) on a stalled handshake",
+                );
+            assert!(
+                result.is_err(),
+                "a stalled handshake must resolve the accept to Err (handshake timeout)"
+            );
+            // CRITICAL: the permit was released when the Err future was dropped, so the cap recovered.
+            assert_eq!(
+                limiter.available_permits(),
+                1,
+                "a stalled-handshake connection must RELEASE its permit on timeout (no permit leak)"
+            );
+        });
+    }
+
+    #[test]
     fn connection_limiter_clamps_huge_value_below_semaphore_max() {
         // A max_connections above tokio's Semaphore::MAX_PERMITS would PANIC in `Semaphore::new`; the
         // clamp fails SAFE to MAX_PERMITS instead of crashing the boot (roborev Low).
@@ -658,6 +778,7 @@ mod tests {
                 header_read_timeout: None,
                 max_connections: 10_000,
                 keep_alive_timeout: None,
+                handshake_timeout: None,
             };
             let mut builder = Builder::new(hyper_util::rt::TokioExecutor::new());
             cfg.apply_to_builder(&mut builder);
