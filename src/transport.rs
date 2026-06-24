@@ -18,8 +18,10 @@
 //!   total request time AFTER the request is parsed — it never starts, because hyper is still reading
 //!   the head. The defence is a **header-read timeout** at the hyper layer (drop a connection that
 //!   has not sent a complete header set in time) plus a **concurrent-connection cap** so a flood of
-//!   such half-open connections cannot exhaust file descriptors / memory, and an **idle keep-alive
-//!   timeout** so a parked keep-alive connection is reclaimed.
+//!   such half-open connections cannot exhaust file descriptors / memory, plus a bounded **TLS
+//!   handshake timeout** so a connection that stalls the handshake (never completing it) cannot pin a
+//!   connection permit, and an **h2 keep-alive PING** (interval + ack-timeout) so a DEAD-peer h2
+//!   connection (host gone without a FIN) that is holding a permit is reclaimed.
 //!
 //! ## What hyper provides vs what we add (the rapid-reset accounting)
 //! The in-tree `hyper` 1.x + `h2` 0.4.x already ship the CVE-2023-44487 reset-accounting:
@@ -35,11 +37,19 @@
 //! `max_concurrent_streams` ceiling (hyper's default is 200; we set it explicitly so it is owned +
 //! documented). The reset cap stays at hyper's secure default unless an operator overrides it.
 //!
-//! ## Where it sits
+//! ## Where it sits (TLS serve path ONLY)
 //! These knobs live BELOW the application layers — they configure the hyper connection serving the
-//! request, applied to the `hyper_util::server::conn::auto::Builder` that BOTH serve paths use (the
-//! TLS path via `axum-server`'s `http_builder()`, the plain-HTTP path via a hyper accept loop). They
-//! are purely transport-level: they change WHEN/WHETHER a connection is served, never the
+//! request. They are applied **only on the in-process TLS serve path**: the h2/header knobs via
+//! `axum-server`'s `http_builder()` (the `hyper_util::server::conn::auto::Builder` it serves with),
+//! and the connection cap + handshake timeout via the [`ConnectionLimitAcceptor`] wrapping
+//! `axum-server`'s acceptor. The **plain-HTTP path is intentionally NOT hardened here** — `axum::serve`
+//! exposes neither the underlying hyper builder nor an acceptor seam, so these knobs cannot be wired
+//! onto it; an operator who needs the transport caps must terminate TLS in-process (or front the
+//! plain path with a reverse proxy that caps connections + terminates HTTP/2). The startup log states
+//! which posture is active per serve mode. On the plain path the application-layer defences (admission
+//! control, per-IP rate limit, request timeout) still apply.
+//!
+//! These knobs are purely transport-level: they change WHEN/WHETHER a connection is served, never the
 //! LDP/auth/WAC semantics of a request that IS served — so conformance is unaffected (the caps are
 //! deliberately lenient enough never to trip the harness's own concurrency; see the defaults).
 
