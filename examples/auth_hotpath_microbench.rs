@@ -1,8 +1,10 @@
 // AUTHORED-BY Claude Opus 4.8
 //! DETERMINISTIC in-process micro-benchmark of the AUTHENTICATED (DPoP) GET hot path, component by
-//! component. It reproduces EXACTLY the sequence `src/auth_cache.rs::verify_fresh_proof` runs on a
-//! cache HIT (the production steady state) plus the cache-MISS access-token verify, using REAL ES256
-//! keys + REAL DPoP proofs minted the same way the verifier's own tests + `examples/auth_load.rs` do.
+//! component. It reproduces the per-component crypto/parse work `src/auth_cache.rs::verify_fresh_proof`
+//! does on a cache HIT under the default policy (the production steady state) plus the cache-MISS
+//! access-token verify, using REAL ES256 keys + REAL DPoP proofs minted the same way the verifier's
+//! own tests + `examples/auth_load.rs` do. The summed budget is ADDITIVE (each step timed in isolation),
+//! NOT the literal execution order of `verify_fresh_proof`.
 //!
 //! Why this and not only the HTTP sweep: on a contended box (load 25-33 here) the end-to-end RPS
 //! wall-clock is noise. This times each crypto/parse step back-to-back in the SAME process on the SAME
@@ -217,10 +219,12 @@ fn main() {
         black_box(k);
     });
 
-    // The summed HIT-path crypto+parse budget — what a cache hit ACTUALLY pays, in the order
-    // `verify_fresh_proof` runs: H1 proof verify, H2 cnf.jkt thumbprint, H3 ath (b64url of the reused
-    // digest), H6 claim-field gets + htu normalise, H7 the one token hash for the cache key. C1/C2 are
-    // EXCLUDED — they are not on the default hit path (see their comments).
+    // The summed HIT-path crypto+parse budget — what a cache hit ACTUALLY pays under the DEFAULT policy
+    // (`allow_missing_ath = false`), as an ADDITIVE total (NOT execution order — the real order is
+    // H1 → H6 field/htu checks → H3 ath → H2 thumbprint): H1 proof verify, H2 cnf.jkt thumbprint, H3 ath
+    // (b64url of the reused digest), H6 claim-field gets + htu normalise, H7 the one token hash for the
+    // cache key. C1/C2 are EXCLUDED — C1 (proof_has_ath) runs only when `allow_missing_ath` is enabled,
+    // and C2 (peek_claims) is a redundant re-parse the hit path never does.
     let hit_budget = proof_op + tp_op + ath_op + fields_op + key_op;
 
     let row = |name: &str, op: f64, total: u128| {
