@@ -104,6 +104,39 @@ fn iri_chars_serialisable(iri: &str) -> bool {
     if iri.is_empty() {
         return false;
     }
+    // FAST PATH (the overwhelmingly common case): a child IRI minted by the store is ASCII —
+    // `https://host/c/item-0042` etc. Every character RFC-3987 forbids in a serialisable `<...>` term
+    // EXCEPT the C1 control range (U+0080..=U+009F) is ASCII, so for an all-ASCII IRI a single byte
+    // scan with plain comparisons decides it — WITHOUT decoding UTF-8 to `char` and WITHOUT the
+    // per-char Unicode `is_control` property-table lookup the `.chars()` path pays. This is the listing
+    // render's largest per-child cost (one call per member); skipping the Unicode table lookup for the
+    // common all-ASCII child is the win. The moment any non-ASCII byte (>= 0x80) is seen, fall through
+    // to the original `char`-based check (which alone handles the C1 range correctly) — so the result
+    // is BYTE-IDENTICAL to the prior implementation for every input, only faster on the ASCII path.
+    let bytes = iri.as_bytes();
+    let mut all_ascii = true;
+    for &b in bytes {
+        if b >= 0x80 {
+            all_ascii = false;
+            break;
+        }
+        // ASCII forbidden set: C0 controls (< 0x20) + DEL (0x7F) + space + the term delimiters.
+        // (`is_control()` for an ASCII char is exactly `b < 0x20 || b == 0x7F`.)
+        if b < 0x20
+            || b == 0x7F
+            || matches!(
+                b,
+                b' ' | b'<' | b'>' | b'"' | b'{' | b'}' | b'|' | b'^' | b'`' | b'\\'
+            )
+        {
+            return false;
+        }
+    }
+    if all_ascii {
+        return true;
+    }
+    // Non-ASCII present (rare — a `ucschar` like `café`): defer to the exact `char`-based check, which
+    // additionally rejects the C1 control range. This is the original implementation, unchanged.
     !iri.chars().any(|c| {
         c.is_control()
             || c == ' '
@@ -2719,7 +2752,8 @@ mod tests {
             "https://pod.example/c/a",
             "https://pod.example/c/a#me",
             "https://pod.example/c/a%20b",
-            "https://pod.example/c/café",
+            "https://pod.example/c/café", // 2-byte ucschar é (U+00E9) — non-control
+            "https://pod.example/c/\u{1f600}emoji", // 4-byte non-ASCII — accepted (non-control)
             "urn:uuid:12345678-1234-1234-1234-123456789abc",
         ] {
             assert!(iri_chars_serialisable(ok), "must accept valid IRI: {ok}");
@@ -2738,10 +2772,58 @@ mod tests {
             "https://pod.example/c/a^b",      // caret
             "https://pod.example/c/a`b",      // backtick
             "https://pod.example/c/a\\b",     // backslash
+            "https://pod.example/c/a\u{80}b", // C1 control U+0080 (non-ASCII) — the fallback-path case
+            "https://pod.example/c/a\u{9f}b", // C1 control U+009F (non-ASCII) — the fallback-path case
         ] {
             assert!(
                 !iri_chars_serialisable(bad),
                 "must reject corrupting IRI: {bad:?}"
+            );
+        }
+    }
+
+    /// Equivalence harness: the optimised `iri_chars_serialisable` must agree BYTE-FOR-BYTE with the
+    /// reference `.chars()`-based predicate across ASCII, C0/C1 controls, the delimiter set, and
+    /// multi-byte ucschar — so the ASCII fast path can never diverge from the proven char path.
+    #[test]
+    fn iri_chars_serialisable_matches_reference_across_inputs() {
+        fn reference(iri: &str) -> bool {
+            if iri.is_empty() {
+                return false;
+            }
+            !iri.chars().any(|c| {
+                c.is_control()
+                    || c == ' '
+                    || matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\')
+            })
+        }
+        // Every ASCII byte as a single-char IRI body, plus an empty string and several multi-byte
+        // ucschar / C1-control cases — the exact boundary where ASCII-fast-path vs char-path could differ.
+        let mut cases: Vec<String> = vec![String::new()];
+        for b in 0u8..=0x7f {
+            cases.push(format!("a{}z", b as char));
+        }
+        for s in [
+            "café",
+            "naïve",
+            "\u{1f600}",
+            "a\u{80}b",
+            "a\u{9f}b",
+            "a\u{a0}b",
+            "ÿ",
+            "ABC",
+            "https://h/c/item-0042",
+            "",
+            "\u{7f}",
+            " ",
+        ] {
+            cases.push(s.to_string());
+        }
+        for c in cases {
+            assert_eq!(
+                iri_chars_serialisable(&c),
+                reference(&c),
+                "diverged from reference for {c:?}"
             );
         }
     }

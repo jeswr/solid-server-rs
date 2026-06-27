@@ -14,3 +14,9 @@
 /bench/results-skip/
 /bench/results-after*/
 /bench/results-before*/
+# Profiling-round DEV artifacts (regenerate with bench/profile-run.sh / bench/profile-auth.sh)
+/bench/prof-*.json.gz
+/bench/prof-*-oha.json
+/bench/prof-server-*.log
+/bench/results-auth-prof/
+/bench/ab-server.log
