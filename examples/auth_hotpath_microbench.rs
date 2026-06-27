@@ -21,10 +21,10 @@ use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 
+use solid_oidc_verifier::jwk::Jwk;
 use solid_oidc_verifier::jwt::{
     peek_claims, proof_has_ath, verify_proof_with_embedded_jwk, verify_signature,
 };
-use solid_oidc_verifier::jwk::Jwk;
 
 struct ClientKey {
     signing: SigningKey,
@@ -41,7 +41,11 @@ fn new_client_key() -> ClientKey {
     let jwk_value = serde_json::json!({"kty":"EC","crv":"P-256","x":x,"y":y});
     let canonical = format!(r#"{{"crv":"P-256","kty":"EC","x":"{x}","y":"{y}"}}"#);
     let jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()));
-    ClientKey { signing, jwk_value, jkt }
+    ClientKey {
+        signing,
+        jwk_value,
+        jkt,
+    }
 }
 
 fn b64url_json(v: &serde_json::Value) -> String {
@@ -61,6 +65,12 @@ const METHOD: &str = "GET";
 
 fn ath(token: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()))
+}
+
+/// Mirror `auth_cache::ath_from_digest` — base64url of the ALREADY-computed SHA-256 token digest (the
+/// cache key). The hit path reuses the cache-key digest here rather than re-hashing the token.
+fn ath_from_digest(digest: &[u8; 32]) -> String {
+    URL_SAFE_NO_PAD.encode(digest)
 }
 
 /// Time a closure `iters` times; returns (total_ns, per_op_ns).
@@ -122,17 +132,28 @@ fn main() {
         }),
     );
 
-    let token_hash_input = access_token.clone();
+    // The cache key is SHA-256(access_token), computed ONCE per request to look up the verified-token
+    // cache. The real hit path (`auth_cache::verify_fresh_proof`) REUSES that same digest for the `ath`
+    // comparison (`ath_from_digest` = base64url of the digest) — it does NOT re-hash the token. So the
+    // bench hashes once (H7) and reuses the digest for ath (H3).
+    let token_digest: [u8; 32] = Sha256::digest(access_token.as_bytes()).into();
 
-    println!("# auth hot-path microbench — iters={iters}, load={}", load_avg());
+    println!(
+        "# auth hot-path microbench — iters={iters}, load={}",
+        load_avg()
+    );
     println!("# (per-op nanoseconds; relative %% of the summed hit-path crypto/parse budget)\n");
 
-    // === MISS-path-only: access-token signature verify (ES256 against issuer JWKS) ===
+    // === Off-hit-path context: access-token signature verify (ES256 against issuer JWKS) ===
     // This is the work the verified-token CACHE removes on a hit. Timed for context (it is NOT on the
     // steady-state hit path).
     let (at_total, at_op) = time_it(iters, || {
-        let claims = verify_signature(black_box(&access_token), black_box(&issuer_keys), Some("at+jwt"))
-            .expect("access token must verify");
+        let claims = verify_signature(
+            black_box(&access_token),
+            black_box(&issuer_keys),
+            Some("at+jwt"),
+        )
+        .expect("access token must verify");
         black_box(claims);
     });
 
@@ -152,21 +173,25 @@ fn main() {
         black_box(t);
     });
 
-    // (H3) ath = base64url(SHA-256(access_token)) — recomputed every request to compare to proof ath.
+    // (H3) ath = base64url of the cache-key digest (`ath_from_digest`). The hit path reuses the digest
+    //      computed for the cache key (H7) — NOT a second SHA-256 of the token — so this is just a
+    //      base64url encode.
     let (ath_total, ath_op) = time_it(iters, || {
-        let a = ath(black_box(&token_hash_input));
+        let a = ath_from_digest(black_box(&token_digest));
         black_box(a);
     });
 
-    // (H4) proof_has_ath peek (base64 + serde_json parse of the proof payload) — done to route ath-compat.
+    // (C1) proof_has_ath peek (base64 + serde_json parse). OFF the default hit path: the cache calls it
+    //      only in ath-compat mode (`allow_missing_ath && !proof_has_ath(proof)` short-circuits, default
+    //      off), so it is excluded from the hit budget and timed for context only.
     let (peekath_total, peekath_op) = time_it(iters, || {
         let b = proof_has_ath(black_box(&proof));
         black_box(b);
     });
 
-    // (H5) peek_claims of the proof (base64 + serde_json parse) — the jti read on the verifier's replay
-    //      path (the cache reads jti from the already-decoded `claims`, but the verifier MISS path
-    //      `check_replay` re-peeks; time it to size the JSON-parse cost).
+    // (C2) peek_claims of the proof (base64 + serde_json parse). OFF the hit path: the hit path reads
+    //      jti/htm/htu/iat from the already-decoded `claims` returned by H1 and never re-peeks. Timed
+    //      for context only (sizes a redundant JSON-parse), excluded from the hit budget.
     let (peek_total, peek_op) = time_it(iters, || {
         let c = peek_claims(black_box(&proof));
         black_box(c);
@@ -192,8 +217,11 @@ fn main() {
         black_box(k);
     });
 
-    // The summed HIT-path crypto+parse budget (H1..H7) — what a cache hit actually pays.
-    let hit_budget = proof_op + tp_op + ath_op + peekath_op + peek_op + fields_op + key_op;
+    // The summed HIT-path crypto+parse budget — what a cache hit ACTUALLY pays, in the order
+    // `verify_fresh_proof` runs: H1 proof verify, H2 cnf.jkt thumbprint, H3 ath (b64url of the reused
+    // digest), H6 claim-field gets + htu normalise, H7 the one token hash for the cache key. C1/C2 are
+    // EXCLUDED — they are not on the default hit path (see their comments).
+    let hit_budget = proof_op + tp_op + ath_op + fields_op + key_op;
 
     let row = |name: &str, op: f64, total: u128| {
         println!(
@@ -206,30 +234,52 @@ fn main() {
     };
 
     println!("--- HIT-path components (paid EVERY authed request) ---");
-    row("H1 DPoP proof ES256 verify (embedded JWK)", proof_op, proof_total);
+    row(
+        "H1 DPoP proof ES256 verify (embedded JWK)",
+        proof_op,
+        proof_total,
+    );
     row("H2 RFC7638 thumbprint SHA-256 (cnf.jkt)", tp_op, tp_total);
-    row("H3 ath = b64url(SHA-256(token))", ath_op, ath_total);
-    row("H4 proof_has_ath peek (b64+json parse)", peekath_op, peekath_total);
-    row("H5 peek_claims proof (b64+json parse)", peek_op, peek_total);
-    row("H6 claim field gets + normalize_htu (2x url parse)", fields_op, fields_total);
+    row("H3 ath = b64url(cache-key digest)", ath_op, ath_total);
+    row(
+        "H6 claim field gets + normalize_htu (2x url parse)",
+        fields_op,
+        fields_total,
+    );
     row("H7 SHA-256 token -> cache key", key_op, key_total);
-    println!("{:<46} {:>10.1} ns/op   100.00%", "= HIT crypto+parse budget (sum H1..H7)", hit_budget);
+    println!(
+        "{:<46} {:>10.1} ns/op   100.00%",
+        "= HIT crypto+parse budget (H1+H2+H3+H6+H7)", hit_budget
+    );
 
-    println!("\n--- MISS-only (removed by the verified-token cache) ---");
+    println!("\n--- Off-hit-path context (NOT in the hit budget) ---");
+    println!(
+        "{:<46} {:>10.1} ns/op   (ath-compat-only; total {:.2} ms)",
+        "C1 proof_has_ath peek (b64+json parse)",
+        peekath_op,
+        peekath_total as f64 / 1e6
+    );
+    println!(
+        "{:<46} {:>10.1} ns/op   (redundant re-parse; total {:.2} ms)",
+        "C2 peek_claims proof (b64+json parse)",
+        peek_op,
+        peek_total as f64 / 1e6
+    );
     println!(
         "{:<46} {:>10.1} ns/op   ({:.2}x the proof verify; total {:.2} ms)",
-        "M  access-token ES256 verify (jsonwebtoken)",
+        "M  access-token ES256 verify (miss-only)",
         at_op,
         at_op / proof_op,
         at_total as f64 / 1e6
     );
 
     println!(
-        "\n# Interpretation: on a cache HIT the server pays ~{:.1} ns of crypto+parse (H1..H7); the two\n\
-         # ES256 verifies (H1 proof + M token) are {:.1} + {:.1} ns. The token verify (M) is the part the\n\
-         # cache removes on a hit, so a hit roughly HALVES the asymmetric crypto. The thumbprint (H2) is a\n\
-         # second SHA-256-based step on the hit path. JSON/base64 parses (H4+H5) total {:.1} ns.",
-        hit_budget, proof_op, at_op, peekath_op + peek_op
+        "\n# Interpretation: on a cache HIT the server pays ~{:.1} ns of crypto+parse (H1+H2+H3+H6+H7);\n\
+         # the two ES256 verifies (H1 proof + M token) are {:.1} + {:.1} ns. The token verify (M) is the\n\
+         # part the cache removes on a hit, so a hit roughly HALVES the asymmetric crypto. The thumbprint\n\
+         # (H2) is a second SHA-256-based step on the hit path; the token is hashed once (H7) and its\n\
+         # digest is reused for ath (H3), not re-hashed. C1/C2 are off the default hit path.",
+        hit_budget, proof_op, at_op
     );
 }
 
