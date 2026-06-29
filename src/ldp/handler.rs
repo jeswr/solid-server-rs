@@ -3457,6 +3457,14 @@ mod tests {
 
     /// A store where Bob holds `acl:Write` (and Append) on `/alice/c/wonly` but NOT `acl:Read` — the
     /// "Write-without-Read" shape. Alice owns the container. An EXISTING `wonly` is present.
+    ///
+    /// Bob is ALSO granted `acl:Write` on the CONTAINER itself (via the container's own `acl:accessTo`),
+    /// so that a DELETE of `wonly` PASSES its parent-containment write authorization (`acl:Write` on the
+    /// nearest parent) and actually REACHES the V4 conditional-read guard — without this, the DELETE
+    /// would be denied at the parent-write check and the V4 DELETE test would pass for the wrong reason
+    /// (the roborev finding). The container grant deliberately omits `acl:Read`, and `wonly`'s OWN `.acl`
+    /// (below) overrides inheritance, so Bob's effective modes on `wonly` stay exactly {Write, Append} —
+    /// no Read — preserving the Write-without-Read shape the V4 guard is meant to catch.
     async fn store_bob_write_without_read(
     ) -> Arc<LdpState<CompositeStore<InMemorySparqClient, InMemoryBlobStore>>> {
         let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
@@ -3478,11 +3486,14 @@ mod tests {
             )
             .await
             .expect("seed wonly");
-        // Alice: full control over the container + members (default). Bob: Write+Append on the SPECIFIC
-        // resource `wonly` via its OWN `.acl` — but NO Read.
+        // Alice: full control over the container + members (default). Bob: `acl:Write` on the CONTAINER
+        // itself (so a DELETE's parent-write check passes and the V4 guard is reached) — but NO `acl:Read`
+        // on the container, and `wonly`'s OWN `.acl` overrides inheritance so Bob never gains Read on
+        // `wonly`.
         let container_acl = format!(
             r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
-<#alice> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <https://pod.example/alice/c/>; acl:default <https://pod.example/alice/c/>; acl:mode acl:Read, acl:Write, acl:Control."#
+<#alice> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <https://pod.example/alice/c/>; acl:default <https://pod.example/alice/c/>; acl:mode acl:Read, acl:Write, acl:Control.
+<#bob> a acl:Authorization; acl:agent <{BOB}>; acl:accessTo <https://pod.example/alice/c/>; acl:mode acl:Write, acl:Append."#
         );
         store
             .write(
@@ -3562,6 +3573,12 @@ mod tests {
     async fn v4_write_without_read_conditional_delete_is_denied() {
         // The same closure on DELETE: a `DELETE … If-Match` by a Write-without-Read holder folds to the
         // denial, not the 412-vs-204 existence/content outcome.
+        //
+        // The fixture grants Bob `acl:Write` on the CONTAINER (so the DELETE's parent-containment write
+        // authorization PASSES and control reaches the V4 guard) but NO `acl:Read` on `wonly` — so the
+        // 403 here is genuinely from V4, NOT from the parent-write check. The unconditional-DELETE
+        // control below PROVES that: the SAME Bob CAN delete `wonly` without a conditional header, so the
+        // only thing that turns the conditional DELETE into a 403 is the V4 guard.
         let state = store_bob_write_without_read().await;
         let uri: axum::http::Uri = "/alice/c/wonly".parse().unwrap();
         let mut headers = HeaderMap::new();
@@ -3570,6 +3587,24 @@ mod tests {
         assert_eq!(
             got.status, 403,
             "a Write-without-Read conditional DELETE must be the denial code: {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_write_without_read_unconditional_delete_succeeds_proving_v4_is_the_cause() {
+        // CONTROL for the test above (the roborev finding): with the SAME fixture and NO conditional
+        // header, Bob's Write (on `wonly`) + container Write (parent-containment) IS sufficient to delete
+        // `wonly` → 204. This proves the conditional-DELETE 403 above comes from the V4 guard, not the
+        // parent-write authorization — the test is not vacuous.
+        let state = store_bob_write_without_read().await;
+        let uri: axum::http::Uri = "/alice/c/wonly".parse().unwrap();
+        let got =
+            observe(delete_handler(State(state), Extension(bob()), uri, HeaderMap::new()).await)
+                .await;
+        assert_eq!(
+            got.status, 204,
+            "an UNCONDITIONAL DELETE by the same Write holder must succeed — proving the conditional \
+             403 is from V4, not the parent-write check: {got:?}"
         );
     }
 
