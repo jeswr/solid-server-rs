@@ -338,22 +338,33 @@ impl<S: Store> LdpState<S> {
     /// present-and-matched, 412 if absent under `If-Match`) and learn the content/membership ETag of a
     /// body it cannot GET.
     ///
-    /// Closure: treat a content/membership-derived validator as REQUIRING `acl:Read`. When the request
-    /// carries ANY conditional precondition AND the (already-authorized) requester's granted modes do
-    /// NOT include `Read`, return the requester's DENIAL code (401 anonymous / 403 authenticated)
-    /// INSTEAD of evaluating the precondition — so the conditional outcome reveals nothing. A requester
-    /// WITHOUT a conditional header is unaffected (no validator is consulted on their path), and a
-    /// requester WITH Read keeps full conditional semantics. `granted` is the mode set the write
-    /// authorization already returned (no extra ACL resolution).
+    /// Closure: treat a content/membership-derived validator as REQUIRING the mode that governs READING
+    /// the target's representation — `acl:Read` for a normal resource, but `acl:Control` for an `.acl`
+    /// target (reading an `.acl`'s representation is itself a Control operation; `Control` does NOT imply
+    /// `Read`, so the read-mode for an `.acl` is Control, not Read — else a Control-only holder, who IS
+    /// entitled to the `.acl`'s ETag, would be wrongly denied a conditional `.acl` write). When the
+    /// request carries ANY conditional precondition AND the (already-authorized) requester's granted
+    /// modes do NOT include that read-mode, return the requester's DENIAL code (401 anonymous / 403
+    /// authenticated) INSTEAD of evaluating the precondition — so the conditional outcome reveals
+    /// nothing. A requester WITHOUT a conditional header is unaffected (no validator is consulted on
+    /// their path), and a requester who holds the read-mode keeps full conditional semantics. `granted`
+    /// is the mode set the write authorization already returned (no extra ACL resolution).
     fn guard_conditional_requires_read(
         &self,
+        target_iri: &str,
         headers: &HeaderMap,
         granted: &std::collections::BTreeSet<AccessMode>,
         token: &VerifiedToken,
     ) -> Result<(), ServerError> {
         let has_conditional =
             headers.contains_key(header::IF_MATCH) || headers.contains_key(header::IF_NONE_MATCH);
-        if has_conditional && !granted.contains(&AccessMode::Read) {
+        // The mode that governs reading THIS target's representation: Control for an `.acl`, else Read.
+        let read_mode = if crate::authz::is_acl_resource(target_iri) {
+            AccessMode::Control
+        } else {
+            AccessMode::Read
+        };
+        if has_conditional && !granted.contains(&read_mode) {
             return Err(if token.web_id.is_none() {
                 self.unauthenticated()
             } else {
@@ -618,7 +629,7 @@ pub async fn put_handler<S: Store>(
     // requester lacking `acl:Read` on the target must NOT get its existence-revealing 412-vs-2xx
     // outcome (nor a returned ETag). Fold to the denial code when a conditional header is present and
     // the requester holds no Read. Done BEFORE the existence probe so it adds no oracle of its own.
-    state.guard_conditional_requires_read(&headers, &granted, &token)?;
+    state.guard_conditional_requires_read(&target.iri, &headers, &granted, &token)?;
 
     // The caller IS authorized. Only NOW probe existence (an authorized writer is entitled to learn
     // create-vs-replace) — reused for the conditional-write ETag and the create/replace branch below.
@@ -771,8 +782,16 @@ pub async fn post_handler<S: Store>(
     // is belt-and-braces against any future mint change that might preserve the suffix. A create of a
     // `.acl` is a Control operation; the Control-gated PUT/PATCH of an `.acl` is the only legitimate
     // path. The check is on the SANITISED STEM (the caller's intent, covering the case-variant
-    // `secret.ACL` via the case-insensitive `is_acl_auxiliary_suffix`). The denial is a uniform 403 —
-    // the SAME code as any other POST authorization failure, so it leaks nothing about the container.
+    // `secret.ACL` via the case-insensitive `is_acl_auxiliary_suffix`).
+    //
+    // The denial uses the REQUESTER's denial shape — 401 + `WWW-Authenticate` for an anonymous caller,
+    // 403 for an authenticated one — IDENTICAL to every other POST denial. (POST authorization already
+    // ran above, so an anonymous caller without public `acl:Append` is already 401'd before here; this
+    // matters only for a PUBLIC-append container where an anonymous caller CAN reach this guard, and
+    // there the anonymous denial must still carry the auth challenge, not a bare 403 — keeping the
+    // denial surface uniform so the `.acl`-intent case is indistinguishable in shape from any other
+    // unauthorized POST. The guard is intent-based, not existence-based: `secret.acl` and `benign.acl`
+    // are refused regardless of what exists, so it is never an existence oracle.)
     //
     // SCOPE: `.acl` ONLY. `.meta` description-resources are NOT load-bearing in this server (the WAC
     // resolver never consults a `.meta`, and the PUT/PATCH create paths only special-case `.acl`), so
@@ -784,7 +803,11 @@ pub async fn post_handler<S: Store>(
         // Check the `.acl` suffix on the bare stem (a leaf segment with no scheme/slashes). A trailing
         // `/` is not part of a sanitised stem, so this catches `secret.acl`/`secret.ACL` directly.
         if crate::authz::is_acl_auxiliary_suffix(s) {
-            return Err(ServerError::Forbidden);
+            return Err(if token.web_id.is_none() {
+                state.unauthenticated()
+            } else {
+                ServerError::Forbidden
+            });
         }
     }
 
@@ -878,7 +901,7 @@ pub async fn delete_handler<S: Store>(
     // against the CONTENT/MEMBERSHIP-derived current ETag is an existence+content oracle. A requester
     // authorized to DELETE but NOT to READ the target (a Write-without-Read document holder) must get
     // the denial code rather than that conditional outcome. Folded BEFORE the existence probe.
-    state.guard_conditional_requires_read(&headers, &granted, &token)?;
+    state.guard_conditional_requires_read(&target.iri, &headers, &granted, &token)?;
 
     let current = state.store.meta(&target.iri).await?;
     // A DELETE of a non-existent target is reported through the SAME denial surface as a permission
@@ -1021,7 +1044,7 @@ pub async fn patch_handler<S: Store>(
 
     // V4 (decisions/0003): a conditional precondition is a CONTENT-derived validator — fold to the
     // denial when the requester lacks `acl:Read` and sent a conditional header, BEFORE the target read.
-    state.guard_conditional_requires_read(&headers, &granted, &token)?;
+    state.guard_conditional_requires_read(&target.iri, &headers, &granted, &token)?;
 
     // The caller IS authorized. ONLY NOW load the current representation (an authorized writer is
     // entitled to learn create-vs-modify). Match the read into THREE states:
@@ -3361,6 +3384,75 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn post_slug_dot_acl_anonymous_on_public_append_gets_401_not_bare_403() {
+        // roborev denial-shape consistency: on a PUBLIC-`acl:Append` container an ANONYMOUS caller CAN
+        // pass POST authorization and reach the `.acl`-intent guard. Its denial must carry the
+        // requester's shape — 401 + `WWW-Authenticate` for anonymous — NOT a bare 403, so the
+        // `.acl`-intent case is indistinguishable in shape from any other unauthorized anonymous POST.
+        let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        store
+            .write(
+                "https://pod.example/alice/c/",
+                AxBytes::from(String::new()),
+                "text/turtle",
+            )
+            .await
+            .expect("seed container");
+        // The container grants the PUBLIC (`foaf:Agent`) Append — so anonymous may POST.
+        let acl = r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+@prefix foaf: <http://xmlns.com/foaf/0.1/>.
+<#pub> a acl:Authorization; acl:agentClass foaf:Agent; acl:accessTo <https://pod.example/alice/c/>; acl:mode acl:Append."#;
+        store
+            .write(
+                "https://pod.example/alice/c/.acl",
+                AxBytes::from(acl.to_string()),
+                "text/turtle",
+            )
+            .await
+            .expect("seed public-append acl");
+        let state = Arc::new(LdpState::new(store, "https://pod.example"));
+        let uri: axum::http::Uri = "/alice/c/".parse().unwrap();
+        // Anonymous POST with `Slug: secret.acl` (a benign body — the body is irrelevant; the INTENT is
+        // what is refused).
+        let got = observe(
+            post_handler(
+                State(state.clone()),
+                Extension(anon()),
+                uri,
+                post_turtle_headers_with_slug("secret.acl"),
+                body_bytes(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 401,
+            "an anonymous `.acl`-intent POST on a public-append container must be 401 (not a bare 403)"
+        );
+        assert!(
+            got.www_authenticate.is_some(),
+            "the anonymous denial must carry a WWW-Authenticate challenge"
+        );
+        // A benign anonymous Slug on the SAME container still succeeds (public Append is real) — the
+        // guard rejects only the `.acl` intent, uniformly by shape.
+        let benign = observe(
+            post_handler(
+                State(state),
+                Extension(anon()),
+                "/alice/c/".parse().unwrap(),
+                post_turtle_headers_with_slug("benign"),
+                body_bytes(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            benign.status, 201,
+            "a benign anonymous Slug on a public-append container must still succeed: {benign:?}"
+        );
+    }
+
     // --- V4: a conditional precondition requires Read (the Write-without-Read shape) ---------------
 
     /// A store where Bob holds `acl:Write` (and Append) on `/alice/c/wonly` but NOT `acl:Read` — the
@@ -3478,6 +3570,51 @@ mod tests {
         assert_eq!(
             got.status, 403,
             "a Write-without-Read conditional DELETE must be the denial code: {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_control_only_holder_conditional_acl_write_is_not_wrongly_denied() {
+        // EDGE: the V4 read-mode for an `.acl` target is CONTROL, not Read (reading an `.acl`'s
+        // representation is a Control op; `Control` does NOT imply `Read`). A holder of Control-but-NOT-
+        // Read on a resource IS entitled to its `.acl`'s ETag, so a CONDITIONAL `.acl` write by such a
+        // holder must NOT be folded to a denial by V4. This pins the regression: if the guard used `Read`
+        // (instead of the `.acl` read-mode `Control`) it would wrongly 403 this legitimate write.
+        let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        // Alice gets ONLY Control on `/alice/c/manager` (no Read, no Write) — a pure access-manager.
+        let acl = format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#alice> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <https://pod.example/alice/c/manager>; acl:mode acl:Control."#
+        );
+        store
+            .write(
+                "https://pod.example/alice/c/manager.acl",
+                AxBytes::from(acl),
+                "text/turtle",
+            )
+            .await
+            .expect("seed manager .acl");
+        let state = Arc::new(LdpState::new(store, "https://pod.example"));
+        let alice = VerifiedToken {
+            web_id: Some(ALICE.into()),
+            ..VerifiedToken::default()
+        };
+        // A CONDITIONAL PUT REPLACING the existing `.acl` (it exists, so `If-Match: *` is satisfied and
+        // the precondition is genuinely evaluated — exercising the V4 gate before it).
+        let uri: axum::http::Uri = "/alice/c/manager.acl".parse().unwrap();
+        let mut headers = turtle_headers();
+        headers.insert(header::IF_MATCH, HeaderValue::from_static("*"));
+        let acl_body = AxBytes::from(format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#alice> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <https://pod.example/alice/c/manager>; acl:mode acl:Control, acl:Read."#
+        ));
+        let got =
+            observe(put_handler(State(state), Extension(alice), uri, headers, acl_body).await)
+                .await;
+        assert_eq!(
+            got.status, 204,
+            "a Control-only holder's CONDITIONAL .acl write must reach the write path (204), not a V4 \
+             denial — the `.acl` read-mode is Control, not Read: {got:?}"
         );
     }
 
