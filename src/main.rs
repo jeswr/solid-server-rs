@@ -31,6 +31,18 @@
 //!   in-memory store doubles so it runs without SPARQ / S3; swapping in `HttpSparqClient` is wiring).
 //! - WAC authorization (gated on sparq#992 — the LDP layer is fail-closed: mutations need an
 //!   authenticated caller, reads are public since no ACLs exist yet).
+//!
+//! ## Global allocator (mimalloc)
+//! The process installs Microsoft's mimalloc as the `#[global_allocator]` (drop-in, musl-friendly).
+//! This is a behaviour-NEUTRAL perf lever — it only changes which allocator backs `alloc`/`dealloc`,
+//! not any server logic. See the `Cargo.toml` dependency comment for the trust-surface delta (a
+//! vendored-C `*-sys` crate compiled at build time) and why mimalloc over jemalloc (musl page-size).
+
+/// Process-wide allocator. mimalloc replaces the default libc allocator on the hot alloc/dealloc
+/// path. Declared at the TOP of the binary so it is the allocator from the first allocation onward.
+/// Behaviour-neutral: no server logic depends on it; conformance + tests are unchanged.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::sync::Arc;
 use std::time::Duration;
