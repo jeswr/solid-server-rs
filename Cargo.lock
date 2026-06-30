@@ -2292,6 +2292,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "itoa",
  "mimalloc",
  "object_store",
  "oxjsonld",
