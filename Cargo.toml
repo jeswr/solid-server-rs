@@ -126,6 +126,13 @@ getrandom = "0.2"
 sha2 = "0.10"
 base64 = "0.22"
 url = "2"
+# Heap-free integer→decimal formatting for the read-response `Content-Length` / `Content-Range`
+# numerals (the public-GET hot path, MALLOC-bound per the round-4 profile). `itoa` writes into a
+# stack buffer, avoiding the `u64::to_string()` heap `String` allocation per response. It is ALREADY
+# resolved in the non-dev tree (transitively via `http`/`hyper`/`serde_json`, which all format
+# integers this way), so naming it directly at the same `1` line adds NO new crate — it only makes
+# the existing dep callable from this server's own response-build code.
+itoa = "1"
 # Distributed (shared) DPoP `jti` replay store — the horizontal-scaling enabler (`src/redis_replay.rs`).
 # Behind the OPT-IN `redis-replay` feature so the DEFAULT build/conformance is byte-identical and adds
 # NO new crate unless an operator wants the shared store. We use the SYNCHRONOUS (blocking) `redis`

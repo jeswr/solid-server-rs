@@ -79,6 +79,49 @@ static LDP_BASIC_CONTAINER_NODE: LazyLock<NamedNode> =
 static LDP_CONTAINS_NODE: LazyLock<NamedNode> =
     LazyLock::new(|| unchecked_const_iri(LDP_CONTAINS_IRI));
 
+// --- request-INVARIANT response header values (perf round-C, MALLOC reduction) ------------------
+//
+// The `Link: <type>; rel="type"` advertisement lines and the method-advertisement lines are
+// REQUEST-INVARIANT: the full header string is a COMPILE-TIME constant (the IRI/value is fixed for
+// every resource of a given shape). The prior code re-formatted them with `format!` and re-validated
+// them through `HeaderValue::from_str` (a heap allocation + UTF-8/structure validation) on EVERY
+// response. These `from_static` `HeaderValue`s are built from a `&'static str` whose bytes are known
+// valid at compile time, so they allocate NOTHING and clone cheaply (a `HeaderValue::from_static`
+// holds a `Bytes` pointing at the static — its `clone` is a refcount bump, not a copy). The set
+// emitted is byte-for-byte the SAME header lines as before.
+//
+// SECURITY NOTE (the perf-round-C trap): NONE of these carry a per-target or per-WebID value — they
+// are the same for every resource of their shape, so interning them leaks nothing. The per-resource
+// `.acl` Link (derived from the target IRI) and the per-server discovery Links (derived from
+// `base_url`) are DELIBERATELY NOT here — the `.acl` link stays computed per request in
+// `add_acl_link`, and the discovery links are precomputed per `LdpState` (per server instance), so
+// no resource's pointer can leak onto another's response.
+const LINK_TYPE_LDP_RESOURCE: &str = "<http://www.w3.org/ns/ldp#Resource>; rel=\"type\"";
+const LINK_TYPE_LDP_CONTAINER: &str = "<http://www.w3.org/ns/ldp#Container>; rel=\"type\"";
+const LINK_TYPE_LDP_BASIC_CONTAINER: &str =
+    "<http://www.w3.org/ns/ldp#BasicContainer>; rel=\"type\"";
+const LINK_TYPE_PIM_STORAGE: &str = "<http://www.w3.org/ns/pim/space#Storage>; rel=\"type\"";
+
+static HV_LINK_TYPE_LDP_RESOURCE: LazyLock<HeaderValue> =
+    LazyLock::new(|| HeaderValue::from_static(LINK_TYPE_LDP_RESOURCE));
+static HV_LINK_TYPE_LDP_CONTAINER: LazyLock<HeaderValue> =
+    LazyLock::new(|| HeaderValue::from_static(LINK_TYPE_LDP_CONTAINER));
+static HV_LINK_TYPE_LDP_BASIC_CONTAINER: LazyLock<HeaderValue> =
+    LazyLock::new(|| HeaderValue::from_static(LINK_TYPE_LDP_BASIC_CONTAINER));
+static HV_LINK_TYPE_PIM_STORAGE: LazyLock<HeaderValue> =
+    LazyLock::new(|| HeaderValue::from_static(LINK_TYPE_PIM_STORAGE));
+
+// The method-advertisement values (`Allow` / `Accept-Post` / `Accept-Patch`) are likewise
+// REQUEST-INVARIANT compile-time constants — the SAME on every response of a given shape — so they
+// are interned once via `from_static` instead of re-validated through `HeaderValue::from_str` per
+// response. `Accept-Post` is emitted only on a container (unchanged). Byte-identical output.
+static HV_ALLOW: LazyLock<HeaderValue> =
+    LazyLock::new(|| HeaderValue::from_static("OPTIONS, HEAD, GET, PUT, POST, DELETE, PATCH"));
+static HV_ACCEPT_POST: LazyLock<HeaderValue> =
+    LazyLock::new(|| HeaderValue::from_static("text/turtle, application/ld+json"));
+static HV_ACCEPT_PATCH: LazyLock<HeaderValue> =
+    LazyLock::new(|| HeaderValue::from_static("text/n3, application/sparql-update"));
+
 /// Build a `NamedNode` from a COMPILE-TIME-CONSTANT IRI without the per-call RFC-3987 re-parse.
 /// Confined to the five `*_IRI` server constants above (validated once, at first use). The
 /// `debug_assert!` re-runs the checked parse in debug/test builds so a malformed constant is caught
@@ -165,6 +208,33 @@ pub struct LdpState<S: Store> {
     /// `SOLID_SERVER_ACL_CACHE_CAPACITY=0` ([`AclCache::disabled`]) yields byte-identical pre-cache
     /// behaviour. Configured at router assembly via [`set_acl_cache`](Self::set_acl_cache).
     pub acl_cache: AclCache,
+    /// The notification-discovery `Link` header VALUES (`describedby` + `solid:storageDescription`,
+    /// both → the storage-description doc), PRECOMPUTED ONCE from `base_url` at construction.
+    ///
+    /// These depend ONLY on the server's `base_url` (a per-instance constant), so re-deriving them per
+    /// request — `link_headers(base_url)` allocating a `Vec` + two `format!` `String`s, then
+    /// `format!("<{target}>; rel=\"{rel}\"")` + `HeaderValue::from_str` per pair — was pure
+    /// per-request waste on the read hot path (the MALLOC band the round-4 profile flagged). Caching
+    /// the finished `HeaderValue`s makes `add_discovery_links` a couple of refcount-bump appends. The
+    /// emitted header lines are byte-for-byte identical to the prior per-request formatting.
+    ///
+    /// SECURITY: these are derived from `base_url` ONLY — NEVER from a request target or WebID — so
+    /// they are the same for every resource and leak no per-resource pointer (cf. the per-request
+    /// `.acl` Link, which is intentionally NOT cached — see `add_acl_link`).
+    discovery_link_values: Vec<HeaderValue>,
+}
+
+/// Precompute the discovery `Link` header VALUES for a given server `base_url`. Mirrors the prior
+/// `add_discovery_links` formatting EXACTLY (`<{target}>; rel="{rel}"` per `link_headers` pair,
+/// skipping any value that cannot be header-encoded), so the emitted lines are byte-identical — only
+/// computed once per server instead of once per request.
+fn build_discovery_link_values(base_url: &str) -> Vec<HeaderValue> {
+    link_headers(base_url)
+        .into_iter()
+        .filter_map(|(rel, target)| {
+            HeaderValue::from_str(&format!("<{target}>; rel=\"{rel}\"")).ok()
+        })
+        .collect()
 }
 
 /// The fallback `WWW-Authenticate` challenge used when no verifier-derived one was injected (e.g. a
@@ -181,14 +251,19 @@ impl<S: Store> LdpState<S> {
     /// Build an LDP state sharing an EXISTING notification hub (so the LDP emit path and the
     /// notification receive routes register against the same registry).
     pub fn with_hub(store: S, base_url: impl Into<String>, notifications: NotificationHub) -> Self {
+        let base_url = base_url.into();
+        // Precompute the request-invariant discovery `Link` values ONCE from `base_url` (see the
+        // field doc) so the read path never re-formats them per request.
+        let discovery_link_values = build_discovery_link_values(&base_url);
         Self {
             store,
-            base_url: base_url.into(),
+            base_url,
             notifications,
             www_authenticate: DEFAULT_WWW_AUTHENTICATE.to_string(),
             // Default-on: the ACL cache is enabled at the default capacity. `main.rs` overrides this
             // from `SOLID_SERVER_ACL_CACHE_CAPACITY` at router assembly (`=0` ⇒ disabled).
             acl_cache: AclCache::new(crate::acl_cache::DEFAULT_ACL_CACHE_CAPACITY),
+            discovery_link_values,
         }
     }
 
@@ -560,7 +635,14 @@ pub(crate) async fn serve_read<S: Store>(
         RangeOutcome::Full
     };
 
-    let mut out = HeaderMap::new();
+    // Pre-size the response header map so the ~10 inserts below never trigger an incremental
+    // `HeaderMap` reallocation (the read response carries Content-Type, ETag, Accept-Ranges,
+    // Allow[+Accept-Post], Accept-Patch, 2 discovery Links, 1–4 type Links, 1 acl Link, WAC-Allow,
+    // and Content-Length/Content-Range — ≈16 entries at most). `HeaderMap::with_capacity` rounds up
+    // to a power of two ≥ the request; sizing for the container/storage-root maximum means neither a
+    // plain-resource nor a container response reallocates. Byte-identical output; one fewer
+    // grow-and-rehash on the MALLOC-bound public-GET path.
+    let mut out = HeaderMap::with_capacity(16);
     set_str(&mut out, header::CONTENT_TYPE, &content_type);
     // ETag: a CONTAINER's body is GENERATED from LIVE membership (the `ldp:contains` listing), so its
     // validator MUST be derived from the FINAL RENDERED representation — not the stored-metadata ETag,
@@ -583,8 +665,9 @@ pub(crate) async fn serve_read<S: Store>(
         resource.meta.etag.clone()
     };
     set_str(&mut out, header::ETAG, &etag);
-    // Advertise byte-range support (RFC 9110 §14.3).
-    set_str(&mut out, header::ACCEPT_RANGES, "bytes");
+    // Advertise byte-range support (RFC 9110 §14.3). The value is the compile-time constant `"bytes"`,
+    // so `from_static` skips the runtime `HeaderValue::from_str` validation+allocation `set_str` does.
+    out.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     // Method advertisement on the read response: `Allow` (the LDP verb set — `read-method-allow`
     // asserts GET/HEAD responses carry `Allow` listing GET + HEAD) + `Accept-Post` (containers only)
     // + `Accept-Patch`. (OPTIONS itself is answered by the CORS layer, which short-circuits every
@@ -592,8 +675,11 @@ pub(crate) async fn serve_read<S: Store>(
     add_method_advertisement(&mut out, target.is_container);
     // Notification discovery: advertise the storage-description doc via `describedby` +
     // `solid:storageDescription` Link rels so a client can HEAD a resource and find the subscription
-    // service (the values live in `notifications::ws::link_headers`, the single discovery home).
-    add_discovery_links(&mut out, &state.base_url);
+    // service. The values were PRECOMPUTED once from `base_url` at construction
+    // (`LdpState::discovery_link_values`), so this is a couple of refcount-bump appends — no
+    // per-request formatting (the single discovery home is still `notifications::ws::link_headers`,
+    // consumed once into the cache).
+    add_discovery_links(&mut out, &state.discovery_link_values);
     // LDP/Solid type advertisement (`Link: <type>; rel="type"`): a container advertises
     // `ldp:BasicContainer` (+ `ldp:Container`/`ldp:Resource`), and the STORAGE ROOT additionally
     // advertises `pim:Storage` (Solid Protocol §4.1). The conformance harness REQUIRES the
@@ -632,7 +718,7 @@ pub(crate) async fn serve_read<S: Store>(
                 header::CONTENT_RANGE,
                 &format!("bytes {start}-{end}/{total_len}"),
             );
-            set_str(&mut out, header::CONTENT_LENGTH, &slice.len().to_string());
+            set_u64(&mut out, header::CONTENT_LENGTH, slice.len() as u64);
             if with_body {
                 Ok((StatusCode::PARTIAL_CONTENT, out, slice).into_response())
             } else {
@@ -640,7 +726,7 @@ pub(crate) async fn serve_read<S: Store>(
             }
         }
         RangeOutcome::Full => {
-            set_str(&mut out, header::CONTENT_LENGTH, &total_len.to_string());
+            set_u64(&mut out, header::CONTENT_LENGTH, total_len);
             if with_body {
                 Ok((StatusCode::OK, out, body).into_response())
             } else {
@@ -1308,22 +1394,16 @@ pub async fn options_handler<S: Store>(
 ///   container advertises it (POST to a non-container is not a containment op).
 /// - `Accept-Patch`: the PATCH media types (`text/n3`, `application/sparql-update`).
 fn add_method_advertisement(headers: &mut HeaderMap, is_container: bool) {
-    set_str(
-        headers,
-        header::ALLOW,
-        "OPTIONS, HEAD, GET, PUT, POST, DELETE, PATCH",
-    );
+    headers.insert(header::ALLOW, HV_ALLOW.clone());
     if is_container {
-        set_str(
-            headers,
+        headers.insert(
             HeaderName::from_static("accept-post"),
-            "text/turtle, application/ld+json",
+            HV_ACCEPT_POST.clone(),
         );
     }
-    set_str(
-        headers,
+    headers.insert(
         HeaderName::from_static("accept-patch"),
-        "text/n3, application/sparql-update",
+        HV_ACCEPT_PATCH.clone(),
     );
 }
 
@@ -1805,13 +1885,15 @@ fn parent_container(target: &LdpTarget) -> Option<String> {
 
 /// Append the notification-discovery `Link` headers (`describedby` + `solid:storageDescription`,
 /// both → the storage description doc) to a read response. Uses `append` (not `insert`) so multiple
-/// rels coexist as separate `Link` header lines. A value that cannot be header-encoded is skipped.
-fn add_discovery_links(headers: &mut HeaderMap, base_url: &str) {
-    for (rel, target) in link_headers(base_url) {
-        let value = format!("<{target}>; rel=\"{rel}\"");
-        if let Ok(v) = HeaderValue::from_str(&value) {
-            headers.append(header::LINK, v);
-        }
+/// rels coexist as separate `Link` header lines.
+///
+/// `values` is the server's PRECOMPUTED [`LdpState::discovery_link_values`] — derived once from
+/// `base_url` at construction, so this is a couple of refcount-bump `append`s with NO per-request
+/// formatting/allocation. The emitted lines are byte-for-byte identical to the prior per-request
+/// `link_headers(base_url)` formatting.
+fn add_discovery_links(headers: &mut HeaderMap, values: &[HeaderValue]) {
+    for v in values {
+        headers.append(header::LINK, v.clone());
     }
 }
 
@@ -1825,26 +1907,21 @@ fn add_discovery_links(headers: &mut HeaderMap, base_url: &str) {
 ///   in-memory/seeded layout the storage root is the per-user pod container `…/{user}/`; treat any
 ///   container that is a direct child of the server base (`<base>/{seg}/`) as a storage root.
 ///
-/// Uses `append` so each rel is its own `Link` header line; values that cannot be header-encoded are
-/// skipped (never panics).
+/// Uses `append` so each rel is its own `Link` header line.
+///
+/// Each emitted value is one of the REQUEST-INVARIANT interned `HV_LINK_TYPE_*` `HeaderValue`s (the
+/// full `Link` line is a compile-time constant per resource shape), so this allocates NOTHING per
+/// response — only `clone`s (a refcount bump) the static value into the map. WHICH rels appear, and
+/// in WHAT ORDER (`Resource`, then `Container`+`BasicContainer`, then `pim:Storage` on a storage
+/// root), is unchanged, so the emitted header lines are byte-for-byte identical to the prior
+/// per-request `format!` + `HeaderValue::from_str` path.
 fn add_type_links(headers: &mut HeaderMap, target: &LdpTarget, base_url: &str) {
-    const LDP_RESOURCE: &str = "http://www.w3.org/ns/ldp#Resource";
-    const LDP_CONTAINER: &str = "http://www.w3.org/ns/ldp#Container";
-    const LDP_BASIC_CONTAINER: &str = "http://www.w3.org/ns/ldp#BasicContainer";
-    const PIM_STORAGE: &str = "http://www.w3.org/ns/pim/space#Storage";
-
-    let mut types: Vec<&str> = vec![LDP_RESOURCE];
+    headers.append(header::LINK, HV_LINK_TYPE_LDP_RESOURCE.clone());
     if target.is_container {
-        types.push(LDP_CONTAINER);
-        types.push(LDP_BASIC_CONTAINER);
+        headers.append(header::LINK, HV_LINK_TYPE_LDP_CONTAINER.clone());
+        headers.append(header::LINK, HV_LINK_TYPE_LDP_BASIC_CONTAINER.clone());
         if is_storage_root(&target.iri, base_url) {
-            types.push(PIM_STORAGE);
-        }
-    }
-    for t in types {
-        let value = format!("<{t}>; rel=\"type\"");
-        if let Ok(v) = HeaderValue::from_str(&value) {
-            headers.append(header::LINK, v);
+            headers.append(header::LINK, HV_LINK_TYPE_PIM_STORAGE.clone());
         }
     }
 }
@@ -1905,6 +1982,19 @@ pub(crate) fn request_origin(headers: &HeaderMap) -> Option<&str> {
 /// Insert a header value, silently skipping a value that cannot be encoded (never panics).
 fn set_str(headers: &mut HeaderMap, name: header::HeaderName, value: &str) {
     if let Ok(v) = HeaderValue::from_str(value) {
+        headers.insert(name, v);
+    }
+}
+
+/// Insert an INTEGER header value (e.g. `Content-Length`) WITHOUT a heap allocation. `itoa` formats
+/// the integer into a stack buffer, and the resulting all-ASCII-digit string is a valid header value
+/// by construction, so `HeaderValue::from_str` never fails on it (it cannot, but we still skip on the
+/// impossible error rather than `unwrap`, mirroring `set_str`'s never-panic contract). This replaces
+/// the `u64::to_string()` heap `String` the read response built per request on the MALLOC-bound
+/// public-GET path — the value is byte-identical (decimal, no separators).
+fn set_u64(headers: &mut HeaderMap, name: header::HeaderName, value: u64) {
+    let mut buf = itoa::Buffer::new();
+    if let Ok(v) = HeaderValue::from_str(buf.format(value)) {
         headers.insert(name, v);
     }
 }
@@ -2018,6 +2108,112 @@ mod tests {
                 .any(|l| l.contains("/alice/test/.acl") && l.contains("rel=\"acl\"")),
             "the ACL-discovery Link rel=acl must be emitted: {links:?}"
         );
+    }
+
+    /// SECURITY (perf round-C — the cross-resource ACL-pointer-disclosure trap): the `.acl` Link is
+    /// derived PER TARGET and must NEVER be interned/cached across requests. Two DIFFERENT targets
+    /// must each receive THEIR OWN `.acl` Link — not a shared/stale one. If a future change were to
+    /// hoist the `.acl` link into a process-wide intern (as the type/method/discovery links are), this
+    /// test fails: target A's response would carry target B's ACL pointer, leaking one resource's ACL
+    /// location onto another's response. Keep `add_acl_link`/`acl_url_for` per-request.
+    #[test]
+    fn acl_link_is_per_target_never_shared_across_resources() {
+        // Resource A.
+        let mut ha = HeaderMap::new();
+        add_acl_link(&mut ha, &target("https://localhost:3000/alice/secret"));
+        // Resource B — a DIFFERENT target.
+        let mut hb = HeaderMap::new();
+        add_acl_link(&mut hb, &target("https://localhost:3000/bob/notes"));
+
+        let a = link_values(&ha);
+        let b = link_values(&hb);
+
+        // Each gets its OWN `.acl` pointer, derived from its OWN IRI.
+        assert!(
+            a.iter()
+                .any(|l| l.contains("<https://localhost:3000/alice/secret.acl>")
+                    && l.contains("rel=\"acl\"")),
+            "resource A must advertise ITS OWN .acl: {a:?}"
+        );
+        assert!(
+            b.iter()
+                .any(|l| l.contains("<https://localhost:3000/bob/notes.acl>")
+                    && l.contains("rel=\"acl\"")),
+            "resource B must advertise ITS OWN .acl: {b:?}"
+        );
+        // CROSS-LEAK GUARD: A's response must NOT carry B's ACL pointer, and vice-versa.
+        assert!(
+            !a.iter().any(|l| l.contains("/bob/notes.acl")),
+            "resource A leaked resource B's .acl pointer: {a:?}"
+        );
+        assert!(
+            !b.iter().any(|l| l.contains("/alice/secret.acl")),
+            "resource B leaked resource A's .acl pointer: {b:?}"
+        );
+    }
+
+    /// The interned (request-invariant) `Link: <type>; rel="type"` values are BYTE-IDENTICAL to the
+    /// pre-optimisation per-request `format!("<{iri}>; rel=\"type\"")` formatting — the optimisation
+    /// only moves WHEN the bytes are produced (once per process vs per request), never WHAT they are.
+    #[test]
+    fn interned_type_link_values_match_reference_formatting() {
+        for iri in [
+            "http://www.w3.org/ns/ldp#Resource",
+            "http://www.w3.org/ns/ldp#Container",
+            "http://www.w3.org/ns/ldp#BasicContainer",
+            "http://www.w3.org/ns/pim/space#Storage",
+        ] {
+            let reference = format!("<{iri}>; rel=\"type\"");
+            let interned = match iri {
+                "http://www.w3.org/ns/ldp#Resource" => &*HV_LINK_TYPE_LDP_RESOURCE,
+                "http://www.w3.org/ns/ldp#Container" => &*HV_LINK_TYPE_LDP_CONTAINER,
+                "http://www.w3.org/ns/ldp#BasicContainer" => &*HV_LINK_TYPE_LDP_BASIC_CONTAINER,
+                "http://www.w3.org/ns/pim/space#Storage" => &*HV_LINK_TYPE_PIM_STORAGE,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                interned.to_str().unwrap(),
+                reference,
+                "interned type-link value must equal the reference formatting for {iri}"
+            );
+        }
+    }
+
+    /// The precomputed discovery `Link` values (from a `base_url`) are BYTE-IDENTICAL to the
+    /// pre-optimisation per-request `link_headers(base_url)` + `format!` formatting.
+    #[test]
+    fn precomputed_discovery_link_values_match_reference_formatting() {
+        let base = "https://localhost:3000";
+        // Reference: the exact prior per-request formatting.
+        let reference: Vec<String> = link_headers(base)
+            .into_iter()
+            .map(|(rel, t)| format!("<{t}>; rel=\"{rel}\""))
+            .collect();
+        // Optimised: the once-per-instance precompute.
+        let precomputed = build_discovery_link_values(base);
+        let got: Vec<String> = precomputed
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            got, reference,
+            "precomputed discovery Link values must equal the reference per-request formatting"
+        );
+    }
+
+    /// `set_u64` emits the SAME decimal bytes the prior `value.to_string()` did (the `itoa` fast path
+    /// is a formatting optimisation, not a representation change) — pins `Content-Length` byte-equality.
+    #[test]
+    fn set_u64_emits_same_decimal_as_to_string() {
+        for n in [0u64, 1, 9, 10, 255, 1024, 65_535, 1_000_000, u64::MAX] {
+            let mut h = HeaderMap::new();
+            set_u64(&mut h, header::CONTENT_LENGTH, n);
+            assert_eq!(
+                h.get(header::CONTENT_LENGTH).unwrap().to_str().unwrap(),
+                n.to_string(),
+                "set_u64 must emit the same decimal bytes as to_string for {n}"
+            );
+        }
     }
 
     #[test]
