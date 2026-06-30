@@ -112,12 +112,16 @@ grow reallocs + the `to_string` numeral.
 - Gate green on HEAD: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo build --release --locked`, `cargo test` (+ `--features redis-replay`) — 334 lib tests
   (+4 new), all integration suites, 0 failures.
-- **Conformance:** `./conformance/run.sh` → see `conformance/SCORE.md` (no regression — the emitted
-  bytes the CTH reads are unchanged).
+- **Conformance:** the CTH (`./conformance/run.sh`) was **NOT run in this round's environment** — the
+  Docker daemon would not start and the Keycloak `solid` realm / `pss-cth:ath` harness image are not
+  provisioned here. It is a HARD guardrail and **MUST be run on a stack-equipped box before this
+  branch is armed** (expected: the committed `conformance/SCORE.md` baseline, no regression — the
+  response bytes the CTH reads are proven byte-identical by the tests above, so the result cannot
+  change).
 
 ## Reproduce
 ```bash
 cargo run --release --example read_response_alloc_microbench   # deterministic alloc-op count
 cargo test --release                                           # the byte-equivalence + security tests
-./conformance/run.sh                                           # 41/41, no regression
+./conformance/run.sh                                           # REQUIRED before arming — expect the SCORE.md baseline, no regression
 ```
