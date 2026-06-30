@@ -21,7 +21,7 @@
 //! Run: `cargo run --release --example read_response_alloc_microbench`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue};
 use solid_server_rs::notifications::ws::link_headers;
@@ -69,15 +69,49 @@ fn set_str(headers: &mut HeaderMap, name: HeaderName, value: &str) {
     }
 }
 
+/// The per-request inputs a read response varies on (grouped so the build fns take few args).
+struct ReadInputs<'a> {
+    base_url: &'a str,
+    target_iri: &'a str,
+    content_type: &'a str,
+    etag: &'a str,
+    content_len: u64,
+}
+
+/// The AFTER path's request-INVARIANT precomputed values (built ONCE, as the server does at
+/// construction): the precomputed discovery Link values + the interned `from_static` statics.
+struct AfterInvariants {
+    discovery_values: Vec<HeaderValue>,
+    hv_resource: HeaderValue,
+    hv_allow: HeaderValue,
+    hv_accept_patch: HeaderValue,
+    hv_accept_ranges: HeaderValue,
+}
+
 // --- BEFORE: the pre-round-C per-request formulation (one `format!`/`from_str` per line) ---------
-fn build_before(base_url: &str, target_iri: &str, content_type: &str, etag: &str, content_len: u64) -> HeaderMap {
+fn build_before(input: &ReadInputs) -> HeaderMap {
+    let &ReadInputs {
+        base_url,
+        target_iri,
+        content_type,
+        etag,
+        content_len,
+    } = input;
     let mut out = HeaderMap::new();
     set_str(&mut out, header::CONTENT_TYPE, content_type);
     set_str(&mut out, header::ETAG, etag);
     set_str(&mut out, header::ACCEPT_RANGES, "bytes");
     // method advertisement (plain resource: Allow + Accept-Patch)
-    set_str(&mut out, header::ALLOW, "OPTIONS, HEAD, GET, PUT, POST, DELETE, PATCH");
-    set_str(&mut out, HeaderName::from_static("accept-patch"), "text/n3, application/sparql-update");
+    set_str(
+        &mut out,
+        header::ALLOW,
+        "OPTIONS, HEAD, GET, PUT, POST, DELETE, PATCH",
+    );
+    set_str(
+        &mut out,
+        HeaderName::from_static("accept-patch"),
+        "text/n3, application/sparql-update",
+    );
     // discovery links — re-derived + re-formatted per request
     for (rel, t) in link_headers(base_url) {
         let value = format!("<{t}>; rel=\"{rel}\"");
@@ -97,37 +131,41 @@ fn build_before(base_url: &str, target_iri: &str, content_type: &str, etag: &str
         out.append(header::LINK, v);
     }
     // WAC-Allow (per-request value — same in both paths)
-    set_str(&mut out, HeaderName::from_static("wac-allow"), "user=\"read\",public=\"read\"");
+    set_str(
+        &mut out,
+        HeaderName::from_static("wac-allow"),
+        "user=\"read\",public=\"read\"",
+    );
     // Content-Length via to_string (heap String)
     set_str(&mut out, header::CONTENT_LENGTH, &content_len.to_string());
     out
 }
 
 // --- AFTER: the round-C formulation (interned/precomputed invariants + itoa numeral) -------------
-fn build_after(
-    discovery_values: &[HeaderValue],
-    hv_resource: &HeaderValue,
-    hv_allow: &HeaderValue,
-    hv_accept_patch: &HeaderValue,
-    hv_accept_ranges: &HeaderValue,
-    target_iri: &str,
-    content_type: &str,
-    etag: &str,
-    content_len: u64,
-) -> HeaderMap {
+fn build_after(inv: &AfterInvariants, input: &ReadInputs) -> HeaderMap {
+    let &ReadInputs {
+        base_url: _,
+        target_iri,
+        content_type,
+        etag,
+        content_len,
+    } = input;
     let mut out = HeaderMap::with_capacity(16);
     set_str(&mut out, header::CONTENT_TYPE, content_type);
     set_str(&mut out, header::ETAG, etag);
-    out.insert(header::ACCEPT_RANGES, hv_accept_ranges.clone());
+    out.insert(header::ACCEPT_RANGES, inv.hv_accept_ranges.clone());
     // method advertisement — interned statics (clone = refcount bump, no alloc)
-    out.insert(header::ALLOW, hv_allow.clone());
-    out.insert(HeaderName::from_static("accept-patch"), hv_accept_patch.clone());
+    out.insert(header::ALLOW, inv.hv_allow.clone());
+    out.insert(
+        HeaderName::from_static("accept-patch"),
+        inv.hv_accept_patch.clone(),
+    );
     // discovery links — PRECOMPUTED (clone = refcount bump)
-    for v in discovery_values {
+    for v in &inv.discovery_values {
         out.append(header::LINK, v.clone());
     }
     // type link — interned static (clone = refcount bump)
-    out.append(header::LINK, hv_resource.clone());
+    out.append(header::LINK, inv.hv_resource.clone());
     // acl link (PER-TARGET — identical to BEFORE, intentionally per-request)
     let acl_url = format!("{target_iri}.acl");
     let value = format!("<{acl_url}>; rel=\"acl\"");
@@ -135,7 +173,11 @@ fn build_after(
         out.append(header::LINK, v);
     }
     // WAC-Allow (per-request value — identical to BEFORE)
-    set_str(&mut out, HeaderName::from_static("wac-allow"), "user=\"read\",public=\"read\"");
+    set_str(
+        &mut out,
+        HeaderName::from_static("wac-allow"),
+        "user=\"read\",public=\"read\"",
+    );
     // Content-Length via itoa (stack buffer, no heap String)
     let mut buf = itoa::Buffer::new();
     if let Ok(v) = HeaderValue::from_str(buf.format(content_len)) {
@@ -155,34 +197,29 @@ fn sorted_lines(h: &HeaderMap) -> Vec<(String, String)> {
 
 fn main() {
     let base = "https://localhost:3000";
-    let target_iri = "https://localhost:3000/alice/profile/card";
-    let content_type = "text/turtle";
-    let etag = "\"abc123\"";
-    let content_len: u64 = 4096;
+    let input = ReadInputs {
+        base_url: base,
+        target_iri: "https://localhost:3000/alice/profile/card",
+        content_type: "text/turtle",
+        etag: "\"abc123\"",
+        content_len: 4096,
+    };
 
     // Precompute the AFTER path's request-invariant values ONCE (as the server does at construction).
-    let discovery_values: Vec<HeaderValue> = link_headers(base)
-        .into_iter()
-        .filter_map(|(rel, t)| HeaderValue::from_str(&format!("<{t}>; rel=\"{rel}\"")).ok())
-        .collect();
-    let hv_resource = HeaderValue::from_static("<http://www.w3.org/ns/ldp#Resource>; rel=\"type\"");
-    let hv_allow = HeaderValue::from_static("OPTIONS, HEAD, GET, PUT, POST, DELETE, PATCH");
-    let hv_accept_patch = HeaderValue::from_static("text/n3, application/sparql-update");
-    let hv_accept_ranges = HeaderValue::from_static("bytes");
+    let inv = AfterInvariants {
+        discovery_values: link_headers(base)
+            .into_iter()
+            .filter_map(|(rel, t)| HeaderValue::from_str(&format!("<{t}>; rel=\"{rel}\"")).ok())
+            .collect(),
+        hv_resource: HeaderValue::from_static("<http://www.w3.org/ns/ldp#Resource>; rel=\"type\""),
+        hv_allow: HeaderValue::from_static("OPTIONS, HEAD, GET, PUT, POST, DELETE, PATCH"),
+        hv_accept_patch: HeaderValue::from_static("text/n3, application/sparql-update"),
+        hv_accept_ranges: HeaderValue::from_static("bytes"),
+    };
 
     // CORRECTNESS GATE: BEFORE and AFTER must emit a BYTE-IDENTICAL header set (same names+values).
-    let before = build_before(base, target_iri, content_type, etag, content_len);
-    let after = build_after(
-        &discovery_values,
-        &hv_resource,
-        &hv_allow,
-        &hv_accept_patch,
-        &hv_accept_ranges,
-        target_iri,
-        content_type,
-        etag,
-        content_len,
-    );
+    let before = build_before(&input);
+    let after = build_after(&inv, &input);
     assert_eq!(
         sorted_lines(&before),
         sorted_lines(&after),
@@ -192,24 +229,12 @@ fn main() {
     // Measure: count the heap alloc/realloc ops each header-build makes (the measured region is the
     // single build call; the precomputed AFTER invariants are built ONCE above, outside the count —
     // exactly as the server amortises them across the process lifetime).
-    let (before_allocs, _) = count_allocs(|| {
-        build_before(base, target_iri, content_type, etag, content_len)
-    });
-    let (after_allocs, _) = count_allocs(|| {
-        build_after(
-            &discovery_values,
-            &hv_resource,
-            &hv_allow,
-            &hv_accept_patch,
-            &hv_accept_ranges,
-            target_iri,
-            content_type,
-            etag,
-            content_len,
-        )
-    });
+    let (before_allocs, _) = count_allocs(|| build_before(&input));
+    let (after_allocs, _) = count_allocs(|| build_after(&inv, &input));
 
-    println!("# read-response header-build allocation count (per public-GET response, plain resource)");
+    println!(
+        "# read-response header-build allocation count (per public-GET response, plain resource)"
+    );
     println!("# DETERMINISTIC heap alloc/realloc op count (counting global allocator)");
     println!("# header set is byte-identical between BEFORE and AFTER (asserted above)");
     println!();

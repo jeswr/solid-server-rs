@@ -194,7 +194,14 @@ fn iri_chars_serialisable(iri: &str) -> bool {
 /// refactor). The hub is cheap to clone (an `Arc` inside) and shared with the notification routes.
 pub struct LdpState<S: Store> {
     pub store: S,
-    pub base_url: String,
+    /// The server's public base URL. PRIVATE on purpose: [`discovery_link_values`] is a cache derived
+    /// from it at construction, so a post-construction mutation of `base_url` would desync the two
+    /// (the cached discovery `Link` headers would advertise the OLD storage-description URL while
+    /// request parsing/type links used the new one). Read it via [`base_url`](Self::base_url); the
+    /// (sole, router-assembly-time) writer is [`set_base_url`](Self::set_base_url), which rebuilds the
+    /// cache atomically. Internal `self.base_url` reads within this module are fine (the field stays
+    /// in scope of the impl).
+    base_url: String,
     pub notifications: NotificationHub,
     /// The `WWW-Authenticate` challenge to emit on a 401 for an anonymous request to a resource that
     /// requires authentication. Populated from the [`AuthContext`](crate::auth::AuthContext) at router
@@ -278,6 +285,24 @@ impl<S: Store> LdpState<S> {
     /// capacity / disable it). The default constructors already enable it at the default capacity.
     pub fn set_acl_cache(&mut self, acl_cache: AclCache) {
         self.acl_cache = acl_cache;
+    }
+
+    /// The server's public base URL. The read accessor for the (now-private) `base_url` field — used
+    /// by router assembly ([`AppState`](crate::app)) and any external consumer.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Replace the base URL, REBUILDING the derived discovery-link cache so the two never desync.
+    ///
+    /// This is the ONLY sanctioned writer of `base_url` (the field is private precisely so a caller
+    /// cannot mutate it WITHOUT rebuilding [`discovery_link_values`] — see the field doc). Provided
+    /// for completeness + the no-stale-cache invariant; in practice `base_url` is fixed at
+    /// construction and never reset, but if a future router-assembly step does reset it, the discovery
+    /// `Link` headers stay consistent with it.
+    pub fn set_base_url(&mut self, base_url: impl Into<String>) {
+        self.base_url = base_url.into();
+        self.discovery_link_values = build_discovery_link_values(&self.base_url);
     }
 
     /// Invalidate the cached parse of an ACL resource after a successful WRITE / DELETE of it (belt-and-
