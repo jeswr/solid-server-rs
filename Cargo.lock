@@ -2278,6 +2278,7 @@ dependencies = [
  "oxrdf 0.3.3",
  "oxttl 0.2.3",
  "p256",
+ "pin-project-lite",
  "r2d2",
  "rand_core 0.6.4",
  "redis",

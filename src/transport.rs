@@ -1,6 +1,7 @@
 // AUTHORED-BY Claude Opus 4.8
 //! Transport-layer DoS hardening — HTTP/2 stream/reset caps + slowloris header timeout + a
-//! concurrent-connection cap.
+//! concurrent-connection cap + TLS-handshake timeout + a per-connection idle-keepalive timeout + a
+//! max-requests-per-connection reuse cap.
 //!
 //! ## Why (the transport-DoS gap the application layers leave open)
 //! The overload layers ([`crate::overload`]) and the per-IP rate limiter ([`crate::rate_limit`]) gate
@@ -22,6 +23,16 @@
 //!   handshake timeout** so a connection that stalls the handshake (never completing it) cannot pin a
 //!   connection permit, and an **h2 keep-alive PING** (interval + ack-timeout) so a DEAD-peer h2
 //!   connection (host gone without a FIN) that is holding a permit is reclaimed.
+//! - **Idle keep-alive hold (the two missing-guard companions).** Two further gaps the bounds above
+//!   leave open, both enforced here (NOT hyper builder knobs — hyper 1.x exposes neither; see below):
+//!   - a peer that completes a request, gets its response, then holds the keep-alive connection open
+//!     sending NOTHING further — `header_read_timeout` only bounds a PARTIAL head (bytes started), and
+//!     the h2 PING only reclaims a DEAD peer, so neither closes a LIVE peer on a fully-idle connection.
+//!     The defence is a per-connection **idle-keepalive read timeout** at the IO layer
+//!     ([`IdleTimeoutStream`]): no bytes for the window ⇒ close + reclaim the permit.
+//!   - unbounded keep-alive REUSE of one connection — bounded by a **max-requests-per-connection** cap
+//!     ([`MaxRequestsService`]) that sets `Connection: close` after N requests (HTTP/1.1 reuse
+//!     rotation; default OFF).
 //!
 //! ## What hyper provides vs what we add (the rapid-reset accounting)
 //! The in-tree `hyper` 1.x + `h2` 0.4.x already ship the CVE-2023-44487 reset-accounting:
@@ -41,8 +52,12 @@
 //! These knobs live BELOW the application layers — they configure the hyper connection serving the
 //! request. They are applied **only on the in-process TLS serve path**: the h2/header knobs via
 //! `axum-server`'s `http_builder()` (the `hyper_util::server::conn::auto::Builder` it serves with),
-//! and the connection cap + handshake timeout via the [`ConnectionLimitAcceptor`] wrapping
-//! `axum-server`'s acceptor. The **plain-HTTP path is intentionally NOT hardened here** — `axum::serve`
+//! and the connection cap + handshake timeout + the per-connection **idle-keepalive read timeout**
+//! (IO-layer [`IdleTimeoutStream`]) + the **max-requests-per-connection** cap (service-layer
+//! [`MaxRequestsService`]) via the [`ConnectionLimitAcceptor`] wrapping `axum-server`'s acceptor — the
+//! last two are NOT hyper builder knobs (hyper 1.x exposes neither a per-connection idle timeout nor a
+//! request-count cap), so they are owned here at the per-connection accept seam. The **plain-HTTP path
+//! is intentionally NOT hardened here** — `axum::serve`
 //! exposes neither the underlying hyper builder nor an acceptor seam, so these knobs cannot be wired
 //! onto it; an operator who needs the transport caps must terminate TLS in-process (or front the
 //! plain path with a reverse proxy that caps connections + terminates HTTP/2). The startup log states
@@ -106,6 +121,27 @@ pub const ENV_KEEP_ALIVE_TIMEOUT_SECS: &str = "SOLID_SERVER_KEEP_ALIVE_TIMEOUT_S
 /// invalid ⇒ [`DEFAULT_HANDSHAKE_TIMEOUT_SECS`]; `0` ⇒ DISABLED (rely on the acceptor's own bound).
 pub const ENV_HANDSHAKE_TIMEOUT_SECS: &str = "SOLID_SERVER_HANDSHAKE_TIMEOUT_SECS";
 
+/// Env var: the per-connection **idle-keepalive timeout** in seconds — a kept-alive connection on which
+/// NO bytes are read for this long (idle BETWEEN requests) is dropped, reclaiming its connection permit.
+/// This is the missing-guard companion to the existing bounds: `header_read_timeout` bounds reading a
+/// COMPLETE header set once bytes START arriving; the h2 keep-alive PING reclaims a DEAD peer (one that
+/// stopped acking). NEITHER bounds a peer that completes a request then holds the keep-alive connection
+/// open sending nothing further — that connection keeps its permit indefinitely. This idle-read timeout
+/// closes it. (It is enforced at the IO layer, on the TLS serve path only — see
+/// [`IdleTimeoutStream`].) Unset / invalid ⇒ [`DEFAULT_IDLE_TIMEOUT_SECS`]; `0` ⇒ DISABLED.
+pub const ENV_IDLE_TIMEOUT_SECS: &str = "SOLID_SERVER_IDLE_TIMEOUT_SECS";
+
+/// Env var: the **max requests per connection** cap — after serving this many requests on a single
+/// HTTP/1.1 keep-alive connection the server sets `Connection: close` on the response, so hyper closes
+/// the connection after it and the client must reconnect. This bounds how long one connection can be
+/// reused (defence-in-depth: it forces periodic re-handshake/re-LB-balance and caps the work a single
+/// long-lived connection can pin without ever re-entering the accept-time connection cap). Unset /
+/// invalid / `0` ⇒ DISABLED (unlimited reuse — the default, so it never trips the conformance harness).
+/// NOTE (h2): under HTTP/2 multiplexing "requests per connection" is fuzzy (no clean `Connection: close`
+/// per stream); this cap is enforced on the per-request response header, which is an HTTP/1.1 construct —
+/// see [`MaxRequestsService`]. The accept-time connection cap + the h2 stream/reset caps bound h2.
+pub const ENV_MAX_REQUESTS_PER_CONN: &str = "SOLID_SERVER_MAX_REQUESTS_PER_CONN";
+
 // --- Defaults -------------------------------------------------------------------------------------
 
 /// Default `max_concurrent_streams`. hyper's own default is 200; we set 256 explicitly (a small,
@@ -137,6 +173,20 @@ pub const DEFAULT_KEEP_ALIVE_TIMEOUT_SECS: u64 = 60;
 /// releases the CONNECTION PERMIT (not just the handshake) on expiry.
 pub const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 
+/// Default per-connection idle-keepalive timeout (seconds). Generous — it must NEVER trip a legitimate
+/// keep-alive client between requests in normal use OR the conformance run (which reuses a handful of
+/// connections with small inter-request gaps), only reclaim a connection a peer is holding open while
+/// sending nothing. 75s mirrors the common reverse-proxy keep-alive-idle default (nginx
+/// `keepalive_timeout 75s`), so it is a familiar, safely-large bound. An operator tightens it for a
+/// hostile-facing edge.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 75;
+
+/// Default max-requests-per-connection. `0` = DISABLED (unlimited keep-alive reuse) — the default,
+/// because a bound here is a defence-in-depth knob (the connection cap + h2 stream caps already bound
+/// the work a connection pins), and any finite value risks tripping the conformance harness / a
+/// legitimate high-reuse client. An operator opts IN to connection rotation by setting a positive value.
+pub const DEFAULT_MAX_REQUESTS_PER_CONN: u64 = 0;
+
 // --- Resolved config ------------------------------------------------------------------------------
 
 /// The resolved transport-hardening configuration. Built from the env via [`TransportConfig::from_env`]
@@ -159,6 +209,14 @@ pub struct TransportConfig {
     /// connection permit, after which the permit is released. `None` ⇒ disabled (rely on the underlying
     /// acceptor's own handshake bound).
     pub handshake_timeout: Option<Duration>,
+    /// Per-connection idle-keepalive timeout: a kept-alive connection with no read activity for this
+    /// long is dropped (reclaiming its permit). `None` ⇒ disabled. Enforced at the IO layer (see
+    /// [`IdleTimeoutStream`]).
+    pub idle_timeout: Option<Duration>,
+    /// Max requests served on one connection before `Connection: close` is set (HTTP/1.1 reuse cap).
+    /// `None` ⇒ disabled (unlimited reuse). Enforced at the per-connection service layer (see
+    /// [`MaxRequestsService`]).
+    pub max_requests_per_conn: Option<u64>,
 }
 
 impl TransportConfig {
@@ -183,6 +241,13 @@ impl TransportConfig {
             handshake_timeout: parse_optional_secs(
                 std::env::var(ENV_HANDSHAKE_TIMEOUT_SECS).ok(),
                 DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+            ),
+            idle_timeout: parse_optional_secs(
+                std::env::var(ENV_IDLE_TIMEOUT_SECS).ok(),
+                DEFAULT_IDLE_TIMEOUT_SECS,
+            ),
+            max_requests_per_conn: parse_max_requests_per_conn(
+                std::env::var(ENV_MAX_REQUESTS_PER_CONN).ok(),
             ),
         }
     }
@@ -293,7 +358,8 @@ impl ConnectionLimiter {
 
     /// Wrap an `axum-server` acceptor so each accepted connection holds a connection permit for its
     /// lifetime — the connection-cap for the TLS serve path, with NO handshake timeout (rely on the
-    /// underlying acceptor's own bound). Prefer [`wrap_acceptor_with_handshake_timeout`].
+    /// underlying acceptor's own bound) and no idle / max-requests guards. Prefer
+    /// [`wrap_acceptor_with_guards`].
     pub fn wrap_acceptor<A>(&self, inner: A) -> ConnectionLimitAcceptor<A> {
         self.wrap_acceptor_with_handshake_timeout(inner, None)
     }
@@ -302,33 +368,66 @@ impl ConnectionLimiter {
     /// `handshake_timeout`: a connection that stalls the handshake longer than this has its permit
     /// RELEASED (the accept resolves to an error, so axum-server drops it), so a slow-handshake flood
     /// cannot pin the connection cap before the HTTP-layer header-read timeout can apply. `None` ⇒ no
-    /// added bound (the underlying acceptor's own handshake timeout still applies).
+    /// added bound (the underlying acceptor's own handshake timeout still applies). Idle / max-requests
+    /// guards are OFF — see [`wrap_acceptor_with_guards`] for those.
     pub fn wrap_acceptor_with_handshake_timeout<A>(
         &self,
         inner: A,
         handshake_timeout: Option<Duration>,
     ) -> ConnectionLimitAcceptor<A> {
+        self.wrap_acceptor_with_guards(inner, handshake_timeout, None, None)
+    }
+
+    /// The full guard wiring: the connection-cap permit + the optional `handshake_timeout` (as above),
+    /// PLUS the two missing-guard companions:
+    /// - `idle_timeout`: the per-connection idle-keepalive read timeout (a connection sending no bytes
+    ///   for this long is dropped, reclaiming its permit) — enforced by wrapping the served IO in an
+    ///   [`IdleTimeoutStream`]; `None` ⇒ no idle bound;
+    /// - `max_requests_per_conn`: after this many requests on one connection the response carries
+    ///   `Connection: close` (HTTP/1.1 reuse cap) — enforced by wrapping the per-connection service in a
+    ///   [`MaxRequestsService`]; `None` ⇒ unlimited reuse.
+    ///
+    /// These are owned, env-tunable, TESTED transport invariants of this crate (see the module docs).
+    pub fn wrap_acceptor_with_guards<A>(
+        &self,
+        inner: A,
+        handshake_timeout: Option<Duration>,
+        idle_timeout: Option<Duration>,
+        max_requests_per_conn: Option<u64>,
+    ) -> ConnectionLimitAcceptor<A> {
         ConnectionLimitAcceptor {
             inner,
             limiter: self.clone(),
             handshake_timeout,
+            idle_timeout,
+            max_requests_per_conn,
         }
     }
 }
 
-/// An [`Accept`] wrapper that bounds concurrently-served connections via a [`ConnectionLimiter`]. It
-/// acquires a permit (FAIL-FAST — without blocking) BEFORE running the inner accept (TLS handshake);
-/// over the cap it REFUSES the connection with an error so `axum-server` drops it and reclaims the
-/// socket at once, rather than queueing it. The inner accept is bounded by an optional
-/// `handshake_timeout` so a stalled handshake cannot pin a permit. On admission it hands back a
-/// [`PermittedStream`] holding the permit for the connection's lifetime — so no more than
-/// `max_connections` served connections exist at once, AND a flood over the cap (or stalled
-/// handshakes) is shed promptly (not parked as pending tasks holding accepted sockets — roborev).
+/// An [`Accept`] wrapper that bounds concurrently-served connections via a [`ConnectionLimiter`] AND
+/// wires the per-connection idle / max-requests guards. It acquires a permit (FAIL-FAST — without
+/// blocking) BEFORE running the inner accept (TLS handshake); over the cap it REFUSES the connection
+/// with an error so `axum-server` drops it and reclaims the socket at once, rather than queueing it. The
+/// inner accept is bounded by an optional `handshake_timeout` so a stalled handshake cannot pin a
+/// permit. On admission it hands back:
+/// - a [`PermittedStream`] (holding the permit for the connection lifetime) wrapping an
+///   [`IdleTimeoutStream`] (the idle-keepalive read timeout) — so no more than `max_connections` served
+///   connections exist at once, a flood over the cap (or a stalled handshake) is shed promptly, AND an
+///   idle keep-alive connection is reclaimed; and
+/// - a [`MaxRequestsService`] wrapping the per-connection service — so an HTTP/1.1 connection is closed
+///   after the configured number of requests (`Connection: close`). Each accepted connection gets its
+///   OWN request counter (it is created here, per `accept`), so the cap is per-connection.
 #[derive(Clone)]
 pub struct ConnectionLimitAcceptor<A> {
     inner: A,
     limiter: ConnectionLimiter,
     handshake_timeout: Option<Duration>,
+    /// Per-connection idle-keepalive read timeout (`None` ⇒ no idle bound). Applied to the served IO.
+    idle_timeout: Option<Duration>,
+    /// Max requests per connection before `Connection: close` (`None` ⇒ unlimited). Applied to the
+    /// per-connection service.
+    max_requests_per_conn: Option<u64>,
 }
 
 impl<A, I, S> Accept<I, S> for ConnectionLimitAcceptor<A>
@@ -340,8 +439,12 @@ where
     I: Send + 'static,
     S: Send + 'static,
 {
-    type Stream = PermittedStream<A::Stream>;
-    type Service = A::Service;
+    // The served IO is `PermittedStream` wrapping an `IdleTimeoutStream` (idle timeout is a no-op
+    // passthrough when `None`), so the permit is held for the connection lifetime AND an idle connection
+    // is reclaimed. The served service is wrapped in `MaxRequestsService` (a no-op passthrough when the
+    // cap is `None`), so an HTTP/1.1 connection is closed after the configured number of requests.
+    type Stream = PermittedStream<IdleTimeoutStream<A::Stream>>;
+    type Service = MaxRequestsService<A::Service>;
     type Future = Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
 
     fn accept(&self, stream: I, service: S) -> Self::Future {
@@ -363,6 +466,8 @@ where
         };
         let inner = self.inner.clone();
         let handshake_timeout = self.handshake_timeout;
+        let idle_timeout = self.idle_timeout;
+        let max_requests = self.max_requests_per_conn;
         Box::pin(async move {
             // Run the inner accept (e.g. the TLS handshake), BOUNDED by `handshake_timeout` when set —
             // a stalled handshake must not pin the permit. On timeout the inner accept future is
@@ -382,7 +487,13 @@ where
                 },
                 None => accept_fut.await?,
             };
-            Ok((PermittedStream::new(io_stream, permit), svc))
+            // Wrap the served IO with the idle-keepalive timeout (no-op when `None`), then the permit;
+            // and wrap the per-connection service with the max-requests cap (no-op when `None`). The
+            // per-connection request counter lives INSIDE `MaxRequestsService` (a fresh counter per
+            // accepted connection — see its docs), so the cap is genuinely per-connection.
+            let idle_io = IdleTimeoutStream::new(io_stream, idle_timeout);
+            let capped_svc = MaxRequestsService::new(svc, max_requests);
+            Ok((PermittedStream::new(idle_io, permit), capped_svc))
         })
     }
 }
@@ -446,6 +557,239 @@ impl<Io: AsyncWrite + Unpin> AsyncWrite for PermittedStream<Io> {
     }
 }
 
+// --- Idle-keepalive timeout (IO-layer read-inactivity bound) --------------------------------------
+
+/// An IO stream that enforces a per-connection **idle-read timeout**: if no bytes are read for the
+/// configured window, the next `poll_read` resolves to an `io::Error` (kind `TimedOut`), which hyper
+/// surfaces as a connection close — reclaiming the connection (and its [`ConnectionLimiter`] permit, via
+/// the outer [`PermittedStream`]). When the timeout is `None` it is a transparent pass-through (zero
+/// overhead — no timer is created).
+///
+/// ## Why this is the right layer (and the gap it closes)
+/// hyper exposes NO native idle-connection timeout (verified against hyper 1.x). The existing bounds do
+/// NOT cover an idle keep-alive connection:
+/// - `http1::Builder::header_read_timeout` bounds reading a COMPLETE header set once bytes START
+///   arriving — it does not fire on a connection that has sent a full request, got its response, and now
+///   holds the keep-alive connection open sending nothing;
+/// - the h2 keep-alive PING reclaims a DEAD peer (one that stops acking), not a live peer holding an
+///   idle connection.
+///
+/// Wrapping the connection IO with a read-inactivity timeout is the canonical fix in this stack.
+///
+/// ## The timer is reset on READ ACTIVITY (any progress), so a legitimate trickle is not killed
+/// The `Sleep` deadline is reset whenever a `poll_read` makes progress (returns `Ready` with bytes OR a
+/// clean EOF). It fires ONLY after a full idle window with the inner read PENDING the whole time — i.e.
+/// the peer sent nothing. A slow-but-progressing reader resets the deadline on each chunk, so this never
+/// kills a legitimately slow link; the slowloris HEADER trickle is bounded separately by
+/// `header_read_timeout` (a complete-head deadline that a per-byte reset cannot defeat).
+///
+/// ## HTTP/2 interaction (deliberate, documented)
+/// Under HTTP/2 the server's keep-alive PING (when configured) elicits a client PONG — a READ — so the
+/// idle-read deadline is reset by that PONG traffic. The idle-read timeout therefore primarily bounds
+/// HTTP/1.1 keep-alive idle (no PING traffic between requests); on h2 the PING/PONG liveness probe is the
+/// dead-peer reclaim and this timeout is effectively subsumed by it (a peer that stops ponging is dropped
+/// by the PING ack-timeout). This is correct: each protocol's idle/dead-peer reclaim is covered. The
+/// default idle window (75s) is deliberately LARGER than the default PING interval (60s) so the two do
+/// not race on a healthy h2 connection.
+///
+/// Requires `Io: Unpin` (every stream we serve is `Unpin`); the boxed `Sleep` keeps the wrapper `Unpin`.
+pub struct IdleTimeoutStream<Io> {
+    inner: Io,
+    /// `None` ⇒ no idle bound (transparent pass-through). `Some((dur, sleep))` ⇒ enforce `dur` of
+    /// read-inactivity; `sleep` is the live deadline, reset to `now + dur` on each read that progresses.
+    idle: Option<(Duration, Pin<Box<tokio::time::Sleep>>)>,
+}
+
+impl<Io> IdleTimeoutStream<Io> {
+    /// Wrap `inner` enforcing an idle-read timeout of `idle_timeout` (or a transparent pass-through when
+    /// `None`). The deadline starts at `now + idle_timeout` (so a connection that sends nothing AT ALL
+    /// after the handshake is still bounded).
+    pub fn new(inner: Io, idle_timeout: Option<Duration>) -> Self {
+        let idle = idle_timeout.map(|dur| (dur, Box::pin(tokio::time::sleep(dur))));
+        Self { inner, idle }
+    }
+}
+
+impl<Io: AsyncRead + Unpin> AsyncRead for IdleTimeoutStream<Io> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        // Poll the inner read first. On any progress (Ready), reset the idle deadline and return it.
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Ready(result) => {
+                if let Some((dur, sleep)) = this.idle.as_mut() {
+                    // Read progressed (bytes or EOF) ⇒ the connection is active ⇒ push the deadline out.
+                    sleep.as_mut().reset(tokio::time::Instant::now() + *dur);
+                }
+                Poll::Ready(result)
+            }
+            Poll::Pending => {
+                // Inner read is pending (no bytes available). If the idle deadline has now elapsed, the
+                // connection has been silent for the whole window ⇒ close it with a TimedOut error.
+                if let Some((_dur, sleep)) = this.idle.as_mut() {
+                    if sleep.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "connection idle past the keep-alive idle timeout — closing",
+                        )));
+                    }
+                }
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl<Io: AsyncWrite + Unpin> AsyncWrite for IdleTimeoutStream<Io> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+// --- Max-requests-per-connection (per-connection service-layer reuse cap) --------------------------
+
+/// A `tower::Service` wrapper that caps how many requests are served on ONE connection: after `cap`
+/// requests it sets `Connection: close` on the response, so hyper closes the (HTTP/1.1) connection
+/// after that response and the client must reconnect. When `cap` is `None` it is a transparent
+/// pass-through (the request count is not even tracked).
+///
+/// ## Per-connection counter (the load-bearing scoping)
+/// The acceptor creates ONE `MaxRequestsService` per accepted connection (in `accept`), so its counter
+/// is genuinely PER-CONNECTION. hyper CLONES the service per request to serve concurrent/pipelined
+/// requests on the connection, so the counter is an `Arc<AtomicU64>` SHARED across those clones (the
+/// `Clone` impl shares the `Arc`) — counting all requests on this one connection — but NOT shared with
+/// any OTHER connection's service (each `accept` makes a fresh `Arc`). A `fetch_add` on each call gives
+/// the request's 1-based ordinal; at/after the cap the response gets `Connection: close`.
+///
+/// ## Why a header, not `graceful_shutdown` (the correctness choice)
+/// Setting `Connection: close` lets the IN-FLIGHT response complete cleanly and THEN closes the
+/// connection — the HTTP-correct way to end keep-alive reuse. Calling hyper's per-connection
+/// `graceful_shutdown` instead would be coarser (it tears the whole connection state down). The header
+/// is exactly what a reverse proxy's `MaxKeepAliveRequests` does.
+///
+/// ## HTTP/2 (documented limitation)
+/// `Connection: close` is an HTTP/1.1 hop-by-hop header; under HTTP/2 there is no per-stream
+/// `Connection: close` (the equivalent is a connection-level GOAWAY, which hyper's SERVER builder does
+/// not expose a hook for). So this cap is meaningful for HTTP/1.1 keep-alive reuse; h2 connection-pinning
+/// is bounded instead by the accept-time connection cap + the h2 stream/reset caps. Setting the header on
+/// an h2 response is harmless (hyper drops connection-specific headers on h2) — it simply has no effect
+/// there. This is acknowledged in the env-var docs ([`ENV_MAX_REQUESTS_PER_CONN`]).
+#[derive(Clone)]
+pub struct MaxRequestsService<S> {
+    inner: S,
+    /// `None` ⇒ unlimited (pass-through). `Some((cap, count))` ⇒ close after `cap` requests; `count` is
+    /// the shared per-connection request counter (shared across this connection's service clones).
+    cap: Option<(u64, Arc<std::sync::atomic::AtomicU64>)>,
+}
+
+impl<S> MaxRequestsService<S> {
+    /// Wrap `inner` with a per-connection request cap of `max_requests` (or a transparent pass-through
+    /// when `None`). Creates a FRESH counter, so this must be called ONCE per connection (the acceptor
+    /// does) for the cap to be per-connection.
+    pub fn new(inner: S, max_requests: Option<u64>) -> Self {
+        let cap = max_requests.map(|c| (c, Arc::new(std::sync::atomic::AtomicU64::new(0))));
+        Self { inner, cap }
+    }
+}
+
+impl<S, ReqBody, ResBody> tower::Service<http::Request<ReqBody>> for MaxRequestsService<S>
+where
+    S: tower::Service<http::Request<ReqBody>, Response = http::Response<ResBody>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = MaxRequestsFuture<S::Future>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: http::Request<ReqBody>) -> Self::Future {
+        // Compute whether THIS request is at/over the per-connection cap BEFORE calling the inner
+        // service. `fetch_add` returns the prior value, so `n+1` is this request's 1-based ordinal; we
+        // close on the cap-th request and every one after (the connection should already be closing, but
+        // being monotone is robust if a race lets one more in).
+        let at_cap = match &self.cap {
+            Some((cap, count)) => {
+                let ordinal = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                ordinal >= *cap
+            }
+            None => false,
+        };
+        MaxRequestsFuture {
+            inner: self.inner.call(req),
+            close: at_cap,
+        }
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// The future for [`MaxRequestsService`]: awaits the inner response, then — when this request hit the
+    /// per-connection cap — sets `Connection: close` so hyper ends keep-alive reuse after it. The inner
+    /// future is structurally pinned via `pin_project_lite` (a SAFE, declarative-macro projection — the
+    /// crate is `#![forbid(unsafe_code)]`, so no hand-rolled `unsafe` pin). No allocation: the inner
+    /// future is held inline, not boxed.
+    pub struct MaxRequestsFuture<F> {
+        #[pin]
+        inner: F,
+        // Whether to stamp `Connection: close` on the produced response (this request hit the cap).
+        close: bool,
+    }
+}
+
+impl<F, ResBody, E> Future for MaxRequestsFuture<F>
+where
+    F: Future<Output = Result<http::Response<ResBody>, E>>,
+{
+    type Output = Result<http::Response<ResBody>, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        match this.inner.poll(cx) {
+            Poll::Ready(Ok(mut resp)) => {
+                if *this.close {
+                    // End keep-alive reuse after this response. `HeaderValue::from_static` is infallible
+                    // for this constant. (On h2 hyper ignores this connection-specific header — see the
+                    // service docs; harmless.)
+                    resp.headers_mut().insert(
+                        http::header::CONNECTION,
+                        http::HeaderValue::from_static("close"),
+                    );
+                }
+                Poll::Ready(Ok(resp))
+            }
+            other => other,
+        }
+    }
+}
+
 // --- Pure parsers (testable cores) ----------------------------------------------------------------
 
 /// Resolve `max_concurrent_streams` from the env value. absent / empty / non-numeric / `0` ⇒ the
@@ -486,7 +830,21 @@ pub fn parse_max_connections(raw: Option<String>) -> usize {
     }
 }
 
-/// Resolve an optional-seconds timeout (header-read / keep-alive): absent / empty / non-numeric ⇒
+/// Resolve the max-requests-per-connection cap. absent / empty / non-numeric / `0` ⇒ `None` (DISABLED —
+/// unlimited keep-alive reuse, the safe default that never trips the conformance harness). `>0` ⇒
+/// `Some(n)` (close the connection after `n` requests). A `0` mapping to disabled (NOT a 0-request
+/// connection) is deliberate: a typo must never brick keep-alive, and a 0-request cap would be useless.
+pub fn parse_max_requests_per_conn(raw: Option<String>) -> Option<u64> {
+    match raw.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(s) => match s.parse::<u64>() {
+            Ok(0) | Err(_) => None,
+            Ok(n) => Some(n),
+        },
+    }
+}
+
+/// Resolve an optional-seconds timeout (header-read / keep-alive / idle): absent / empty / non-numeric ⇒
 /// `Some(default)` (ENABLED at the default); `0` ⇒ `None` (explicitly DISABLED); `>0` ⇒ `Some(n)`.
 pub fn parse_optional_secs(raw: Option<String>, default_secs: u64) -> Option<Duration> {
     let secs = match raw.as_deref().map(str::trim) {
@@ -635,6 +993,10 @@ mod tests {
                 max_connections: DEFAULT_MAX_CONNECTIONS,
                 keep_alive_timeout: Some(Duration::from_secs(DEFAULT_KEEP_ALIVE_TIMEOUT_SECS)),
                 handshake_timeout: Some(Duration::from_secs(DEFAULT_HANDSHAKE_TIMEOUT_SECS)),
+                idle_timeout: Some(Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)),
+                // Default-OFF: a finite reuse cap is opt-in (it could trip a high-reuse client / the
+                // harness), so the documented default is `None` (unlimited keep-alive reuse).
+                max_requests_per_conn: None,
             }
         );
     }
@@ -654,6 +1016,8 @@ mod tests {
                 max_connections: 10_000,
                 keep_alive_timeout: Some(Duration::from_secs(60)),
                 handshake_timeout: Some(Duration::from_secs(10)),
+                idle_timeout: Some(Duration::from_secs(75)),
+                max_requests_per_conn: Some(10_000),
             };
             let mut builder = Builder::new(hyper_util::rt::TokioExecutor::new());
             cfg.apply_to_builder(&mut builder);
@@ -789,9 +1153,163 @@ mod tests {
                 max_connections: 10_000,
                 keep_alive_timeout: None,
                 handshake_timeout: None,
+                idle_timeout: None,
+                max_requests_per_conn: None,
             };
             let mut builder = Builder::new(hyper_util::rt::TokioExecutor::new());
             cfg.apply_to_builder(&mut builder);
         });
+    }
+
+    #[test]
+    fn max_requests_per_conn_disabled_on_absent_empty_invalid_or_zero() {
+        // The DEFAULT must be disabled (None) — a finite reuse cap is opt-in. A `0`/typo must NEVER
+        // become a 0-request cap (which would brick keep-alive); it maps to None (unlimited).
+        assert_eq!(parse_max_requests_per_conn(None), None);
+        assert_eq!(parse_max_requests_per_conn(Some("".into())), None);
+        assert_eq!(parse_max_requests_per_conn(Some("  ".into())), None);
+        assert_eq!(parse_max_requests_per_conn(Some("abc".into())), None);
+        assert_eq!(parse_max_requests_per_conn(Some("0".into())), None);
+        // A positive value enables the cap.
+        assert_eq!(parse_max_requests_per_conn(Some("1".into())), Some(1));
+        assert_eq!(parse_max_requests_per_conn(Some("1000".into())), Some(1000));
+        assert_eq!(parse_max_requests_per_conn(Some("  64  ".into())), Some(64));
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_stream_passes_through_then_fires_when_idle() {
+        // Drive the IdleTimeoutStream over an in-memory duplex pair with a SHORT real idle window. A read
+        // that gets bytes succeeds and RESETS the deadline; after a full idle window with no bytes, the
+        // next read resolves to a TimedOut error (NOT a hang).
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let idle_window = Duration::from_millis(150);
+        let (mut client, server) = tokio::io::duplex(64);
+        let mut idle = IdleTimeoutStream::new(server, Some(idle_window));
+
+        // 1) A read that gets bytes succeeds (pass-through) and resets the idle deadline.
+        client.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        idle.read_exact(&mut buf)
+            .await
+            .expect("read passes through");
+        assert_eq!(&buf, b"hello");
+
+        // 2) Now go idle (no further writes). The next read must resolve to a TimedOut error within a
+        // few idle windows (the idle guard fired) rather than hang. The outer timeout is generously
+        // larger than the idle window so it only trips if the guard FAILED to fire (a real hang).
+        let mut buf2 = [0u8; 1];
+        let res = tokio::time::timeout(idle_window * 20, idle.read(&mut buf2)).await;
+        let inner =
+            res.expect("the idle read must RESOLVE (the guard fires), not hang past the window");
+        let err = inner.expect_err("an idle connection past the window must resolve to an error");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::TimedOut,
+            "the idle-keepalive guard must close with a TimedOut error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_stream_none_is_transparent_passthrough() {
+        // With idle = None the wrapper is a transparent pass-through: a delayed write is still read fine
+        // (no timer, no spurious close) even though a real delay elapses between the read starting and
+        // the bytes arriving.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut client, server) = tokio::io::duplex(64);
+        let mut idle = IdleTimeoutStream::new(server, None);
+
+        // Spawn a delayed writer; the read must wait for it (no idle bound closes it early).
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            client.write_all(b"x").await.unwrap();
+            client // keep the client end alive until the read completes
+        });
+        let mut buf = [0u8; 1];
+        idle.read_exact(&mut buf)
+            .await
+            .expect("None ⇒ transparent pass-through (a delayed read still succeeds)");
+        assert_eq!(&buf, b"x");
+        let _client = writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn max_requests_service_stamps_connection_close_at_the_cap_only() {
+        // A stub tower::Service returning a 200 with no body. Wrap it with a cap of 2 and call it 3
+        // times (simulating 3 requests on ONE connection — the per-connection counter is shared across
+        // the wrapper's clones the way hyper clones the service per request). The 1st response must NOT
+        // carry `Connection: close`; the 2nd (== cap) and 3rd (over cap) MUST.
+        use std::task::Poll;
+        use tower::Service;
+
+        #[derive(Clone)]
+        struct Ok200;
+        impl Service<http::Request<()>> for Ok200 {
+            type Response = http::Response<()>;
+            type Error = std::convert::Infallible;
+            type Future =
+                std::pin::Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+            fn call(&mut self, _req: http::Request<()>) -> Self::Future {
+                Box::pin(async { Ok(http::Response::new(())) })
+            }
+        }
+
+        let mut svc = MaxRequestsService::new(Ok200, Some(2));
+        let has_close = |resp: &http::Response<()>| {
+            resp.headers()
+                .get(http::header::CONNECTION)
+                .map(|v| v.as_bytes().eq_ignore_ascii_case(b"close"))
+                .unwrap_or(false)
+        };
+
+        let r1 = svc.call(http::Request::new(())).await.unwrap();
+        assert!(
+            !has_close(&r1),
+            "request 1 (< cap) must NOT carry Connection: close"
+        );
+        let r2 = svc.call(http::Request::new(())).await.unwrap();
+        assert!(
+            has_close(&r2),
+            "request 2 (== cap) MUST carry Connection: close"
+        );
+        let r3 = svc.call(http::Request::new(())).await.unwrap();
+        assert!(
+            has_close(&r3),
+            "request 3 (> cap) MUST also carry Connection: close (monotone after the cap)"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_requests_service_none_never_stamps_close() {
+        // With the cap disabled (None), no response ever gets `Connection: close` — unlimited reuse.
+        use std::task::Poll;
+        use tower::Service;
+
+        #[derive(Clone)]
+        struct Ok200;
+        impl Service<http::Request<()>> for Ok200 {
+            type Response = http::Response<()>;
+            type Error = std::convert::Infallible;
+            type Future =
+                std::pin::Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+            fn call(&mut self, _req: http::Request<()>) -> Self::Future {
+                Box::pin(async { Ok(http::Response::new(())) })
+            }
+        }
+
+        let mut svc = MaxRequestsService::new(Ok200, None);
+        for _ in 0..5 {
+            let resp = svc.call(http::Request::new(())).await.unwrap();
+            assert!(
+                resp.headers().get(http::header::CONNECTION).is_none(),
+                "with the cap disabled, no response may carry Connection: close"
+            );
+        }
     }
 }
