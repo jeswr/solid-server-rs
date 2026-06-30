@@ -98,7 +98,10 @@ fn main() {
 
     let per_child_ref = ref_op / children.len() as f64;
     let per_child_opt = opt_op / children.len() as f64;
-    println!("# iri_chars_serialisable micro-bench — iters={iters}, {} children/iter", children.len());
+    println!(
+        "# iri_chars_serialisable micro-bench — iters={iters}, {} children/iter",
+        children.len()
+    );
     println!("# load={}", load_avg());
     println!();
     println!("REFERENCE (.chars()+is_control)  {per_child_ref:8.3} ns/child   ({ref_op:.1} ns / 100-child render)");
