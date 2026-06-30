@@ -28,8 +28,10 @@
 //!   - a peer that completes a request, gets its response, then holds the keep-alive connection open
 //!     sending NOTHING further — `header_read_timeout` only bounds a PARTIAL head (bytes started), and
 //!     the h2 PING only reclaims a DEAD peer, so neither closes a LIVE peer on a fully-idle connection.
-//!     The defence is a per-connection **idle-keepalive read timeout** at the IO layer
-//!     ([`IdleTimeoutStream`]): no bytes for the window ⇒ close + reclaim the permit.
+//!     The defence is a per-connection **idle-keepalive timeout** at the IO layer ([`IdleTimeoutStream`]):
+//!     no read/write progress for the window ⇒ close + reclaim the permit. It is **DEFAULT-OFF** — an
+//!     IO-layer idle bound cannot exclude an UPGRADED long-lived stream (a WebSocketChannel2023 receive
+//!     socket that sits quiet until a notification), so it is opt-in (roborev High).
 //!   - unbounded keep-alive REUSE of one connection — bounded by a **max-requests-per-connection** cap
 //!     ([`MaxRequestsService`]) that sets `Connection: close` after N requests (HTTP/1.1 reuse
 //!     rotation; default OFF).
@@ -121,14 +123,16 @@ pub const ENV_KEEP_ALIVE_TIMEOUT_SECS: &str = "SOLID_SERVER_KEEP_ALIVE_TIMEOUT_S
 /// invalid ⇒ [`DEFAULT_HANDSHAKE_TIMEOUT_SECS`]; `0` ⇒ DISABLED (rely on the acceptor's own bound).
 pub const ENV_HANDSHAKE_TIMEOUT_SECS: &str = "SOLID_SERVER_HANDSHAKE_TIMEOUT_SECS";
 
-/// Env var: the per-connection **idle-keepalive timeout** in seconds — a kept-alive connection on which
-/// NO bytes are read for this long (idle BETWEEN requests) is dropped, reclaiming its connection permit.
-/// This is the missing-guard companion to the existing bounds: `header_read_timeout` bounds reading a
-/// COMPLETE header set once bytes START arriving; the h2 keep-alive PING reclaims a DEAD peer (one that
-/// stopped acking). NEITHER bounds a peer that completes a request then holds the keep-alive connection
-/// open sending nothing further — that connection keeps its permit indefinitely. This idle-read timeout
-/// closes it. (It is enforced at the IO layer, on the TLS serve path only — see
-/// [`IdleTimeoutStream`].) Unset / invalid ⇒ [`DEFAULT_IDLE_TIMEOUT_SECS`]; `0` ⇒ DISABLED.
+/// Env var: the per-connection **idle-keepalive timeout** in seconds — a connection with NO read OR
+/// write progress for this long is dropped, reclaiming its connection permit. The missing-guard
+/// companion to the existing bounds: `header_read_timeout` bounds reading a COMPLETE header set once
+/// bytes START arriving; the h2 keep-alive PING reclaims a DEAD peer (one that stopped acking). NEITHER
+/// bounds a peer that completes a request then holds the keep-alive connection open sending nothing
+/// further. This idle bound closes it (IO layer, TLS serve path only — see [`IdleTimeoutStream`]).
+/// **DEFAULT-OFF**: unset / empty / invalid / `0` ⇒ DISABLED. It is OPT-IN because the IO-layer bound
+/// cannot exclude an UPGRADED long-lived streaming connection (a WebSocketChannel2023 receive socket)
+/// that legitimately sits quiet — enable it (e.g. `=75`) only where no such connection exists on this
+/// listener. `>0` ⇒ that idle window. See [`DEFAULT_IDLE_TIMEOUT_SECS`] for the full rationale.
 pub const ENV_IDLE_TIMEOUT_SECS: &str = "SOLID_SERVER_IDLE_TIMEOUT_SECS";
 
 /// Env var: the **max requests per connection** cap — after serving this many requests on a single
@@ -173,13 +177,18 @@ pub const DEFAULT_KEEP_ALIVE_TIMEOUT_SECS: u64 = 60;
 /// releases the CONNECTION PERMIT (not just the handshake) on expiry.
 pub const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 
-/// Default per-connection idle-keepalive timeout (seconds). Generous — it must NEVER trip a legitimate
-/// keep-alive client between requests in normal use OR the conformance run (which reuses a handful of
-/// connections with small inter-request gaps), only reclaim a connection a peer is holding open while
-/// sending nothing. 75s mirrors the common reverse-proxy keep-alive-idle default (nginx
-/// `keepalive_timeout 75s`), so it is a familiar, safely-large bound. An operator tightens it for a
-/// hostile-facing edge.
-pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 75;
+/// Default per-connection idle-keepalive timeout (seconds). **`0` = DISABLED by default** — a
+/// deliberate fail-safe (roborev High): the idle bound is enforced at the raw IO read/write layer, which
+/// CANNOT distinguish an idle HTTP/1.1 keep-alive gap from an UPGRADED, long-lived streaming connection
+/// (a WebSocketChannel2023 receive socket — see [`crate::notifications::ws`]) that is server→client only
+/// and legitimately sits quiet (no inbound bytes, and no outbound until the first notification fires).
+/// Closing such a connection after an idle window would tear down a LIVE subscription. So the guard is
+/// OFF by default; an operator who has NO long-lived upgraded/streaming connections on this listener (or
+/// fronts them elsewhere) opts IN via `SOLID_SERVER_IDLE_TIMEOUT_SECS` — e.g. 75s, the nginx
+/// `keepalive_timeout` default. See [`IdleTimeoutStream`] for the full caveat. When enabled, the
+/// deadline resets on read OR write progress (so an actively-pushing connection survives), but a
+/// connection quiet in BOTH directions is still closed — which is exactly why the WS case needs OFF.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 0;
 
 /// Default max-requests-per-connection. `0` = DISABLED (unlimited keep-alive reuse) — the default,
 /// because a bound here is a defence-in-depth knob (the connection cap + h2 stream caps already bound
@@ -242,10 +251,11 @@ impl TransportConfig {
                 std::env::var(ENV_HANDSHAKE_TIMEOUT_SECS).ok(),
                 DEFAULT_HANDSHAKE_TIMEOUT_SECS,
             ),
-            idle_timeout: parse_optional_secs(
-                std::env::var(ENV_IDLE_TIMEOUT_SECS).ok(),
-                DEFAULT_IDLE_TIMEOUT_SECS,
-            ),
+            // Idle-keepalive is DEFAULT-OFF (opt-in): absent / empty / invalid / `0` ⇒ None (disabled).
+            // Unlike the other timeouts, an absent value is DISABLED (not a default-enabled value) — see
+            // `parse_idle_timeout` + `DEFAULT_IDLE_TIMEOUT_SECS` for why (the upgraded-WS-connection
+            // fail-safe, roborev High).
+            idle_timeout: parse_idle_timeout(std::env::var(ENV_IDLE_TIMEOUT_SECS).ok()),
             max_requests_per_conn: parse_max_requests_per_conn(
                 std::env::var(ENV_MAX_REQUESTS_PER_CONN).ok(),
             ),
@@ -559,13 +569,24 @@ impl<Io: AsyncWrite + Unpin> AsyncWrite for PermittedStream<Io> {
 
 // --- Idle-keepalive timeout (IO-layer read-inactivity bound) --------------------------------------
 
-/// An IO stream that enforces a per-connection **idle-read timeout**: if no bytes are read for the
-/// configured window, the next `poll_read` resolves to an `io::Error` (kind `TimedOut`), which hyper
-/// surfaces as a connection close — reclaiming the connection (and its [`ConnectionLimiter`] permit, via
-/// the outer [`PermittedStream`]). When the timeout is `None` it is a transparent pass-through (zero
-/// overhead — no timer is created).
+/// An IO stream that enforces a per-connection **idle-activity timeout**: if NO read OR write progress
+/// is made for the configured window, the next `poll_read` resolves to an `io::Error` (kind `TimedOut`),
+/// which hyper surfaces as a connection close — reclaiming the connection (and its [`ConnectionLimiter`]
+/// permit, via the outer [`PermittedStream`]). When the timeout is `None` it is a transparent
+/// pass-through (zero overhead — no timer is created).
 ///
-/// ## Why this is the right layer (and the gap it closes)
+/// ## ⚠️ DEFAULT-OFF — the upgraded-streaming-connection caveat (roborev High)
+/// This bound lives at the RAW IO layer, BELOW hyper, so it CANNOT see whether a connection has upgraded
+/// to a long-lived bidirectional stream. A **WebSocketChannel2023 receive socket**
+/// ([`crate::notifications::ws`]) is **server→client only** and legitimately sits quiet — no inbound
+/// bytes, and no outbound until the first notification fires — for as long as the client subscribes.
+/// An idle bound that closed it would tear down a LIVE subscription. So this guard is **disabled by
+/// default** ([`DEFAULT_IDLE_TIMEOUT_SECS`] = 0) and is for operators who terminate no long-lived
+/// upgraded/streaming connections on this listener (or front them elsewhere). The deadline resets on
+/// read OR write activity (so an actively-pushing connection survives even when the guard is on), but a
+/// connection quiet in BOTH directions is still closed — which is exactly why the WS case requires OFF.
+///
+/// ## The gap it closes (when an operator DOES enable it)
 /// hyper exposes NO native idle-connection timeout (verified against hyper 1.x). The existing bounds do
 /// NOT cover an idle keep-alive connection:
 /// - `http1::Builder::header_read_timeout` bounds reading a COMPLETE header set once bytes START
@@ -574,30 +595,36 @@ impl<Io: AsyncWrite + Unpin> AsyncWrite for PermittedStream<Io> {
 /// - the h2 keep-alive PING reclaims a DEAD peer (one that stops acking), not a live peer holding an
 ///   idle connection.
 ///
-/// Wrapping the connection IO with a read-inactivity timeout is the canonical fix in this stack.
+/// ## The timer is reset on READ OR WRITE ACTIVITY (any progress), so an active connection is not killed
+/// The `Sleep` deadline is reset whenever a `poll_read` OR a `poll_write`/`poll_write_vectored` makes
+/// progress (returns `Ready`). It fires ONLY after a full idle window with NO progress in EITHER
+/// direction. A slow-but-progressing reader/writer resets the deadline on each chunk, so this never kills
+/// a legitimately slow link; the slowloris HEADER trickle is bounded separately by `header_read_timeout`
+/// (a complete-head deadline that a per-byte reset cannot defeat).
 ///
-/// ## The timer is reset on READ ACTIVITY (any progress), so a legitimate trickle is not killed
-/// The `Sleep` deadline is reset whenever a `poll_read` makes progress (returns `Ready` with bytes OR a
-/// clean EOF). It fires ONLY after a full idle window with the inner read PENDING the whole time — i.e.
-/// the peer sent nothing. A slow-but-progressing reader resets the deadline on each chunk, so this never
-/// kills a legitimately slow link; the slowloris HEADER trickle is bounded separately by
-/// `header_read_timeout` (a complete-head deadline that a per-byte reset cannot defeat).
-///
-/// ## HTTP/2 interaction (deliberate, documented)
-/// Under HTTP/2 the server's keep-alive PING (when configured) elicits a client PONG — a READ — so the
-/// idle-read deadline is reset by that PONG traffic. The idle-read timeout therefore primarily bounds
-/// HTTP/1.1 keep-alive idle (no PING traffic between requests); on h2 the PING/PONG liveness probe is the
-/// dead-peer reclaim and this timeout is effectively subsumed by it (a peer that stops ponging is dropped
-/// by the PING ack-timeout). This is correct: each protocol's idle/dead-peer reclaim is covered. The
-/// default idle window (75s) is deliberately LARGER than the default PING interval (60s) so the two do
-/// not race on a healthy h2 connection.
+/// ## HTTP/2 interaction
+/// Under HTTP/2 the server's keep-alive PING (when configured) elicits a client PONG — a READ — and the
+/// PING itself is a WRITE, so an h2 connection with the PING on is never seen as idle by this bound; the
+/// PING/PONG liveness probe is the h2 dead-peer reclaim. So when both are enabled, set the idle window
+/// LARGER than the PING interval so they do not race.
 ///
 /// Requires `Io: Unpin` (every stream we serve is `Unpin`); the boxed `Sleep` keeps the wrapper `Unpin`.
 pub struct IdleTimeoutStream<Io> {
     inner: Io,
     /// `None` ⇒ no idle bound (transparent pass-through). `Some((dur, sleep))` ⇒ enforce `dur` of
-    /// read-inactivity; `sleep` is the live deadline, reset to `now + dur` on each read that progresses.
+    /// read+write inactivity; `sleep` is the live deadline, reset to `now + dur` on each read OR write
+    /// that progresses.
     idle: Option<(Duration, Pin<Box<tokio::time::Sleep>>)>,
+}
+
+impl<Io> IdleTimeoutStream<Io> {
+    /// Reset the idle deadline to `now + dur` — called on any read OR write progress so an actively
+    /// transferring connection is never closed by the idle bound. A no-op when the guard is disabled.
+    fn touch(idle: &mut Option<(Duration, Pin<Box<tokio::time::Sleep>>)>) {
+        if let Some((dur, sleep)) = idle.as_mut() {
+            sleep.as_mut().reset(tokio::time::Instant::now() + *dur);
+        }
+    }
 }
 
 impl<Io> IdleTimeoutStream<Io> {
@@ -620,20 +647,19 @@ impl<Io: AsyncRead + Unpin> AsyncRead for IdleTimeoutStream<Io> {
         // Poll the inner read first. On any progress (Ready), reset the idle deadline and return it.
         match Pin::new(&mut this.inner).poll_read(cx, buf) {
             Poll::Ready(result) => {
-                if let Some((dur, sleep)) = this.idle.as_mut() {
-                    // Read progressed (bytes or EOF) ⇒ the connection is active ⇒ push the deadline out.
-                    sleep.as_mut().reset(tokio::time::Instant::now() + *dur);
-                }
+                // Read progressed (bytes or EOF) ⇒ the connection is active ⇒ push the deadline out.
+                Self::touch(&mut this.idle);
                 Poll::Ready(result)
             }
             Poll::Pending => {
                 // Inner read is pending (no bytes available). If the idle deadline has now elapsed, the
-                // connection has been silent for the whole window ⇒ close it with a TimedOut error.
+                // connection has made NO progress (read or write) for the whole window ⇒ close it with a
+                // TimedOut error. (A write since the last reset would have pushed the deadline out.)
                 if let Some((_dur, sleep)) = this.idle.as_mut() {
                     if sleep.as_mut().poll(cx).is_ready() {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::TimedOut,
-                            "connection idle past the keep-alive idle timeout — closing",
+                            "connection idle (no read/write progress) past the idle timeout — closing",
                         )));
                     }
                 }
@@ -649,7 +675,14 @@ impl<Io: AsyncWrite + Unpin> AsyncWrite for IdleTimeoutStream<Io> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        let this = &mut *self;
+        let r = Pin::new(&mut this.inner).poll_write(cx, buf);
+        // A write that progressed is connection ACTIVITY (e.g. a server→client WS push / response body)
+        // ⇒ reset the idle deadline so an actively-pushing connection is never closed by the idle bound.
+        if r.is_ready() {
+            Self::touch(&mut this.idle);
+        }
+        r
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -665,7 +698,12 @@ impl<Io: AsyncWrite + Unpin> AsyncWrite for IdleTimeoutStream<Io> {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+        let this = &mut *self;
+        let r = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+        if r.is_ready() {
+            Self::touch(&mut this.idle); // vectored write progress is connection activity too
+        }
+        r
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -844,7 +882,23 @@ pub fn parse_max_requests_per_conn(raw: Option<String>) -> Option<u64> {
     }
 }
 
-/// Resolve an optional-seconds timeout (header-read / keep-alive / idle): absent / empty / non-numeric ⇒
+/// Resolve the idle-keepalive timeout. This guard is **DEFAULT-OFF / OPT-IN** (unlike the header-read /
+/// keep-alive timeouts), so the absent case is DISABLED, not a default-enabled value: absent / empty /
+/// non-numeric / `0` ⇒ `None` (DISABLED); `>0` ⇒ `Some(n)` (enabled with that idle window). The
+/// fail-safe default is load-bearing — an IO-layer idle bound cannot exclude an UPGRADED long-lived
+/// streaming connection (a WebSocketChannel2023 receive socket), so it must be opted into only where no
+/// such connection exists (see [`DEFAULT_IDLE_TIMEOUT_SECS`] / [`IdleTimeoutStream`], roborev High).
+pub fn parse_idle_timeout(raw: Option<String>) -> Option<Duration> {
+    match raw.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(s) => match s.parse::<u64>() {
+            Ok(0) | Err(_) => None,
+            Ok(n) => Some(Duration::from_secs(n)),
+        },
+    }
+}
+
+/// Resolve an optional-seconds timeout (header-read / keep-alive): absent / empty / non-numeric ⇒
 /// `Some(default)` (ENABLED at the default); `0` ⇒ `None` (explicitly DISABLED); `>0` ⇒ `Some(n)`.
 pub fn parse_optional_secs(raw: Option<String>, default_secs: u64) -> Option<Duration> {
     let secs = match raw.as_deref().map(str::trim) {
@@ -993,7 +1047,9 @@ mod tests {
                 max_connections: DEFAULT_MAX_CONNECTIONS,
                 keep_alive_timeout: Some(Duration::from_secs(DEFAULT_KEEP_ALIVE_TIMEOUT_SECS)),
                 handshake_timeout: Some(Duration::from_secs(DEFAULT_HANDSHAKE_TIMEOUT_SECS)),
-                idle_timeout: Some(Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)),
+                // Idle-keepalive is DEFAULT-OFF (the upgraded-WS-connection fail-safe, roborev High):
+                // an absent var ⇒ None (disabled), NOT a default-enabled value.
+                idle_timeout: None,
                 // Default-OFF: a finite reuse cap is opt-in (it could trip a high-reuse client / the
                 // harness), so the documented default is `None` (unlimited keep-alive reuse).
                 max_requests_per_conn: None,
@@ -1174,6 +1230,80 @@ mod tests {
         assert_eq!(parse_max_requests_per_conn(Some("1".into())), Some(1));
         assert_eq!(parse_max_requests_per_conn(Some("1000".into())), Some(1000));
         assert_eq!(parse_max_requests_per_conn(Some("  64  ".into())), Some(64));
+    }
+
+    #[test]
+    fn idle_timeout_is_default_off_and_zero_disables() {
+        // DEFAULT-OFF (the upgraded-WS-connection fail-safe, roborev High): absent / empty / invalid /
+        // `0` ⇒ None (DISABLED). Only a positive value enables it. This is the load-bearing safety
+        // property — an absent or typo'd value must NEVER silently turn on an IO-layer idle bound that
+        // could close a WebSocketChannel2023 receive socket.
+        assert_eq!(parse_idle_timeout(None), None);
+        assert_eq!(parse_idle_timeout(Some("".into())), None);
+        assert_eq!(parse_idle_timeout(Some("  ".into())), None);
+        assert_eq!(parse_idle_timeout(Some("abc".into())), None);
+        assert_eq!(parse_idle_timeout(Some("0".into())), None);
+        // The default constant is 0 (disabled) — pin it so a future bump is a conscious choice.
+        assert_eq!(DEFAULT_IDLE_TIMEOUT_SECS, 0);
+        // A positive value enables it.
+        assert_eq!(
+            parse_idle_timeout(Some("75".into())),
+            Some(Duration::from_secs(75))
+        );
+        assert_eq!(
+            parse_idle_timeout(Some("  30  ".into())),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_stream_resets_on_write_activity_does_not_close_active_pusher() {
+        // An actively-PUSHING connection (server→client writes, no inbound reads — the WS-push shape)
+        // must NOT be closed by the idle bound: a write resets the deadline. We poll READ and WRITE on
+        // the SAME stream from one task (no lock — as hyper drives a connection): the read stays PENDING
+        // while periodic writes keep the deadline fresh, across a TOTAL time > the idle window. Without
+        // the write-reset, the read would resolve to a TimedOut error within one window.
+        use std::future::poll_fn;
+        use tokio::io::ReadBuf;
+        use tokio::time::{sleep, Duration as TDur};
+
+        let idle_window = TDur::from_millis(120);
+        let (client, server) = tokio::io::duplex(1024);
+        // Keep the client end open so the duplex never EOFs (an EOF would resolve the read independently
+        // of the idle bound and mask what we're testing).
+        let _client_keepalive = client;
+        let mut idle = IdleTimeoutStream::new(server, Some(idle_window));
+
+        // Drive 5 write+poll-read cycles, each half a window apart (total ~5*60ms = 300ms > 120ms idle).
+        // Each iteration: WRITE (resets the deadline), then poll READ ONCE (must be Pending, NOT a
+        // TimedOut error). The reads never get bytes (client sends nothing), so the ONLY way a read here
+        // becomes Ready is the idle bound firing — which the writes must prevent.
+        let mut rbuf = [0u8; 1];
+        for i in 0..5 {
+            // Write (server→client push) — resets the idle deadline.
+            poll_fn(|cx| Pin::new(&mut idle).poll_write(cx, b"push"))
+                .await
+                .expect("server push write");
+            // Poll the read ONCE; it must be Pending (no data, and the deadline was just reset).
+            let read_state = poll_fn(|cx| {
+                let mut buf = ReadBuf::new(&mut rbuf);
+                match Pin::new(&mut idle).poll_read(cx, &mut buf) {
+                    Poll::Pending => Poll::Ready(Ok::<bool, io::Error>(false)), // pending = healthy
+                    Poll::Ready(Ok(())) => Poll::Ready(Ok(true)), // EOF/data (unexpected)
+                    Poll::Ready(Err(e)) => Poll::Ready(Err(e)),   // idle fired (the guard)
+                }
+            })
+            .await;
+            match read_state {
+                Ok(false) => { /* pending — healthy; the write kept it alive */ }
+                Ok(true) => panic!("read iteration {i} got data/EOF unexpectedly (test setup wrong)"),
+                Err(e) => panic!(
+                    "the idle bound FIRED on an actively-PUSHING connection at iteration {i} ({e}) — a \
+                     write must reset the deadline (the WS-push fail-safe)"
+                ),
+            }
+            sleep(idle_window / 2).await;
+        }
     }
 
     #[tokio::test]
