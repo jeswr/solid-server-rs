@@ -327,6 +327,44 @@ impl<S: Store> LdpState<S> {
         }
     }
 
+    /// WAC container-modification authorization for a CREATE (the missing half of the WAC create rule).
+    ///
+    /// Creating a resource — and materialising any missing intermediate container via
+    /// [`ensure_ancestor_containers`] — MUTATES the `ldp:contains` membership of the nearest EXISTING
+    /// ancestor container. Per Web Access Control this requires `acl:Append` (which `acl:Write`
+    /// subsumes) ON THAT CONTAINER via its own `acl:accessTo` scope — the "creating a resource requires
+    /// write/append access to the containing container" rule (WAC spec §"Modes of access"; CSS's create
+    /// authorization; the TS-sibling `authorizeCreation`). This is enforced IN ADDITION to the target's
+    /// own effective-ACL Write/Append that the create paths authorize first (which the existence-non-
+    /// disclosure V1/V3 closure requires), and makes CREATE **symmetric with DELETE** (whose parent-Write
+    /// check gates containment shrink). Without it, an `acl:default`-only Write grant — or a
+    /// Control-holder-pre-provisioned target `.acl` — would let an agent with NO mode on the container
+    /// create members / intermediate containers in it (a privilege-escalation container-write bypass).
+    ///
+    /// An `.acl` auxiliary is NOT a contained child (it carries no `ldp:contains` edge — see the create
+    /// paths), so authoring one mutates no containment and is exempt (mirroring DELETE, which skips its
+    /// parent-Write check for an `.acl`). The check runs against the nearest EXISTING ancestor via
+    /// [`nearest_existing_container`](Self::nearest_existing_container); when NONE exists (an
+    /// unprovisioned store whose root container is absent) there is no container whose membership is
+    /// being mutated, so the check is skipped — exactly as DELETE skips its parent check on a `None`
+    /// nearest-parent. The access decision reads only ancestor `.acl` resources (never the target).
+    async fn authorize_container_modification(
+        &self,
+        target_iri: &str,
+        token: &VerifiedToken,
+        origin: Option<&str>,
+    ) -> Result<(), ServerError> {
+        // An `.acl` auxiliary is not a contained child — no container-modification right is required.
+        if crate::authz::is_acl_resource(target_iri) {
+            return Ok(());
+        }
+        if let Some(container) = self.nearest_existing_container(target_iri).await? {
+            self.authorize_iri(&container, AccessMode::Append, token, origin)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// EXISTENCE-NON-DISCLOSURE — the **V4** conditional-channel closure (decisions/0003).
     ///
     /// A conditional precondition (`If-Match` / `If-None-Match`) on a mutating request is evaluated
@@ -674,6 +712,15 @@ pub async fn put_handler<S: Store>(
         // resource into its parent's `ldp:contains` membership (so the container GET lists it). An
         // ancestor that already exists as a NON-container is a conflict (a resource cannot have a
         // child) → handled by `ensure_ancestor_containers`.
+        //
+        // WAC container-modification: this mutates the containment of the nearest existing ancestor, so
+        // it requires `acl:Append` (Write subsumes) ON THAT CONTAINER — in addition to the target-ACL
+        // Write authorized above. Symmetric with DELETE's parent-Write check; closes the create-authz
+        // widening (an `acl:default`-only Write / pre-provisioned target `.acl` must NOT let an agent
+        // with no mode on the container mint members or intermediate containers in it).
+        state
+            .authorize_container_modification(&target.iri, &token, origin)
+            .await?;
         ensure_ancestor_containers(state.as_ref(), &target.iri).await?;
         match &parent {
             Some(p) => {
@@ -1117,6 +1164,13 @@ pub async fn patch_handler<S: Store>(
         // Create-on-PATCH: like PUT, create intermediate containers + wire the new resource into its
         // parent's `ldp:contains` (so the containment scenario's container GET lists it). An ancestor
         // that exists as a non-container is a conflict (`ensure_ancestor_containers`).
+        //
+        // WAC container-modification (same as PUT-create): materialising the new member (+ any missing
+        // intermediate container) mutates the nearest existing ancestor's containment, so it requires
+        // `acl:Append` on THAT container — in addition to the content-derived target-ACL mode above.
+        state
+            .authorize_container_modification(&target.iri, &token, origin)
+            .await?;
         ensure_ancestor_containers(state.as_ref(), &target.iri).await?;
         match &parent {
             Some(p) => {
@@ -3682,6 +3736,217 @@ mod tests {
         assert!(
             alice_get.etag.is_some(),
             "the authorized reader DOES receive the container ETag"
+        );
+    }
+
+    // =====================================================================================
+    // CREATE-AUTHZ CONTAINER-MODIFICATION (PR #3 review finding [HIGH]) — creating a member (or an
+    // intermediate container) requires `acl:Append`/`Write` on the CONTAINING container, in ADDITION
+    // to the target's own effective-ACL mode. An `acl:default`-only Write grant (or a pre-provisioned
+    // target `.acl`) must NOT let an agent with NO mode on the container mint members in it. Symmetric
+    // with DELETE's parent-Write check.
+    // =====================================================================================
+
+    /// A third agent (distinct from ALICE/BOB) for the create-authz positive control.
+    const CAROL: &str = "https://pod.example/carol/profile/card#me";
+
+    /// `/alice/c/` exists with a container `.acl` where:
+    ///  - ALICE: `acl:accessTo` + `acl:default` Read/Write/Control (full owner).
+    ///  - BOB: `acl:default acl:Write` ONLY — inheritable Write on the container's MEMBERS, but NO
+    ///    `acl:accessTo` on the container itself (so Bob holds NO mode on `/alice/c/` as a target). This
+    ///    is the attacker shape the finding names: Bob can WRITE any member's representation (target-ACL
+    ///    Write via default) yet must NOT be able to CREATE one (no container-modification right).
+    ///  - CAROL: `acl:default acl:Write` (member Write, so target auth passes) PLUS `acl:accessTo
+    ///    acl:Append` on the container (the container-modification right) — the "WITH container
+    ///    write/append" agent who IS allowed to create.
+    async fn store_default_write_no_container_access(
+    ) -> Arc<LdpState<CompositeStore<InMemorySparqClient, InMemoryBlobStore>>> {
+        let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        store
+            .write(
+                "https://pod.example/alice/c/",
+                AxBytes::from(String::new()),
+                "text/turtle",
+            )
+            .await
+            .expect("seed container");
+        let acl = format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#alice> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <https://pod.example/alice/c/>; acl:default <https://pod.example/alice/c/>; acl:mode acl:Read, acl:Write, acl:Control.
+<#bob> a acl:Authorization; acl:agent <{BOB}>; acl:default <https://pod.example/alice/c/>; acl:mode acl:Write.
+<#carol> a acl:Authorization; acl:agent <{CAROL}>; acl:accessTo <https://pod.example/alice/c/>; acl:default <https://pod.example/alice/c/>; acl:mode acl:Write, acl:Append."#
+        );
+        store
+            .write(
+                "https://pod.example/alice/c/.acl",
+                AxBytes::from(acl),
+                "text/turtle",
+            )
+            .await
+            .expect("seed container acl");
+        Arc::new(LdpState::new(store, "https://pod.example"))
+    }
+
+    fn carol() -> VerifiedToken {
+        VerifiedToken {
+            web_id: Some(CAROL.into()),
+            ..VerifiedToken::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn create_authz_default_write_only_agent_denied_put_create() {
+        // Bob holds member Write via `acl:default` (so his target-ACL Write authorizes the write itself)
+        // but NO mode on the container → a PUT-create must be DENIED (403), and nothing written. Pre-fix
+        // the create authorized purely against the (inherited) target ACL and returned 201.
+        let state = store_default_write_no_container_access().await;
+        let got = observe(
+            put_handler(
+                State(state.clone()),
+                Extension(bob()),
+                "/alice/c/newdoc".parse().unwrap(),
+                turtle_headers(),
+                body_bytes(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 403,
+            "an acl:default-only Write agent with NO container mode must be denied PUT-create: {got:?}"
+        );
+        assert!(
+            !state
+                .store
+                .exists("https://pod.example/alice/c/newdoc")
+                .await
+                .unwrap(),
+            "a denied PUT-create must have written nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_authz_default_write_only_agent_denied_patch_create() {
+        // The same closure on the create-on-PATCH path: an INSERT-only patch (needs Append on the
+        // target, which Bob's member Write satisfies) still must be denied at the container-modification
+        // check because Bob holds no Append on the container → 403, nothing written.
+        let state = store_default_write_no_container_access().await;
+        let got = observe(
+            patch_handler(
+                State(state.clone()),
+                Extension(bob()),
+                "/alice/c/newdoc".parse().unwrap(),
+                n3_patch_headers(),
+                insert_only_patch("https://pod.example/alice/c/newdoc#me"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 403,
+            "an acl:default-only Write agent must be denied create-on-PATCH: {got:?}"
+        );
+        assert!(
+            !state
+                .store
+                .exists("https://pod.example/alice/c/newdoc")
+                .await
+                .unwrap(),
+            "a denied PATCH-create must have written nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_authz_default_write_only_agent_denied_post() {
+        // POST already routes the container-modification right through its container-Append
+        // authorization: Bob holds no `acl:accessTo` mode on `/alice/c/`, so a POST is denied (403). This
+        // pins that CREATE (PUT/PATCH) is now symmetric with POST — all three require the container right.
+        let state = store_default_write_no_container_access().await;
+        let got = observe(
+            post_handler(
+                State(state.clone()),
+                Extension(bob()),
+                "/alice/c/".parse().unwrap(),
+                turtle_headers(),
+                body_bytes(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 403,
+            "an acl:default-only Write agent must be denied POST (no container Append): {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_authz_default_write_only_agent_denied_deep_ancestor_mint() {
+        // The `ensure_ancestor_containers` escalation: Bob PUT-creates `/alice/c/deep/x` (an inherited
+        // target ACL grants member Write). The container-modification check authorizes Append on the
+        // NEAREST EXISTING ancestor (`/alice/c/`) — which Bob lacks — so the mint of the intermediate
+        // container `/alice/c/deep/` is refused (403), and no intermediate container is materialised.
+        let state = store_default_write_no_container_access().await;
+        let got = observe(
+            put_handler(
+                State(state.clone()),
+                Extension(bob()),
+                "/alice/c/deep/x".parse().unwrap(),
+                turtle_headers(),
+                body_bytes(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 403,
+            "a deep-ancestor mint by an agent with no container right must be denied: {got:?}"
+        );
+        assert!(
+            !state
+                .store
+                .exists("https://pod.example/alice/c/deep/")
+                .await
+                .unwrap(),
+            "a denied deep mint must NOT have materialised the intermediate container"
+        );
+        assert!(
+            !state
+                .store
+                .exists("https://pod.example/alice/c/deep/x")
+                .await
+                .unwrap(),
+            "a denied deep mint must NOT have written the target"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_authz_agent_with_container_append_is_allowed() {
+        // The positive control: CAROL holds member Write (target auth) AND `acl:accessTo acl:Append` on
+        // the container (the container-modification right) → her PUT-create succeeds (201). This proves
+        // the fix denies ONLY the missing-container-right shape, not every non-owner create.
+        let state = store_default_write_no_container_access().await;
+        let got = observe(
+            put_handler(
+                State(state.clone()),
+                Extension(carol()),
+                "/alice/c/newdoc".parse().unwrap(),
+                turtle_headers(),
+                body_bytes(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 201,
+            "an agent WITH container Append (+ member Write) must be allowed to create: {got:?}"
+        );
+        assert!(
+            state
+                .store
+                .exists("https://pod.example/alice/c/newdoc")
+                .await
+                .unwrap(),
+            "the allowed create must have written the resource"
         );
     }
 }
