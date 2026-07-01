@@ -726,6 +726,15 @@ impl<Io: AsyncWrite + Unpin> AsyncWrite for IdleTimeoutStream<Io> {
 /// any OTHER connection's service (each `accept` makes a fresh `Arc`). A `fetch_add` on each call gives
 /// the request's 1-based ordinal; at/after the cap the response gets `Connection: close`.
 ///
+/// ## Protocol-upgrade exemption (the WebSocketChannel2023 receive socket)
+/// The `Connection: close` stamp is SKIPPED for a protocol-UPGRADE response — a `101 Switching
+/// Protocols` or any response carrying an `Upgrade` header / `Connection: upgrade` token (see
+/// [`is_upgrade_response`]). The WS receive-socket handshake (`GET …/receive`) is served through this
+/// same guarded acceptor, so with a small cap the upgrade IS the cap-th (or a later) request; stamping
+/// `Connection: close` on its 101 would strip the required `Connection: Upgrade` token and the client
+/// would FAIL the handshake (RFC 6455 §4.1). The cap still applies to ordinary keep-alive responses;
+/// it simply never clobbers an upgrade.
+///
 /// ## Why a header, not `graceful_shutdown` (the correctness choice)
 /// Setting `Connection: close` lets the IN-FLIGHT response complete cleanly and THEN closes the
 /// connection — the HTTP-correct way to end keep-alive reuse. Calling hyper's per-connection
@@ -802,6 +811,29 @@ pin_project_lite::pin_project! {
     }
 }
 
+/// Whether `resp` is a protocol-UPGRADE response whose `Connection` header MUST be preserved — a `101
+/// Switching Protocols` (the WebSocketChannel2023 receive-socket handshake) or any response already
+/// carrying an `Upgrade` header / a `Connection: upgrade` token. The max-requests cap MUST NOT stamp
+/// `Connection: close` on such a response: RFC 6455 §4.1 requires the client to FAIL the WebSocket
+/// handshake when `Connection` lacks the `upgrade` token, so clobbering it would break every live
+/// notification receive socket that happens to be the cap-th (or a later) request on its connection.
+fn is_upgrade_response<B>(resp: &http::Response<B>) -> bool {
+    if resp.status() == http::StatusCode::SWITCHING_PROTOCOLS {
+        return true;
+    }
+    if resp.headers().contains_key(http::header::UPGRADE) {
+        return true;
+    }
+    // A `Connection` header listing the `upgrade` token (comma-separated, case-insensitive).
+    resp.headers()
+        .get(http::header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| {
+            s.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+        })
+}
+
 impl<F, ResBody, E> Future for MaxRequestsFuture<F>
 where
     F: Future<Output = Result<http::Response<ResBody>, E>>,
@@ -812,10 +844,12 @@ where
         let this = self.project();
         match this.inner.poll(cx) {
             Poll::Ready(Ok(mut resp)) => {
-                if *this.close {
-                    // End keep-alive reuse after this response. `HeaderValue::from_static` is infallible
-                    // for this constant. (On h2 hyper ignores this connection-specific header — see the
-                    // service docs; harmless.)
+                // End keep-alive reuse after this response — UNLESS it is a protocol upgrade (a 101 WS
+                // receive-socket handshake), whose `Connection: Upgrade` we must never clobber (else the
+                // client fails the WebSocket handshake — RFC 6455 §4.1). See [`is_upgrade_response`].
+                if *this.close && !is_upgrade_response(&resp) {
+                    // `HeaderValue::from_static` is infallible for this constant. (On h2 hyper ignores
+                    // this connection-specific header — see the service docs; harmless.)
                     resp.headers_mut().insert(
                         http::header::CONNECTION,
                         http::HeaderValue::from_static("close"),
@@ -1441,5 +1475,104 @@ mod tests {
                 "with the cap disabled, no response may carry Connection: close"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn max_requests_service_never_clobbers_a_101_websocket_upgrade() {
+        // The WebSocketChannel2023 receive-socket handshake is a `101 Switching Protocols` served through
+        // the SAME guarded acceptor. With cap=1 the VERY FIRST request on a fresh connection is already
+        // at the cap, so without the exemption every WS upgrade would be stamped `Connection: close` and
+        // the client would FAIL the RFC 6455 handshake. The guard must leave the upgrade response's
+        // `Connection: Upgrade` intact.
+        use std::task::Poll;
+        use tower::Service;
+
+        // A stub service returning the axum-shaped WS upgrade response: 101 + `Connection: Upgrade` +
+        // `Upgrade: websocket` (exactly what `WebSocketUpgrade` emits).
+        #[derive(Clone)]
+        struct Ws101;
+        impl Service<http::Request<()>> for Ws101 {
+            type Response = http::Response<()>;
+            type Error = std::convert::Infallible;
+            type Future =
+                std::pin::Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+            fn call(&mut self, _req: http::Request<()>) -> Self::Future {
+                Box::pin(async {
+                    let mut resp = http::Response::new(());
+                    *resp.status_mut() = http::StatusCode::SWITCHING_PROTOCOLS;
+                    resp.headers_mut().insert(
+                        http::header::CONNECTION,
+                        http::HeaderValue::from_static("Upgrade"),
+                    );
+                    resp.headers_mut().insert(
+                        http::header::UPGRADE,
+                        http::HeaderValue::from_static("websocket"),
+                    );
+                    Ok(resp)
+                })
+            }
+        }
+
+        // cap=1 ⇒ the first (and every) request is at/over the cap ⇒ the guard WOULD stamp close.
+        let mut svc = MaxRequestsService::new(Ws101, Some(1));
+        let resp = svc.call(http::Request::new(())).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            http::StatusCode::SWITCHING_PROTOCOLS,
+            "the 101 status must be preserved"
+        );
+        let conn = resp
+            .headers()
+            .get(http::header::CONNECTION)
+            .expect("the upgrade response must retain its Connection header");
+        assert!(
+            conn.as_bytes().eq_ignore_ascii_case(b"upgrade"),
+            "the max-requests cap MUST NOT clobber `Connection: Upgrade` on a 101 — got {conn:?} (WS \
+             handshake would fail, RFC 6455 §4.1)"
+        );
+        assert!(
+            resp.headers().get(http::header::UPGRADE).is_some(),
+            "the Upgrade header must survive the guard"
+        );
+    }
+
+    #[test]
+    fn is_upgrade_response_detects_upgrades_and_ignores_plain_responses() {
+        // 101 status ⇒ upgrade.
+        let mut r = http::Response::new(());
+        *r.status_mut() = http::StatusCode::SWITCHING_PROTOCOLS;
+        assert!(is_upgrade_response(&r));
+
+        // `Connection: upgrade` token (case-insensitive, possibly comma-listed) ⇒ upgrade.
+        let mut r = http::Response::new(());
+        r.headers_mut().insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("keep-alive, Upgrade"),
+        );
+        assert!(is_upgrade_response(&r));
+
+        // Bare `Upgrade` header ⇒ upgrade.
+        let mut r = http::Response::new(());
+        r.headers_mut().insert(
+            http::header::UPGRADE,
+            http::HeaderValue::from_static("websocket"),
+        );
+        assert!(is_upgrade_response(&r));
+
+        // A plain 200 with no upgrade signals ⇒ NOT an upgrade (the cap may stamp close).
+        let r = http::Response::new(());
+        assert!(!is_upgrade_response(&r));
+
+        // `Connection: close` is not an upgrade token.
+        let mut r = http::Response::new(());
+        r.headers_mut().insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("close"),
+        );
+        assert!(!is_upgrade_response(&r));
     }
 }
