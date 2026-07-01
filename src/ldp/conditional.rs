@@ -82,8 +82,11 @@ pub fn require(p: Precondition) -> Result<(), ServerError> {
     }
 }
 
-/// Whether a header value is the wildcard `*` (after trimming).
-fn is_wildcard(header: &str) -> bool {
+/// Whether a header value is the wildcard `*` (after trimming). `pub(crate)` so the V4
+/// existence-non-disclosure guard ([`crate::ldp::handler`]) can distinguish a bare `*` precondition
+/// (existence-only, no content-derived ETag) from a concrete-validator one when deciding whether a
+/// conditional write must be Read-gated.
+pub(crate) fn is_wildcard(header: &str) -> bool {
     header.trim() == "*"
 }
 

@@ -327,23 +327,115 @@ impl<S: Store> LdpState<S> {
         }
     }
 
-    /// Authorize CREATION of a new resource at `target` — WAC creation grants live on the PARENT
-    /// container (a client may write `/c/new` if granted `acl:Append`/`acl:Write` on `/c/`), so this
-    /// authorizes `acl:Append` at the nearest EXISTING ancestor container (intermediate containers are
-    /// auto-created later, but their materialisation needs the same right at the nearest existing
-    /// ancestor — else an unauthorized agent could create containers for free). Mirrors
-    /// prod-solid-server `authorizeCreation`.
-    async fn authorize_create(
+    /// WAC container-modification authorization for a CREATE (the missing half of the WAC create rule).
+    ///
+    /// Creating a resource — and materialising any missing intermediate container via
+    /// [`ensure_ancestor_containers`] — MUTATES the `ldp:contains` membership of the nearest EXISTING
+    /// ancestor container. Per Web Access Control this requires `acl:Append` (which `acl:Write`
+    /// subsumes) ON THAT CONTAINER via its own `acl:accessTo` scope — the "creating a resource requires
+    /// write/append access to the containing container" rule (WAC spec §"Modes of access"; CSS's create
+    /// authorization; the TS-sibling `authorizeCreation`). This is enforced IN ADDITION to the target's
+    /// own effective-ACL Write/Append that the create paths authorize first (which the existence-non-
+    /// disclosure V1/V3 closure requires), and makes CREATE **symmetric with DELETE** (whose parent-Write
+    /// check gates containment shrink). Without it, an `acl:default`-only Write grant — or a
+    /// Control-holder-pre-provisioned target `.acl` — would let an agent with NO mode on the container
+    /// create members / intermediate containers in it (a privilege-escalation container-write bypass).
+    ///
+    /// An `.acl` auxiliary is NOT a contained child (it carries no `ldp:contains` edge — see the create
+    /// paths), so authoring one mutates no containment and is exempt (mirroring DELETE, which skips its
+    /// parent-Write check for an `.acl`). The check runs against the nearest EXISTING ancestor via
+    /// [`nearest_existing_container`](Self::nearest_existing_container); when NONE exists (an
+    /// unprovisioned store whose root container is absent) there is no container whose membership is
+    /// being mutated, so the check is skipped — exactly as DELETE skips its parent check on a `None`
+    /// nearest-parent. The access decision reads only ancestor `.acl` resources (never the target).
+    async fn authorize_container_modification(
         &self,
-        target: &LdpTarget,
+        target_iri: &str,
         token: &VerifiedToken,
         origin: Option<&str>,
     ) -> Result<(), ServerError> {
-        let parent = self.nearest_existing_container(&target.iri).await?;
-        let container =
-            parent.unwrap_or_else(|| format!("{}/", self.base_url.trim_end_matches('/')));
-        self.authorize_iri(&container, AccessMode::Append, token, origin)
-            .await
+        // An `.acl` auxiliary is not a contained child — no container-modification right is required.
+        if crate::authz::is_acl_resource(target_iri) {
+            return Ok(());
+        }
+        if let Some(container) = self.nearest_existing_container(target_iri).await? {
+            self.authorize_iri(&container, AccessMode::Append, token, origin)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// EXISTENCE-NON-DISCLOSURE — the **V4** conditional-channel closure (decisions/0003).
+    ///
+    /// A conditional precondition (`If-Match` / `If-None-Match`) on a mutating request is evaluated
+    /// against the target's CURRENT ETag, which is a CONTENT-derived (for a document) or
+    /// MEMBERSHIP-derived (for a container) validator. Its 412-vs-2xx outcome — and any `ETag` the
+    /// write response then carries — therefore leak whether the target exists AND a fingerprint of a
+    /// representation the requester may NOT be entitled to read. A `Write`-without-`Read` holder doing
+    /// `PUT … If-Match: "x"` could thus probe existence (412 if present-and-mismatched, 2xx-then-ETag if
+    /// present-and-matched, 412 if absent under `If-Match`) and learn the content/membership ETag of a
+    /// body it cannot GET.
+    ///
+    /// Closure: treat a content/membership-derived validator as REQUIRING the mode that governs READING
+    /// the target's representation — `acl:Read` for a normal resource, but `acl:Control` for an `.acl`
+    /// target (reading an `.acl`'s representation is itself a Control operation; `Control` does NOT imply
+    /// `Read`, so the read-mode for an `.acl` is Control, not Read — else a Control-only holder, who IS
+    /// entitled to the `.acl`'s ETag, would be wrongly denied a conditional `.acl` write). When the
+    /// request carries ANY conditional precondition AND the (already-authorized) requester's granted
+    /// modes do NOT include that read-mode, return the requester's DENIAL code (401 anonymous / 403
+    /// authenticated) INSTEAD of evaluating the precondition — so the conditional outcome reveals
+    /// nothing. A requester WITHOUT a conditional header is unaffected (no validator is consulted on
+    /// their path), and a requester who holds the read-mode keeps full conditional semantics. `granted`
+    /// is the mode set the write authorization already returned (no extra ACL resolution).
+    fn guard_conditional_requires_read(
+        &self,
+        target_iri: &str,
+        headers: &HeaderMap,
+        granted: &std::collections::BTreeSet<AccessMode>,
+        token: &VerifiedToken,
+    ) -> Result<(), ServerError> {
+        // Only a CONCRETE entity-tag validator gates on Read. A bare `*` (`If-None-Match: *` safe-create
+        // / `If-Match: *` lost-update guard) carries NO content-derived ETag fingerprint — it tests only
+        // EXISTENCE, which a holder of the operation's required mode is already entitled to per this
+        // module's own invariant (and already learns from the unconditional 201-vs-204 write split). So a
+        // bare `*` is EXEMPT from this Read-gate: a `Write`-without-`Read` holder keeps the spec-
+        // recommended conditional safe-create / lost-update guards with ZERO non-disclosure loss. A
+        // QUOTED validator still leaks a content/membership ETag (and the response then carries the
+        // target's real ETag), so it still requires the read-mode. (This closed the V4-over-broad
+        // finding: bare `*` was previously 403'd for a Write-without-Read holder, breaking the standard
+        // Inrupt `PUT … If-None-Match: *` create pattern for no non-disclosure gain.)
+        let has_etag_conditional = Self::conditional_carries_etag(headers, header::IF_MATCH)
+            || Self::conditional_carries_etag(headers, header::IF_NONE_MATCH);
+        // The mode that governs reading THIS target's representation: Control for an `.acl`, else Read.
+        let read_mode = if crate::authz::is_acl_resource(target_iri) {
+            AccessMode::Control
+        } else {
+            AccessMode::Read
+        };
+        if has_etag_conditional && !granted.contains(&read_mode) {
+            return Err(if token.web_id.is_none() {
+                self.unauthenticated()
+            } else {
+                ServerError::Forbidden
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether the conditional precondition header `name` carries a CONCRETE entity-tag validator (a
+    /// quoted ETag, or a list of them) rather than the bare `*` wildcard. An ABSENT header carries
+    /// none; a bare `*` is existence-only (not content-derived) so it is NOT ETag-bearing; anything
+    /// else — including a present-but-non-ASCII value that cannot be decoded — is treated as ETag-
+    /// bearing (fail-closed), keeping it subject to the V4 Read-gate. Used only by
+    /// [`guard_conditional_requires_read`](Self::guard_conditional_requires_read).
+    fn conditional_carries_etag(headers: &HeaderMap, name: HeaderName) -> bool {
+        match headers.get(&name) {
+            None => false,
+            Some(v) => match v.to_str() {
+                Ok(s) => !crate::ldp::conditional::is_wildcard(s),
+                Err(_) => true,
+            },
+        }
     }
 
     /// The nearest EXISTING container at or above `target` (its parent, then grandparent, … up to the
@@ -477,6 +569,14 @@ pub(crate) async fn serve_read<S: Store>(
     // negotiated, serialised body changes whenever the membership/body or the negotiated format
     // changes. GET and HEAD compute the SAME `body` here, so they agree on this validator. A plain
     // resource keeps its stored-metadata ETag (its bytes ARE the stored representation).
+    //
+    // V5 (decisions/0003) — the membership-derived container ETag shifts on every child add/remove, so
+    // it is a listing oracle. It is exposed ONLY here, on the GET/HEAD read path, which is gated above
+    // by `authorize_read` requiring `acl:Read` on the container — so a non-reader NEVER reaches this
+    // ETag. The conditional-channel sibling (a non-reader probing the container ETag via `If-Match` on a
+    // write) is closed by the V4 `guard_conditional_requires_read` in the mutating handlers. Together
+    // these Read-gate the container ETag end to end. (If a future change emits a container's
+    // representation ETag outside a Read-gated path, that gate must be re-established there too.)
     let etag = if target.is_container {
         representation_etag(&body)
     } else {
@@ -566,21 +666,39 @@ pub async fn put_handler<S: Store>(
 ) -> Result<Response, ServerError> {
     let target = parse_target(&state.base_url, uri.path())?;
 
-    // WAC for PUT (Solid WAC write-access matrix):
-    //  - **Overwrite** (target exists): needs `acl:Write` on the TARGET — a grant of Write on the
-    //    resource (even with no parent grant) suffices.
-    //  - **Create** (target does not exist): needs `acl:Append`/`acl:Write` on the PARENT container —
-    //    creating a new member mutates the container, NOT the (absent) target.
-    //  - **`.acl` target**: routes to `acl:Control` on the protected resource (managing access rules).
-    // Resolve existence ONCE here and reuse it for both the authorization branch and the create path.
+    // WAC for PUT — EXISTENCE-NON-DISCLOSURE (decisions/0003): a PUT requires `acl:Write` on the
+    // TARGET's effective ACL (inherited via `acl:default` for a not-yet-existing target), authorized
+    // **regardless of whether the target exists** so create and overwrite are INDISTINGUISHABLE to an
+    // under-authorized requester:
+    //  - **Overwrite** (target exists): `acl:Write` on the target — unchanged.
+    //  - **Create** (target absent): ALSO `acl:Write` on the target's INHERITED ACL — NOT the weaker
+    //    parent-`acl:Append`. This closes the V1 create-vs-forbidden-overwrite existence oracle: a
+    //    drop-box writer holding only parent `acl:Append` (no target Write) previously got a 201 on a
+    //    free name but a 403 on a taken one — leaking which child names exist. Now both are the SAME
+    //    denial. (CTH-safe: every `write-access-*` PUT-fictive row that expects 201 grants the agent
+    //    inheritable `acl:Write`; no row expects an Append-only PUT-create=201 — see decisions/0003.)
+    //    TRADE-OFF: an `acl:Append`-only agent can no longer PUT-create; it MUST use POST (which mints
+    //    a server-opaque, collision-free name — the containment-mutating create primitive). Documented
+    //    in the ADR.
+    //  - **`.acl` target**: routes to `acl:Control` on the protected resource (managing access rules) —
+    //    `mode_for_operation`/`authorize` already override the mode to Control for an `.acl`.
+    //
+    // Authorize BEFORE any target-dependent `meta()`/existence probe (the V1 timing closure): the
+    // under-authorized denial is returned with no observable dependence on whether the target exists,
+    // and the access decision itself reads ONLY `.acl` resources (never the target's own bytes/meta).
     let origin = request_origin(&headers);
+    let granted = state.authorize("PUT", &target, &token, origin).await?;
+
+    // V4 (decisions/0003): a conditional precondition is a CONTENT/MEMBERSHIP-derived validator — a
+    // requester lacking `acl:Read` on the target must NOT get its existence-revealing 412-vs-2xx
+    // outcome (nor a returned ETag). Fold to the denial code when a conditional header is present and
+    // the requester holds no Read. Done BEFORE the existence probe so it adds no oracle of its own.
+    state.guard_conditional_requires_read(&target.iri, &headers, &granted, &token)?;
+
+    // The caller IS authorized. Only NOW probe existence (an authorized writer is entitled to learn
+    // create-vs-replace) — reused for the conditional-write ETag and the create/replace branch below.
     let current = state.store.meta(&target.iri).await?;
     let existed = current.is_some();
-    if existed || crate::authz::is_acl_resource(&target.iri) {
-        state.authorize("PUT", &target, &token, origin).await?;
-    } else {
-        state.authorize_create(&target, &token, origin).await?;
-    }
 
     // Slash-semantics: a trailing-slash IRI (a container) and the same IRI without the slash (a plain
     // resource) MUST NOT co-exist (Solid Protocol — "with and without trailing slash cannot
@@ -620,6 +738,15 @@ pub async fn put_handler<S: Store>(
         // resource into its parent's `ldp:contains` membership (so the container GET lists it). An
         // ancestor that already exists as a NON-container is a conflict (a resource cannot have a
         // child) → handled by `ensure_ancestor_containers`.
+        //
+        // WAC container-modification: this mutates the containment of the nearest existing ancestor, so
+        // it requires `acl:Append` (Write subsumes) ON THAT CONTAINER — in addition to the target-ACL
+        // Write authorized above. Symmetric with DELETE's parent-Write check; closes the create-authz
+        // widening (an `acl:default`-only Write / pre-provisioned target `.acl` must NOT let an agent
+        // with no mode on the container mint members or intermediate containers in it).
+        state
+            .authorize_container_modification(&target.iri, &token, origin)
+            .await?;
         ensure_ancestor_containers(state.as_ref(), &target.iri).await?;
         match &parent {
             Some(p) => {
@@ -712,32 +839,60 @@ pub async fn post_handler<S: Store>(
     // resource child is created.
     let wants_container = wants_container_via_link(&headers);
 
-    // Mint the child IRI: Slug-derived if present + free, else a server-generated opaque name. A
-    // container child gets a trailing slash.
+    // The sanitised Slug STEM (the caller's name hint; `None` if no usable Slug). The mint uses it ONLY
+    // as a prefix of an opaque, collision-free name (V2 — see `mint_child_iri`), so the final segment
+    // never equals the verbatim Slug. The `.acl`-intent guard below is checked against THIS STEM (the
+    // caller's intent) rather than the post-opaque minted IRI.
     let slug = header_str(&headers, HeaderName::from_static("slug"));
-    let child_iri = mint_child_iri(&state.store, &container.iri, slug, wants_container).await?;
+    let stem = slug.and_then(sanitise_slug);
 
     // SECURITY (privilege-escalation guard): a POST authorizes only `acl:Append`/`Write` on the
-    // CONTAINER — never `acl:Control`. Yet `sanitise_slug` keeps `.`, so a `Slug: secret.acl` would
-    // mint `…/secret.acl`, which the WAC resolver then reads as the OWN ACL of `…/secret` (overriding
-    // inheritance). That lets an Append-only caller author an ACL granting itself Control over a
-    // sibling resource — a full read + ACL-ownership bypass. A create of a `.acl` is a Control
-    // operation; the Append-only POST chokepoint MUST refuse it (a Control-gated PUT/PATCH of an
-    // `.acl` is the only legitimate path to author one). Reject rather than silently rename — a
-    // silently-renamed `.acl` is surprising and could still confuse a client. The check is on the
-    // MINTED IRI (covering Slug AND any generated-name edge) and is case-insensitive
-    // (`is_acl_auxiliary_suffix`), mirroring the access-side `is_acl_resource`, so no case variant
-    // slips through.
+    // CONTAINER — never `acl:Control`. `sanitise_slug` keeps `.`, so a `Slug: secret.acl` carries the
+    // INTENT to mint an ACL auxiliary. Even though V2's opaque-suffix mint would now produce a benign
+    // `…/secret.acl-<opaque>` (which the WAC resolver — exact `.acl` suffix only — never reads as an
+    // ACL, so the escalation is already structurally defused), we STILL refuse the request: rejecting
+    // the INTENT keeps a single, clear contract — "an Append-only POST cannot author an `.acl`" — and
+    // is belt-and-braces against any future mint change that might preserve the suffix. A create of a
+    // `.acl` is a Control operation; the Control-gated PUT/PATCH of an `.acl` is the only legitimate
+    // path. The check is on the SANITISED STEM (the caller's intent, covering the case-variant
+    // `secret.ACL` via the case-insensitive `is_acl_auxiliary_suffix`).
+    //
+    // The denial uses the REQUESTER's denial shape — 401 + `WWW-Authenticate` for an anonymous caller,
+    // 403 for an authenticated one — IDENTICAL to every other POST denial. (POST authorization already
+    // ran above, so an anonymous caller without public `acl:Append` is already 401'd before here; this
+    // matters only for a PUBLIC-append container where an anonymous caller CAN reach this guard, and
+    // there the anonymous denial must still carry the auth challenge, not a bare 403 — keeping the
+    // denial surface uniform so the `.acl`-intent case is indistinguishable in shape from any other
+    // unauthorized POST. The guard is intent-based, not existence-based: `secret.acl` and `benign.acl`
+    // are refused regardless of what exists, so it is never an existence oracle.)
     //
     // SCOPE: `.acl` ONLY. `.meta` description-resources are NOT load-bearing in this server (the WAC
     // resolver never consults a `.meta`, and the PUT/PATCH create paths only special-case `.acl`), so
-    // a `secret.meta` minted here is just a normal resource — guarding it ONLY at POST while PUT/PATCH
+    // a `secret.meta` stem is just a normal resource name — guarding it ONLY at POST while PUT/PATCH
     // would create it freely is an inconsistency with no security benefit, so it is not guarded. If
     // `.meta` (or any other auxiliary) ever becomes load-bearing it MUST be guarded UNIFORMLY across
     // POST/PUT/PATCH/DELETE/read — not POST-only (see `is_acl_auxiliary_suffix`).
-    if crate::authz::is_acl_auxiliary_suffix(&child_iri) {
-        return Err(ServerError::Forbidden);
+    if let Some(s) = &stem {
+        // Check the `.acl` suffix on the bare stem (a leaf segment with no scheme/slashes). A trailing
+        // `/` is not part of a sanitised stem, so this catches `secret.acl`/`secret.ACL` directly.
+        if crate::authz::is_acl_auxiliary_suffix(s) {
+            return Err(if token.web_id.is_none() {
+                state.unauthenticated()
+            } else {
+                ServerError::Forbidden
+            });
+        }
     }
+
+    // Mint the child IRI from the (guarded) stem: an opaque, collision-free name prefixed by the stem,
+    // so the `Location` is collision-INDEPENDENT (V2). A container child gets a trailing slash.
+    let child_iri = mint_child_iri(
+        &state.store,
+        &container.iri,
+        stem.as_deref(),
+        wants_container,
+    )
+    .await?;
 
     // Validate + select the stored media type, resolving relative IRIs against the MINTED child IRI.
     // RDF is parse-validated; a non-RDF type is stored verbatim as an opaque binary resource. A
@@ -803,7 +958,7 @@ pub async fn delete_handler<S: Store>(
         AccessMode::Write
     };
     let origin = request_origin(&headers);
-    state
+    let granted = state
         .authorize_mode(&target, target_mode, &token, origin)
         .await?;
     if !is_acl {
@@ -814,6 +969,12 @@ pub async fn delete_handler<S: Store>(
                 .await?;
         }
     }
+
+    // V4 (decisions/0003): a DELETE may carry `If-Match`/`If-None-Match`, whose 412-vs-2xx outcome
+    // against the CONTENT/MEMBERSHIP-derived current ETag is an existence+content oracle. A requester
+    // authorized to DELETE but NOT to READ the target (a Write-without-Read document holder) must get
+    // the denial code rather than that conditional outcome. Folded BEFORE the existence probe.
+    state.guard_conditional_requires_read(&target.iri, &headers, &granted, &token)?;
 
     let current = state.store.meta(&target.iri).await?;
     // A DELETE of a non-existent target is reported through the SAME denial surface as a permission
@@ -921,76 +1082,84 @@ pub async fn patch_handler<S: Store>(
 
     let origin = request_origin(&headers);
 
-    // Load the current representation FIRST — the authorization branch depends on whether the target
-    // exists (modify vs create-on-PATCH). Match the read result into THREE states EXPLICITLY:
-    //  - `Ok(r)`            → present (modify path);
-    //  - `Err(NotFound)`    → absent  (create-on-PATCH / delete-on-missing path);
-    //  - `Err(other)`       → a backend/blob inconsistency (a faulting store).
+    // WAC for PATCH — EXISTENCE-NON-DISCLOSURE (decisions/0003): the required mode is derived purely
+    // from the patch CONTENT (already parsed) and authorized against the TARGET's effective ACL
+    // (inherited via `acl:default` for a not-yet-existing target), **BEFORE any target-dependent
+    // read/existence probe**, so create-on-PATCH and forbidden-modify are INDISTINGUISHABLE to an
+    // under-authorized requester:
+    //  - an INSERT-ONLY patch (no `solid:deletes`) needs `acl:Append`;
+    //  - a patch with ANY delete needs `acl:Write` (a delete removes existing triples);
+    //  - an `.acl` target needs `acl:Control` (the `authorize_mode` override).
     //
-    // A non-`NotFound` store error MUST NOT be propagated BEFORE authorization: doing so lets an
-    // UNAUTHORIZED caller receive a 500 (distinguishing a backend/blob inconsistency from a
-    // missing/normally-stored resource) instead of the uniform 401/403 — an existence/state oracle.
-    // So we CAPTURE the error here and surface it only AFTER the caller is authorized (below). We must
-    // ALSO preserve the round-1 fail-closed property: a faulting store must NEVER silently take the
-    // create path. We do that by treating a faulted read like "could be present" for the purpose of
-    // SELECTING the authorization branch — the TARGET-mode branch (NOT the parent-create branch) — so a
-    // genuinely-faulting store is authorized against the strictest applicable right and never routed
-    // through create-on-PATCH.
+    // This UNIFIES the prior create-vs-modify split (which authorized create-on-PATCH via
+    // `authorize_create` = parent-`acl:Append`). That split was the **V3** existence oracle: an agent
+    // holding parent-`acl:Append` (e.g. a drop-box) but NOT the target's effective Append got a 2xx on a
+    // free name (create path) vs a 401/403 on a taken-but-forbidden name (modify path) — leaking which
+    // child names exist. Authorizing the SAME content-derived mode against the SAME (inherited) target
+    // ACL for BOTH cases removes the oracle: create and forbidden-modify return byte-identical denials.
+    // (CTH-safe: every `write-access-*` PATCH-fictive row that expects 2xx grants the agent inheritable
+    // `acl:Append`/`acl:Write` — which the target's effective-ACL resolution picks up via `acl:default`;
+    // the `acl:Control`-only fictive rows expect a denial, which Append-on-target rejects. The earlier
+    // delete-on-missing closure is now just the general rule. See decisions/0003.)
     //
-    // `ServerError` is not `Clone`, so we keep the faulted error in `read_error` (the owned `Err`) and
-    // distinguish "present" / "absent" / "faulted" via `current` + `read_error`.
-    let (current, read_error): (Option<crate::store::Resource>, Option<ServerError>) =
-        match state.store.read(&target.iri).await {
-            Ok(r) => (Some(r), None),
-            Err(ServerError::NotFound) => (None, None),
-            // A non-NotFound error: remember it (to surface post-auth), but do NOT propagate it yet.
-            // It presents as "no current representation" (None) but is NOT the create path — the branch
-            // selection below routes it to the TARGET-mode authorization (fail-closed).
-            Err(e) => (None, Some(e)),
-        };
-
-    // WAC for PATCH (Solid WAC write-access matrix):
-    //  - **Modify** (target exists): an INSERT-ONLY patch (no `solid:deletes`) needs `acl:Append`; a
-    //    patch with ANY delete needs `acl:Write`. (An `.acl` target needs `acl:Control` — handled by
-    //    `authorize_mode`.)
-    //  - **Delete-on-missing**: a patch with ANY delete needs `acl:Write` on the TARGET even when the
-    //    target is absent — a delete is NOT a create, so it must NOT be routed through the parent-Append
-    //    create path. Authorizing Write-on-target here (rather than the create path) both enforces the
-    //    correct right AND closes the 403-vs-409 existence oracle: an append-only/anonymous caller gets
-    //    the SAME denial whether or not the resource exists, instead of leaking existence via a
-    //    create-authorized-then-409 (present) vs create-denied-403 (absent) split.
-    //  - **Create-on-PATCH** (target absent, INSERT-ONLY): creation rights live on the PARENT container
-    //    (same as PUT-create) — authorize `acl:Append` at the nearest existing ancestor.
-    //
-    // A FAULTED read (`read_error.is_some()`) takes the TARGET-mode branch (never the create branch):
-    // it is authorized against the strictest applicable right AND stays fail-closed (no create path on
-    // an inconsistent backend) — and only AFTER that authorization succeeds is the stored error
-    // surfaced, so an unauthorized caller still gets the uniform 401/403, not a 500.
+    // Authorizing BEFORE the target read closes the V3 timing channel too: the under-authorized denial
+    // is returned with NO target-dependent read in its path, and the access decision reads ONLY `.acl`
+    // resources (never the target's own bytes/meta).
     let has_deletes = !patch.deletes.is_empty();
     let required = if has_deletes {
         AccessMode::Write
     } else {
         AccessMode::Append
     };
-    if current.is_some()
-        || read_error.is_some()
-        || has_deletes
-        || crate::authz::is_acl_resource(&target.iri)
-    {
-        state
-            .authorize_mode(&target, required, &token, origin)
-            .await?;
-    } else {
-        state.authorize_create(&target, &token, origin).await?;
+    let granted = state
+        .authorize_mode(&target, required, &token, origin)
+        .await?;
+
+    // V4 (decisions/0003) — the `solid:where` READ-gate. A patch carrying a `solid:where` clause READS
+    // the target graph: `apply_patch` runs the BGP solver over the target's CURRENT triples, and its
+    // outcome (exactly-one-solution ⇒ 2xx vs zero/many ⇒ 409, and a missing target ⇒ empty graph ⇒
+    // always 0 ⇒ 409) is a CONTENT/EXISTENCE oracle — the very channel V4 closes for conditional
+    // HEADERS, but reachable through the patch BODY at only `acl:Append`. So a `where`-bearing patch
+    // additionally requires the target's READ mode (`acl:Read`, or `acl:Control` for an `.acl` — reading
+    // an `.acl`'s representation is a Control op, and `granted` already holds Control for an authorized
+    // `.acl` writer). This matches CSS's `N3PatchModesExtractor`, which adds `read` when the patch has
+    // `conditions`. Fold to the requester's denial (401 anon / 403 auth) BEFORE the target read, so it
+    // adds no oracle of its own. An unconditional (no-`where`) patch is unaffected.
+    if !patch.conditions.is_empty() {
+        let read_mode = if crate::authz::is_acl_resource(&target.iri) {
+            AccessMode::Control
+        } else {
+            AccessMode::Read
+        };
+        if !granted.contains(&read_mode) {
+            return Err(if token.web_id.is_none() {
+                state.unauthenticated()
+            } else {
+                ServerError::Forbidden
+            });
+        }
     }
 
-    // The caller IS authorized for the operation. NOW surface any captured non-NotFound store error
-    // (the backend/blob inconsistency) — it becomes the 500 it always was, but ONLY for an authorized
-    // caller. An unauthorized caller already returned the uniform 401/403 above, so the error never
-    // leaks the backend state to a caller who is not permitted to learn it.
-    if let Some(e) = read_error {
-        return Err(e);
-    }
+    // V4 (decisions/0003): a conditional precondition is a CONTENT-derived validator — fold to the
+    // denial when the requester lacks `acl:Read` and sent a conditional header, BEFORE the target read.
+    state.guard_conditional_requires_read(&target.iri, &headers, &granted, &token)?;
+
+    // The caller IS authorized. ONLY NOW load the current representation (an authorized writer is
+    // entitled to learn create-vs-modify). Match the read into THREE states:
+    //  - `Ok(r)`            → present (modify path);
+    //  - `Err(NotFound)`    → absent  (create-on-PATCH / delete-on-missing path);
+    //  - `Err(other)`       → a backend/blob inconsistency → surface the 500 (the caller is authorized,
+    //                         so a 500 leaks nothing they could not already learn via a normal read).
+    //
+    // Because authorization already ran above, a non-`NotFound` store error can be propagated
+    // immediately here WITHOUT an existence/state oracle: an UNAUTHORIZED caller never reaches this
+    // line (they returned the uniform 401/403 above), so a 500 is only ever seen by a caller permitted
+    // to read the target. (`ServerError` is not `Clone`; we distinguish present/absent via `current`.)
+    let current: Option<crate::store::Resource> = match state.store.read(&target.iri).await {
+        Ok(r) => Some(r),
+        Err(ServerError::NotFound) => None,
+        Err(e) => return Err(e),
+    };
 
     // Apply preconditions against the current ETag.
     let current_etag = current.as_ref().map(|r| r.meta.etag.clone());
@@ -1046,6 +1215,13 @@ pub async fn patch_handler<S: Store>(
         // Create-on-PATCH: like PUT, create intermediate containers + wire the new resource into its
         // parent's `ldp:contains` (so the containment scenario's container GET lists it). An ancestor
         // that exists as a non-container is a conflict (`ensure_ancestor_containers`).
+        //
+        // WAC container-modification (same as PUT-create): materialising the new member (+ any missing
+        // intermediate container) mutates the nearest existing ancestor's containment, so it requires
+        // `acl:Append` on THAT container — in addition to the content-derived target-ACL mode above.
+        state
+            .authorize_container_modification(&target.iri, &token, origin)
+            .await?;
         ensure_ancestor_containers(state.as_ref(), &target.iri).await?;
         match &parent {
             Some(p) => {
@@ -1533,46 +1709,33 @@ fn wants_container_via_link(headers: &HeaderMap) -> bool {
     })
 }
 
-/// Mint a child IRI within `container`, honouring a `Slug` (sanitised) when present and free, else a
-/// server-generated opaque name (the `buildTaskUri`-style mint). Guarantees the returned IRI does
-/// not currently exist (collision-avoiding). When `as_container` is set, the minted IRI ends in `/`
-/// (an LDP container child) and collision is checked against that trailing-slash form.
+/// Mint a child IRI within `container`. A `Slug` (sanitised) is used ONLY as a NON-binding PREFIX of a
+/// server-generated, collision-free, **opaque** name — NEVER as the verbatim final segment.
+///
+/// V2 — EXISTENCE-NON-DISCLOSURE for the `Location` header (decisions/0003). The prior mint returned
+/// the verbatim `…/<slug>` when that name was FREE but a mangled `…/<slug>-<opaque>` when it was TAKEN.
+/// A POST always returns 201, so the *shape* of the `Location` was the only difference — and it leaked
+/// whether `<slug>` already existed in the container to any caller who can POST (an `acl:Append`
+/// holder) but cannot READ the container's listing. By ALWAYS appending the opaque suffix (whether or
+/// not `<slug>` is free), the `Location` shape is collision-INDEPENDENT — it carries no existence
+/// signal — while STILL CONTAINING the Slug substring (the Solid Protocol treats `Slug` as a hint and
+/// the conformance `post-uri-assignment-slug` row asserts only `Location contains '<slug>'`, which an
+/// opaque-suffixed name satisfies). A name with no usable Slug falls back to the default `resource-…`
+/// stem, identical in shape, so the two cases are indistinguishable.
+///
+/// `generate_unique` does the `exists` probe + retry internally, so the returned IRI is guaranteed
+/// free (and, being opaque, never collides with the trailing-slash opposite form either — the old
+/// `slash_form_taken` co-existence probe is no longer needed). When `as_container` is set the minted
+/// IRI ends in `/` (an LDP container child). `stem` is the ALREADY-SANITISED Slug (the caller
+/// sanitises + `.acl`-guards it before this point), used only as the opaque name's prefix.
 async fn mint_child_iri<S: Store>(
     store: &S,
     container_iri: &str,
-    slug: Option<&str>,
+    stem: Option<&str>,
     as_container: bool,
 ) -> Result<String, ServerError> {
     let base = container_iri.trim_end_matches('/');
-    let suffix = if as_container { "/" } else { "" };
-
-    // Try the sanitised Slug first.
-    if let Some(raw) = slug {
-        if let Some(name) = sanitise_slug(raw) {
-            let candidate = format!("{base}/{name}{suffix}");
-            // Free iff NEITHER slash-form exists — a resource `…/name` and a container `…/name/` MUST
-            // NOT co-exist (the trailing-slash invariant), so a Slug colliding with the OPPOSITE form
-            // is a collision too and must not be used (else the POST would create a sibling of the
-            // opposite kind at the same name). On any collision, fall through to a generated name.
-            if !slash_form_taken(store, base, &name).await? {
-                return Ok(candidate);
-            }
-            return generate_unique(store, base, Some(&name), as_container).await;
-        }
-    }
-    generate_unique(store, base, None, as_container).await
-}
-
-/// Whether EITHER slash-form of a child name (`<base>/<name>` resource OR `<base>/<name>/` container)
-/// already exists — the trailing-slash co-existence guard for child minting.
-async fn slash_form_taken<S: Store>(
-    store: &S,
-    base: &str,
-    name: &str,
-) -> Result<bool, ServerError> {
-    let resource = format!("{base}/{name}");
-    let container = format!("{base}/{name}/");
-    Ok(store.exists(&resource).await? || store.exists(&container).await?)
+    generate_unique(store, base, stem, as_container).await
 }
 
 /// Generate a unique child IRI under `base`, optionally seeded by `stem`. Deterministic-but-unique:
@@ -2625,11 +2788,21 @@ mod tests {
         .await
         .expect("a .meta slug is a normal resource name and must be allowed");
         assert_eq!(resp.status(), StatusCode::CREATED);
-        assert!(state
-            .store
-            .exists("https://pod.example/alice/c/secret.meta")
-            .await
-            .unwrap());
+        // V2 (decisions/0003): the minted `Location` is collision-INDEPENDENT — it CONTAINS the Slug
+        // stem (`secret.meta`) but is opaque-suffixed (never the verbatim segment), so it carries no
+        // existence signal. The created resource exists at exactly that minted Location.
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .expect("Location header")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            loc.starts_with("https://pod.example/alice/c/secret.meta-"),
+            "the Location must contain the Slug stem as an opaque-suffixed prefix: {loc}"
+        );
+        assert!(state.store.exists(&loc).await.unwrap());
         // And it grants Bob NOTHING over the sibling `…/secret` — a `.meta` is not consulted by WAC,
         // so `secret` stays Alice-private by inheritance.
         let get_uri: axum::http::Uri = "/alice/c/secret".parse().unwrap();
@@ -2663,7 +2836,10 @@ mod tests {
         .await
         .expect("a benign Append POST must still succeed");
         assert_eq!(resp.status(), StatusCode::CREATED);
-        // The child was created under the expected name.
+        // V2 (decisions/0003): the child's `Location` CONTAINS the Slug (`note`) as an opaque-suffixed
+        // prefix — collision-INDEPENDENT, so it leaks nothing about which names already exist — and the
+        // resource exists at exactly that Location. (The CTH `post-uri-assignment-slug` row asserts only
+        // `Location contains '<slug>'`, which this satisfies.)
         let loc = resp
             .headers()
             .get(header::LOCATION)
@@ -2671,7 +2847,14 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
-        assert_eq!(loc, "https://pod.example/alice/c/note");
+        assert!(
+            loc.starts_with("https://pod.example/alice/c/note-"),
+            "the Location must contain the Slug as an opaque-suffixed prefix: {loc}"
+        );
+        assert!(
+            loc.contains("note"),
+            "Location must contain the Slug: {loc}"
+        );
         assert!(state.store.exists(&loc).await.unwrap());
     }
 
@@ -2990,5 +3173,1098 @@ mod tests {
                 "stored triple o{i} must be carried through once: {text}"
             );
         }
+    }
+
+    // =====================================================================================
+    // EXISTENCE-NON-DISCLOSURE (decisions/0003) — the exhaustive byte-identical matrix.
+    //
+    // THE RULE: 404 is served ONLY to a requester who holds the operation's required mode. Every other
+    // requester (anonymous → 401, authenticated-but-unauthorized → 403) gets their DENIAL code for BOTH
+    // "forbidden-existing" and "not-found", BYTE-IDENTICALLY (same status + body + Location + ETag +
+    // WWW-Authenticate). These tests drive the REAL handlers over the drop-box adversary fixture
+    // (`store_alice_container_bob_append_only`: Alice owns `/alice/c/` with inheritable R/W/C; Bob holds
+    // ONLY `acl:Append` on the container — the canonical "create-rights-on-parent, no-rights-on-target"
+    // shape) and assert the full materialised response is identical across the missing-vs-forbidden axis.
+    // =====================================================================================
+
+    /// A fully-materialised HTTP response, reduced to the client-observable fields the rule constrains:
+    /// the status, the body bytes, and the security-relevant headers (`Location`, `ETag`,
+    /// `WWW-Authenticate`). Two responses are an EXISTENCE ORACLE iff they differ in ANY of these.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ObservableResponse {
+        status: u16,
+        body: Vec<u8>,
+        location: Option<String>,
+        etag: Option<String>,
+        www_authenticate: Option<String>,
+    }
+
+    /// Materialise a handler result (`Ok(Response)` or `Err(ServerError)`) into the
+    /// client-observable response — exactly what the HTTP client sees, via `IntoResponse` (so a denial
+    /// `ServerError` is rendered through the SAME path the server uses, carrying its real body +
+    /// `WWW-Authenticate`).
+    async fn observe(result: Result<Response, ServerError>) -> ObservableResponse {
+        let resp = match result {
+            Ok(r) => r,
+            Err(e) => e.into_response(),
+        };
+        let status = resp.status().as_u16();
+        let header = |resp: &Response, name: HeaderName| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let location = header(&resp, header::LOCATION);
+        let etag = header(&resp, header::ETAG);
+        let www_authenticate = header(&resp, header::WWW_AUTHENTICATE);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        ObservableResponse {
+            status,
+            body,
+            location,
+            etag,
+            www_authenticate,
+        }
+    }
+
+    /// Bob (authenticated, Append-only on `/alice/c/`, NO rights on its members) — the adversary.
+    fn bob() -> VerifiedToken {
+        VerifiedToken {
+            web_id: Some(BOB.into()),
+            ..VerifiedToken::default()
+        }
+    }
+
+    /// An anonymous (no-WebID) requester.
+    fn anon() -> VerifiedToken {
+        VerifiedToken::default()
+    }
+
+    /// The drop-box fixture with an EXISTING Alice-private child `/alice/c/secret` (forbidden to Bob by
+    /// inheritance) so we can exercise the "exists-but-forbidden" axis against the "missing" one.
+    async fn dropbox_with_secret(
+    ) -> Arc<LdpState<CompositeStore<InMemorySparqClient, InMemoryBlobStore>>> {
+        let store = store_alice_container_bob_append_only().await;
+        // Seed an EXISTING member `/alice/c/secret` (Alice-private by inheritance — no own ACL).
+        store
+            .write(
+                "https://pod.example/alice/c/secret",
+                AxBytes::from(
+                    "<https://pod.example/alice/c/secret#me> <http://xmlns.com/foaf/0.1/name> \"S\" ."
+                        .to_string(),
+                ),
+                "text/turtle",
+            )
+            .await
+            .expect("seed secret member");
+        Arc::new(LdpState::new(store, "https://pod.example"))
+    }
+
+    const EXISTING: &str = "/alice/c/secret"; // exists, Alice-private (forbidden to Bob/anon)
+    const MISSING: &str = "/alice/c/ghost"; // never created
+
+    fn turtle_headers() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/turtle"),
+        );
+        h
+    }
+
+    fn body_bytes() -> AxBytes {
+        AxBytes::from("<https://pod.example/alice/c/x#me> <http://p> <http://o> .".to_string())
+    }
+
+    /// Run one verb against one path with one token, returning the observable response. Centralises the
+    /// per-verb handler dispatch so the matrix below is a tight loop.
+    async fn run_verb(
+        state: &Arc<LdpState<CompositeStore<InMemorySparqClient, InMemoryBlobStore>>>,
+        verb: &str,
+        path: &str,
+        token: VerifiedToken,
+    ) -> ObservableResponse {
+        let uri: axum::http::Uri = path.parse().unwrap();
+        let s = State(state.clone());
+        let t = Extension(token);
+        let result = match verb {
+            "GET" => get_handler(s, t, uri, HeaderMap::new()).await,
+            "HEAD" => head_handler(s, t, uri, HeaderMap::new()).await,
+            "PUT" => put_handler(s, t, uri, turtle_headers(), body_bytes()).await,
+            "POST" => post_handler(s, t, uri, turtle_headers(), body_bytes()).await,
+            "PATCH" => {
+                patch_handler(
+                    s,
+                    t,
+                    uri,
+                    n3_patch_headers(),
+                    insert_only_patch("https://pod.example/alice/c/x#me"),
+                )
+                .await
+            }
+            "DELETE" => delete_handler(s, t, uri, HeaderMap::new()).await,
+            other => panic!("unknown verb {other}"),
+        };
+        observe(result).await
+    }
+
+    /// THE MATRIX: for every verb × {anonymous, Bob-unauthorized}, the response to the EXISTING-but-
+    /// forbidden target MUST be BYTE-IDENTICAL to the response to the MISSING target — no verb is an
+    /// existence oracle, and the denial code is the requester's (401 anon / 403 Bob), never a 404.
+    #[tokio::test]
+    async fn matrix_missing_equals_forbidden_byte_identical_for_every_verb() {
+        for verb in ["GET", "HEAD", "PUT", "POST", "PATCH", "DELETE"] {
+            for (label, token_fn) in [
+                ("anonymous", anon as fn() -> VerifiedToken),
+                ("bob-unauthorized", bob as fn() -> VerifiedToken),
+            ] {
+                // A FRESH fixture per (verb, requester) so a mutating verb on one axis cannot perturb
+                // the other (e.g. a stray write changing membership/ETag).
+                let state_existing = dropbox_with_secret().await;
+                let state_missing = dropbox_with_secret().await;
+                let on_existing = run_verb(&state_existing, verb, EXISTING, token_fn()).await;
+                let on_missing = run_verb(&state_missing, verb, MISSING, token_fn()).await;
+
+                assert_eq!(
+                    on_existing, on_missing,
+                    "{verb} as {label}: the exists-but-forbidden response must be BYTE-IDENTICAL to the \
+                     not-found response (else it is an existence oracle).\n exists:  {on_existing:?}\n \
+                     missing: {on_missing:?}"
+                );
+                // And the denial code is the requester's — NEVER a 404 (only an authorized holder of the
+                // required mode learns 404). Anonymous → 401, Bob (authenticated) → 403.
+                let expected = if label == "anonymous" { 401 } else { 403 };
+                assert_eq!(
+                    on_existing.status, expected,
+                    "{verb} as {label}: must be the denial code {expected}, never 404/2xx"
+                );
+                assert_ne!(
+                    on_existing.status, 404,
+                    "{verb} as {label}: an under-authorized requester must NEVER see 404"
+                );
+                // A POST/PUT/PATCH denial must not have leaked a Location (no created child revealed).
+                assert!(
+                    on_existing.location.is_none(),
+                    "{verb} as {label}: a denial must carry no Location"
+                );
+            }
+        }
+    }
+
+    /// POSITIVE control: an AUTHORIZED reader (Alice, who has inheritable Read on `/alice/c/`) gets a
+    /// TRUE 404 on a genuinely-missing resource — the rule keeps the authorized-reader-404 (the CTH
+    /// `read-access-*` fictive rows + `post-target-not-found` GET depend on this). Bob/anon get the
+    /// denial for the SAME missing path (already covered by the matrix) — so 404 ⇒ "you were allowed to
+    /// know, and it isn't there."
+    #[tokio::test]
+    async fn authorized_reader_gets_true_404_on_genuinely_missing() {
+        let state = dropbox_with_secret().await;
+        let alice = VerifiedToken {
+            web_id: Some(ALICE.into()),
+            ..VerifiedToken::default()
+        };
+        let got = run_verb(&state, "GET", MISSING, alice.clone()).await;
+        assert_eq!(
+            got.status, 404,
+            "an authorized reader (Alice) must get a TRUE 404 on a missing resource: {got:?}"
+        );
+        // HEAD likewise.
+        let head = run_verb(&state, "HEAD", MISSING, alice).await;
+        assert_eq!(head.status, 404, "HEAD must also be a true 404 for Alice");
+    }
+
+    // --- V1: PUT-create now requires target Write (the drop-box trade-off) -------------------------
+
+    #[tokio::test]
+    async fn v1_append_only_put_create_is_denied_not_201() {
+        // Bob holds parent `acl:Append` (he can POST) but NOT target `acl:Write`. A PUT-create of a free
+        // name MUST now be denied (403) — it previously fell through to a parent-Append 201, which (paired
+        // with the 403 on a taken name) leaked existence. The denial is byte-identical to the missing case
+        // (covered by the matrix); here we pin the specific status + that NOTHING was created.
+        let state = dropbox_with_secret().await;
+        let got = run_verb(&state, "PUT", MISSING, bob()).await;
+        assert_eq!(
+            got.status, 403,
+            "an Append-only PUT-create must be a 403, not a 201: {got:?}"
+        );
+        use crate::store::Store;
+        assert!(
+            !state
+                .store
+                .exists("https://pod.example/alice/c/ghost")
+                .await
+                .unwrap(),
+            "a denied PUT-create must not have written anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn v1_owner_put_create_still_succeeds_201() {
+        // The control: the OWNER (Alice, inheritable Write) can still PUT-create a fresh resource → 201.
+        // The V1 tightening (require target Write) must not regress the legitimate create.
+        let state = dropbox_with_secret().await;
+        let alice = VerifiedToken {
+            web_id: Some(ALICE.into()),
+            ..VerifiedToken::default()
+        };
+        let got = run_verb(&state, "PUT", MISSING, alice).await;
+        assert_eq!(
+            got.status, 201,
+            "the owner's PUT-create must still succeed: {got:?}"
+        );
+    }
+
+    // --- V3: insert-only PATCH-create is symmetric with forbidden-modify ---------------------------
+
+    #[tokio::test]
+    async fn v3_append_holder_patch_create_succeeds_but_oracle_is_closed() {
+        // An INSERT-ONLY PATCH-create needs `acl:Append` on the TARGET (inherited). Bob has Append only
+        // on the CONTAINER, not on the members (the `/alice/c/.acl` grants Bob Append via `acl:accessTo`
+        // on the container, NOT `acl:default`), so the member `ghost` does NOT inherit Bob's Append → an
+        // insert-only PATCH-create is DENIED (403). Crucially this is the SAME 403 Bob gets modifying the
+        // EXISTING forbidden `secret` — no create-vs-modify oracle. (Both are covered byte-identically by
+        // the matrix; this pins the V3-specific reasoning.)
+        let state_missing = dropbox_with_secret().await;
+        let state_existing = dropbox_with_secret().await;
+        let create = run_verb(&state_missing, "PATCH", MISSING, bob()).await;
+        let modify = run_verb(&state_existing, "PATCH", EXISTING, bob()).await;
+        assert_eq!(
+            create.status, 403,
+            "Bob's PATCH-create is denied: {create:?}"
+        );
+        assert_eq!(
+            create, modify,
+            "V3: PATCH-create and PATCH-forbidden-modify must be byte-identical (no existence oracle)"
+        );
+    }
+
+    // --- V2: the POST Location is collision-INDEPENDENT (no taken-vs-free signal) ------------------
+
+    #[tokio::test]
+    async fn v2_post_location_shape_is_collision_independent() {
+        // An AUTHORIZED appender POSTing `Slug: foo` gets a `…/foo-<opaque>` Location whether or not
+        // `foo` already exists — so the Location reveals nothing about which names are taken. Drive it as
+        // Bob (who HOLDS container Append, so the POST is authorized) twice with the same Slug: the two
+        // Locations differ (distinct opaque names) and NEITHER is the verbatim `…/foo`.
+        let state = dropbox_with_secret().await;
+        let uri: axum::http::Uri = "/alice/c/".parse().unwrap();
+        let post = |slug: &'static str| {
+            let st = State(state.clone());
+            let mut headers = turtle_headers();
+            headers.insert(
+                HeaderName::from_static("slug"),
+                HeaderValue::from_static(slug),
+            );
+            let u = uri.clone();
+            async move {
+                observe(post_handler(st, Extension(bob()), u, headers, body_bytes()).await).await
+            }
+        };
+        let first = post("foo").await;
+        let second = post("foo").await;
+        assert_eq!(first.status, 201);
+        assert_eq!(second.status, 201);
+        let loc1 = first.location.expect("Location");
+        let loc2 = second.location.expect("Location");
+        // Collision-independent: same Slug, DIFFERENT opaque Locations; neither is the verbatim name.
+        assert_ne!(
+            loc1, loc2,
+            "two POSTs of the same Slug must mint distinct opaque names"
+        );
+        assert_ne!(
+            loc1, "https://pod.example/alice/c/foo",
+            "Location must not be the verbatim Slug"
+        );
+        assert!(
+            loc1.starts_with("https://pod.example/alice/c/foo-"),
+            "Location must contain the Slug: {loc1}"
+        );
+        assert!(
+            loc2.starts_with("https://pod.example/alice/c/foo-"),
+            "Location must contain the Slug: {loc2}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_slug_dot_acl_anonymous_on_public_append_gets_401_not_bare_403() {
+        // roborev denial-shape consistency: on a PUBLIC-`acl:Append` container an ANONYMOUS caller CAN
+        // pass POST authorization and reach the `.acl`-intent guard. Its denial must carry the
+        // requester's shape — 401 + `WWW-Authenticate` for anonymous — NOT a bare 403, so the
+        // `.acl`-intent case is indistinguishable in shape from any other unauthorized anonymous POST.
+        let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        store
+            .write(
+                "https://pod.example/alice/c/",
+                AxBytes::from(String::new()),
+                "text/turtle",
+            )
+            .await
+            .expect("seed container");
+        // The container grants the PUBLIC (`foaf:Agent`) Append — so anonymous may POST.
+        let acl = r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+@prefix foaf: <http://xmlns.com/foaf/0.1/>.
+<#pub> a acl:Authorization; acl:agentClass foaf:Agent; acl:accessTo <https://pod.example/alice/c/>; acl:mode acl:Append."#;
+        store
+            .write(
+                "https://pod.example/alice/c/.acl",
+                AxBytes::from(acl.to_string()),
+                "text/turtle",
+            )
+            .await
+            .expect("seed public-append acl");
+        let state = Arc::new(LdpState::new(store, "https://pod.example"));
+        let uri: axum::http::Uri = "/alice/c/".parse().unwrap();
+        // Anonymous POST with `Slug: secret.acl` (a benign body — the body is irrelevant; the INTENT is
+        // what is refused).
+        let got = observe(
+            post_handler(
+                State(state.clone()),
+                Extension(anon()),
+                uri,
+                post_turtle_headers_with_slug("secret.acl"),
+                body_bytes(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 401,
+            "an anonymous `.acl`-intent POST on a public-append container must be 401 (not a bare 403)"
+        );
+        assert!(
+            got.www_authenticate.is_some(),
+            "the anonymous denial must carry a WWW-Authenticate challenge"
+        );
+        // A benign anonymous Slug on the SAME container still succeeds (public Append is real) — the
+        // guard rejects only the `.acl` intent, uniformly by shape.
+        let benign = observe(
+            post_handler(
+                State(state),
+                Extension(anon()),
+                "/alice/c/".parse().unwrap(),
+                post_turtle_headers_with_slug("benign"),
+                body_bytes(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            benign.status, 201,
+            "a benign anonymous Slug on a public-append container must still succeed: {benign:?}"
+        );
+    }
+
+    // --- V4: a conditional precondition requires Read (the Write-without-Read shape) ---------------
+
+    /// A store where Bob holds `acl:Write` (and Append) on `/alice/c/wonly` but NOT `acl:Read` — the
+    /// "Write-without-Read" shape. Alice owns the container. An EXISTING `wonly` is present.
+    ///
+    /// Bob is ALSO granted `acl:Write` on the CONTAINER itself (via the container's own `acl:accessTo`),
+    /// so that a DELETE of `wonly` PASSES its parent-containment write authorization (`acl:Write` on the
+    /// nearest parent) and actually REACHES the V4 conditional-read guard — without this, the DELETE
+    /// would be denied at the parent-write check and the V4 DELETE test would pass for the wrong reason
+    /// (the roborev finding). The container grant deliberately omits `acl:Read`, and `wonly`'s OWN `.acl`
+    /// (below) overrides inheritance, so Bob's effective modes on `wonly` stay exactly {Write, Append} —
+    /// no Read — preserving the Write-without-Read shape the V4 guard is meant to catch.
+    async fn store_bob_write_without_read(
+    ) -> Arc<LdpState<CompositeStore<InMemorySparqClient, InMemoryBlobStore>>> {
+        let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        store
+            .write(
+                "https://pod.example/alice/c/",
+                AxBytes::from(String::new()),
+                "text/turtle",
+            )
+            .await
+            .expect("seed container");
+        store
+            .write(
+                "https://pod.example/alice/c/wonly",
+                AxBytes::from(
+                    "<https://pod.example/alice/c/wonly#me> <http://p> <http://o> .".to_string(),
+                ),
+                "text/turtle",
+            )
+            .await
+            .expect("seed wonly");
+        // Alice: full control over the container + members (default). Bob: `acl:Write` on the CONTAINER
+        // itself (so a DELETE's parent-write check passes and the V4 guard is reached) — but NO `acl:Read`
+        // on the container, and `wonly`'s OWN `.acl` overrides inheritance so Bob never gains Read on
+        // `wonly`.
+        let container_acl = format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#alice> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <https://pod.example/alice/c/>; acl:default <https://pod.example/alice/c/>; acl:mode acl:Read, acl:Write, acl:Control.
+<#bob> a acl:Authorization; acl:agent <{BOB}>; acl:accessTo <https://pod.example/alice/c/>; acl:mode acl:Write, acl:Append."#
+        );
+        store
+            .write(
+                "https://pod.example/alice/c/.acl",
+                AxBytes::from(container_acl),
+                "text/turtle",
+            )
+            .await
+            .expect("seed container acl");
+        let wonly_acl = format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#alice> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <https://pod.example/alice/c/wonly>; acl:mode acl:Read, acl:Write, acl:Control.
+<#bob> a acl:Authorization; acl:agent <{BOB}>; acl:accessTo <https://pod.example/alice/c/wonly>; acl:mode acl:Write, acl:Append."#
+        );
+        store
+            .write(
+                "https://pod.example/alice/c/wonly.acl",
+                AxBytes::from(wonly_acl),
+                "text/turtle",
+            )
+            .await
+            .expect("seed wonly acl");
+        Arc::new(LdpState::new(store, "https://pod.example"))
+    }
+
+    #[tokio::test]
+    async fn v4_write_without_read_conditional_put_is_denied_not_412_or_2xx() {
+        // Bob has Write but NOT Read on `wonly`. A conditional `PUT … If-Match: "x"` would otherwise
+        // yield a 412-vs-2xx outcome (an existence/content probe) + an ETag of a body Bob cannot GET.
+        // V4 folds it to Bob's denial code (403) BEFORE any precondition evaluation.
+        let state = store_bob_write_without_read().await;
+        let uri: axum::http::Uri = "/alice/c/wonly".parse().unwrap();
+        let mut headers = turtle_headers();
+        headers.insert(header::IF_MATCH, HeaderValue::from_static("\"deadbeef\""));
+        let got = observe(
+            put_handler(
+                State(state.clone()),
+                Extension(bob()),
+                uri,
+                headers,
+                body_bytes(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 403,
+            "a Write-without-Read conditional PUT must be the denial code, not 412/2xx: {got:?}"
+        );
+        assert!(got.etag.is_none(), "a V4 denial must not leak an ETag");
+    }
+
+    #[tokio::test]
+    async fn v4_write_without_read_unconditional_put_still_succeeds() {
+        // The control: WITHOUT a conditional header, Bob's Write IS sufficient — an unconditional PUT to
+        // `wonly` succeeds (204). V4 only gates the CONDITIONAL channel; it must not block a plain write.
+        let state = store_bob_write_without_read().await;
+        let uri: axum::http::Uri = "/alice/c/wonly".parse().unwrap();
+        let got = observe(
+            put_handler(
+                State(state),
+                Extension(bob()),
+                uri,
+                turtle_headers(),
+                body_bytes(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 204,
+            "an unconditional PUT by a Write holder must still succeed: {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_write_without_read_conditional_delete_is_denied() {
+        // The same closure on DELETE: a `DELETE … If-Match` by a Write-without-Read holder folds to the
+        // denial, not the 412-vs-204 existence/content outcome.
+        //
+        // The fixture grants Bob `acl:Write` on the CONTAINER (so the DELETE's parent-containment write
+        // authorization PASSES and control reaches the V4 guard) but NO `acl:Read` on `wonly` — so the
+        // 403 here is genuinely from V4, NOT from the parent-write check. The unconditional-DELETE
+        // control below PROVES that: the SAME Bob CAN delete `wonly` without a conditional header, so the
+        // only thing that turns the conditional DELETE into a 403 is the V4 guard.
+        let state = store_bob_write_without_read().await;
+        let uri: axum::http::Uri = "/alice/c/wonly".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_MATCH, HeaderValue::from_static("\"deadbeef\""));
+        let got = observe(delete_handler(State(state), Extension(bob()), uri, headers).await).await;
+        assert_eq!(
+            got.status, 403,
+            "a Write-without-Read conditional DELETE must be the denial code: {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_write_without_read_unconditional_delete_succeeds_proving_v4_is_the_cause() {
+        // CONTROL for the test above (the roborev finding): with the SAME fixture and NO conditional
+        // header, Bob's Write (on `wonly`) + container Write (parent-containment) IS sufficient to delete
+        // `wonly` → 204. This proves the conditional-DELETE 403 above comes from the V4 guard, not the
+        // parent-write authorization — the test is not vacuous.
+        let state = store_bob_write_without_read().await;
+        let uri: axum::http::Uri = "/alice/c/wonly".parse().unwrap();
+        let got =
+            observe(delete_handler(State(state), Extension(bob()), uri, HeaderMap::new()).await)
+                .await;
+        assert_eq!(
+            got.status, 204,
+            "an UNCONDITIONAL DELETE by the same Write holder must succeed — proving the conditional \
+             403 is from V4, not the parent-write check: {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_control_only_holder_conditional_acl_write_is_not_wrongly_denied() {
+        // EDGE: the V4 read-mode for an `.acl` target is CONTROL, not Read (reading an `.acl`'s
+        // representation is a Control op; `Control` does NOT imply `Read`). A holder of Control-but-NOT-
+        // Read on a resource IS entitled to its `.acl`'s ETag, so a CONDITIONAL `.acl` write by such a
+        // holder must NOT be folded to a denial by V4. This pins the regression: if the guard used `Read`
+        // (instead of the `.acl` read-mode `Control`) it would wrongly 403 this legitimate write.
+        let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        // Alice gets ONLY Control on `/alice/c/manager` (no Read, no Write) — a pure access-manager.
+        let acl = format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#alice> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <https://pod.example/alice/c/manager>; acl:mode acl:Control."#
+        );
+        store
+            .write(
+                "https://pod.example/alice/c/manager.acl",
+                AxBytes::from(acl),
+                "text/turtle",
+            )
+            .await
+            .expect("seed manager .acl");
+        let state = Arc::new(LdpState::new(store, "https://pod.example"));
+        let alice = VerifiedToken {
+            web_id: Some(ALICE.into()),
+            ..VerifiedToken::default()
+        };
+        // A CONDITIONAL PUT REPLACING the existing `.acl` (it exists, so `If-Match: *` is satisfied and
+        // the precondition is genuinely evaluated — exercising the V4 gate before it).
+        let uri: axum::http::Uri = "/alice/c/manager.acl".parse().unwrap();
+        let mut headers = turtle_headers();
+        headers.insert(header::IF_MATCH, HeaderValue::from_static("*"));
+        let acl_body = AxBytes::from(format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#alice> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <https://pod.example/alice/c/manager>; acl:mode acl:Control, acl:Read."#
+        ));
+        let got =
+            observe(put_handler(State(state), Extension(alice), uri, headers, acl_body).await)
+                .await;
+        assert_eq!(
+            got.status, 204,
+            "a Control-only holder's CONDITIONAL .acl write must reach the write path (204), not a V4 \
+             denial — the `.acl` read-mode is Control, not Read: {got:?}"
+        );
+    }
+
+    // --- V5: the membership-derived container ETag is Read-gated -----------------------------------
+
+    #[tokio::test]
+    async fn v5_container_etag_only_reaches_a_reader() {
+        // The container's membership-derived ETag is exposed ONLY on the Read-gated GET/HEAD path. An
+        // Append-only Bob cannot GET `/alice/c/` (no Read) → 401/403, so he NEVER observes the ETag that
+        // shifts on child add/remove. Alice (Read) does observe it. (The conditional-channel sibling — a
+        // non-reader probing the ETag via a conditional write — is closed by V4 above.)
+        let state = dropbox_with_secret().await;
+        // Bob (Append-only, no Read on the container) → denied, no ETag observable.
+        let bob_get = run_verb(&state, "GET", "/alice/c/", bob()).await;
+        assert_eq!(
+            bob_get.status, 403,
+            "Bob cannot read the container: {bob_get:?}"
+        );
+        assert!(
+            bob_get.etag.is_none(),
+            "a non-reader must observe NO container ETag (it is the membership oracle): {bob_get:?}"
+        );
+        // Alice (Read) DOES get the container listing + its membership ETag.
+        let alice = VerifiedToken {
+            web_id: Some(ALICE.into()),
+            ..VerifiedToken::default()
+        };
+        let alice_get = run_verb(&state, "GET", "/alice/c/", alice).await;
+        assert_eq!(alice_get.status, 200);
+        assert!(
+            alice_get.etag.is_some(),
+            "the authorized reader DOES receive the container ETag"
+        );
+    }
+
+    // =====================================================================================
+    // CREATE-AUTHZ CONTAINER-MODIFICATION (PR #3 review finding [HIGH]) — creating a member (or an
+    // intermediate container) requires `acl:Append`/`Write` on the CONTAINING container, in ADDITION
+    // to the target's own effective-ACL mode. An `acl:default`-only Write grant (or a pre-provisioned
+    // target `.acl`) must NOT let an agent with NO mode on the container mint members in it. Symmetric
+    // with DELETE's parent-Write check.
+    // =====================================================================================
+
+    /// A third agent (distinct from ALICE/BOB) for the create-authz positive control.
+    const CAROL: &str = "https://pod.example/carol/profile/card#me";
+
+    /// `/alice/c/` exists with a container `.acl` where:
+    ///  - ALICE: `acl:accessTo` + `acl:default` Read/Write/Control (full owner).
+    ///  - BOB: `acl:default acl:Write` ONLY — inheritable Write on the container's MEMBERS, but NO
+    ///    `acl:accessTo` on the container itself (so Bob holds NO mode on `/alice/c/` as a target). This
+    ///    is the attacker shape the finding names: Bob can WRITE any member's representation (target-ACL
+    ///    Write via default) yet must NOT be able to CREATE one (no container-modification right).
+    ///  - CAROL: `acl:default acl:Write` (member Write, so target auth passes) PLUS `acl:accessTo
+    ///    acl:Append` on the container (the container-modification right) — the "WITH container
+    ///    write/append" agent who IS allowed to create.
+    async fn store_default_write_no_container_access(
+    ) -> Arc<LdpState<CompositeStore<InMemorySparqClient, InMemoryBlobStore>>> {
+        let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        store
+            .write(
+                "https://pod.example/alice/c/",
+                AxBytes::from(String::new()),
+                "text/turtle",
+            )
+            .await
+            .expect("seed container");
+        let acl = format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#alice> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <https://pod.example/alice/c/>; acl:default <https://pod.example/alice/c/>; acl:mode acl:Read, acl:Write, acl:Control.
+<#bob> a acl:Authorization; acl:agent <{BOB}>; acl:default <https://pod.example/alice/c/>; acl:mode acl:Write.
+<#carol> a acl:Authorization; acl:agent <{CAROL}>; acl:accessTo <https://pod.example/alice/c/>; acl:default <https://pod.example/alice/c/>; acl:mode acl:Write, acl:Append."#
+        );
+        store
+            .write(
+                "https://pod.example/alice/c/.acl",
+                AxBytes::from(acl),
+                "text/turtle",
+            )
+            .await
+            .expect("seed container acl");
+        Arc::new(LdpState::new(store, "https://pod.example"))
+    }
+
+    fn carol() -> VerifiedToken {
+        VerifiedToken {
+            web_id: Some(CAROL.into()),
+            ..VerifiedToken::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn create_authz_default_write_only_agent_denied_put_create() {
+        // Bob holds member Write via `acl:default` (so his target-ACL Write authorizes the write itself)
+        // but NO mode on the container → a PUT-create must be DENIED (403), and nothing written. Pre-fix
+        // the create authorized purely against the (inherited) target ACL and returned 201.
+        let state = store_default_write_no_container_access().await;
+        let got = observe(
+            put_handler(
+                State(state.clone()),
+                Extension(bob()),
+                "/alice/c/newdoc".parse().unwrap(),
+                turtle_headers(),
+                body_bytes(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 403,
+            "an acl:default-only Write agent with NO container mode must be denied PUT-create: {got:?}"
+        );
+        assert!(
+            !state
+                .store
+                .exists("https://pod.example/alice/c/newdoc")
+                .await
+                .unwrap(),
+            "a denied PUT-create must have written nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_authz_default_write_only_agent_denied_patch_create() {
+        // The same closure on the create-on-PATCH path: an INSERT-only patch (needs Append on the
+        // target, which Bob's member Write satisfies) still must be denied at the container-modification
+        // check because Bob holds no Append on the container → 403, nothing written.
+        let state = store_default_write_no_container_access().await;
+        let got = observe(
+            patch_handler(
+                State(state.clone()),
+                Extension(bob()),
+                "/alice/c/newdoc".parse().unwrap(),
+                n3_patch_headers(),
+                insert_only_patch("https://pod.example/alice/c/newdoc#me"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 403,
+            "an acl:default-only Write agent must be denied create-on-PATCH: {got:?}"
+        );
+        assert!(
+            !state
+                .store
+                .exists("https://pod.example/alice/c/newdoc")
+                .await
+                .unwrap(),
+            "a denied PATCH-create must have written nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_authz_default_write_only_agent_denied_post() {
+        // POST already routes the container-modification right through its container-Append
+        // authorization: Bob holds no `acl:accessTo` mode on `/alice/c/`, so a POST is denied (403). This
+        // pins that CREATE (PUT/PATCH) is now symmetric with POST — all three require the container right.
+        let state = store_default_write_no_container_access().await;
+        let got = observe(
+            post_handler(
+                State(state.clone()),
+                Extension(bob()),
+                "/alice/c/".parse().unwrap(),
+                turtle_headers(),
+                body_bytes(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 403,
+            "an acl:default-only Write agent must be denied POST (no container Append): {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_authz_default_write_only_agent_denied_deep_ancestor_mint() {
+        // The `ensure_ancestor_containers` escalation: Bob PUT-creates `/alice/c/deep/x` (an inherited
+        // target ACL grants member Write). The container-modification check authorizes Append on the
+        // NEAREST EXISTING ancestor (`/alice/c/`) — which Bob lacks — so the mint of the intermediate
+        // container `/alice/c/deep/` is refused (403), and no intermediate container is materialised.
+        let state = store_default_write_no_container_access().await;
+        let got = observe(
+            put_handler(
+                State(state.clone()),
+                Extension(bob()),
+                "/alice/c/deep/x".parse().unwrap(),
+                turtle_headers(),
+                body_bytes(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 403,
+            "a deep-ancestor mint by an agent with no container right must be denied: {got:?}"
+        );
+        assert!(
+            !state
+                .store
+                .exists("https://pod.example/alice/c/deep/")
+                .await
+                .unwrap(),
+            "a denied deep mint must NOT have materialised the intermediate container"
+        );
+        assert!(
+            !state
+                .store
+                .exists("https://pod.example/alice/c/deep/x")
+                .await
+                .unwrap(),
+            "a denied deep mint must NOT have written the target"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_authz_agent_with_container_append_is_allowed() {
+        // The positive control: CAROL holds member Write (target auth) AND `acl:accessTo acl:Append` on
+        // the container (the container-modification right) → her PUT-create succeeds (201). This proves
+        // the fix denies ONLY the missing-container-right shape, not every non-owner create.
+        let state = store_default_write_no_container_access().await;
+        let got = observe(
+            put_handler(
+                State(state.clone()),
+                Extension(carol()),
+                "/alice/c/newdoc".parse().unwrap(),
+                turtle_headers(),
+                body_bytes(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 201,
+            "an agent WITH container Append (+ member Write) must be allowed to create: {got:?}"
+        );
+        assert!(
+            state
+                .store
+                .exists("https://pod.example/alice/c/newdoc")
+                .await
+                .unwrap(),
+            "the allowed create must have written the resource"
+        );
+    }
+
+    // =====================================================================================
+    // N3-PATCH `solid:where` READ-GATE (PR #3 review finding [MEDIUM]) — a patch carrying a where clause
+    // READS the target graph (the BGP solver), so its 2xx-vs-409 outcome is a content/existence oracle.
+    // An Append-without-Read agent must NOT be able to use a where clause to probe triple presence.
+    // =====================================================================================
+
+    /// A where-bearing INSERT-only patch (conditions non-empty, NO deletes ⇒ required mode is Append):
+    /// it binds `?n` from an existing `<subject> foaf:name ?n` triple in the target and inserts a nick.
+    /// Its outcome depends on whether that triple is PRESENT (one solution ⇒ apply) or ABSENT (zero
+    /// solutions ⇒ 409) — the exact existence/content oracle the read-gate closes.
+    fn where_insert_patch(subject: &str) -> AxBytes {
+        AxBytes::from(format!(
+            "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
+             @prefix foaf: <http://xmlns.com/foaf/0.1/> .\n\
+             _:p solid:where   {{ <{subject}> foaf:name ?n . }} ;\n\
+                 solid:inserts {{ <{subject}> foaf:nick ?n . }} .\n",
+        ))
+    }
+
+    /// `/alice/log` exists holding `body`; its own `.acl` grants ALICE full control and BOB ONLY
+    /// `acl:Append` (accessTo) — the Append-without-Read shape. (An own `.acl` fixes Bob's effective
+    /// modes on `/alice/log` to exactly `{Append}` regardless of inheritance.)
+    async fn store_bob_append_only_log(
+        body: &str,
+    ) -> Arc<LdpState<CompositeStore<InMemorySparqClient, InMemoryBlobStore>>> {
+        let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        store
+            .write(
+                "https://pod.example/alice/log",
+                AxBytes::from(body.to_string()),
+                "text/turtle",
+            )
+            .await
+            .expect("seed log");
+        let acl = format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#alice> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <https://pod.example/alice/log>; acl:mode acl:Read, acl:Write, acl:Control.
+<#bob> a acl:Authorization; acl:agent <{BOB}>; acl:accessTo <https://pod.example/alice/log>; acl:mode acl:Append."#
+        );
+        store
+            .write(
+                "https://pod.example/alice/log.acl",
+                AxBytes::from(acl),
+                "text/turtle",
+            )
+            .await
+            .expect("seed log acl");
+        Arc::new(LdpState::new(store, "https://pod.example"))
+    }
+
+    #[tokio::test]
+    async fn where_patch_by_append_only_agent_is_denied_not_a_content_probe() {
+        // Bob holds `acl:Append` on `/alice/log` but NOT `acl:Read`. A where-bearing patch would run the
+        // BGP solver over the log's triples and leak (via 2xx-vs-409) whether the probed triple exists.
+        // The read-gate folds it to Bob's denial (403) BEFORE any target read.
+        let state = store_bob_append_only_log(
+            "<https://pod.example/alice/log#me> <http://xmlns.com/foaf/0.1/name> \"L\" .",
+        )
+        .await;
+        let got = observe(
+            patch_handler(
+                State(state),
+                Extension(bob()),
+                "/alice/log".parse().unwrap(),
+                n3_patch_headers(),
+                where_insert_patch("https://pod.example/alice/log#me"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 403,
+            "an Append-without-Read where-patch must be the denial code, not a 2xx/409 probe: {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn where_patch_is_not_an_existence_oracle_present_vs_absent_byte_identical() {
+        // The oracle is CLOSED: the same where-patch by the same Append-only Bob is BYTE-IDENTICAL
+        // whether the probed triple is PRESENT (would-be 2xx) or ABSENT (would-be 409) — both fold to
+        // the SAME 403 before the solver ever runs, so Bob learns nothing about the triple's presence.
+        let subject = "https://pod.example/alice/log#me";
+        let present = store_bob_append_only_log(
+            "<https://pod.example/alice/log#me> <http://xmlns.com/foaf/0.1/name> \"L\" .",
+        )
+        .await;
+        let absent = store_bob_append_only_log(
+            "<https://pod.example/alice/log#me> <http://xmlns.com/foaf/0.1/note> \"other\" .",
+        )
+        .await;
+        let on_present = observe(
+            patch_handler(
+                State(present),
+                Extension(bob()),
+                "/alice/log".parse().unwrap(),
+                n3_patch_headers(),
+                where_insert_patch(subject),
+            )
+            .await,
+        )
+        .await;
+        let on_absent = observe(
+            patch_handler(
+                State(absent),
+                Extension(bob()),
+                "/alice/log".parse().unwrap(),
+                n3_patch_headers(),
+                where_insert_patch(subject),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(on_present.status, 403);
+        assert_eq!(
+            on_present, on_absent,
+            "the where-patch response must not depend on whether the probed triple exists (no oracle)"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_append_patch_by_the_same_agent_still_succeeds_proving_gate_is_the_cause() {
+        // CONTROL (non-vacuous): the SAME Append-only Bob, with a WHERE-LESS insert patch, DOES succeed
+        // (204 modify of the existing resource) — proving the 403 above is specifically the where-clause
+        // read-gate, not a general denial of Bob's Append.
+        let state = store_bob_append_only_log(
+            "<https://pod.example/alice/log#me> <http://xmlns.com/foaf/0.1/name> \"L\" .",
+        )
+        .await;
+        let got = observe(
+            patch_handler(
+                State(state),
+                Extension(bob()),
+                "/alice/log".parse().unwrap(),
+                n3_patch_headers(),
+                insert_only_patch("https://pod.example/alice/log#me"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 204,
+            "a WHERE-LESS append patch by the same Append holder must still succeed: {got:?}"
+        );
+    }
+
+    // =====================================================================================
+    // V4 `*`-FORM CONDITIONAL EXEMPTION (PR #3 review finding [MEDIUM]) — a bare `If-None-Match: *` /
+    // `If-Match: *` carries no content-derived ETag (existence-only), so a Write-without-Read holder
+    // keeps the spec-recommended safe-create / lost-update guards. Only a QUOTED validator gates on Read.
+    // =====================================================================================
+
+    /// `/alice/c/` + an existing member `/alice/c/existing`; the container `.acl` grants BOB `acl:default
+    /// acl:Write` (inheritable member Write, NO Read) PLUS `acl:accessTo acl:Append` on the container
+    /// (so the create's container-modification check passes) — the Write-without-Read shape that a
+    /// standard `PUT … If-None-Match: *` client would hit.
+    async fn store_bob_default_write_no_read_container(
+    ) -> Arc<LdpState<CompositeStore<InMemorySparqClient, InMemoryBlobStore>>> {
+        let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        store
+            .write(
+                "https://pod.example/alice/c/",
+                AxBytes::from(String::new()),
+                "text/turtle",
+            )
+            .await
+            .expect("seed container");
+        store
+            .write(
+                "https://pod.example/alice/c/existing",
+                AxBytes::from(
+                    "<https://pod.example/alice/c/existing#me> <http://p> <http://o> .".to_string(),
+                ),
+                "text/turtle",
+            )
+            .await
+            .expect("seed existing member");
+        let acl = format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#alice> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <https://pod.example/alice/c/>; acl:default <https://pod.example/alice/c/>; acl:mode acl:Read, acl:Write, acl:Control.
+<#bob> a acl:Authorization; acl:agent <{BOB}>; acl:accessTo <https://pod.example/alice/c/>; acl:default <https://pod.example/alice/c/>; acl:mode acl:Write, acl:Append."#
+        );
+        store
+            .write(
+                "https://pod.example/alice/c/.acl",
+                AxBytes::from(acl),
+                "text/turtle",
+            )
+            .await
+            .expect("seed container acl");
+        Arc::new(LdpState::new(store, "https://pod.example"))
+    }
+
+    #[tokio::test]
+    async fn v4_star_if_none_match_safe_create_allowed_for_write_without_read() {
+        // A Write-without-Read Bob doing the standard `PUT … If-None-Match: *` safe-create of a FREE name
+        // must SUCCEED (201) — bare `*` reveals only existence (which the write's 201-vs-204 split already
+        // reveals to an authorized writer), so it is exempt from the V4 Read-gate. Pre-fix this was 403.
+        let state = store_bob_default_write_no_read_container().await;
+        let mut headers = turtle_headers();
+        headers.insert(header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+        let got = observe(
+            put_handler(
+                State(state),
+                Extension(bob()),
+                "/alice/c/fresh".parse().unwrap(),
+                headers,
+                body_bytes(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 201,
+            "a Write-without-Read `If-None-Match: *` safe-create must be allowed (bare * is exempt): {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_star_if_match_lost_update_allowed_for_write_without_read() {
+        // The `If-Match: *` lost-update guard (overwrite only if it EXISTS) is likewise existence-only —
+        // a Write-without-Read Bob overwriting the existing member with `If-Match: *` must reach the write
+        // (204), not a V4 denial.
+        let state = store_bob_default_write_no_read_container().await;
+        let mut headers = turtle_headers();
+        headers.insert(header::IF_MATCH, HeaderValue::from_static("*"));
+        let got = observe(
+            put_handler(
+                State(state),
+                Extension(bob()),
+                "/alice/c/existing".parse().unwrap(),
+                headers,
+                body_bytes(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 204,
+            "a Write-without-Read `If-Match: *` overwrite must be allowed (bare * is exempt): {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_concrete_if_none_match_still_denied_for_write_without_read() {
+        // The exemption is ONLY for bare `*`: a QUOTED validator DOES fingerprint content, so a
+        // Write-without-Read `If-None-Match: "etag"` still folds to the denial (403). This pins that
+        // finding-3's fix did not open the concrete-validator channel V4 exists to close.
+        let state = store_bob_default_write_no_read_container().await;
+        let mut headers = turtle_headers();
+        headers.insert(header::IF_NONE_MATCH, HeaderValue::from_static("\"abc\""));
+        let got = observe(
+            put_handler(
+                State(state),
+                Extension(bob()),
+                "/alice/c/fresh2".parse().unwrap(),
+                headers,
+                body_bytes(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 403,
+            "a CONCRETE-ETag conditional by a Write-without-Read holder must still be gated on Read: {got:?}"
+        );
     }
 }
