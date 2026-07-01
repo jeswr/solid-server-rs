@@ -73,11 +73,14 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum_server::accept::Accept;
+// `hyper::body` re-exports the `http_body` trait items — no new dependency (hyper is already direct).
+use hyper::body::{Body, Frame, SizeHint};
 use hyper_util::rt::TokioTimer;
 use hyper_util::server::conn::auto::Builder;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -497,12 +500,18 @@ where
                 },
                 None => accept_fut.await?,
             };
+            // The shared per-connection in-flight-exchange count that couples the idle guard to the
+            // request lifecycle (see `InFlightGuard`). Created ONLY when the idle guard is enabled — so
+            // when it is off (the default) neither the IO nor the service touches an atomic or wraps a
+            // body, keeping the default hot path unaffected. A FRESH `Arc` per accepted connection, one
+            // clone to the IO (reader) and one to the service (writer), so the count is per-connection.
+            let in_flight = idle_timeout.map(|_| Arc::new(AtomicUsize::new(0)));
             // Wrap the served IO with the idle-keepalive timeout (no-op when `None`), then the permit;
             // and wrap the per-connection service with the max-requests cap (no-op when `None`). The
             // per-connection request counter lives INSIDE `MaxRequestsService` (a fresh counter per
             // accepted connection — see its docs), so the cap is genuinely per-connection.
-            let idle_io = IdleTimeoutStream::new(io_stream, idle_timeout);
-            let capped_svc = MaxRequestsService::new(svc, max_requests);
+            let idle_io = IdleTimeoutStream::new(io_stream, idle_timeout, in_flight.clone());
+            let capped_svc = MaxRequestsService::new(svc, max_requests, in_flight);
             Ok((PermittedStream::new(idle_io, permit), capped_svc))
         })
     }
@@ -575,16 +584,29 @@ impl<Io: AsyncWrite + Unpin> AsyncWrite for PermittedStream<Io> {
 /// permit, via the outer [`PermittedStream`]). When the timeout is `None` it is a transparent
 /// pass-through (zero overhead — no timer is created).
 ///
-/// ## ⚠️ DEFAULT-OFF — the upgraded-streaming-connection caveat (roborev High)
-/// This bound lives at the RAW IO layer, BELOW hyper, so it CANNOT see whether a connection has upgraded
-/// to a long-lived bidirectional stream. A **WebSocketChannel2023 receive socket**
+/// ## Request-aware — the idle clock is PAUSED while an HTTP exchange is in flight
+/// The bound is genuinely an *idle-BETWEEN-requests* bound: it fires ONLY when NO HTTP exchange is in
+/// flight. Via a shared per-connection [`InFlightGuard`] count (raised by [`MaxRequestsService`] from the
+/// moment a request is dispatched until its response body has fully drained — see `in_flight`), the idle
+/// clock is PAUSED for the whole exchange. So a slow handler (a >window SPARQ/S3 backend call), a slow
+/// PUT that trickles its body between chunks, or a streaming GET stalled on client backpressure is NEVER
+/// severed by this bound — it can only close a connection that is quiet AND has no request/response in
+/// flight. (This request-awareness is what the earlier "never kills a legitimately slow link" claim now
+/// actually delivers.)
+///
+/// ## ⚠️ DEFAULT-OFF — the POST-UPGRADE streaming-connection caveat (roborev High)
+/// The request-awareness above covers ordinary HTTP exchanges, but this bound lives at the RAW IO layer,
+/// BELOW hyper, so once a connection has UPGRADED to a long-lived bidirectional stream it can no longer
+/// see an application-level "exchange" at all — the upgrade's originating HTTP request has completed, so
+/// the in-flight count is back to 0. A **WebSocketChannel2023 receive socket**
 /// ([`crate::notifications::ws`]) is **server→client only** and legitimately sits quiet — no inbound
 /// bytes, and no outbound until the first notification fires — for as long as the client subscribes.
 /// An idle bound that closed it would tear down a LIVE subscription. So this guard is **disabled by
 /// default** ([`DEFAULT_IDLE_TIMEOUT_SECS`] = 0) and is for operators who terminate no long-lived
-/// upgraded/streaming connections on this listener (or front them elsewhere). The deadline resets on
+/// upgraded/streaming connections on this listener (or front them elsewhere). The deadline also resets on
 /// read OR write activity (so an actively-pushing connection survives even when the guard is on), but a
-/// connection quiet in BOTH directions is still closed — which is exactly why the WS case requires OFF.
+/// post-upgrade connection quiet in BOTH directions is still closed — which is exactly why the WS case
+/// requires OFF.
 ///
 /// ## The gap it closes (when an operator DOES enable it)
 /// hyper exposes NO native idle-connection timeout (verified against hyper 1.x). The existing bounds do
@@ -595,12 +617,14 @@ impl<Io: AsyncWrite + Unpin> AsyncWrite for PermittedStream<Io> {
 /// - the h2 keep-alive PING reclaims a DEAD peer (one that stops acking), not a live peer holding an
 ///   idle connection.
 ///
-/// ## The timer is reset on READ OR WRITE ACTIVITY (any progress), so an active connection is not killed
+/// ## The timer is reset on READ OR WRITE ACTIVITY (any progress) AND paused while a request is in flight
 /// The `Sleep` deadline is reset whenever a `poll_read` OR a `poll_write`/`poll_write_vectored` makes
-/// progress (returns `Ready`). It fires ONLY after a full idle window with NO progress in EITHER
-/// direction. A slow-but-progressing reader/writer resets the deadline on each chunk, so this never kills
-/// a legitimately slow link; the slowloris HEADER trickle is bounded separately by `header_read_timeout`
-/// (a complete-head deadline that a per-byte reset cannot defeat).
+/// progress (returns `Ready`), AND held fresh (never fired) while an HTTP exchange is in flight (the
+/// request-aware pause above). It fires ONLY after a full window with NO progress in EITHER direction AND
+/// NO exchange in flight. So a slow-but-progressing reader/writer resets the deadline on each chunk, and a
+/// stalled-but-in-flight request/response is paused, so this never kills a legitimately slow link; the
+/// slowloris HEADER trickle is bounded separately by `header_read_timeout` (a complete-head deadline that
+/// a per-byte reset cannot defeat).
 ///
 /// ## HTTP/2 interaction
 /// Under HTTP/2 the server's keep-alive PING (when configured) elicits a client PONG — a READ — and the
@@ -615,6 +639,12 @@ pub struct IdleTimeoutStream<Io> {
     /// read+write inactivity; `sleep` is the live deadline, reset to `now + dur` on each read OR write
     /// that progresses.
     idle: Option<(Duration, Pin<Box<tokio::time::Sleep>>)>,
+    /// Shared per-connection count of HTTP exchanges IN FLIGHT (see [`InFlightGuard`]). While it is `> 0`
+    /// the connection is NOT idle — a request is being handled and/or its response body is still
+    /// streaming — so the idle clock is PAUSED (the deadline is held fresh and the timeout never fires).
+    /// The idle timeout therefore fires ONLY when the connection is genuinely idle BETWEEN exchanges.
+    /// `None` ⇒ no tracking (the idle guard is off), so the default hot path is untouched.
+    in_flight: Option<Arc<AtomicUsize>>,
 }
 
 impl<Io> IdleTimeoutStream<Io> {
@@ -630,10 +660,19 @@ impl<Io> IdleTimeoutStream<Io> {
 impl<Io> IdleTimeoutStream<Io> {
     /// Wrap `inner` enforcing an idle-read timeout of `idle_timeout` (or a transparent pass-through when
     /// `None`). The deadline starts at `now + idle_timeout` (so a connection that sends nothing AT ALL
-    /// after the handshake is still bounded).
-    pub fn new(inner: Io, idle_timeout: Option<Duration>) -> Self {
+    /// after the handshake is still bounded). `in_flight` is the shared per-connection in-flight-exchange
+    /// count (see the field docs); pass `None` to disable request-aware pausing.
+    pub fn new(
+        inner: Io,
+        idle_timeout: Option<Duration>,
+        in_flight: Option<Arc<AtomicUsize>>,
+    ) -> Self {
         let idle = idle_timeout.map(|dur| (dur, Box::pin(tokio::time::sleep(dur))));
-        Self { inner, idle }
+        Self {
+            inner,
+            idle,
+            in_flight,
+        }
     }
 }
 
@@ -652,14 +691,33 @@ impl<Io: AsyncRead + Unpin> AsyncRead for IdleTimeoutStream<Io> {
                 Poll::Ready(result)
             }
             Poll::Pending => {
-                // Inner read is pending (no bytes available). If the idle deadline has now elapsed, the
-                // connection has made NO progress (read or write) for the whole window ⇒ close it with a
-                // TimedOut error. (A write since the last reset would have pushed the deadline out.)
-                if let Some((_dur, sleep)) = this.idle.as_mut() {
-                    if sleep.as_mut().poll(cx).is_ready() {
+                // Inner read is pending (no bytes available). Two sub-cases:
+                //
+                //  (a) an HTTP exchange is IN FLIGHT (a request dispatched to the service, its response
+                //      not yet fully drained — see `in_flight`): the connection is NOT idle even though no
+                //      bytes are moving right now (a slow handler, a slow-uploading PUT between chunks, or
+                //      a streaming GET stalled on client backpressure). PAUSE the idle clock — reset the
+                //      deadline to a fresh window and stay Pending. This is what keeps the idle bound from
+                //      severing a legitimately slow request/response; the timeout fires only BETWEEN
+                //      exchanges. (When the exchange ends the count drops to 0 and the next poll_read —
+                //      hyper reading the following keep-alive request — arms a full fresh idle window.)
+                //
+                //  (b) genuinely idle (no exchange in flight): if the deadline has elapsed, the connection
+                //      has made NO progress for the whole window ⇒ close it with a TimedOut error. (A read
+                //      or write since the last reset would have pushed the deadline out.)
+                let exchange_in_flight = this
+                    .in_flight
+                    .as_ref()
+                    .is_some_and(|count| count.load(Ordering::Relaxed) > 0);
+                if let Some((dur, sleep)) = this.idle.as_mut() {
+                    if exchange_in_flight {
+                        // (a) Hold the deadline fresh; do NOT poll/fire while the exchange runs.
+                        sleep.as_mut().reset(tokio::time::Instant::now() + *dur);
+                    } else if sleep.as_mut().poll(cx).is_ready() {
+                        // (b) Idle past the window ⇒ close.
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::TimedOut,
-                            "connection idle (no read/write progress) past the idle timeout — closing",
+                            "connection idle between requests past the idle timeout — closing",
                         )));
                     }
                 }
@@ -711,6 +769,91 @@ impl<Io: AsyncWrite + Unpin> AsyncWrite for IdleTimeoutStream<Io> {
     }
 }
 
+// --- In-flight-exchange tracking (couples the idle guard to the request lifecycle) ----------------
+
+/// RAII guard over the shared per-connection in-flight-exchange count. [`MaxRequestsService`] constructs
+/// one when a request is dispatched (raising the count) and holds it across the request future AND the
+/// response body ([`TrackedBody`]); it is released when the body finishes streaming or is dropped
+/// (lowering the count). While the count is `> 0` the connection is NOT idle, which the
+/// [`IdleTimeoutStream`] reads to pause its idle clock (so a slow/streaming exchange is never severed).
+/// Cancellation-safe: dropping the future or the body always decrements. Only created when the idle
+/// guard is enabled, so the default hot path never touches the atomic.
+pub struct InFlightGuard {
+    count: Arc<AtomicUsize>,
+}
+
+impl InFlightGuard {
+    /// Raise the in-flight-exchange count; the matching decrement happens on drop.
+    fn new(count: Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self { count }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// The response body produced by [`MaxRequestsService`], carrying an [`InFlightGuard`] so the
+    /// in-flight-exchange count stays raised until the response body has fully streamed (or is dropped).
+    /// This is what makes the idle guard safe for a slow/streaming RESPONSE: while this body is alive the
+    /// connection is not idle. When in-flight tracking is off (the idle guard is disabled) the `Plain`
+    /// variant is a zero-cost pass-through — no guard, no atomics, just a delegated `poll_frame` — so the
+    /// default hot path is unaffected.
+    #[project = TrackedBodyProj]
+    pub enum TrackedBody<B> {
+        /// Tracking OFF (idle guard disabled): a transparent pass-through — the default hot path.
+        Plain { #[pin] inner: B },
+        /// Tracking ON: holds the in-flight guard until the body ends (released eagerly on end-of-stream,
+        /// and on drop as a fallback if the body is never fully polled).
+        Tracked {
+            #[pin]
+            inner: B,
+            guard: Option<InFlightGuard>,
+        },
+    }
+}
+
+impl<B: Body> Body for TrackedBody<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.project() {
+            TrackedBodyProj::Plain { inner } => inner.poll_frame(cx),
+            TrackedBodyProj::Tracked { inner, guard } => {
+                let polled = inner.poll_frame(cx);
+                // End of stream ⇒ the response has fully drained ⇒ release the in-flight guard eagerly so
+                // the connection is treated as idle at once (not only once hyper drops the body).
+                if matches!(polled, Poll::Ready(None)) {
+                    *guard = None;
+                }
+                polled
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            TrackedBody::Plain { inner } => inner.is_end_stream(),
+            TrackedBody::Tracked { inner, .. } => inner.is_end_stream(),
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match self {
+            TrackedBody::Plain { inner } => inner.size_hint(),
+            TrackedBody::Tracked { inner, .. } => inner.size_hint(),
+        }
+    }
+}
+
 // --- Max-requests-per-connection (per-connection service-layer reuse cap) --------------------------
 
 /// A `tower::Service` wrapper that caps how many requests are served on ONE connection: after `cap`
@@ -754,15 +897,26 @@ pub struct MaxRequestsService<S> {
     /// `None` ⇒ unlimited (pass-through). `Some((cap, count))` ⇒ close after `cap` requests; `count` is
     /// the shared per-connection request counter (shared across this connection's service clones).
     cap: Option<(u64, Arc<std::sync::atomic::AtomicU64>)>,
+    /// Shared per-connection in-flight-exchange count (see [`InFlightGuard`] / [`IdleTimeoutStream`]).
+    /// `Some` ⇒ raise it for each dispatched request and hold the guard across the response body so the
+    /// idle guard can pause its clock; `None` ⇒ no tracking (the idle guard is off — the default hot
+    /// path). Shared with this connection's [`IdleTimeoutStream`] via a clone of the same `Arc`.
+    in_flight: Option<Arc<AtomicUsize>>,
 }
 
 impl<S> MaxRequestsService<S> {
     /// Wrap `inner` with a per-connection request cap of `max_requests` (or a transparent pass-through
-    /// when `None`). Creates a FRESH counter, so this must be called ONCE per connection (the acceptor
-    /// does) for the cap to be per-connection.
-    pub fn new(inner: S, max_requests: Option<u64>) -> Self {
+    /// when `None`). `in_flight` is the shared per-connection in-flight-exchange count (pass the same
+    /// `Arc` given to this connection's [`IdleTimeoutStream`], or `None` to disable tracking). Creates a
+    /// FRESH cap counter, so this must be called ONCE per connection (the acceptor does) for the cap to be
+    /// per-connection.
+    pub fn new(inner: S, max_requests: Option<u64>, in_flight: Option<Arc<AtomicUsize>>) -> Self {
         let cap = max_requests.map(|c| (c, Arc::new(std::sync::atomic::AtomicU64::new(0))));
-        Self { inner, cap }
+        Self {
+            inner,
+            cap,
+            in_flight,
+        }
     }
 }
 
@@ -770,7 +924,9 @@ impl<S, ReqBody, ResBody> tower::Service<http::Request<ReqBody>> for MaxRequests
 where
     S: tower::Service<http::Request<ReqBody>, Response = http::Response<ResBody>>,
 {
-    type Response = S::Response;
+    // The response body is wrapped in [`TrackedBody`] so an [`InFlightGuard`] spans the response body
+    // (the `Plain` variant is a zero-cost pass-through when in-flight tracking is off — the default path).
+    type Response = http::Response<TrackedBody<ResBody>>;
     type Error = S::Error;
     type Future = MaxRequestsFuture<S::Future>;
 
@@ -790,24 +946,36 @@ where
             }
             None => false,
         };
+        // Raise the in-flight-exchange count for the whole exchange (dispatch → response body drained).
+        // `None` when the idle guard is off ⇒ no atomic, no body wrapping cost on the default hot path.
+        let guard = self
+            .in_flight
+            .as_ref()
+            .map(|c| InFlightGuard::new(c.clone()));
         MaxRequestsFuture {
             inner: self.inner.call(req),
             close: at_cap,
+            guard,
         }
     }
 }
 
 pin_project_lite::pin_project! {
-    /// The future for [`MaxRequestsService`]: awaits the inner response, then — when this request hit the
-    /// per-connection cap — sets `Connection: close` so hyper ends keep-alive reuse after it. The inner
-    /// future is structurally pinned via `pin_project_lite` (a SAFE, declarative-macro projection — the
-    /// crate is `#![forbid(unsafe_code)]`, so no hand-rolled `unsafe` pin). No allocation: the inner
-    /// future is held inline, not boxed.
+    /// The future for [`MaxRequestsService`]: awaits the inner response, then (a) — when this request hit
+    /// the per-connection cap and it is not a protocol upgrade — sets `Connection: close` so hyper ends
+    /// keep-alive reuse after it, and (b) moves the [`InFlightGuard`] into the response [`TrackedBody`] so
+    /// the in-flight-exchange count stays raised until the body drains. The inner future is structurally
+    /// pinned via `pin_project_lite` (a SAFE, declarative-macro projection — the crate is
+    /// `#![forbid(unsafe_code)]`, so no hand-rolled `unsafe` pin). No allocation: the inner future is held
+    /// inline, not boxed.
     pub struct MaxRequestsFuture<F> {
         #[pin]
         inner: F,
         // Whether to stamp `Connection: close` on the produced response (this request hit the cap).
         close: bool,
+        // The in-flight guard, moved into the response body when the inner future resolves (or dropped
+        // with this future if the request is cancelled). `None` when in-flight tracking is off.
+        guard: Option<InFlightGuard>,
     }
 }
 
@@ -838,7 +1006,7 @@ impl<F, ResBody, E> Future for MaxRequestsFuture<F>
 where
     F: Future<Output = Result<http::Response<ResBody>, E>>,
 {
-    type Output = Result<http::Response<ResBody>, E>;
+    type Output = Result<http::Response<TrackedBody<ResBody>>, E>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
@@ -855,9 +1023,22 @@ where
                         http::HeaderValue::from_static("close"),
                     );
                 }
+                // Move the in-flight guard into the response body so the exchange stays counted until the
+                // body has fully streamed (the request-aware idle pause). `None` ⇒ `Plain` pass-through.
+                let guard = this.guard.take();
+                let resp = resp.map(|body| match guard {
+                    Some(guard) => TrackedBody::Tracked {
+                        inner: body,
+                        guard: Some(guard),
+                    },
+                    None => TrackedBody::Plain { inner: body },
+                });
                 Poll::Ready(Ok(resp))
             }
-            other => other,
+            // Preserve the inner future's Pending / Err outcome (the guard is held until we resolve, or
+            // dropped with this future on cancellation — either way the in-flight count is correct).
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -1306,7 +1487,7 @@ mod tests {
         // Keep the client end open so the duplex never EOFs (an EOF would resolve the read independently
         // of the idle bound and mask what we're testing).
         let _client_keepalive = client;
-        let mut idle = IdleTimeoutStream::new(server, Some(idle_window));
+        let mut idle = IdleTimeoutStream::new(server, Some(idle_window), None);
 
         // Drive 5 write+poll-read cycles, each half a window apart (total ~5*60ms = 300ms > 120ms idle).
         // Each iteration: WRITE (resets the deadline), then poll READ ONCE (must be Pending, NOT a
@@ -1349,7 +1530,7 @@ mod tests {
 
         let idle_window = Duration::from_millis(150);
         let (mut client, server) = tokio::io::duplex(64);
-        let mut idle = IdleTimeoutStream::new(server, Some(idle_window));
+        let mut idle = IdleTimeoutStream::new(server, Some(idle_window), None);
 
         // 1) A read that gets bytes succeeds (pass-through) and resets the idle deadline.
         client.write_all(b"hello").await.unwrap();
@@ -1381,7 +1562,7 @@ mod tests {
         // the bytes arriving.
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (mut client, server) = tokio::io::duplex(64);
-        let mut idle = IdleTimeoutStream::new(server, None);
+        let mut idle = IdleTimeoutStream::new(server, None, None);
 
         // Spawn a delayed writer; the read must wait for it (no idle bound closes it early).
         let writer = tokio::spawn(async move {
@@ -1421,8 +1602,9 @@ mod tests {
             }
         }
 
-        let mut svc = MaxRequestsService::new(Ok200, Some(2));
-        let has_close = |resp: &http::Response<()>| {
+        let mut svc = MaxRequestsService::new(Ok200, Some(2), None);
+        // The service now yields `TrackedBody`-wrapped responses; headers are inspected the same way.
+        let has_close = |resp: &http::Response<TrackedBody<()>>| {
             resp.headers()
                 .get(http::header::CONNECTION)
                 .map(|v| v.as_bytes().eq_ignore_ascii_case(b"close"))
@@ -1467,7 +1649,7 @@ mod tests {
             }
         }
 
-        let mut svc = MaxRequestsService::new(Ok200, None);
+        let mut svc = MaxRequestsService::new(Ok200, None, None);
         for _ in 0..5 {
             let resp = svc.call(http::Request::new(())).await.unwrap();
             assert!(
@@ -1517,7 +1699,7 @@ mod tests {
         }
 
         // cap=1 ⇒ the first (and every) request is at/over the cap ⇒ the guard WOULD stamp close.
-        let mut svc = MaxRequestsService::new(Ws101, Some(1));
+        let mut svc = MaxRequestsService::new(Ws101, Some(1), None);
         let resp = svc.call(http::Request::new(())).await.unwrap();
 
         assert_eq!(
@@ -1574,5 +1756,167 @@ mod tests {
             http::HeaderValue::from_static("close"),
         );
         assert!(!is_upgrade_response(&r));
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_stream_pauses_while_a_request_is_in_flight_then_fires_when_idle() {
+        // The idle guard must be request-AWARE: while an HTTP exchange is in flight (a slow handler, a
+        // trickling PUT, or a stalled streaming GET — modelled here by the shared in-flight count > 0) the
+        // idle clock is PAUSED, so the connection is NEVER severed no matter how long the exchange takes.
+        // Once the exchange ends (count back to 0) the connection is genuinely idle and MUST close after a
+        // window. Without the fix the in-flight read would resolve to a TimedOut error within one window.
+        use std::future::poll_fn;
+        use tokio::io::{AsyncReadExt, ReadBuf};
+        use tokio::time::{sleep, Duration as TDur};
+
+        let idle_window = TDur::from_millis(100);
+        let (client, server) = tokio::io::duplex(64);
+        // Keep the client end open so the duplex never EOFs (an EOF would resolve the read on its own).
+        let _client_keepalive = client;
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let mut idle = IdleTimeoutStream::new(server, Some(idle_window), Some(in_flight.clone()));
+
+        // A request is dispatched and its handler is slow / its response is streaming: mark it in flight.
+        in_flight.store(1, Ordering::Relaxed);
+
+        // Poll the read repeatedly across MUCH more than one idle window (6 * 50ms = 300ms >> 100ms). No
+        // bytes ever arrive, so the ONLY way a read becomes Ready is the idle bound firing — which the
+        // in-flight pause must prevent for the whole duration.
+        let mut rbuf = [0u8; 1];
+        for i in 0..6 {
+            sleep(idle_window / 2).await;
+            let read_state = poll_fn(|cx| {
+                let mut buf = ReadBuf::new(&mut rbuf);
+                match Pin::new(&mut idle).poll_read(cx, &mut buf) {
+                    Poll::Pending => Poll::Ready(Ok::<bool, io::Error>(false)), // pending = healthy
+                    Poll::Ready(Ok(())) => Poll::Ready(Ok(true)), // data/EOF (unexpected)
+                    Poll::Ready(Err(e)) => Poll::Ready(Err(e)),   // idle FIRED (the bug)
+                }
+            })
+            .await;
+            match read_state {
+                Ok(false) => { /* pending — healthy; the in-flight pause held */ }
+                Ok(true) => panic!("read iteration {i} got data/EOF (test setup wrong)"),
+                Err(e) => panic!(
+                    "the idle bound FIRED on an IN-FLIGHT request at iteration {i} ({e}) — the idle \
+                     clock must be paused while an HTTP exchange is in flight"
+                ),
+            }
+        }
+
+        // The exchange finishes ⇒ no longer in flight ⇒ the connection is now genuinely idle and MUST
+        // close after a window (the guard is not disabled, it was only paused).
+        in_flight.store(0, Ordering::Relaxed);
+        let mut buf2 = [0u8; 1];
+        let res = tokio::time::timeout(idle_window * 20, idle.read(&mut buf2)).await;
+        let inner = res.expect("once idle the read must RESOLVE (the guard fires), not hang");
+        let err = inner.expect_err("a genuinely idle connection past the window must close");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::TimedOut,
+            "an idle connection (no in-flight exchange) past the window must close with TimedOut, got \
+             {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_requests_service_in_flight_guard_spans_request_and_response_body() {
+        // The in-flight-exchange count must stay raised for the WHOLE exchange — from request dispatch
+        // through the response body streaming — and drop back to 0 exactly at end-of-stream, so the idle
+        // guard treats a slow/streaming RESPONSE as "not idle" (never severing it) and reclaims the
+        // connection promptly once the body has drained.
+        use bytes::Bytes;
+        use http_body_util::Full;
+        use std::future::poll_fn;
+        use std::task::Poll;
+        use tower::Service;
+
+        // A stub service returning a body with content (one DATA frame, then end-of-stream).
+        #[derive(Clone)]
+        struct BodySvc;
+        impl Service<http::Request<()>> for BodySvc {
+            type Response = http::Response<Full<Bytes>>;
+            type Error = std::convert::Infallible;
+            type Future =
+                std::pin::Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+            fn call(&mut self, _req: http::Request<()>) -> Self::Future {
+                Box::pin(async { Ok(http::Response::new(Full::new(Bytes::from_static(b"hello")))) })
+            }
+        }
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let mut svc = MaxRequestsService::new(BodySvc, None, Some(in_flight.clone()));
+
+        // Dispatch: the exchange is counted from dispatch and remains counted at the response head.
+        let resp = svc.call(http::Request::new(())).await.unwrap();
+        assert_eq!(
+            in_flight.load(Ordering::Relaxed),
+            1,
+            "the exchange must be counted from dispatch through the produced response"
+        );
+
+        let mut body = resp.into_body();
+        // First frame is data — still in flight while the body streams.
+        let frame1 = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
+        assert!(
+            frame1.is_some_and(|f| f.is_ok()),
+            "expected a data frame from the streaming body"
+        );
+        assert_eq!(
+            in_flight.load(Ordering::Relaxed),
+            1,
+            "the exchange must STILL be counted while the response body is streaming"
+        );
+
+        // Next poll is end-of-stream — the guard releases eagerly, count returns to 0 (idle again).
+        let frame2 = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
+        assert!(frame2.is_none(), "expected end-of-stream");
+        assert_eq!(
+            in_flight.load(Ordering::Relaxed),
+            0,
+            "the in-flight guard must release at end-of-stream so the connection is idle again"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_requests_service_in_flight_guard_releases_on_dropped_body() {
+        // Cancellation-safety: if the response body is DROPPED before it finishes streaming (client
+        // disconnect, connection reset), the in-flight guard must still release — the count must not leak
+        // and wedge the idle guard permanently paused.
+        use bytes::Bytes;
+        use http_body_util::Full;
+        use std::task::Poll;
+        use tower::Service;
+
+        #[derive(Clone)]
+        struct BodySvc;
+        impl Service<http::Request<()>> for BodySvc {
+            type Response = http::Response<Full<Bytes>>;
+            type Error = std::convert::Infallible;
+            type Future =
+                std::pin::Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+            fn call(&mut self, _req: http::Request<()>) -> Self::Future {
+                Box::pin(async { Ok(http::Response::new(Full::new(Bytes::from_static(b"hello")))) })
+            }
+        }
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let mut svc = MaxRequestsService::new(BodySvc, None, Some(in_flight.clone()));
+        let resp = svc.call(http::Request::new(())).await.unwrap();
+        assert_eq!(in_flight.load(Ordering::Relaxed), 1);
+
+        // Drop the response (and its body) WITHOUT draining it — the guard must decrement.
+        drop(resp);
+        assert_eq!(
+            in_flight.load(Ordering::Relaxed),
+            0,
+            "dropping an un-drained response body must release the in-flight guard (no leak)"
+        );
     }
 }

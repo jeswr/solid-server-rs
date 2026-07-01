@@ -415,8 +415,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              (CVE-2023-44487)={} (hyper default 20 unless overridden), slowloris header-read \
              timeout={}, max concurrent connections={}, handshake timeout={}, h2 keep-alive \
              ping={} (reclaims a DEAD-peer connection, not a live-idle one), idle-keepalive \
-             timeout={} (reclaims an IDLE connection between requests), max requests/connection={} \
-             (Connection: close after N — HTTP/1.1 reuse cap).",
+             timeout={} (reclaims a connection idle BETWEEN requests — request-aware: the idle clock \
+             is paused while an HTTP exchange is in flight, so a slow/streaming request is never \
+             severed; DEFAULT-OFF as it cannot see a post-UPGRADE WebSocket stream), max \
+             requests/connection={} (Connection: close after N — HTTP/1.1 reuse cap; never clobbers a \
+             101 Upgrade).",
             transport_config.h2_max_concurrent_streams,
             match transport_config.h2_max_pending_reset_streams {
                 Some(n) => format!("{n} (override)"),
