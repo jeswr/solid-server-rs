@@ -1089,6 +1089,31 @@ pub async fn patch_handler<S: Store>(
         .authorize_mode(&target, required, &token, origin)
         .await?;
 
+    // V4 (decisions/0003) — the `solid:where` READ-gate. A patch carrying a `solid:where` clause READS
+    // the target graph: `apply_patch` runs the BGP solver over the target's CURRENT triples, and its
+    // outcome (exactly-one-solution ⇒ 2xx vs zero/many ⇒ 409, and a missing target ⇒ empty graph ⇒
+    // always 0 ⇒ 409) is a CONTENT/EXISTENCE oracle — the very channel V4 closes for conditional
+    // HEADERS, but reachable through the patch BODY at only `acl:Append`. So a `where`-bearing patch
+    // additionally requires the target's READ mode (`acl:Read`, or `acl:Control` for an `.acl` — reading
+    // an `.acl`'s representation is a Control op, and `granted` already holds Control for an authorized
+    // `.acl` writer). This matches CSS's `N3PatchModesExtractor`, which adds `read` when the patch has
+    // `conditions`. Fold to the requester's denial (401 anon / 403 auth) BEFORE the target read, so it
+    // adds no oracle of its own. An unconditional (no-`where`) patch is unaffected.
+    if !patch.conditions.is_empty() {
+        let read_mode = if crate::authz::is_acl_resource(&target.iri) {
+            AccessMode::Control
+        } else {
+            AccessMode::Read
+        };
+        if !granted.contains(&read_mode) {
+            return Err(if token.web_id.is_none() {
+                state.unauthenticated()
+            } else {
+                ServerError::Forbidden
+            });
+        }
+    }
+
     // V4 (decisions/0003): a conditional precondition is a CONTENT-derived validator — fold to the
     // denial when the requester lacks `acl:Read` and sent a conditional header, BEFORE the target read.
     state.guard_conditional_requires_read(&target.iri, &headers, &granted, &token)?;
@@ -3947,6 +3972,151 @@ mod tests {
                 .await
                 .unwrap(),
             "the allowed create must have written the resource"
+        );
+    }
+
+    // =====================================================================================
+    // N3-PATCH `solid:where` READ-GATE (PR #3 review finding [MEDIUM]) — a patch carrying a where clause
+    // READS the target graph (the BGP solver), so its 2xx-vs-409 outcome is a content/existence oracle.
+    // An Append-without-Read agent must NOT be able to use a where clause to probe triple presence.
+    // =====================================================================================
+
+    /// A where-bearing INSERT-only patch (conditions non-empty, NO deletes ⇒ required mode is Append):
+    /// it binds `?n` from an existing `<subject> foaf:name ?n` triple in the target and inserts a nick.
+    /// Its outcome depends on whether that triple is PRESENT (one solution ⇒ apply) or ABSENT (zero
+    /// solutions ⇒ 409) — the exact existence/content oracle the read-gate closes.
+    fn where_insert_patch(subject: &str) -> AxBytes {
+        AxBytes::from(format!(
+            "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
+             @prefix foaf: <http://xmlns.com/foaf/0.1/> .\n\
+             _:p solid:where   {{ <{subject}> foaf:name ?n . }} ;\n\
+                 solid:inserts {{ <{subject}> foaf:nick ?n . }} .\n",
+        ))
+    }
+
+    /// `/alice/log` exists holding `body`; its own `.acl` grants ALICE full control and BOB ONLY
+    /// `acl:Append` (accessTo) — the Append-without-Read shape. (An own `.acl` fixes Bob's effective
+    /// modes on `/alice/log` to exactly `{Append}` regardless of inheritance.)
+    async fn store_bob_append_only_log(
+        body: &str,
+    ) -> Arc<LdpState<CompositeStore<InMemorySparqClient, InMemoryBlobStore>>> {
+        let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        store
+            .write(
+                "https://pod.example/alice/log",
+                AxBytes::from(body.to_string()),
+                "text/turtle",
+            )
+            .await
+            .expect("seed log");
+        let acl = format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#alice> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <https://pod.example/alice/log>; acl:mode acl:Read, acl:Write, acl:Control.
+<#bob> a acl:Authorization; acl:agent <{BOB}>; acl:accessTo <https://pod.example/alice/log>; acl:mode acl:Append."#
+        );
+        store
+            .write(
+                "https://pod.example/alice/log.acl",
+                AxBytes::from(acl),
+                "text/turtle",
+            )
+            .await
+            .expect("seed log acl");
+        Arc::new(LdpState::new(store, "https://pod.example"))
+    }
+
+    #[tokio::test]
+    async fn where_patch_by_append_only_agent_is_denied_not_a_content_probe() {
+        // Bob holds `acl:Append` on `/alice/log` but NOT `acl:Read`. A where-bearing patch would run the
+        // BGP solver over the log's triples and leak (via 2xx-vs-409) whether the probed triple exists.
+        // The read-gate folds it to Bob's denial (403) BEFORE any target read.
+        let state = store_bob_append_only_log(
+            "<https://pod.example/alice/log#me> <http://xmlns.com/foaf/0.1/name> \"L\" .",
+        )
+        .await;
+        let got = observe(
+            patch_handler(
+                State(state),
+                Extension(bob()),
+                "/alice/log".parse().unwrap(),
+                n3_patch_headers(),
+                where_insert_patch("https://pod.example/alice/log#me"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 403,
+            "an Append-without-Read where-patch must be the denial code, not a 2xx/409 probe: {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn where_patch_is_not_an_existence_oracle_present_vs_absent_byte_identical() {
+        // The oracle is CLOSED: the same where-patch by the same Append-only Bob is BYTE-IDENTICAL
+        // whether the probed triple is PRESENT (would-be 2xx) or ABSENT (would-be 409) — both fold to
+        // the SAME 403 before the solver ever runs, so Bob learns nothing about the triple's presence.
+        let subject = "https://pod.example/alice/log#me";
+        let present = store_bob_append_only_log(
+            "<https://pod.example/alice/log#me> <http://xmlns.com/foaf/0.1/name> \"L\" .",
+        )
+        .await;
+        let absent = store_bob_append_only_log(
+            "<https://pod.example/alice/log#me> <http://xmlns.com/foaf/0.1/note> \"other\" .",
+        )
+        .await;
+        let on_present = observe(
+            patch_handler(
+                State(present),
+                Extension(bob()),
+                "/alice/log".parse().unwrap(),
+                n3_patch_headers(),
+                where_insert_patch(subject),
+            )
+            .await,
+        )
+        .await;
+        let on_absent = observe(
+            patch_handler(
+                State(absent),
+                Extension(bob()),
+                "/alice/log".parse().unwrap(),
+                n3_patch_headers(),
+                where_insert_patch(subject),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(on_present.status, 403);
+        assert_eq!(
+            on_present, on_absent,
+            "the where-patch response must not depend on whether the probed triple exists (no oracle)"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_append_patch_by_the_same_agent_still_succeeds_proving_gate_is_the_cause() {
+        // CONTROL (non-vacuous): the SAME Append-only Bob, with a WHERE-LESS insert patch, DOES succeed
+        // (204 modify of the existing resource) — proving the 403 above is specifically the where-clause
+        // read-gate, not a general denial of Bob's Append.
+        let state = store_bob_append_only_log(
+            "<https://pod.example/alice/log#me> <http://xmlns.com/foaf/0.1/name> \"L\" .",
+        )
+        .await;
+        let got = observe(
+            patch_handler(
+                State(state),
+                Extension(bob()),
+                "/alice/log".parse().unwrap(),
+                n3_patch_headers(),
+                insert_only_patch("https://pod.example/alice/log#me"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 204,
+            "a WHERE-LESS append patch by the same Append holder must still succeed: {got:?}"
         );
     }
 }
