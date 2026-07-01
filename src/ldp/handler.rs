@@ -394,15 +394,25 @@ impl<S: Store> LdpState<S> {
         granted: &std::collections::BTreeSet<AccessMode>,
         token: &VerifiedToken,
     ) -> Result<(), ServerError> {
-        let has_conditional =
-            headers.contains_key(header::IF_MATCH) || headers.contains_key(header::IF_NONE_MATCH);
+        // Only a CONCRETE entity-tag validator gates on Read. A bare `*` (`If-None-Match: *` safe-create
+        // / `If-Match: *` lost-update guard) carries NO content-derived ETag fingerprint — it tests only
+        // EXISTENCE, which a holder of the operation's required mode is already entitled to per this
+        // module's own invariant (and already learns from the unconditional 201-vs-204 write split). So a
+        // bare `*` is EXEMPT from this Read-gate: a `Write`-without-`Read` holder keeps the spec-
+        // recommended conditional safe-create / lost-update guards with ZERO non-disclosure loss. A
+        // QUOTED validator still leaks a content/membership ETag (and the response then carries the
+        // target's real ETag), so it still requires the read-mode. (This closed the V4-over-broad
+        // finding: bare `*` was previously 403'd for a Write-without-Read holder, breaking the standard
+        // Inrupt `PUT … If-None-Match: *` create pattern for no non-disclosure gain.)
+        let has_etag_conditional = Self::conditional_carries_etag(headers, header::IF_MATCH)
+            || Self::conditional_carries_etag(headers, header::IF_NONE_MATCH);
         // The mode that governs reading THIS target's representation: Control for an `.acl`, else Read.
         let read_mode = if crate::authz::is_acl_resource(target_iri) {
             AccessMode::Control
         } else {
             AccessMode::Read
         };
-        if has_conditional && !granted.contains(&read_mode) {
+        if has_etag_conditional && !granted.contains(&read_mode) {
             return Err(if token.web_id.is_none() {
                 self.unauthenticated()
             } else {
@@ -410,6 +420,22 @@ impl<S: Store> LdpState<S> {
             });
         }
         Ok(())
+    }
+
+    /// Whether the conditional precondition header `name` carries a CONCRETE entity-tag validator (a
+    /// quoted ETag, or a list of them) rather than the bare `*` wildcard. An ABSENT header carries
+    /// none; a bare `*` is existence-only (not content-derived) so it is NOT ETag-bearing; anything
+    /// else — including a present-but-non-ASCII value that cannot be decoded — is treated as ETag-
+    /// bearing (fail-closed), keeping it subject to the V4 Read-gate. Used only by
+    /// [`guard_conditional_requires_read`](Self::guard_conditional_requires_read).
+    fn conditional_carries_etag(headers: &HeaderMap, name: HeaderName) -> bool {
+        match headers.get(&name) {
+            None => false,
+            Some(v) => match v.to_str() {
+                Ok(s) => !crate::ldp::conditional::is_wildcard(s),
+                Err(_) => true,
+            },
+        }
     }
 
     /// The nearest EXISTING container at or above `target` (its parent, then grandparent, … up to the
@@ -4117,6 +4143,128 @@ mod tests {
         assert_eq!(
             got.status, 204,
             "a WHERE-LESS append patch by the same Append holder must still succeed: {got:?}"
+        );
+    }
+
+    // =====================================================================================
+    // V4 `*`-FORM CONDITIONAL EXEMPTION (PR #3 review finding [MEDIUM]) — a bare `If-None-Match: *` /
+    // `If-Match: *` carries no content-derived ETag (existence-only), so a Write-without-Read holder
+    // keeps the spec-recommended safe-create / lost-update guards. Only a QUOTED validator gates on Read.
+    // =====================================================================================
+
+    /// `/alice/c/` + an existing member `/alice/c/existing`; the container `.acl` grants BOB `acl:default
+    /// acl:Write` (inheritable member Write, NO Read) PLUS `acl:accessTo acl:Append` on the container
+    /// (so the create's container-modification check passes) — the Write-without-Read shape that a
+    /// standard `PUT … If-None-Match: *` client would hit.
+    async fn store_bob_default_write_no_read_container(
+    ) -> Arc<LdpState<CompositeStore<InMemorySparqClient, InMemoryBlobStore>>> {
+        let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        store
+            .write(
+                "https://pod.example/alice/c/",
+                AxBytes::from(String::new()),
+                "text/turtle",
+            )
+            .await
+            .expect("seed container");
+        store
+            .write(
+                "https://pod.example/alice/c/existing",
+                AxBytes::from(
+                    "<https://pod.example/alice/c/existing#me> <http://p> <http://o> .".to_string(),
+                ),
+                "text/turtle",
+            )
+            .await
+            .expect("seed existing member");
+        let acl = format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#alice> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <https://pod.example/alice/c/>; acl:default <https://pod.example/alice/c/>; acl:mode acl:Read, acl:Write, acl:Control.
+<#bob> a acl:Authorization; acl:agent <{BOB}>; acl:accessTo <https://pod.example/alice/c/>; acl:default <https://pod.example/alice/c/>; acl:mode acl:Write, acl:Append."#
+        );
+        store
+            .write(
+                "https://pod.example/alice/c/.acl",
+                AxBytes::from(acl),
+                "text/turtle",
+            )
+            .await
+            .expect("seed container acl");
+        Arc::new(LdpState::new(store, "https://pod.example"))
+    }
+
+    #[tokio::test]
+    async fn v4_star_if_none_match_safe_create_allowed_for_write_without_read() {
+        // A Write-without-Read Bob doing the standard `PUT … If-None-Match: *` safe-create of a FREE name
+        // must SUCCEED (201) — bare `*` reveals only existence (which the write's 201-vs-204 split already
+        // reveals to an authorized writer), so it is exempt from the V4 Read-gate. Pre-fix this was 403.
+        let state = store_bob_default_write_no_read_container().await;
+        let mut headers = turtle_headers();
+        headers.insert(header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+        let got = observe(
+            put_handler(
+                State(state),
+                Extension(bob()),
+                "/alice/c/fresh".parse().unwrap(),
+                headers,
+                body_bytes(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 201,
+            "a Write-without-Read `If-None-Match: *` safe-create must be allowed (bare * is exempt): {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_star_if_match_lost_update_allowed_for_write_without_read() {
+        // The `If-Match: *` lost-update guard (overwrite only if it EXISTS) is likewise existence-only —
+        // a Write-without-Read Bob overwriting the existing member with `If-Match: *` must reach the write
+        // (204), not a V4 denial.
+        let state = store_bob_default_write_no_read_container().await;
+        let mut headers = turtle_headers();
+        headers.insert(header::IF_MATCH, HeaderValue::from_static("*"));
+        let got = observe(
+            put_handler(
+                State(state),
+                Extension(bob()),
+                "/alice/c/existing".parse().unwrap(),
+                headers,
+                body_bytes(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 204,
+            "a Write-without-Read `If-Match: *` overwrite must be allowed (bare * is exempt): {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_concrete_if_none_match_still_denied_for_write_without_read() {
+        // The exemption is ONLY for bare `*`: a QUOTED validator DOES fingerprint content, so a
+        // Write-without-Read `If-None-Match: "etag"` still folds to the denial (403). This pins that
+        // finding-3's fix did not open the concrete-validator channel V4 exists to close.
+        let state = store_bob_default_write_no_read_container().await;
+        let mut headers = turtle_headers();
+        headers.insert(header::IF_NONE_MATCH, HeaderValue::from_static("\"abc\""));
+        let got = observe(
+            put_handler(
+                State(state),
+                Extension(bob()),
+                "/alice/c/fresh2".parse().unwrap(),
+                headers,
+                body_bytes(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            got.status, 403,
+            "a CONCRETE-ETag conditional by a Write-without-Read holder must still be gated on Read: {got:?}"
         );
     }
 }
