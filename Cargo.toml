@@ -92,6 +92,12 @@ object_store = "0.13"
 async-trait = "0.1"
 bytes = "1"
 http = "1"
+# Safe `Pin` projection for the per-connection `MaxRequestsService` response-future (the
+# max-requests-per-conn transport guard). The crate is `#![forbid(unsafe_code)]`, so a hand-rolled
+# structural pin is not allowed; `pin-project-lite` generates the projection safely (a declarative macro,
+# NOT a proc-macro). It is ALREADY in the resolved tree (tokio / hyper / tower depend on it), so naming
+# it here adds NO new crate to the build — the same pattern as `bytes` / `tokio-rustls`. MIT-OR-Apache.
+pin-project-lite = "0.2"
 # Live SPARQ HTTP client (M3): a SPARQL 1.1 Protocol client over the SPARQ /sparql endpoint. Built
 # on the hyper 1.x client + hyper-util's legacy pooled Client — both ALREADY in the tree (axum +
 # the verifier pull them in), so this adds NO new crates, only enables already-resolved client

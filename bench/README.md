@@ -62,10 +62,31 @@ measured apples-to-apples on the same box/binary/run. Results → `bench/AUTH-BA
 
 ## Tool
 
-`oha` 1.14.0 — an HTTP/1.1 load generator with clean p50/p99/p999 + an RPS histogram and a JSON output
-mode (`--output-format json`) the harness parses. The server is **HTTP/1.1 only** (no h2 ALPN), so an
-HTTP/1.1 tool is required; `oha` is invoked with keep-alive (default) and `--insecure` (self-signed
-cert). State the exact tool + version when you cite numbers — they live in `BASELINE.md`.
+`oha` 1.14.0 — an HTTP load generator (HTTP/1.1 by default, **HTTP/2 via `--http2`**) with clean
+p50/p99/p999 + an RPS histogram and a JSON output mode (`--output-format json`) the harness parses.
+`oha` is invoked with keep-alive (default) and `--insecure` (self-signed cert). State the exact tool +
+version when you cite numbers — they live in `BASELINE.md`.
+
+### HTTP/2 vs HTTP/1.1
+
+The server advertises **both `h2` and `http/1.1` via ALPN** (`src/tls.rs`), so the SAME binary serves
+either — the client picks via its ALPN offer (an `h2`-capable client negotiates HTTP/2 multiplexing
+over one connection; an HTTP/1.1-only client negotiates down). To measure the multiplexing effect:
+
+| env | effect |
+|---|---|
+| _(default)_ | sweep **HTTP/1.1 only** (the baseline) |
+| `BENCH_HTTP2=1` | sweep **HTTP/2 only** (`oha --http2`) |
+| `BENCH_COMPARE_H2=1` | sweep **both h1 AND h2 over the same boot** and emit a side-by-side h2-vs-h1 **RPS/latency delta** → `bench/results/h2-vs-h1.tsv`. This is the **h2 bench arm** — the decisive apples-to-apples number (same binary, fixtures, box, run). |
+
+```bash
+BENCH_COMPARE_H2=1 ./bench/run.sh   # h1 + h2 side-by-side + the delta table
+```
+
+The results TSV gains a `proto` column (`h1`/`h2`); the delta table reports, per (scenario,
+concurrency), `h2_rps_pct_of_h1` (>100% = an h2 multiplexing RPS win) and the p99 latency delta
+(negative = h2 faster at the tail). The decisive h2-vs-h1 verdict is the EC2/Linux run — locally this
+confirms h2 negotiates + serves and the harness runs over the h2-advertising server (see `BASELINE.md`).
 
 ## The IPv6 `localhost` trap (why we dial `127.0.0.1`)
 

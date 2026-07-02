@@ -17,8 +17,8 @@
 | **Server** | `solid-server-rs` `cargo build --release`, branch `perf/https-baseline` |
 | **Toolchain** | rustc 1.89.0 / cargo 1.89.0 |
 | **Store** | in-memory doubles (`CompositeStore<InMemorySparqClient, InMemoryBlobStore>`) — **NO S3, NO live SPARQ** |
-| **TLS** | in-process rustls/aws-lc-rs (`src/tls.rs`), self-signed `localhost` EC P-256 cert, **HTTP/1.1** (no h2 ALPN) |
-| **Load tool** | `oha` 1.14.0 (HTTP/1.1, keep-alive, `--insecure`), 10s per concurrency level, one discarded warm-up |
+| **TLS** | in-process rustls/aws-lc-rs (`src/tls.rs`), self-signed `localhost` EC P-256 cert. **This run drove HTTP/1.1.** (The server now advertises **both `h2` and `http/1.1` via ALPN** — see `src/tls.rs`; an h2-vs-h1 comparison is a separate sweep via `BENCH_COMPARE_H2=1 ./bench/run.sh`, recorded below once measured on a quiet box.) |
+| **Load tool** | `oha` 1.14.0 (HTTP/1.1 here; HTTP/2 via `--http2`), keep-alive, `--insecure`, 10s per concurrency level, one discarded warm-up |
 | **Fixtures** | `SOLID_SERVER_SEED_BENCH=100`: a public RDF doc, a public listing container with **100 children**, an owner-private doc |
 | **Topology** | load generator + server on the SAME box (loopback); the client (`oha`) and server contend for the same cores |
 

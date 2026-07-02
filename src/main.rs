@@ -414,7 +414,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  TRANSPORT (TLS path, ACTIVE): HTTP/2 max_concurrent_streams={}, rapid-reset cap \
              (CVE-2023-44487)={} (hyper default 20 unless overridden), slowloris header-read \
              timeout={}, max concurrent connections={}, handshake timeout={}, h2 keep-alive \
-             ping={} (reclaims a DEAD-peer connection, not a live-idle one).",
+             ping={} (reclaims a DEAD-peer connection, not a live-idle one), idle-keepalive \
+             timeout={} (reclaims a connection idle BETWEEN requests — request-aware: the idle clock \
+             is paused while an HTTP exchange is in flight, so a slow/streaming request is never \
+             severed; DEFAULT-OFF as it cannot see a post-UPGRADE WebSocket stream), max \
+             requests/connection={} (Connection: close after N — HTTP/1.1 reuse cap; never clobbers a \
+             101 Upgrade).",
             transport_config.h2_max_concurrent_streams,
             match transport_config.h2_max_pending_reset_streams {
                 Some(n) => format!("{n} (override)"),
@@ -424,6 +429,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             connection_limiter.max_connections(),
             fmt_opt_secs(transport_config.handshake_timeout),
             fmt_opt_secs(transport_config.keep_alive_timeout),
+            fmt_opt_secs(transport_config.idle_timeout),
+            match transport_config.max_requests_per_conn {
+                Some(n) => n.to_string(),
+                None => "unlimited".to_string(),
+            },
         );
     } else {
         eprintln!(
@@ -652,11 +662,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             //      `auto::Builder` axum-server serves with — preserving rustls TLS + h2/http1.1 ALPN
             //      exactly (the rustls config owns ALPN; we touch only the hyper protocol knobs).
             let handshake_timeout = transport_config.handshake_timeout;
+            let idle_timeout = transport_config.idle_timeout;
+            let max_requests_per_conn = transport_config.max_requests_per_conn;
             let mut server = axum_server::from_tcp_rustls(std_listener, config)?
                 .handle(handle)
-                .map(|acceptor| {
-                    connection_limiter
-                        .wrap_acceptor_with_handshake_timeout(acceptor, handshake_timeout)
+                .map(move |acceptor| {
+                    // The FULL guard set: connection-cap permit + handshake timeout (accept-time) +
+                    // idle-keepalive read timeout (IO-layer) + max-requests-per-conn (service-layer).
+                    connection_limiter.wrap_acceptor_with_guards(
+                        acceptor,
+                        handshake_timeout,
+                        idle_timeout,
+                        max_requests_per_conn,
+                    )
                 });
             transport_config.apply_to_builder(server.http_builder());
 

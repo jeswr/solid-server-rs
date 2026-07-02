@@ -84,12 +84,20 @@ async fn boot_hardened_server(
     let handle = axum_server::Handle::new();
     let server_handle = handle.clone();
     let handshake_timeout = transport.handshake_timeout;
+    let idle_timeout = transport.idle_timeout;
+    let max_requests_per_conn = transport.max_requests_per_conn;
     tokio::spawn(async move {
+        // The EXACT serve construction the binary's TLS arm uses (the FULL guard set).
         let mut server = axum_server::from_tcp_rustls(std_listener, rustls_config)
             .expect("from_tcp_rustls")
             .handle(server_handle)
             .map(move |acceptor| {
-                limiter.wrap_acceptor_with_handshake_timeout(acceptor, handshake_timeout)
+                limiter.wrap_acceptor_with_guards(
+                    acceptor,
+                    handshake_timeout,
+                    idle_timeout,
+                    max_requests_per_conn,
+                )
             });
         transport.apply_to_builder(server.http_builder());
         let _ = server
@@ -139,6 +147,8 @@ async fn rapid_reset_burst_is_bounded_by_goaway() {
         max_connections: 10_000,
         keep_alive_timeout: Some(Duration::from_secs(60)),
         handshake_timeout: Some(Duration::from_secs(10)),
+        idle_timeout: None,          // disabled — not under test here
+        max_requests_per_conn: None, // disabled — not under test here
     };
     let (addr, handle) = boot_hardened_server(transport).await;
 
@@ -228,6 +238,8 @@ async fn slowloris_header_trickle_is_dropped_after_timeout() {
         max_connections: 10_000,
         keep_alive_timeout: Some(Duration::from_secs(60)),
         handshake_timeout: Some(Duration::from_secs(10)),
+        idle_timeout: None,          // disabled — not under test here
+        max_requests_per_conn: None, // disabled — not under test here
     };
     let (addr, handle) = boot_hardened_server(transport).await;
 
@@ -292,6 +304,8 @@ async fn connection_cap_bounds_concurrent_served_connections() {
         // No handshake timeout here: the held connections complete their handshake fast; the cap test
         // is about post-handshake permit holding, and a short handshake bound could race the test.
         handshake_timeout: None,
+        idle_timeout: None, // disabled — the held connections are kept idle on purpose here
+        max_requests_per_conn: None, // disabled — not under test here
     };
     let (addr, handle) = boot_hardened_server(transport).await;
 
@@ -372,5 +386,156 @@ async fn connection_cap_bounds_concurrent_served_connections() {
 
     // Keep held2 alive until here so the cap stayed at capacity for the blocked assertion.
     drop(held2);
+    handle.graceful_shutdown(Some(Duration::from_secs(1)));
+}
+
+/// REGRESSION 4 — Idle-keepalive timeout (NEW GUARD). Open a TLS HTTP/1.1 keep-alive connection,
+/// complete ONE request (so the connection is established + served), then go IDLE — send NOTHING further
+/// — past a SHORT idle timeout. The server MUST drop the idle connection within the window (a read
+/// returns EOF / 0 bytes). This is the gap the existing bounds miss: `header_read_timeout` only bounds a
+/// PARTIAL head (bytes started), and the h2 PING only reclaims a DEAD peer — neither closes a live peer
+/// holding a fully-idle keep-alive connection. An UNPROTECTED server would hold the idle connection (and
+/// its permit) open indefinitely.
+#[tokio::test]
+#[ignore = "needs the fixture test cert + real socket I/O; run with --ignored"]
+async fn idle_keepalive_connection_is_dropped_after_idle_timeout() {
+    // A SHORT idle timeout so the test is fast + deterministic. Header-read timeout DISABLED so it
+    // cannot be what closes the connection — the idle timeout must be the sole cause (no false pass).
+    let idle = Duration::from_secs(1);
+    let transport = TransportConfig {
+        h2_max_concurrent_streams: 256,
+        h2_max_pending_reset_streams: None,
+        header_read_timeout: None, // OFF — so ONLY the idle timeout can close the connection
+        max_connections: 10_000,
+        keep_alive_timeout: None,
+        handshake_timeout: Some(Duration::from_secs(10)),
+        idle_timeout: Some(idle),
+        max_requests_per_conn: None,
+    };
+    let (addr, handle) = boot_hardened_server(transport).await;
+
+    // HTTP/1.1 keep-alive: complete one request, keep the connection open, read just the status so the
+    // request finishes but the keep-alive connection stays up.
+    let mut tls = connect_tls(addr, &[b"http/1.1"]).await;
+    let req = "GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n"; // NO `Connection: close` ⇒ keep-alive
+    tls.write_all(req.as_bytes()).await.expect("write request");
+    tls.flush().await.expect("flush");
+    let mut status = [0u8; 12];
+    tls.read_exact(&mut status).await.expect("read status line");
+    assert!(
+        status.starts_with(b"HTTP/1.1 200"),
+        "the first request must be served (200): {:?}",
+        String::from_utf8_lossy(&status)
+    );
+
+    // Drain the rest of THAT response (headers + tiny body) without sending a new request, so the
+    // connection is now genuinely idle (no in-flight request, no new bytes from us). We read with a
+    // short per-read timeout; once the server's idle window elapses, a read returns EOF (0) — the idle
+    // timeout fired. If the connection HUNG open (no idle guard), the final read would block past the
+    // window and the outer timeout would catch it as a FAILURE.
+    let idle_closed = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut buf = [0u8; 256];
+        loop {
+            match tls.read(&mut buf).await {
+                Ok(0) => return true, // EOF — the server closed the idle connection (PASS)
+                Ok(_n) => { /* still draining the first response's bytes — keep reading */ }
+                Err(_e) => return true, // reset/closed — also the idle guard firing
+            }
+        }
+    })
+    .await;
+    assert!(
+        matches!(idle_closed, Ok(true)),
+        "the idle keep-alive connection must be DROPPED within the idle timeout window (got {idle_closed:?}) \
+         — the idle-keepalive guard did not fire (an idle connection HUNG open holding its permit)"
+    );
+
+    handle.graceful_shutdown(Some(Duration::from_secs(1)));
+}
+
+/// REGRESSION 5 — Max-requests-per-connection (NEW GUARD). With the cap = 3, drive requests on ONE
+/// HTTP/1.1 keep-alive connection: the first (cap-1) responses must NOT carry `Connection: close` (reuse
+/// continues), and the cap-th response MUST carry `Connection: close` so the connection ends after it.
+/// This bounds how long a single connection can be reused (defence-in-depth connection rotation). An
+/// UNPROTECTED server would reuse the connection unboundedly (never closing it on its own).
+#[tokio::test]
+#[ignore = "needs the fixture test cert + real socket I/O; run with --ignored"]
+async fn max_requests_per_connection_sets_connection_close_at_the_cap() {
+    let cap = 3u64;
+    let transport = TransportConfig {
+        h2_max_concurrent_streams: 256,
+        h2_max_pending_reset_streams: None,
+        header_read_timeout: Some(Duration::from_secs(15)),
+        max_connections: 10_000,
+        keep_alive_timeout: None,
+        handshake_timeout: Some(Duration::from_secs(10)),
+        idle_timeout: None, // OFF — the cap, not an idle close, must end the connection
+        max_requests_per_conn: Some(cap),
+    };
+    let (addr, handle) = boot_hardened_server(transport).await;
+
+    let mut tls = connect_tls(addr, &[b"http/1.1"]).await;
+
+    // Issue `cap` keep-alive requests on the SAME connection, reading each response head. The first
+    // `cap-1` must keep the connection alive (no `connection: close`); the cap-th must carry
+    // `connection: close`. We read until the end of each response's headers (the blank line) and inspect
+    // the header block for `connection: close` (case-insensitive).
+    async fn read_response_head<R: AsyncReadExt + Unpin>(tls: &mut R) -> String {
+        // Read byte-by-byte until the CRLFCRLF header terminator. The bodies here are tiny ("ok") and
+        // hyper sends Content-Length, so after the head we don't need the body to inspect the header.
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let n = tls.read(&mut byte).await.expect("read header byte");
+            assert!(n == 1, "connection closed mid-response head (unexpected)");
+            head.push(byte[0]);
+            if head.len() >= 4 && &head[head.len() - 4..] == b"\r\n\r\n" {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&head).to_lowercase()
+    }
+
+    for i in 1..=cap {
+        let req = "GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n"; // keep-alive (no Connection: close)
+        tls.write_all(req.as_bytes()).await.expect("write request");
+        tls.flush().await.expect("flush");
+        let head = read_response_head(&mut tls).await;
+        assert!(
+            head.starts_with("http/1.1 200"),
+            "request {i} served: {head}"
+        );
+        // Drain the tiny body so the next request starts clean. The response is "ok" (Content-Length 2).
+        let mut body = [0u8; 2];
+        let _ = tls.read_exact(&mut body).await;
+        let has_close = head.contains("connection: close");
+        if i < cap {
+            assert!(
+                !has_close,
+                "request {i} (< cap {cap}) must NOT carry `Connection: close` — keep-alive reuse should \
+                 continue (header block: {head})"
+            );
+        } else {
+            assert!(
+                has_close,
+                "the cap-th request ({i} == cap {cap}) MUST carry `Connection: close` so the connection \
+                 ends after it (the max-requests-per-conn guard did not fire; header block: {head})"
+            );
+        }
+    }
+
+    // After the cap-th `Connection: close`, the server closes the connection: a subsequent read returns
+    // EOF (the connection genuinely ended, not just an advisory header).
+    let mut buf = [0u8; 64];
+    let read = tokio::time::timeout(Duration::from_secs(3), tls.read(&mut buf)).await;
+    match read {
+        Ok(Ok(0)) | Ok(Err(_)) => { /* EOF / reset — the connection was closed after the cap (PASS) */ }
+        Ok(Ok(n)) => panic!(
+            "after the cap-th `Connection: close` the server still sent {n} more bytes — the connection \
+             was NOT closed"
+        ),
+        Err(_) => panic!("the connection HUNG open after the cap-th `Connection: close` — it was not closed"),
+    }
+
     handle.graceful_shutdown(Some(Duration::from_secs(1)));
 }
