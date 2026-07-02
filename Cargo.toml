@@ -136,6 +136,26 @@ url = "2"
 # features are enabled (default-features = false), keeping the dep surface to the blocking client + r2d2.
 redis = { version = "1", default-features = false, features = ["r2d2"], optional = true }
 r2d2 = { version = "0.8", optional = true }
+# Global allocator: mimalloc (Microsoft's drop-in performance-oriented allocator) installed as the
+# process `#[global_allocator]` in `main.rs`. The default-libc allocator path (nano-malloc on
+# macOS, the libc allocator elsewhere) was the dominant non-app cost in the local profile — the perf
+# lever this dep exists for. mimalloc was chosen over jemalloc DELIBERATELY: jemalloc
+# (`tikv-jemallocator`) has Alpine/musl page-size pain (the 64K-vs-4K page assumption bites on some
+# musl targets), whereas mimalloc builds cleanly on musl — and this repo targets a musl deploy image
+# (the musl/glibc lockfile scars are real). There is NO runtime conflict with `aws-lc-rs`: aws-lc-rs
+# is the rustls CRYPTO PROVIDER, not an allocator, so swapping the global allocator is orthogonal to
+# it. MIT-licensed (already in deny.toml's allow-list).
+#
+# TRUST-SURFACE DELTA (documented per the deny.toml build-time-code-execution note): mimalloc 0.1.x
+# pulls `libmimalloc-sys`, a `*-sys` crate that VENDORS the mimalloc C source (~23.5k lines C + ~6.7k
+# lines headers) and COMPILES it at build time via a `build.rs` driving the `cc` crate. This is the
+# cargo analogue of an npm install/build hook — arbitrary code (a C compiler invocation over vendored
+# C) runs at BUILD time. It is governed by the existing cargo-deny lane (advisories/bans/sources/
+# licenses); both crates are MIT, ~40.9M downloads each, actively maintained by purpleprotocol. We do
+# NOT enable the `secure` feature (guard pages / encrypted free-lists, ~10% perf penalty) here — that
+# is an available hardening lever to evaluate separately. A C toolchain is REQUIRED in the build image
+# (already true for the musl release build). Cargo.lock is committed for a reproducible, reviewable build.
+mimalloc = "0.1"
 
 [dev-dependencies]
 # Mint test JWS access tokens + DPoP proofs for the auth-middleware unit tests (mirrors the
