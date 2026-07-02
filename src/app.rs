@@ -204,7 +204,7 @@ where
     // `…/receive` is the same registry the LDP emit path fans to.
     let notify_state = Arc::new(NotifyState::new(
         ldp.notifications.clone(),
-        ldp.base_url.clone(),
+        ldp.base_url().to_string(),
     ));
 
     // The full LDP method set, shared by the wildcard `/{*path}` route AND the explicit `/` (root)
