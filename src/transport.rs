@@ -645,6 +645,14 @@ pub struct IdleTimeoutStream<Io> {
     /// The idle timeout therefore fires ONLY when the connection is genuinely idle BETWEEN exchanges.
     /// `None` ⇒ no tracking (the idle guard is off), so the default hot path is untouched.
     in_flight: Option<Arc<AtomicUsize>>,
+    /// Whether the LAST `poll_read` observed an exchange in flight. Used to detect the in-flight→idle
+    /// TRANSITION: while an exchange is in flight the deadline is only refreshed when `poll_read` is
+    /// actually called, so a long exchange that makes no read progress for more than a window leaves the
+    /// deadline STALE. On the first idle poll after such an exchange we must grant a FULL FRESH window
+    /// (reset the deadline once) rather than fire immediately on that stale deadline — the connection
+    /// becomes idle at the moment the exchange ENDS, not when it started. Only meaningful when
+    /// [`in_flight`](Self::in_flight) is `Some`; starts `false`.
+    prev_in_flight: bool,
 }
 
 impl<Io> IdleTimeoutStream<Io> {
@@ -672,6 +680,7 @@ impl<Io> IdleTimeoutStream<Io> {
             inner,
             idle,
             in_flight,
+            prev_in_flight: false,
         }
     }
 }
@@ -700,11 +709,17 @@ impl<Io: AsyncRead + Unpin> AsyncRead for IdleTimeoutStream<Io> {
                 //      deadline to a fresh window and stay Pending. This is what keeps the idle bound from
                 //      severing a legitimately slow request/response; the timeout fires only BETWEEN
                 //      exchanges. (When the exchange ends the count drops to 0 and the next poll_read —
-                //      hyper reading the following keep-alive request — arms a full fresh idle window.)
+                //      hyper reading the following keep-alive request — arms a full fresh idle window via
+                //      the transition-reset below.)
                 //
                 //  (b) genuinely idle (no exchange in flight): if the deadline has elapsed, the connection
                 //      has made NO progress for the whole window ⇒ close it with a TimedOut error. (A read
-                //      or write since the last reset would have pushed the deadline out.)
+                //      or write since the last reset would have pushed the deadline out.) BUT the very
+                //      first idle poll AFTER an in-flight exchange must not fire on a STALE deadline: while
+                //      in flight the deadline is only refreshed when poll_read is actually called, so a
+                //      long exchange with no read progress for >window leaves it in the past. On the
+                //      in-flight→idle TRANSITION we therefore reset the deadline ONCE (a full fresh window
+                //      counting from now — the connection becomes idle at exchange-END), then evaluate.
                 let exchange_in_flight = this
                     .in_flight
                     .as_ref()
@@ -713,12 +728,21 @@ impl<Io: AsyncRead + Unpin> AsyncRead for IdleTimeoutStream<Io> {
                     if exchange_in_flight {
                         // (a) Hold the deadline fresh; do NOT poll/fire while the exchange runs.
                         sleep.as_mut().reset(tokio::time::Instant::now() + *dur);
-                    } else if sleep.as_mut().poll(cx).is_ready() {
+                        this.prev_in_flight = true;
+                    } else {
+                        if this.prev_in_flight {
+                            // (a→b) The exchange JUST ended: grant a FULL FRESH idle window from now, so a
+                            // stale in-flight deadline can never fire immediately on this first idle poll.
+                            sleep.as_mut().reset(tokio::time::Instant::now() + *dur);
+                            this.prev_in_flight = false;
+                        }
                         // (b) Idle past the window ⇒ close.
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "connection idle between requests past the idle timeout — closing",
-                        )));
+                        if sleep.as_mut().poll(cx).is_ready() {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "connection idle between requests past the idle timeout — closing",
+                            )));
+                        }
                     }
                 }
                 Poll::Pending
@@ -870,13 +894,15 @@ impl<B: Body> Body for TrackedBody<B> {
 /// the request's 1-based ordinal; at/after the cap the response gets `Connection: close`.
 ///
 /// ## Protocol-upgrade exemption (the WebSocketChannel2023 receive socket)
-/// The `Connection: close` stamp is SKIPPED for a protocol-UPGRADE response — a `101 Switching
-/// Protocols` or any response carrying an `Upgrade` header / `Connection: upgrade` token (see
-/// [`is_upgrade_response`]). The WS receive-socket handshake (`GET …/receive`) is served through this
-/// same guarded acceptor, so with a small cap the upgrade IS the cap-th (or a later) request; stamping
-/// `Connection: close` on its 101 would strip the required `Connection: Upgrade` token and the client
-/// would FAIL the handshake (RFC 6455 §4.1). The cap still applies to ordinary keep-alive responses;
-/// it simply never clobbers an upgrade.
+/// The `Connection: close` stamp is SKIPPED for a COMPLETED protocol-UPGRADE response — a `101 Switching
+/// Protocols` (see [`is_upgrade_response`]). The WS receive-socket handshake (`GET …/receive`) is served
+/// through this same guarded acceptor, so with a small cap the upgrade IS the cap-th (or a later)
+/// request; stamping `Connection: close` on its 101 would strip the required `Connection: Upgrade` token
+/// and the client would FAIL the handshake (RFC 6455 §4.1). The exemption is keyed on the `101` STATUS,
+/// not the mere presence of an `Upgrade` header — a non-101 response that merely advertises `Upgrade`
+/// (e.g. a `426 Upgrade Required`) is an ordinary keep-alive response the cap still closes, so it cannot
+/// bypass the reuse cap. The cap therefore applies to every ordinary keep-alive response; it simply
+/// never clobbers a real (101) upgrade.
 ///
 /// ## Why a header, not `graceful_shutdown` (the correctness choice)
 /// Setting `Connection: close` lets the IN-FLIGHT response complete cleanly and THEN closes the
@@ -979,27 +1005,22 @@ pin_project_lite::pin_project! {
     }
 }
 
-/// Whether `resp` is a protocol-UPGRADE response whose `Connection` header MUST be preserved — a `101
-/// Switching Protocols` (the WebSocketChannel2023 receive-socket handshake) or any response already
-/// carrying an `Upgrade` header / a `Connection: upgrade` token. The max-requests cap MUST NOT stamp
-/// `Connection: close` on such a response: RFC 6455 §4.1 requires the client to FAIL the WebSocket
-/// handshake when `Connection` lacks the `upgrade` token, so clobbering it would break every live
-/// notification receive socket that happens to be the cap-th (or a later) request on its connection.
+/// Whether `resp` is a COMPLETED protocol-UPGRADE response whose `Connection` header MUST be preserved —
+/// a `101 Switching Protocols` (the WebSocketChannel2023 receive-socket handshake). A genuine HTTP
+/// protocol switch is ALWAYS signalled by the `101` status; the `Upgrade` / `Connection: upgrade` tokens
+/// are the handshake tokens the 101 CARRIES (which we must not clobber), not the discriminator.
+///
+/// The status is checked, NOT the presence of an `Upgrade` header, DELIBERATELY: an `Upgrade` header (or
+/// a `Connection: upgrade` token) on a NON-101 response is merely ADVISORY — e.g. a `426 Upgrade
+/// Required`, or a `200` advertising `Upgrade: h2c` — and that response is an ordinary keep-alive
+/// response the max-requests cap MUST still be able to close. Exempting every `Upgrade`-carrying response
+/// (the earlier, over-broad predicate) would let such responses bypass the reuse cap indefinitely
+/// (adversarial-review MED, PR #6). The cap MUST NOT stamp `Connection: close` on a 101, though: RFC 6455
+/// §4.1 requires the client to FAIL the WebSocket handshake when `Connection` lacks the `upgrade` token,
+/// so clobbering it would break every live notification receive socket that happens to be the cap-th (or
+/// a later) request on its connection.
 fn is_upgrade_response<B>(resp: &http::Response<B>) -> bool {
-    if resp.status() == http::StatusCode::SWITCHING_PROTOCOLS {
-        return true;
-    }
-    if resp.headers().contains_key(http::header::UPGRADE) {
-        return true;
-    }
-    // A `Connection` header listing the `upgrade` token (comma-separated, case-insensitive).
-    resp.headers()
-        .get(http::header::CONNECTION)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|s| {
-            s.split(',')
-                .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
-        })
+    resp.status() == http::StatusCode::SWITCHING_PROTOCOLS
 }
 
 impl<F, ResBody, E> Future for MaxRequestsFuture<F>
@@ -1722,34 +1743,103 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn max_requests_service_still_stamps_close_on_a_non_101_upgrade_advertising_response() {
+        // Adversarial-review MED (PR #6): the upgrade exemption must key on the `101` STATUS, not the mere
+        // presence of an `Upgrade` header. A `426 Upgrade Required` (or any non-101 response advertising
+        // `Upgrade`) is an ORDINARY keep-alive response — it is NOT a completed protocol switch — so the
+        // max-requests cap must still stamp `Connection: close` on it at/after the cap. The earlier,
+        // over-broad predicate exempted every `Upgrade`-carrying response, letting such responses bypass
+        // the reuse cap indefinitely.
+        use std::task::Poll;
+        use tower::Service;
+
+        // A stub returning a `426 Upgrade Required` that advertises `Upgrade` (but is NOT a 101 switch).
+        #[derive(Clone)]
+        struct Upgrade426;
+        impl Service<http::Request<()>> for Upgrade426 {
+            type Response = http::Response<()>;
+            type Error = std::convert::Infallible;
+            type Future =
+                std::pin::Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+            fn call(&mut self, _req: http::Request<()>) -> Self::Future {
+                Box::pin(async {
+                    let mut resp = http::Response::new(());
+                    *resp.status_mut() = http::StatusCode::UPGRADE_REQUIRED;
+                    resp.headers_mut().insert(
+                        http::header::UPGRADE,
+                        http::HeaderValue::from_static("HTTP/2.0"),
+                    );
+                    Ok(resp)
+                })
+            }
+        }
+
+        // cap=1 ⇒ the first request is at the cap ⇒ the guard must stamp close on this non-101 response.
+        let mut svc = MaxRequestsService::new(Upgrade426, Some(1), None);
+        let resp = svc.call(http::Request::new(())).await.unwrap();
+
+        let conn = resp
+            .headers()
+            .get(http::header::CONNECTION)
+            .expect("a non-101 Upgrade-advertising response at the cap MUST get Connection: close");
+        assert!(
+            conn.as_bytes().eq_ignore_ascii_case(b"close"),
+            "the max-requests cap MUST still close a non-101 (426) response that merely advertises \
+             Upgrade — got {conn:?}; exempting it would let it bypass the reuse cap"
+        );
+    }
+
     #[test]
-    fn is_upgrade_response_detects_upgrades_and_ignores_plain_responses() {
-        // 101 status ⇒ upgrade.
+    fn is_upgrade_response_exempts_only_101_not_advisory_upgrade_headers() {
+        // 101 Switching Protocols ⇒ a real completed upgrade (exempt from the close stamp).
         let mut r = http::Response::new(());
         *r.status_mut() = http::StatusCode::SWITCHING_PROTOCOLS;
         assert!(is_upgrade_response(&r));
 
-        // `Connection: upgrade` token (case-insensitive, possibly comma-listed) ⇒ upgrade.
+        // A 101 is exempt on its STATUS alone — even the (malformed) case with no upgrade tokens: we must
+        // never stamp `Connection: close` on a Switching-Protocols response.
+        let mut r = http::Response::new(());
+        *r.status_mut() = http::StatusCode::SWITCHING_PROTOCOLS;
+        r.headers_mut().insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("close"),
+        );
+        assert!(is_upgrade_response(&r));
+
+        // NON-101 with a `Connection: upgrade` token ⇒ NOT exempt (adversarial-review MED, PR #6): the
+        // token is only advisory here; this is an ordinary keep-alive response the cap must still close.
         let mut r = http::Response::new(());
         r.headers_mut().insert(
             http::header::CONNECTION,
             http::HeaderValue::from_static("keep-alive, Upgrade"),
         );
-        assert!(is_upgrade_response(&r));
+        assert!(!is_upgrade_response(&r));
 
-        // Bare `Upgrade` header ⇒ upgrade.
+        // NON-101 with a bare `Upgrade` header (e.g. a `426 Upgrade Required`) ⇒ NOT exempt: the
+        // over-broad predicate used to let such responses bypass the reuse cap indefinitely.
         let mut r = http::Response::new(());
+        *r.status_mut() = http::StatusCode::UPGRADE_REQUIRED;
         r.headers_mut().insert(
             http::header::UPGRADE,
             http::HeaderValue::from_static("websocket"),
         );
-        assert!(is_upgrade_response(&r));
+        assert!(!is_upgrade_response(&r));
+
+        // A `200` advertising `Upgrade: h2c` ⇒ NOT exempt (advisory, not a completed switch).
+        let mut r = http::Response::new(());
+        r.headers_mut()
+            .insert(http::header::UPGRADE, http::HeaderValue::from_static("h2c"));
+        assert!(!is_upgrade_response(&r));
 
         // A plain 200 with no upgrade signals ⇒ NOT an upgrade (the cap may stamp close).
         let r = http::Response::new(());
         assert!(!is_upgrade_response(&r));
 
-        // `Connection: close` is not an upgrade token.
+        // `Connection: close` on a non-101 is not an upgrade token.
         let mut r = http::Response::new(());
         r.headers_mut().insert(
             http::header::CONNECTION,
@@ -1816,6 +1906,76 @@ mod tests {
             io::ErrorKind::TimedOut,
             "an idle connection (no in-flight exchange) past the window must close with TimedOut, got \
              {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_stream_grants_a_full_fresh_window_after_an_exchange_ends() {
+        // Regression for the in-flight→idle TRANSITION (adversarial-review MED, PR #6). While an exchange
+        // is in flight the idle deadline is only refreshed when `poll_read` is actually CALLED. A long
+        // exchange that makes NO read progress for more than a window (a slow handler with a quiet client)
+        // therefore leaves the deadline STALE (in the past). When the exchange then ends, the FIRST idle
+        // `poll_read` must NOT fire on that stale deadline — the connection becomes idle at exchange-END
+        // and is owed a FULL FRESH window. Without the transition-reset the read resolves to TimedOut
+        // immediately, prematurely severing a keep-alive connection right after a slow request.
+        use std::future::poll_fn;
+        use tokio::io::{AsyncReadExt, ReadBuf};
+        use tokio::time::{sleep, Duration as TDur};
+
+        let idle_window = TDur::from_millis(100);
+        let (client, server) = tokio::io::duplex(64);
+        let _client_keepalive = client; // keep the client end open so the duplex never EOFs
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let mut idle = IdleTimeoutStream::new(server, Some(idle_window), Some(in_flight.clone()));
+
+        // An exchange is dispatched (in flight). ONE poll_read arms/refreshes the deadline, then there are
+        // NO further reads while the slow exchange runs (the quiet-client case).
+        in_flight.store(1, Ordering::Relaxed);
+        let mut rbuf = [0u8; 1];
+        let first = poll_fn(|cx| {
+            let mut buf = ReadBuf::new(&mut rbuf);
+            Poll::Ready(Pin::new(&mut idle).poll_read(cx, &mut buf))
+        })
+        .await;
+        assert!(
+            matches!(first, Poll::Pending),
+            "the in-flight read must be Pending (no bytes, exchange in flight)"
+        );
+
+        // Let MORE than a full window pass with the exchange STILL in flight and NO intervening poll_read,
+        // so the last-set deadline is now in the PAST (stale).
+        sleep(idle_window + idle_window / 2).await; // 150ms > the 100ms window
+
+        // The exchange ends. The very first idle poll_read must treat the connection as idle-from-NOW and
+        // must NOT immediately fire on the stale in-flight deadline.
+        in_flight.store(0, Ordering::Relaxed);
+        let transition = poll_fn(|cx| {
+            let mut buf = ReadBuf::new(&mut rbuf);
+            Poll::Ready(Pin::new(&mut idle).poll_read(cx, &mut buf))
+        })
+        .await;
+        match transition {
+            Poll::Pending => { /* healthy: a full fresh window was granted at the transition */ }
+            Poll::Ready(Ok(())) => panic!("unexpected data/EOF (test setup wrong)"),
+            Poll::Ready(Err(e)) => panic!(
+                "the idle bound FIRED on the FIRST idle poll after an exchange ended ({e}) — the \
+                 in-flight→idle transition must grant a full fresh idle window, not fire on the stale \
+                 in-flight deadline"
+            ),
+        }
+
+        // The fresh window IS still enforced: once genuinely idle past the NEW window, the connection
+        // closes (the guard was only reset, never disabled).
+        let mut buf2 = [0u8; 1];
+        let res = tokio::time::timeout(idle_window * 20, idle.read(&mut buf2)).await;
+        let inner =
+            res.expect("once idle the read must resolve (the guard fires after the fresh window)");
+        let err = inner.expect_err("a genuinely idle connection past the fresh window must close");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::TimedOut,
+            "after the fresh window elapses with no activity, the idle connection must close with \
+             TimedOut, got {err:?}"
         );
     }
 
