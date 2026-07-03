@@ -319,9 +319,12 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// An inbound entity-tag with its validator strength preserved (RFC 9110 §8.8.3).
+/// A syntactically VALID inbound entity-tag with its validator strength preserved (RFC 9110
+/// §8.8.3). Only [`parse_entity_tag`] constructs one — a malformed header member never becomes an
+/// `InboundTag`, so it can never reach a comparison.
 struct InboundTag<'a> {
-    /// The opaque quoted tag value (e.g. `"abc"`), with any `W/` prefix removed.
+    /// The tag's inner opaque characters (the `*etagc` between the quotes, e.g. `abc` for `"abc"`),
+    /// with the quotes and any `W/` prefix removed.
     opaque: &'a str,
     /// Whether the inbound validator was weak (`W/`-prefixed).
     weak: bool,
@@ -333,21 +336,65 @@ impl InboundTag<'_> {
     /// matches the stored state it derives from (the GET → `If-Match` round-trip). The server's
     /// stored tag is always strong, so a weak inbound tag never matches strongly.
     fn matches_strong_state(&self, current_strong: &str) -> bool {
-        !self.weak && state_part(self.opaque) == state_part(current_strong)
+        if self.weak {
+            return false;
+        }
+        match parse_current(current_strong) {
+            Some(cur) => state_part(self.opaque) == state_part(cur),
+            None => false,
+        }
     }
 
     /// WEAK comparison on the STATE part (for the WRITE path's `If-None-Match` guard): state parts
     /// equal regardless of strength.
     fn matches_weak_state(&self, current_strong: &str) -> bool {
-        state_part(self.opaque) == state_part(current_strong)
+        match parse_current(current_strong) {
+            Some(cur) => state_part(self.opaque) == state_part(cur),
+            None => false,
+        }
     }
 
     /// WEAK comparison, EXACT opaque tags (for the READ path's `If-None-Match`): the inbound tag
     /// must equal the negotiated representation's own tag — variant suffix included — so a tag for
     /// a different negotiated representation of the same state never yields a 304.
     fn matches_weak(&self, current_strong: &str) -> bool {
-        self.opaque == current_strong
+        match parse_current(current_strong) {
+            Some(cur) => self.opaque == cur,
+            None => false,
+        }
     }
+}
+
+/// Parse ONE inbound entity-tag STRICTLY per RFC 9110 §8.8.3 — `entity-tag = [ weak ] opaque-tag`,
+/// `weak = "W/"` (case-sensitive), `opaque-tag = DQUOTE *etagc DQUOTE`,
+/// `etagc = %x21 / %x23-7E / obs-text` (no DQUOTE, no whitespace, no control chars inside).
+///
+/// Returns the tag's INNER opaque characters (quotes stripped) + its strength, or `None` when the
+/// value is malformed — an unclosed quote (`"abc`), a doubled trailing quote (`"abc""`), a bare
+/// unquoted token, an interior DQUOTE/space/control byte, a lone `W/`, etc. Validation happens
+/// BEFORE any comparison, so a malformed validator can never match anything (in particular it can
+/// never be "normalised" into equality with a valid current tag — the regression roborev caught).
+fn parse_entity_tag(raw: &str) -> Option<InboundTag<'_>> {
+    let t = raw.trim();
+    let (weak, quoted) = match t.strip_prefix("W/") {
+        Some(rest) => (true, rest),
+        None => (false, t),
+    };
+    let inner = quoted.strip_prefix('"')?.strip_suffix('"')?;
+    inner
+        .bytes()
+        .all(|b| b == 0x21 || (0x23..=0x7E).contains(&b) || b >= 0x80)
+        .then_some(InboundTag {
+            opaque: inner,
+            weak,
+        })
+}
+
+/// The inner opaque characters of the SERVER's own current ETag, which is always a well-formed
+/// STRONG tag. `None` (⇒ no match, fail closed) if it is somehow not — defensive only.
+fn parse_current(current_strong: &str) -> Option<&str> {
+    let tag = parse_entity_tag(current_strong)?;
+    (!tag.weak).then_some(tag.opaque)
 }
 
 /// Mint the representation-variant entity-tag for a content-negotiated response: the stored (state)
@@ -363,35 +410,26 @@ pub fn variant_etag(stored: &str, variant: &str) -> String {
     }
 }
 
-/// The STATE part of an entity-tag minted by this server: everything before the first `+`
-/// (dropping any `+<variant>` representation suffix; the closing quote is normalised away on both
-/// sides so a suffixed and an unsuffixed tag of the same state compare equal).
-fn state_part(tag: &str) -> &str {
-    match tag.split_once('+') {
+/// The STATE part of a VALIDATED tag's inner opaque characters: everything before the first `+`
+/// (dropping any `+<variant>` representation suffix). Operates only on [`parse_entity_tag`] output,
+/// so no quote handling happens here — a malformed tag was already rejected upstream.
+fn state_part(inner: &str) -> &str {
+    match inner.split_once('+') {
         Some((head, _)) => head,
-        None => tag.trim_end_matches('"'),
+        None => inner,
     }
 }
 
-/// Iterate the entity-tags in a comma-separated `If-(None-)Match` header value, preserving each
-/// tag's validator STRENGTH (so `If-Match` can correctly reject a weak validator). Whitespace is
-/// trimmed and an empty/blank entry is skipped.
+/// Iterate the WELL-FORMED entity-tags in a comma-separated `If-(None-)Match` header value,
+/// preserving each tag's validator STRENGTH (so `If-Match` can correctly reject a weak validator).
+/// Each member is validated by [`parse_entity_tag`]; a malformed member is DROPPED — it can never
+/// match — while the remaining valid members are still evaluated. (A quoted tag containing a comma
+/// — legal `etagc`, never minted by this server — splits into two malformed halves and is likewise
+/// dropped: fail-safe in both directions, `If-Match` won't proceed on it and `If-None-Match` won't
+/// 304/412 on it. A `*` is handled by the callers on the WHOLE header only, per the grammar —
+/// a `*` member inside a list is not a wildcard and, unquoted, drops as malformed.)
 fn tag_list(header: &str) -> impl Iterator<Item = InboundTag<'_>> {
-    header
-        .split(',')
-        .map(|t| t.trim())
-        .filter(|t| !t.is_empty())
-        .map(|t| match t.strip_prefix("W/") {
-            Some(rest) => InboundTag {
-                opaque: rest.trim(),
-                weak: true,
-            },
-            None => InboundTag {
-                opaque: t,
-                weak: false,
-            },
-        })
-        .filter(|t| !t.opaque.is_empty())
+    header.split(',').filter_map(parse_entity_tag)
 }
 
 #[cfg(test)]
@@ -752,6 +790,131 @@ mod tests {
         assert_eq!(
             evaluate_read(Some(&served_variant), None, &served_variant, None),
             ReadPrecondition::NotModified
+        );
+    }
+
+    // --- Entity-tag syntax validation (RFC 9110 §8.8.3) — malformed tags never match --------------
+
+    /// Malformed entity-tag header values: each must never satisfy any precondition against the
+    /// valid current tag [`TAG`] = `"abc-123"`.
+    const MALFORMED: &[&str] = &[
+        "\"abc-123",     // unclosed quote
+        "abc-123\"",     // unopened quote
+        "\"abc-123\"\"", // doubled trailing quote
+        "abc-123",       // bare unquoted token
+        "\"abc 123\"",   // interior space (not etagc)
+        "\"abc\"123\"",  // interior DQUOTE (not etagc)
+        "W/abc-123",     // weak prefix without quotes
+        "W/",            // lone weak prefix
+        "w/\"abc-123\"", // lowercase weak prefix (RFC 9110: `weak = %x57.2F`, case-sensitive)
+    ];
+
+    #[test]
+    fn malformed_if_match_never_matches_the_valid_current_tag() {
+        for bad in MALFORMED {
+            assert_eq!(
+                evaluate(Some(bad), None, Some(TAG)),
+                Precondition::Failed,
+                "If-Match {bad:?} must not match {TAG:?}"
+            );
+        }
+        // A well-formed EMPTY tag `""` is valid syntax but matches only an empty opaque-tag —
+        // never a real current tag (and this server never mints an empty tag).
+        assert_eq!(
+            evaluate(Some("\"\""), None, Some(TAG)),
+            Precondition::Failed
+        );
+    }
+
+    #[test]
+    fn malformed_if_none_match_never_matches_so_the_guard_proceeds() {
+        // On If-None-Match, "no match" means the request PROCEEDS (write guard passes) — a
+        // malformed tag must not 412.
+        for bad in MALFORMED {
+            assert_eq!(
+                evaluate(None, Some(bad), Some(TAG)),
+                Precondition::Proceed,
+                "If-None-Match {bad:?} must not match {TAG:?}"
+            );
+        }
+        assert_eq!(
+            evaluate(None, Some("\"\""), Some(TAG)),
+            Precondition::Proceed
+        );
+    }
+
+    #[test]
+    fn malformed_read_if_none_match_is_a_fresh_200_never_304() {
+        for bad in MALFORMED {
+            assert_eq!(
+                evaluate_read(Some(bad), None, TAG, None),
+                ReadPrecondition::Proceed,
+                "read If-None-Match {bad:?} must not 304 against {TAG:?}"
+            );
+        }
+        assert_eq!(
+            evaluate_read(Some("\"\""), None, TAG, None),
+            ReadPrecondition::Proceed
+        );
+    }
+
+    #[test]
+    fn empty_opaque_tag_matches_only_an_empty_current_tag() {
+        // `""` is well-formed (`*etagc` allows zero chars): exact-match semantics still hold.
+        assert_eq!(
+            evaluate_read(Some("\"\""), None, "\"\"", None),
+            ReadPrecondition::NotModified
+        );
+        // But it is NOT the same as a tag whose CONTENT is a quote-pair — that content is not
+        // valid etagc, so such an inbound tag is malformed and matches nothing.
+        assert_eq!(
+            evaluate_read(Some("\"\\\"\\\"\""), None, "\"\"", None),
+            ReadPrecondition::Proceed
+        );
+    }
+
+    #[test]
+    fn malformed_member_in_a_list_is_dropped_but_valid_members_still_match() {
+        // A malformed member must not poison the list: the VALID member still matches…
+        let with_valid = format!("\"unclosed, {TAG}");
+        assert_eq!(
+            evaluate(Some(&with_valid), None, Some(TAG)),
+            Precondition::Proceed,
+            "the valid If-Match member must still match"
+        );
+        assert_eq!(
+            evaluate_read(Some(&with_valid), None, TAG, None),
+            ReadPrecondition::NotModified,
+            "the valid read member must still 304"
+        );
+        // …and a list of ONLY malformed members matches nothing.
+        let all_bad = "\"unclosed, bare, \"doubled\"\"";
+        assert_eq!(
+            evaluate(Some(all_bad), None, Some(TAG)),
+            Precondition::Failed
+        );
+        assert_eq!(
+            evaluate_read(Some(all_bad), None, TAG, None),
+            ReadPrecondition::Proceed
+        );
+    }
+
+    #[test]
+    fn wildcard_is_only_the_whole_header_never_a_list_member() {
+        // `*` inside a list is not a wildcard (the grammar is `*` OR a tag list) — and, unquoted,
+        // it drops as malformed, so it cannot satisfy If-Match…
+        assert_eq!(
+            evaluate(Some(&format!("*, {OTHER}")), None, Some(TAG)),
+            Precondition::Failed
+        );
+        // …nor trip If-None-Match / the read path into a match.
+        assert_eq!(
+            evaluate(None, Some(&format!("*, {OTHER}")), Some(TAG)),
+            Precondition::Proceed
+        );
+        assert_eq!(
+            evaluate_read(Some(&format!("*, {OTHER}")), None, TAG, None),
+            ReadPrecondition::Proceed
         );
     }
 }
