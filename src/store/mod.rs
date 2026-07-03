@@ -7,6 +7,10 @@
 //! whole stack is testable without a running SPARQ or S3.
 
 pub mod blob;
+// Deterministic backend round-trip counters at the SparqClient/BlobStore seams (read-1 of the
+// read-path perf plan — docs/design/backend-read-path.md §7). Decorators used by the pinned
+// counter tests + the bench harness; zero-cost when not wired in.
+pub mod counting;
 // The in-process embedded SPARQ backend (opt-in `embedded-sparq` feature) — a THIRD `SparqClient`
 // impl alongside the HTTP client + the in-memory double. Off by default so the standard build
 // carries no sparq dependency. See [`embedded`] + decisions/0001-embed-sparq-in-process.md.
@@ -22,6 +26,7 @@ use bytes::Bytes;
 use oxrdf::NamedNode;
 
 pub use blob::{BlobEntry, BlobError, BlobStore, InMemoryBlobStore};
+pub use counting::{BackendCounters, CounterSnapshot, CountingBlobStore, CountingSparqClient};
 #[cfg(feature = "embedded-sparq")]
 pub use embedded::EmbeddedSparqClient;
 pub use http::{HttpSparqClient, SparqHttpError};
