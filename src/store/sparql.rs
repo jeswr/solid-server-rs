@@ -212,6 +212,41 @@ pub fn select_meta(resource: &str) -> Result<String, BuildError> {
     ))
 }
 
+/// SELECT the COMBINED read plan (read-2 — the §3.1 combined query): the index-record metadata of
+/// the target AND of every ACL candidate on its resolution chain, in ONE query — `VALUES ?g { … }`
+/// over the graph IRIs, matching each graph's reserved record. A graph with no record simply
+/// yields no row (authoritatively absent — the query consulted SPARQ, not a cache).
+///
+/// The SPARQL 1.1 Protocol permits exactly ONE query string per request, so batching the walk
+/// means one richer query — this one. Every IRI (the target + each server-derived candidate) flows
+/// through the injection-safe fallible [`iri`] builder: an IRIREF-invalid value REJECTS the whole
+/// build (fail-closed, never escaped-and-aliased). Duplicate IRIs (a `.acl` target is its own
+/// first candidate) are emitted once — the response is keyed by graph IRI, so de-duplication in
+/// the `VALUES` list cannot change the result.
+pub fn select_read_plan(target: &str, acl_candidates: &[String]) -> Result<String, BuildError> {
+    let mut values = String::new();
+    let mut seen: Vec<&str> = Vec::with_capacity(1 + acl_candidates.len());
+    for raw in std::iter::once(target).chain(acl_candidates.iter().map(String::as_str)) {
+        if seen.contains(&raw) {
+            continue;
+        }
+        seen.push(raw);
+        if !values.is_empty() {
+            values.push(' ');
+        }
+        values.push_str(&iri(raw)?);
+    }
+    Ok(format!(
+        "SELECT ?g ?ct ?bk ?etag WHERE {{ VALUES ?g {{ {values} }} \
+            GRAPH ?g {{ {s} {pct} ?ct ; {pbk} ?bk ; {pet} ?etag . }} }}",
+        values = values,
+        s = iri_const(&s_record()),
+        pct = iri_const(&p_content_type()),
+        pbk = iri_const(&p_blob_key()),
+        pet = iri_const(&p_etag()),
+    ))
+}
+
 /// CONSTRUCT the resource's own RDF (everything in its graph EXCEPT the reserved index record).
 pub fn construct_resource(resource: &str) -> Result<String, BuildError> {
     Ok(format!(
@@ -1013,6 +1048,57 @@ mod tests {
             "marker predicate: {q}"
         );
         assert!(q.contains("\"op-abc\""), "nonce as a literal: {q}");
+    }
+
+    #[test]
+    fn select_read_plan_is_one_query_over_all_candidates() {
+        // ONE SELECT carrying the target + every ACL candidate as VALUES rows — the whole per-read
+        // metadata chain in one protocol request (§3.1).
+        let candidates = vec![
+            "http://pod/a/b/doc.acl".to_string(),
+            "http://pod/a/b/.acl".to_string(),
+            "http://pod/a/.acl".to_string(),
+            "http://pod/.acl".to_string(),
+        ];
+        let q = select_read_plan("http://pod/a/b/doc", &candidates).unwrap();
+        assert!(q.starts_with("SELECT ?g ?ct ?bk ?etag"), "{q}");
+        assert_eq!(q.matches("VALUES").count(), 1, "one VALUES block: {q}");
+        assert!(q.contains(&iri_const("http://pod/a/b/doc")), "target: {q}");
+        for c in &candidates {
+            assert!(q.contains(&iri_const(c)), "candidate {c}: {q}");
+        }
+        // The record match binds the three reserved predicates once each.
+        assert!(q.contains(&iri_const(&p_content_type())));
+        assert!(q.contains(&iri_const(&p_blob_key())));
+        assert!(q.contains(&iri_const(&p_etag())));
+    }
+
+    #[test]
+    fn select_read_plan_dedups_a_target_that_is_its_own_candidate() {
+        // A `.acl` target IS its own first candidate (protected-resource derivation): the VALUES
+        // list carries it ONCE — dedup cannot change the (graph-keyed) result.
+        let acl = "http://pod/a/doc.acl";
+        let candidates = vec![acl.to_string(), "http://pod/a/.acl".to_string()];
+        let q = select_read_plan(acl, &candidates).unwrap();
+        assert_eq!(
+            q.matches(&iri_const(acl)).count(),
+            1,
+            "the duplicate IRI appears once in VALUES: {q}"
+        );
+    }
+
+    #[test]
+    fn select_read_plan_rejects_an_invalid_iri_fail_closed() {
+        // An IRIREF-invalid target OR candidate rejects the WHOLE build — never escaped-and-aliased
+        // (the injection-safe builder discipline).
+        assert_eq!(
+            select_read_plan("http://pod/a b", &[]),
+            Err(BuildError::InvalidIri)
+        );
+        assert_eq!(
+            select_read_plan("http://pod/a", &["http://pod/> DROP".to_string()]),
+            Err(BuildError::InvalidIri)
+        );
     }
 
     #[test]

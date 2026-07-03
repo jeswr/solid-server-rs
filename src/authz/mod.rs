@@ -28,5 +28,5 @@ pub mod wac_allow;
 
 pub use acl::{AclScope, Requester};
 pub use mode::{is_acl_auxiliary_suffix, is_acl_resource, mode_for_operation, AccessMode};
-pub use wac::{Decision, WacAuthorizer};
+pub use wac::{AclCandidate, Decision, ReadDecision, WacAuthorizer};
 pub use wac_allow::{wac_allow_header, EffectivePermissions};

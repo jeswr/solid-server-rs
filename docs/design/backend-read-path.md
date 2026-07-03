@@ -15,9 +15,21 @@
 > PSS house invariants carry over verbatim: read paths never fall back to a blob-store
 > LIST/HEAD, and **no cache is ever authoritative**.
 
-## 1. The read path today (code-verified inventory)
+## 1. The read path BEFORE read-2 (code-verified inventory — the baseline the counters pinned)
 
-`serve_read` (`src/ldp/handler.rs`) for a GET/HEAD:
+> **Status update:** read-1 (the deterministic RTT/await-depth counters, `src/store/counting.rs` +
+> `tests/read_path_counters.rs`) and read-2 (the §3.1 combined read-plan query —
+> `SparqClient::read_plan` / `Store::read_plan` + the `WacAuthorizer` planned resolve + a minimal
+> `Store::read_at` for the target bytes) have **LANDED**. The chain inventoried below is the
+> PRE-read-2 baseline, kept because the §1.1 table is the model the read-1 commit pinned (see the
+> counter test's git history for the before/after evidence). `serve_read` now issues ONE
+> `Store::read_plan` (target meta + the whole ACL-candidate chain), authorizes over it in memory,
+> and fetches the target bytes through the plan's held metadata via `read_at`. The O(depth) ACL WALK
+> collapses into the plan (warm doc GET **k+2 → 2** queries, depth-independent); the single governing
+> ACL is re-confirmed with a live probe for fail-closed-on-delete correctness — see the §3.7 landed
+> correction.
+
+`serve_read` (`src/ldp/handler.rs`) for a GET/HEAD — as it stood BEFORE read-2:
 
 1. `parse_target` — CPU only.
 2. `authorize_read` → `WacAuthorizer::resolve_effective_acl` (`src/authz/wac.rs`): probe the
@@ -240,14 +252,26 @@ counters (§7) show residual duplicate in-flight fetches on realistic traces.
 
 ### 3.7 Read-path RTT model after §3 (remote mode)
 
-| scenario | SPARQ queries | blob gets | sequential RTT depth |
-|---|---:|---:|---:|
-| doc GET, warm (ACL-parse hit, body-cache miss) | **1** | 1 | **2** |
-| doc GET, warm + body-cache hit | **1** | 0 | **1** |
-| doc GET, cold ACL (speculative off) | **1** | 2 | **3** |
-| container GET, warm | **2** (1 with the folded membership UNION) | 0–1 | **2–3** |
+> **Landed correction (fail-closed-on-delete).** The aspirational "1 query" warm rows below assumed
+> the combined query's plan-time etag could gate the ACL-parse cache directly. It cannot: an ACL
+> DELETED between the read-plan query and the in-memory walk would leave the plan reporting present
+> with a now-stale etag, and a cached parse under that etag would **authorize from a deleted ACL**
+> (a fail-open — invariant 4). So the AS-BUILT read path re-confirms the ONE governing (nearest
+> present) ACL with a live index probe (`WacAuthorizer::read_acl_confirmed`) before trusting its
+> cache entry; the k *absent* candidate probes stay collapsed into the plan (the real win). Net:
+> the warm doc GET is **2 queries** (plan + found-ACL re-confirm), not 1 — still flat in depth. The
+> counts below are annotated with the as-built figure.
 
-Depth-independence is the point: today's `k+3…k+5` becomes a flat `1–3`.
+| scenario | SPARQ queries (design → as-built) | blob gets | sequential RTT depth |
+|---|---:|---:|---:|
+| doc GET, warm (ACL-parse hit, body-cache miss) | 1 → **2** (plan + found-ACL re-confirm) | 1 | **3** |
+| doc GET, warm + body-cache hit | 1 → **2** | 0 | **2** |
+| doc GET, cold ACL (speculative off) | 1 → **2** (plan + re-confirm; ACL bytes via `read_at`) | 2 | **3** |
+| container GET, warm | 2 → **3** (plan + re-confirm + membership) | 0–1 | **3–4** |
+
+Depth-independence is the point: today's `k+3…k+5` becomes a flat `2–3` (the O(depth) ACL WALK
+collapses into the one plan; the single governing ACL is re-confirmed live for correctness). A
+future WAC-in-SPARQ decide (§5.2) folds the re-confirm back into the authority.
 
 ## 4. Connection pooling + transport to the remote backends
 
@@ -368,13 +392,13 @@ task, not a design blocker:
 Deterministic (hard-gateable, pinned by tests against counting doubles — the
 `InMemorySparqClient`/`InMemoryBlobStore` counters the bench harness already uses):
 
-| metric | pinned floor after §3 |
+| metric | pinned floor after §3 (as-built, `tests/read_path_counters.rs`) |
 |---|---|
-| SPARQ queries per warm authed doc GET | **1** (today: k+2) |
-| SPARQ queries per doc GET, cold ACL | **1** (+0 — the ACL bytes ride `read_at`; today: k+3) |
-| blob gets per warm doc GET (body-cache hit) | **0** |
-| sequential backend await-depth per op (a critical-path counter at the Store seam) | 1–3 per §3.7 |
-| SPARQ queries per container GET | ≤2 (=1 if the membership fold lands) |
+| SPARQ queries per warm authed doc GET | **2** — plan + found-ACL live re-confirm (today: k+2); the walk collapse is depth-independent, the re-confirm is the fail-closed-on-delete probe |
+| SPARQ queries per doc GET, cold ACL | **2** — plan + re-confirm; the ACL bytes ride `read_at` (no duplicate `get_meta`) (today: k+3) |
+| blob gets per warm doc GET (body-cache hit) | **0** (once the §3.4 body cache lands; today 1 — the target bytes) |
+| sequential backend await-depth per op (a critical-path counter at the Store seam) | 2–4 per §3.7 |
+| SPARQ queries per container GET | **3** (plan + re-confirm + membership; ≤2 if the membership fold lands) |
 | queries per listing **independent of child count** (the no-N+1 rule, pinned so it can never regress) | listing = 1 query at any N |
 | backend connects over an M-request run (pool-reuse proof) | ≪ M |
 | body/ACL cache hit+miss counters | observability, not gated |
@@ -387,9 +411,9 @@ never a merge gate**, reported with run context — unchanged discipline
 
 | id (proposed) | task | depends on | gate class |
 |---|---|---|---|
-| read-1-counters | backend-RTT + await-depth counters at the `SparqClient`/`BlobStore` seams; pin today's counts as the baseline table (§1.1) | — | deterministic |
-| read-2-readplan | the §3.1 combined read-plan query: `sparql.rs` builder + `SparqClient::read_plan` (default loop impl) + `WacAuthorizer` batch resolve; equivalence-tested against the sequential walk over the full WAC suite | read-1 | deterministic (queries/op k+2→1) |
-| read-3-read-at | `Store::read_at(meta)` — retire the duplicate `get_meta` (F2) on the ACL-miss + read paths | read-2 | deterministic |
+| read-1-counters | **LANDED** — `src/store/counting.rs` (CountingSparqClient/CountingBlobStore + the max-in-flight await-depth witness) + `tests/read_path_counters.rs` pinning the §1.1 baseline, then re-pinned post-read-2 | — | deterministic |
+| read-2-readplan | **LANDED** — `sparql::select_read_plan` + `SparqClient::read_plan` (default loop; one-pass in-memory + one-combined-SELECT HTTP overrides) + `WacAuthorizer::read_plan_candidates`/`authorize_read_planned` (differential-tested against the sequential walk over the full WAC matrix, incl. `.acl`-target parity, vanished-ACL, mismatched-plan fail-closed, AND the CACHED delete-after-plan / rotate-after-plan windows) + `Store::read_at`. The O(depth) ACL WALK collapses into the one combined query; the ONE governing ACL is re-confirmed with a LIVE probe (`read_acl_confirmed`) so a delete-after-plan can never grant from a stale cache (fail-closed, bit-for-bit sequential). queries/op **k+2→2** (warm), **k+3→2** (cold) — depth-independent | read-1 | deterministic (queries/op k+2→2, depth-independent) |
+| read-3-read-at | LARGELY LANDED with read-2: the planned ACL path already uses `read_at` on the parse-cache miss (no duplicate `get_meta`), and the target read uses `read_at`. The residual per-read cost is the ONE governing-ACL live existence re-confirm (security-required — see §3.7); folding THAT away needs the WAC-in-SPARQ `decide` (§5.2), not another `read_at`. | read-2 | deterministic |
 | read-4-bodycache | the §3.4 immutable-key blob-body LRU (`(blob_key, etag)`-keyed, byte-budgeted, per-entry cap, `=0` disables); adversarial tests: stale-serve impossible under write/delete/recreate races | read-1 | deterministic (blob gets/op) |
 | read-5-container-fold | fold `list_children` into the read-plan query (measure first — unknown #1) | read-2 + live SPARQ | deterministic |
 | read-6-singleflight | §3.6 per-IRI fetch coalescing (only if read-1 counters show duplicate in-flight fetches on realistic load) | read-1,2,4 | deterministic (burst queries N→1) |

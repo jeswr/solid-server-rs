@@ -54,7 +54,7 @@ use crate::ldp::range::{self, RangeOutcome};
 use crate::ldp::target::{parse_target, LdpTarget};
 use crate::notifications::ws::link_headers;
 use crate::notifications::{ActivityType, NotificationHub};
-use crate::store::{DeleteOutcome, ResourceMeta, Store};
+use crate::store::{DeleteOutcome, Resource, ResourceMeta, Store};
 
 /// LDP/RDF vocabulary IRIs used to synthesise a container's `ldp:contains` representation.
 const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -189,24 +189,34 @@ impl<S: Store> LdpState<S> {
         self.authorize_mode(target, required, token, origin).await
     }
 
-    /// Single-pass READ authorization (Optimization #2): authorize a GET/HEAD AND resolve the
-    /// `WAC-Allow` audiences (`user` + `public`) from ONE effective-ACL resolution.
+    /// Single-pass READ authorization over ONE combined read-plan round-trip (read-2 —
+    /// `docs/design/backend-read-path.md` §3.1), still deriving the decision AND both `WAC-Allow`
+    /// audiences from ONE effective-ACL resolution (Optimization #2).
     ///
-    /// Replaces the read path's prior `authorize(...)` + `wac_allow_value(...)` pair, which built a
-    /// fresh [`WacAuthorizer`] and re-resolved the protected resource (and, for an authenticated
-    /// requester, re-walked + re-read + re-parsed the SAME `.acl`) a SECOND time. The required mode is
-    /// the `method`-derived read mode, overridden to [`AccessMode::Control`] for an `.acl` target
-    /// (managing access rules is always Control) — IDENTICAL to [`authorize`](Self::authorize) /
-    /// [`authorize_mode`](Self::authorize_mode). On a permitted read returns the
-    /// [`EffectivePermissions`] for `WAC-Allow`; on a denial the SAME spec error (401 + challenge when
-    /// anonymous, 403 when authenticated-but-unauthorized).
+    /// The per-read metadata chain — the target's own metadata plus the presence/etag of EVERY ACL
+    /// candidate on its resolution chain — is fetched in ONE [`Store::read_plan`] call (one
+    /// combined SPARQL query on the live backend, replacing the previous k+2 sequential queries);
+    /// the ACL walk then runs IN MEMORY over those rows with semantics identical to the sequential
+    /// resolver ([`WacAuthorizer::authorize_read_planned`] — differentially tested against
+    /// [`WacAuthorizer::authorize_read`] over the full WAC matrix). The plan is
+    /// principal-independent metadata and precedes authorization (design §3.6); the target's BYTES
+    /// are never fetched here — the caller fetches them only after an Allow (invariant 5, no
+    /// speculative byte fetch).
+    ///
+    /// The required mode is the `method`-derived read mode, overridden to [`AccessMode::Control`]
+    /// for an `.acl` target (managing access rules is always Control) — IDENTICAL to
+    /// [`authorize`](Self::authorize) / [`authorize_mode`](Self::authorize_mode). On a permitted
+    /// read returns the [`EffectivePermissions`] for `WAC-Allow` PLUS the target's metadata from
+    /// the same plan (`None` ⇒ the caller's 404, decided AFTER authorization exactly as before);
+    /// on a denial the SAME spec error (401 + challenge when anonymous, 403 when
+    /// authenticated-but-unauthorized).
     async fn authorize_read(
         &self,
         method: &str,
         target: &LdpTarget,
         token: &VerifiedToken,
         origin: Option<&str>,
-    ) -> Result<crate::authz::EffectivePermissions, ServerError> {
+    ) -> Result<(crate::authz::EffectivePermissions, Option<ResourceMeta>), ServerError> {
         // The required read mode, with the `.acl`→Control override (an `.acl` is governed by Control
         // regardless of the operation) — matching `authorize`/`authorize_mode` exactly.
         let required = if crate::authz::is_acl_resource(&target.iri) {
@@ -215,11 +225,22 @@ impl<S: Store> LdpState<S> {
             mode_for_operation(method, &target.iri, target.is_container)
         };
         let wac = WacAuthorizer::with_cache(&self.store, &self.base_url, &self.acl_cache);
+        // ONE combined round-trip: the target row is the RAW target (the bytes to serve); the ACL
+        // candidates derive from the PROTECTED resource (the design's two IRI roles).
+        let candidates = wac.read_plan_candidates(&target.iri);
+        let acl_iris: Vec<String> = candidates.iter().map(|c| c.acl.clone()).collect();
+        let plan = self.store.read_plan(&target.iri, &acl_iris).await?;
         match wac
-            .authorize_read(&target.iri, required, token.web_id.as_deref(), origin)
+            .authorize_read_planned(
+                required,
+                token.web_id.as_deref(),
+                origin,
+                &candidates,
+                &plan.acls,
+            )
             .await?
         {
-            ReadDecision::Allow(perms) => Ok(perms),
+            ReadDecision::Allow(perms) => Ok((perms, plan.target)),
             ReadDecision::Unauthenticated => Err(self.unauthenticated()),
             ReadDecision::Forbidden => Err(ServerError::Forbidden),
         }
@@ -328,7 +349,7 @@ impl<S: Store> LdpState<S> {
 /// versa) when the client's `Accept` prefers it; a non-RDF body is served verbatim (its `Accept`
 /// is honoured only as `*/*`). `Range: bytes=…` yields a 206 + `Content-Range` (single range), or a
 /// 416 when unsatisfiable. Conditional-GET read preconditions (`If-None-Match` → 304, with
-/// `If-Modified-Since` as the lower-precedence fallback) are applied in [`serve_read`] AFTER
+/// `If-Modified-Since` as the lower-precedence fallback) are applied in `serve_read` AFTER
 /// authorization and BEFORE the body/Range work (RFC 9110 §13).
 pub async fn get_handler<S: Store>(
     State(state): State<Arc<LdpState<S>>>,
@@ -370,12 +391,14 @@ pub(crate) async fn serve_read<S: Store>(
     // private data answers 401 (anonymous) / 403 (authenticated-but-unauthorized). Authorization runs
     // BEFORE the existence check, so a permitted read of a missing resource is a 404, while an
     // unauthorized read of the same is a 401/403 (no existence leak).
-    // SINGLE-PASS read authorization (Optimization #2): resolve the effective ACL ONCE and derive
-    // BOTH the access decision (Allow / 401 / 403) AND the `WAC-Allow` audiences (`user` + `public`)
-    // from that one resolution. (Previously the decision and the `WAC-Allow` header each resolved the
-    // ACL independently.) `perms` is reused below to emit `WAC-Allow` with no further ACL work.
+    // SINGLE-PASS read authorization (Optimization #2) over ONE combined read-plan round-trip
+    // (read-2): the target's metadata + the whole ACL-candidate chain are fetched in ONE
+    // `Store::read_plan` call, the ACL walk runs in memory over those rows, and BOTH the access
+    // decision (Allow / 401 / 403) AND the `WAC-Allow` audiences (`user` + `public`) derive from
+    // that one resolution. `perms` is reused below to emit `WAC-Allow` with no further ACL work;
+    // `target_meta` is the SAME plan's target row, so no second metadata query is needed.
     let origin = request_origin(req_headers);
-    let perms = state
+    let (perms, target_meta) = state
         .authorize_read(
             if with_body { "GET" } else { "HEAD" },
             &target,
@@ -384,7 +407,14 @@ pub(crate) async fn serve_read<S: Store>(
         )
         .await?;
 
-    let resource = state.store.read(&target.iri).await?;
+    // The 404 decision stays AFTER authorization (no existence leak — an unauthorized read of a
+    // missing resource remains 401/403 above, a permitted one 404 here), exactly as before.
+    let meta = target_meta.ok_or(ServerError::NotFound)?;
+    // The BYTES are fetched only now — after the Allow (no speculative byte fetch, design
+    // invariant 5) — through the plan's held metadata (`read_at`, §3.3): the unique-per-write blob
+    // key names an immutable object, so these are exactly the bytes that metadata committed with.
+    let body = state.store.read_at(&target.iri, &meta).await?;
+    let resource = Resource { body, meta };
 
     let accept = header_str(req_headers, header::ACCEPT);
     // Compute the response validator (ETag) that a 200 would carry FIRST, so a 304 short-circuit uses
