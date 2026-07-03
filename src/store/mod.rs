@@ -19,6 +19,7 @@ pub mod sparql;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use oxrdf::NamedNode;
 
 pub use blob::{BlobEntry, BlobError, BlobStore, InMemoryBlobStore};
 #[cfg(feature = "embedded-sparq")]
@@ -38,6 +39,50 @@ use crate::error::{ServerError, ServerResult};
 pub struct Resource {
     pub body: Bytes,
     pub meta: ResourceMeta,
+}
+
+/// A container child IRI **validated as RFC-3987 at the [`Store::list_children`] boundary** — the
+/// architecturally-correct home for child-IRI validation (bead wg3).
+///
+/// # Why this newtype exists (the invariant it carries)
+/// The container-listing render (`ldp::handler`) serialises each child IRI into a Turtle/N-Triples
+/// `<...>` term. Previously it did so on the hot path behind a *cheap structural* guard plus a
+/// `debug_assert!` — which left a residual: an invalid-but-serialisable IRI (e.g. a bad percent-escape)
+/// could slip into a release build's output. Validating **once, here, at the store boundary** — where a
+/// malformed/injected row from storage first crosses into the server's own logic — makes "every child
+/// IRI that reaches the render is a full RFC-3987-valid IRI" a **type-level invariant**: the render
+/// receives `ValidatedChildIri` values and can construct the RDF term with NO per-child re-parse and NO
+/// structural guard. A malformed row is FAIL-CLOSED **omitted** at the boundary (see
+/// [`ValidatedChildIri::parse`] / the [`CompositeStore`] impl), so it never flows unchecked into a
+/// response.
+///
+/// It wraps a validated [`NamedNode`], so a consumer that needs the RDF term (the render) gets it for
+/// free (`as_named_node`/`into_named_node`) without re-parsing, and one that needs the string form uses
+/// `as_str`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedChildIri(NamedNode);
+
+impl ValidatedChildIri {
+    /// Validate a raw child IRI (full RFC-3987 via oxrdf/oxiri's `NamedNode::new`). Returns `None` for a
+    /// malformed IRI, so the caller can FAIL CLOSED (omit it) rather than let it flow unchecked.
+    pub fn parse(raw: &str) -> Option<Self> {
+        NamedNode::new(raw).ok().map(Self)
+    }
+
+    /// The validated IRI as a string slice.
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// Borrow the validated [`NamedNode`] (for building an RDF term without a re-parse).
+    pub fn as_named_node(&self) -> &NamedNode {
+        &self.0
+    }
+
+    /// Consume into the validated [`NamedNode`] (moved into an RDF term on the render path).
+    pub fn into_named_node(self) -> NamedNode {
+        self.0
+    }
 }
 
 /// The composite storage seam used by the LDP handlers.
@@ -112,9 +157,11 @@ pub trait Store: Send + Sync {
         parent: Option<&str>,
     ) -> ServerResult<DeleteOutcome>;
 
-    /// List the direct children (their IRIs) of a container — the authoritative `ldp:contains`
-    /// membership. Used for the empty-container DELETE refusal.
-    async fn list_children(&self, container: &str) -> ServerResult<Vec<String>>;
+    /// List the direct children of a container — the authoritative `ldp:contains` membership — each as a
+    /// [`ValidatedChildIri`] (RFC-3987-validated at THIS boundary, so a malformed/injected row never
+    /// flows unchecked into the container-listing render; see [`ValidatedChildIri`]). Consumed by the
+    /// container-listing render; the empty-container check uses only its length.
+    async fn list_children(&self, container: &str) -> ServerResult<Vec<ValidatedChildIri>>;
 }
 
 /// The default [`Store`]: SPARQ (authoritative metadata) + a blob store (backup bytes).
@@ -372,11 +419,31 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
         Ok(outcome)
     }
 
-    async fn list_children(&self, container: &str) -> ServerResult<Vec<String>> {
-        self.sparq
+    async fn list_children(&self, container: &str) -> ServerResult<Vec<ValidatedChildIri>> {
+        let raw = self
+            .sparq
             .list_children(container)
             .await
-            .map_err(|e| ServerError::Storage(format!("{e}")))
+            .map_err(|e| ServerError::Storage(format!("{e}")))?;
+        // Validate each raw child IRI (full RFC-3987) at THIS boundary — the point where a
+        // malformed/injected row from storage first crosses into the server's own logic. A malformed
+        // IRI is FAIL-CLOSED OMITTED (never flows unchecked into the render), preserving the render's
+        // prior skip-on-invalid behaviour but moving the guarantee to the architecturally-correct place.
+        // Unreachable via the validated LDP write path (every stored child IRI is RFC-3987-valid by
+        // construction); a store-layer bug that produced one is caught in debug/test by the assert.
+        let mut out = Vec::with_capacity(raw.len());
+        for iri in raw {
+            match ValidatedChildIri::parse(&iri) {
+                Some(v) => out.push(v),
+                None => {
+                    debug_assert!(false, "store yielded a non-RFC-3987 child IRI: {iri}");
+                    eprintln!(
+                        "  STORE: omitting non-RFC-3987 child IRI from list_children: {iri:?}"
+                    );
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -397,6 +464,65 @@ mod tests {
     use crate::store::sparq::InMemorySparqClient;
 
     type S = CompositeStore<InMemorySparqClient, InMemoryBlobStore>;
+
+    #[test]
+    fn validated_child_iri_accepts_valid_rejects_malformed() {
+        // The fail-closed gate (bead wg3): full RFC-3987 validation. A valid IRI parses (and exposes
+        // both the string + the NamedNode without a re-parse); a malformed one returns None so the
+        // caller omits it rather than letting it flow unchecked.
+        let v = ValidatedChildIri::parse("https://pod.example/c/item-0042")
+            .expect("a valid http IRI must parse");
+        assert_eq!(v.as_str(), "https://pod.example/c/item-0042");
+        assert_eq!(
+            v.as_named_node().as_str(),
+            "https://pod.example/c/item-0042"
+        );
+        assert_eq!(
+            v.clone().into_named_node(),
+            NamedNode::new_unchecked("https://pod.example/c/item-0042")
+        );
+
+        // Malformed / injected forms RFC-3987 forbids in an IRI ⇒ None (fail-closed).
+        for bad in [
+            "",                              // empty
+            "not an iri",                    // spaces
+            "https://pod.example/c/a b",     // embedded space
+            "https://pod.example/c/a\nb",    // control (newline)
+            "https://pod.example/c/<a>",     // angle brackets (would corrupt a term)
+            "https://pod.example/c/a\u{7f}", // DEL control
+            "https://pod.example/c/a`b",     // backtick delimiter
+        ] {
+            assert!(
+                ValidatedChildIri::parse(bad).is_none(),
+                "malformed child IRI {bad:?} must be rejected (parse ⇒ None)"
+            );
+        }
+    }
+
+    #[test]
+    fn composite_list_children_returns_validated_iris() {
+        // The Store boundary yields RFC-3987-validated children. Written through the authoritative path,
+        // then listed back — each child is a ValidatedChildIri whose string matches what was stored.
+        let store = S::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        let container = "https://pod.example/c/";
+        let child = "https://pod.example/c/note1";
+        tokio_test_block_on(async {
+            store
+                .write(container, Bytes::from_static(b""), "text/turtle")
+                .await
+                .expect("mint container");
+            store
+                .create_in_container(container, child, Bytes::from_static(b"x"), "text/turtle")
+                .await
+                .expect("add child");
+            let kids = store.list_children(container).await.expect("list");
+            assert_eq!(
+                kids.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+                vec![child],
+                "list_children returns the child as a validated IRI"
+            );
+        });
+    }
 
     #[test]
     fn mint_blob_key_is_unique_per_call_for_the_same_iri() {

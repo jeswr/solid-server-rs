@@ -91,59 +91,6 @@ fn unchecked_const_iri(iri: &str) -> NamedNode {
     NamedNode::new_unchecked(iri)
 }
 
-/// CHEAP (O(len), no allocation) structural guard for a child IRI that is about to be wrapped in a
-/// `NamedNode::new_unchecked` and serialised into a Turtle/N-Triples `<...>` term. It is NOT a full
-/// RFC-3987 validator (the fast path deliberately skips oxiri's parse) — it rejects ONLY the
-/// characters RFC-3987 forbids INSIDE an IRI reference and that would corrupt the serialised term:
-/// the C0/C1 control range and DEL, the space, and the ASCII delimiters `< > " { } | ^ \` `\` `.
-/// An empty IRI is also rejected. Every IRI the store mints passes this (it is RFC-3987-valid on
-/// write); the guard exists so a hypothetically-malformed backend row is OMITTED from the listing
-/// rather than silently producing an invalid RDF term (defence-in-depth, matching the prior
-/// skip-on-`NamedNode::new`-error behaviour).
-fn iri_chars_serialisable(iri: &str) -> bool {
-    if iri.is_empty() {
-        return false;
-    }
-    // FAST PATH (the overwhelmingly common case): a child IRI minted by the store is ASCII —
-    // `https://host/c/item-0042` etc. Every character RFC-3987 forbids in a serialisable `<...>` term
-    // EXCEPT the C1 control range (U+0080..=U+009F) is ASCII, so for an all-ASCII IRI a single byte
-    // scan with plain comparisons decides it — WITHOUT decoding UTF-8 to `char` and WITHOUT the
-    // per-char Unicode `is_control` property-table lookup the `.chars()` path pays. This is the listing
-    // render's largest per-child cost (one call per member); skipping the Unicode table lookup for the
-    // common all-ASCII child is the win. The moment any non-ASCII byte (>= 0x80) is seen, fall through
-    // to the original `char`-based check (which alone handles the C1 range correctly) — so the result
-    // is BYTE-IDENTICAL to the prior implementation for every input, only faster on the ASCII path.
-    let bytes = iri.as_bytes();
-    let mut all_ascii = true;
-    for &b in bytes {
-        if b >= 0x80 {
-            all_ascii = false;
-            break;
-        }
-        // ASCII forbidden set: C0 controls (< 0x20) + DEL (0x7F) + space + the term delimiters.
-        // (`is_control()` for an ASCII char is exactly `b < 0x20 || b == 0x7F`.)
-        if b < 0x20
-            || b == 0x7F
-            || matches!(
-                b,
-                b' ' | b'<' | b'>' | b'"' | b'{' | b'}' | b'|' | b'^' | b'`' | b'\\'
-            )
-        {
-            return false;
-        }
-    }
-    if all_ascii {
-        return true;
-    }
-    // Non-ASCII present (rare — a `ucschar` like `café`): defer to the exact `char`-based check, which
-    // additionally rejects the C1 control range. This is the original implementation, unchanged.
-    !iri.chars().any(|c| {
-        c.is_control()
-            || c == ' '
-            || matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\')
-    })
-}
-
 /// Shared state for the LDP handlers: the store + the server's public base URL + the notification hub.
 ///
 /// The hub is the SINGLE emit seam: after a successful mutation the handler calls
@@ -1306,52 +1253,18 @@ async fn render_container<S: Store>(
         Triple::new(subject.clone(), rdf_type, LDP_BASIC_CONTAINER_NODE.clone()),
     );
 
-    // 3) The generated `ldp:contains` membership triples (one per authoritative child). The child IRIs
-    // come from the authoritative index and are server-CONSTRUCTED — every stored IRI is
-    // `format!("{base}{path}")` for the server's own validated `base_url` and a `path` that already
-    // passed `ldp::target::parse_target` (absolute, no `?`/`#`, no `..`/`.`, no `//`). They are
-    // therefore structurally well-formed by construction, so this fast path skips the FULL per-IRI
-    // `NamedNode::new` oxiri RFC-3987 re-parse (the per-child cost this optimisation removes).
-    //
-    // Two layers still protect the serialiser, so this is NOT a blind `new_unchecked`:
-    //   * debug/test: the FULL checked `NamedNode::new` runs behind a `debug_assert!`, so if the store
-    //     ever yielded a non-RFC-3987 child IRI it fails the suite rather than shipping; and
-    //   * release: a CHEAP O(len) structural guard (`iri_chars_serialisable`) rejects exactly the
-    //     characters RFC-3987 forbids INSIDE an IRI and that would CORRUPT a Turtle `<...>` term
-    //     (controls, space/whitespace, the `<>"{}|^\`+backslash delimiters) — a malformed child is
-    //     OMITTED from the listing, exactly as the old `NamedNode::new(&child)` skip-on-`Err` did, and
-    //     can never produce a corrupt term or break the document.
-    //
-    // ACCEPTED TRADEOFF (roborev Medium, triaged): the cheap guard does NOT catch an
-    // invalid-but-serialisable IRI (e.g. a bad percent-escape) the way the full parse would. That
-    // residual is bounded and deliberate: (a) such an IRI is NOT reachable through the LDP write path
-    // (the `parse_target` construction above), so it requires a store-layer bug, which the
-    // `debug_assert!` catches in test; (b) were one to slip through in release it serialises as a
-    // syntactically well-formed but slightly-non-conformant `<...>` term — no corruption, no parse
-    // break, no security impact, in ONE membership triple; and (c) restoring the full `NamedNode::new`
-    // per child would give back exactly the per-child RFC-3987 parse this optimisation exists to
-    // remove (the measured ~2x at N=500). The store-invariant enforcement belongs at the
-    // `list_children` boundary, not on this hot render path — tracked as a follow-up, not a blocker.
+    // 3) The generated `ldp:contains` membership triples (one per authoritative child). Each child is a
+    // [`ValidatedChildIri`](crate::store::ValidatedChildIri) — RFC-3987-VALIDATED at the
+    // `Store::list_children` boundary (bead wg3), which is where a malformed/injected storage row first
+    // crosses into the server's own logic. So the render receives a full-RFC-3987-valid `NamedNode` and
+    // moves it straight into the term — NO per-child re-parse and NO structural guard needed here (both
+    // moved to the boundary). A malformed backend row was already fail-closed OMITTED at that boundary,
+    // so it can never reach this loop; there is no invalid-but-serialisable residual left to leak in
+    // release (the roborev Medium this closes).
     for child in children {
-        debug_assert!(
-            NamedNode::new(&child).is_ok(),
-            "store yielded a non-RFC-3987 child IRI: {child}"
-        );
-        if !iri_chars_serialisable(&child) {
-            // Defence-in-depth: a malformed child IRI is omitted from the listing (as the prior
-            // `NamedNode::new(&child)` skip-on-Err did), never serialised as a corrupt term.
-            continue;
-        }
         push_generated(
             &mut generated,
-            // SAFETY/validity: `child` passed the structural guard above (and the store's write-time
-            // RFC-3987 guarantee), so `new_unchecked` produces a well-formed term without the full
-            // oxiri re-parse.
-            Triple::new(
-                subject.clone(),
-                contains.clone(),
-                NamedNode::new_unchecked(child),
-            ),
+            Triple::new(subject.clone(), contains.clone(), child.into_named_node()),
         );
     }
 
@@ -1992,7 +1905,10 @@ mod tests {
         ) -> ServerResult<DeleteOutcome> {
             Ok(DeleteOutcome::NotFound)
         }
-        async fn list_children(&self, _container: &str) -> ServerResult<Vec<String>> {
+        async fn list_children(
+            &self,
+            _container: &str,
+        ) -> ServerResult<Vec<crate::store::ValidatedChildIri>> {
             Ok(Vec::new())
         }
     }
@@ -2140,7 +2056,10 @@ mod tests {
         ) -> ServerResult<DeleteOutcome> {
             Ok(DeleteOutcome::NotFound)
         }
-        async fn list_children(&self, _container: &str) -> ServerResult<Vec<String>> {
+        async fn list_children(
+            &self,
+            _container: &str,
+        ) -> ServerResult<Vec<crate::store::ValidatedChildIri>> {
             Ok(Vec::new())
         }
     }
@@ -2739,93 +2658,6 @@ mod tests {
             from += i + needle.len();
         }
         n
-    }
-
-    #[test]
-    fn iri_chars_serialisable_accepts_valid_rejects_corrupting() {
-        // The cheap structural guard the listing fast path runs before `new_unchecked`. It must ACCEPT
-        // every well-formed IRI (the store mints only these) and REJECT exactly the characters that
-        // RFC-3987 forbids in an IRI and that would corrupt a serialised `<...>` term — so a
-        // hypothetically-malformed backend row is OMITTED rather than producing an invalid RDF term.
-        // Accept: ordinary http(s) IRIs incl. percent-encoding, fragments, and non-ASCII (ucschar).
-        for ok in [
-            "https://pod.example/c/a",
-            "https://pod.example/c/a#me",
-            "https://pod.example/c/a%20b",
-            "https://pod.example/c/café", // 2-byte ucschar é (U+00E9) — non-control
-            "https://pod.example/c/\u{1f600}emoji", // 4-byte non-ASCII — accepted (non-control)
-            "urn:uuid:12345678-1234-1234-1234-123456789abc",
-        ] {
-            assert!(iri_chars_serialisable(ok), "must accept valid IRI: {ok}");
-        }
-        // Reject: empty, space, controls (incl. newline/tab/DEL), and the term-delimiter set.
-        assert!(!iri_chars_serialisable(""), "empty must be rejected");
-        for bad in [
-            "https://pod.example/c/a b",      // space
-            "https://pod.example/c/a\nb",     // newline (control)
-            "https://pod.example/c/a\tb",     // tab (control)
-            "https://pod.example/c/a\u{7f}b", // DEL (control)
-            "https://pod.example/c/<a>",      // angle brackets (would close the term)
-            "https://pod.example/c/\"a",      // quote
-            "https://pod.example/c/a{b}",     // braces
-            "https://pod.example/c/a|b",      // pipe
-            "https://pod.example/c/a^b",      // caret
-            "https://pod.example/c/a`b",      // backtick
-            "https://pod.example/c/a\\b",     // backslash
-            "https://pod.example/c/a\u{80}b", // C1 control U+0080 (non-ASCII) — the fallback-path case
-            "https://pod.example/c/a\u{9f}b", // C1 control U+009F (non-ASCII) — the fallback-path case
-        ] {
-            assert!(
-                !iri_chars_serialisable(bad),
-                "must reject corrupting IRI: {bad:?}"
-            );
-        }
-    }
-
-    /// Equivalence harness: the optimised `iri_chars_serialisable` must agree BYTE-FOR-BYTE with the
-    /// reference `.chars()`-based predicate across ASCII, C0/C1 controls, the delimiter set, and
-    /// multi-byte ucschar — so the ASCII fast path can never diverge from the proven char path.
-    #[test]
-    fn iri_chars_serialisable_matches_reference_across_inputs() {
-        fn reference(iri: &str) -> bool {
-            if iri.is_empty() {
-                return false;
-            }
-            !iri.chars().any(|c| {
-                c.is_control()
-                    || c == ' '
-                    || matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\')
-            })
-        }
-        // Every ASCII byte as a single-char IRI body, plus an empty string and several multi-byte
-        // ucschar / C1-control cases — the exact boundary where ASCII-fast-path vs char-path could differ.
-        let mut cases: Vec<String> = vec![String::new()];
-        for b in 0u8..=0x7f {
-            cases.push(format!("a{}z", b as char));
-        }
-        for s in [
-            "café",
-            "naïve",
-            "\u{1f600}",
-            "a\u{80}b",
-            "a\u{9f}b",
-            "a\u{a0}b",
-            "ÿ",
-            "ABC",
-            "https://h/c/item-0042",
-            "",
-            "\u{7f}",
-            " ",
-        ] {
-            cases.push(s.to_string());
-        }
-        for c in cases {
-            assert_eq!(
-                iri_chars_serialisable(&c),
-                reference(&c),
-                "diverged from reference for {c:?}"
-            );
-        }
     }
 
     #[tokio::test]

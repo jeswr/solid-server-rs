@@ -93,7 +93,10 @@ impl<S: Store> Store for CountingStore<S> {
     ) -> ServerResult<DeleteOutcome> {
         self.inner.delete_container_if_empty(iri, parent).await
     }
-    async fn list_children(&self, c: &str) -> ServerResult<Vec<String>> {
+    async fn list_children(
+        &self,
+        c: &str,
+    ) -> ServerResult<Vec<solid_server_rs::store::ValidatedChildIri>> {
         self.inner.list_children(c).await
     }
 }
