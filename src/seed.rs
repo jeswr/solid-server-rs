@@ -20,12 +20,12 @@
 //! conformance suite (Protocol + WAC) would fail-closed. They mirror prod-solid-server's provisioner
 //! (`src/provisioning/provisioner.ts`).
 //!
-//! It is **dev/conformance only**, gated behind `SOLID_SERVER_SEED_CONFORMANCE=1` in [`main`]. It
+//! It is **dev/conformance only**, gated behind `SOLID_SERVER_SEED_CONFORMANCE=1` in `main`. It
 //! never runs against a real (SPARQ/S3) backend in production.
 //!
 //! ## RDF construction
 //! The WebID profile is built as `oxrdf::Triple`s and serialised with the server's own
-//! [`serialize_triples`](crate::ldp::content::serialize_triples) (oxttl) — the house rule of never
+//! [`serialize_triples`] (oxttl) — the house rule of never
 //! hand-concatenating RDF. The container records are created through the public [`Store`] API
 //! (`write` to mint the container's metadata record, `create_in_container` to wire containment), so
 //! seeding exercises the same code path a real write would.
