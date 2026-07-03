@@ -219,7 +219,7 @@ specs).
 | Asymmetric signature verify | **1 × ES256** (fresh proof) | 1 × ES256 | **0** (handshake-amortized: 1 per connection) | **0** (establishment-amortized: 1 per session) |
 | Hashing | 2 × SHA-256 (ath digest shared w/ cache key; JWK thumbprint) | same | **0** (cert digest cached per connection → 32-B compare) | **1 × HMAC-SHA256** (covered components) |
 | Parse/decode | JWT: 2 × base64url + serde_json (proof header+claims) | same + nonce bookkeeping | none (token claims already cached) | `Signature-Input` structured-field parse (no JSON, no base64 beyond the 32-B tag) |
-| Replay state | `jti` map insert under mutex (or Redis RTT) | jti + nonce window | **none** (TLS AEAD is the anti-replay) | **1 integer compare** (per-session monotonic counter) |
+| Replay state | `jti` map insert under mutex (or Redis RTT) | jti + nonce window | **none** (TLS AEAD is the anti-replay) | **O(1) sliding-window check** (per-session counter + bitmap, RFC 4303-style) |
 | Binding check | `cnf.jkt` ↔ thumbprint (string cmp) | same | `cnf.x5t#S256` ↔ cached cert hash (**32-B memcmp**) | keyid → session lookup (hash map) + token-hash cmp |
 | Amortized (NOT per request) | token verify per 300 s window (round 3) | + nonce issuance | TLS handshake w/ client `CertificateVerify`; SHA-256(cert) once/conn | 1 full DPoP verify + HKDF at session establishment; rekey per TTL |
 | Expected authed-path ceiling | ES256-bound (~50% of active CPU — [ROUND4-PROFILE](../../bench/ROUND4-PROFILE.md)) | unchanged | **≈ anonymous-path ceiling** (crypto floor removed; TLS/framing-bound) | ≈ anonymous ceiling minus one HMAC + parse |
@@ -260,7 +260,7 @@ Content-Type: application/json
   the RS generates K randomly and returns it in the (TLS-protected) response body; the client
   imports it as a **non-extractable WebCrypto HMAC key** and discards the raw bytes.
 - **Server state:** `session_id → { K, sha256(access_token), cnf.jkt, webid/VerifiedToken,
-  token_exp, established_at, counter_high_water, conn_id? }` in a bounded LRU (same discipline as
+  token_exp, established_at, replay_window (high-water + bitmap), conn_id? }` in a bounded LRU (same discipline as
   `VerifiedTokenCache`; capacity-capped, TTL'd). For `cb=tls-exporter` the session additionally
   pins the connection id and dies with the connection.
 
@@ -282,12 +282,23 @@ RS per-request verification (all fail-closed, order mirrors `verify_fresh_proof`
 3. `@method`/`@target-uri` from the *actual request* (htm/htu-equivalent, computed server-side —
    unforgeable by construction, unlike DPoP where the client asserts them and the server compares).
 4. `created` within the same `iat` window policy the verifier uses.
-5. `nonce` (decimal counter) **strictly greater** than the session high-water mark ⇒ update
-   high-water. One integer compare replaces the whole `jti` replay map for this path. (h2 streams
-   may complete out of order; the strictly-increasing rule stays cheap and merely forces an
-   occasional re-establishment on pathological reordering — acceptable; alternatively a small
-   sliding window bitmap, decided at implementation.)
-6. Recompute HMAC over the RFC 9421 signature base; constant-time compare.
+5. **Recompute the HMAC over the RFC 9421 signature base; constant-time compare.** This runs
+   BEFORE any session-state mutation — an unauthenticated request must not be able to change
+   anything (see step 6's ordering note).
+6. **Anti-replay: sliding-window check on `nonce` (decimal counter), applied ONLY after the HMAC
+   verified.** The required mechanism is the IPsec/DTLS-style window
+   ([RFC 4303 §3.4.3](https://www.rfc-editor.org/rfc/rfc4303.html#section-3.4.3): a high-water
+   mark + a fixed-size bitmap, e.g. 1024 bits): `nonce > high_water` ⇒ shift window + mark;
+   within the window and unmarked ⇒ mark; marked (duplicate) or below the window ⇒ 401. Still
+   O(1) integer/bit ops per request — replacing the `jti` map — but, unlike a strictly-increasing
+   rule, it accepts the out-of-order completion that HTTP/2 multiplexing makes *normal* for
+   concurrent streams (a strict rule would spuriously reject valid in-flight requests; rejected
+   as a design option, not deferred). Ordering is load-bearing both ways: verify-then-mark means
+   a forged request can neither burn a counter value nor advance/shift the window (state-DoS on
+   the session), mirroring the verifier's validate-then-`check_replay` order that
+   `auth_cache.rs::verify_fresh_proof` documents ("a proof that fails the binding must not burn
+   a jti"). The verify+mark pair executes under the session entry's lock (or an equivalent CAS)
+   so two concurrent copies of the same nonce cannot both pass.
 7. For `cb=tls-exporter` sessions: request's connection id == session's pinned connection.
 
 On success, the session's stored `VerifiedToken` is injected exactly as `auth.rs` does today —
@@ -348,7 +359,9 @@ RFC 9449 §11.1; XSS can use, though not export, the browser key) are inherited,
   only, for this token only. DPoP with a non-extractable key does not have that instant; DPoP
   with an extractable key (many real apps) is strictly worse. Verdict: acceptable as an
   *opt-in negotiated* profile; apps with the strictest threat model simply don't opt in.
-- *P2:* per-session strictly-monotonic counter (one compare) + `created` window; cross-session
+- *P2:* per-session sliding-window counter (verify-then-mark, §4.2 step 6) + `created` window;
+  a duplicate or out-of-window nonce is rejected, and a forged request cannot mutate the window
+  (HMAC verified first — no state-burn DoS); cross-session
   replay impossible (K differs); cross-connection replay impossible in the `tls-exporter`
   flavour, and in the browser flavour bounded by counter + TTL. Establishment requests are full
   DPoP ⇒ inherit jti protection.
@@ -410,7 +423,7 @@ issuer-agnosticism is intact.
 |---|---|---|---|---|
 | 0 (baseline, mandatory) | everyone | DPoP (RFC 9449) + round-3 token cache | 1 ES256 verify | shipped |
 | 1 | services / agents / server-to-server (the A2A + federation + reconciler traffic) | **RFC 8705 cert-bound tokens**, self-signed flavour first | 32-B memcmp | **first** — standards-final, IdP-ready, smallest new code |
-| 2 | browser apps + native apps (via `tls-exporter`) | **DPoP-SK symmetric session profile** (§4) | 1 HMAC-SHA256 + int compare | second — needs the small spec + client lib |
+| 2 | browser apps + native apps (via `tls-exporter`) | **DPoP-SK symmetric session profile** (§4) | 1 HMAC-SHA256 + O(1) window check | second — needs the small spec + client lib |
 | — | micro-win, any | accept `EdDSA` DPoP proofs | 1 Ed25519 verify | opportunistic (bench first) |
 
 **Server integration points (all seams already exist):**
@@ -534,6 +547,7 @@ it as of 2026-07 — flagged as a search result, not an exhaustive registry audi
 - RFC 9728 (Protected Resource Metadata): https://www.rfc-editor.org/rfc/rfc9728.html — well-known URI, `dpop_*` + `tls_client_certificate_bound_access_tokens` members, `resource_metadata` challenge param
 - RFC 8446 (TLS 1.3): https://www.rfc-editor.org/rfc/rfc8446.html — §2.2 PSK resumption, §7.5 exporters, §8/E.5 0-RTT replay, renegotiation forbidden
 - RFC 9266 (tls-exporter channel binding): https://www.rfc-editor.org/rfc/rfc9266.html
+- RFC 4303 (ESP) §3.4.3 — the sliding-window anti-replay algorithm Tier 2 adopts: https://www.rfc-editor.org/rfc/rfc4303.html#section-3.4.3
 - Solid-OIDC 0.1.0: https://solidproject.org/TR/oidc — §8 client DPoP MUST, §9.3 RS validation
 - FAPI 2.0 Security Profile (Final, 2025-02-22): https://openid.net/specs/fapi-security-profile-2_0-final.html — §5.3.2.1/§5.3.3.1/§5.3.4 sender-constraining via MTLS or DPoP
 - OAuth 2.0 for Browser-Based Apps, draft -26 (2025-12-04): https://datatracker.ietf.org/doc/html/draft-ietf-oauth-browser-based-apps
