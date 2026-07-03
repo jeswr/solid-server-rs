@@ -327,8 +327,9 @@ impl<S: Store> LdpState<S> {
 /// Content negotiation: an RDF resource stored as Turtle is re-serialised to JSON-LD (or vice
 /// versa) when the client's `Accept` prefers it; a non-RDF body is served verbatim (its `Accept`
 /// is honoured only as `*/*`). `Range: bytes=…` yields a 206 + `Content-Range` (single range), or a
-/// 416 when unsatisfiable. Conditional GET preconditions are not applied here (this slice scopes
-/// conditional handling to the mutating verbs — see [`conditional`]).
+/// 416 when unsatisfiable. Conditional-GET read preconditions (`If-None-Match` → 304, with
+/// `If-Modified-Since` as the lower-precedence fallback) are applied in [`serve_read`] AFTER
+/// authorization and BEFORE the body/Range work (RFC 9110 §13).
 pub async fn get_handler<S: Store>(
     State(state): State<Arc<LdpState<S>>>,
     Extension(token): Extension<VerifiedToken>,
@@ -385,53 +386,52 @@ pub(crate) async fn serve_read<S: Store>(
 
     let resource = state.store.read(&target.iri).await?;
 
-    // Decide the response bytes + content type. For a CONTAINER, synthesise the LDP representation
-    // (`ldp:contains` listing + container typing) from the authoritative membership; for a plain
-    // resource, content-negotiate its stored bytes. Both honour the `Accept` header.
     let accept = header_str(req_headers, header::ACCEPT);
-    let (body, content_type) = if target.is_container {
-        render_container(
+    // Compute the response validator (ETag) that a 200 would carry FIRST, so a 304 short-circuit uses
+    // the IDENTICAL tag (RFC 9110 §13 — the 304 validator must equal the 200's for the same state).
+    //
+    // ETag: an entity-tag identifies a REPRESENTATION, not a resource (RFC 9110 §8.8.3), so the
+    // validator must be specific to the representation this request negotiates.
+    //
+    // - A CONTAINER's body is GENERATED from LIVE membership (the `ldp:contains` listing), so its
+    //   validator is derived from the FINAL RENDERED representation — not the stored-metadata ETag,
+    //   which never changes when a child is added/removed (the stale-validator bug). We render it
+    //   here (a 200 needs it anyway) and hash it; the negotiated format changes the bytes, so the
+    //   tag is representation-specific for free. GET and HEAD compute the SAME body, so they agree.
+    // - A PLAIN resource served VERBATIM (stored format, or non-RDF bytes) keeps its stored-metadata
+    //   ETag. A content-NEGOTIATED (re-serialised) RDF response gets the `"<state>+<variant>"` tag
+    //   ([`conditional::variant_etag`]) — computed from the Accept header ALONE, WITHOUT serialising
+    //   the body, so a matching read precondition can 304 while SKIPPING negotiation + Range (the
+    //   read-304 fast path). A client holding the Turtle tag but asking for JSON-LD therefore gets a
+    //   fresh 200, never a 304 for a representation it doesn't hold; the write path accepts either
+    //   tag's STATE part for If-Match (the GET → PUT round-trip — see `conditional`'s module doc).
+    //   An Accept that matches NO producible type is a 406 here, BEFORE the precondition check (a
+    //   conditional applies to the selected representation; with none selectable there is no 304).
+    let (rendered, etag): (Option<(Bytes, String)>, String) = if target.is_container {
+        let (body, content_type) = render_container(
             state,
             &target.iri,
             &resource.body,
             &resource.meta.content_type,
             accept,
         )
-        .await?
+        .await?;
+        let etag = representation_etag(&body);
+        (Some((body, content_type)), etag)
     } else {
-        negotiate_body(
-            &resource.body,
-            &resource.meta.content_type,
-            accept,
-            &target.iri,
-        )?
+        let etag = negotiated_validator(&resource.meta.etag, &resource.meta.content_type, accept)?;
+        (None, etag)
     };
 
-    let total_len = body.len() as u64;
-    // `Range` is defined for GET (RFC 9110 §14.2); ignore it for HEAD so a HEAD never returns 206.
-    let outcome = if with_body {
-        range::evaluate(header_str(req_headers, header::RANGE), total_len)
-    } else {
-        RangeOutcome::Full
-    };
-
+    // The response headers shared by the 304 short-circuit and the full 200/206/416 path: the
+    // validator (`ETag`) plus every NON-representation advertisement header this server emits on a
+    // read. RFC 9110 §15.4.5 requires a 304 to carry the validators a 200 would and forbids only
+    // *representation metadata* (`Content-Type` / body `Content-Length` are added on the full path
+    // below, never on the 304) — while the WAC spec requires `WAC-Allow` on GET/HEAD responses and
+    // the conformance harness reads the acl/type/discovery `Link` rels off HEAD, so a 304 carries
+    // those advertisements exactly like a 200 (they describe the RESOURCE, not the representation).
     let mut out = HeaderMap::new();
-    set_str(&mut out, header::CONTENT_TYPE, &content_type);
-    // ETag: a CONTAINER's body is GENERATED from LIVE membership (the `ldp:contains` listing), so its
-    // validator MUST be derived from the FINAL RENDERED representation — not the stored-metadata ETag,
-    // which never changes when a child is added/removed (the stale-validator bug: the body would
-    // change while the ETag did not, breaking conditional requests / caches). A strong hash of the
-    // negotiated, serialised body changes whenever the membership/body or the negotiated format
-    // changes. GET and HEAD compute the SAME `body` here, so they agree on this validator. A plain
-    // resource keeps its stored-metadata ETag (its bytes ARE the stored representation).
-    let etag = if target.is_container {
-        representation_etag(&body)
-    } else {
-        resource.meta.etag.clone()
-    };
     set_str(&mut out, header::ETAG, &etag);
-    // Advertise byte-range support (RFC 9110 §14.3).
-    set_str(&mut out, header::ACCEPT_RANGES, "bytes");
     // Method advertisement on the read response: `Allow` (the LDP verb set — `read-method-allow`
     // asserts GET/HEAD responses carry `Allow` listing GET + HEAD) + `Accept-Post` (containers only)
     // + `Accept-Patch`. (OPTIONS itself is answered by the CORS layer, which short-circuits every
@@ -455,6 +455,54 @@ pub(crate) async fn serve_read<S: Store>(
     // access decision (no second ACL walk/read/parse) — `perms` is serialised directly.
     let wac_allow = wac_allow_header(&perms);
     set_str(&mut out, HeaderName::from_static("wac-allow"), &wac_allow);
+
+    // READ preconditions (RFC 9110 §13), evaluated AFTER authorization (so a 304 can never leak the
+    // existence of a resource the caller could not read — auth + the 404 for a missing target both
+    // already ran above) and BEFORE serialising a plain resource's body / computing Range.
+    // `If-None-Match` (weak comparison, `*`) takes PRECEDENCE over `If-Modified-Since`. A match ⇒ 304
+    // Not Modified carrying the validators + no body; when a `Range` is present alongside a matching
+    // `If-None-Match` the precondition WINS (304, never a 206). `last_modified` is `None` because the
+    // SPARQ-index metadata does not yet surface a modification time — so `If-Modified-Since` does not
+    // fire end-to-end today (its decision logic + precedence are exhaustively unit-tested in
+    // `conditional`, and it activates the instant the store surfaces `last_modified`; see the
+    // follow-up). `If-None-Match` (the ETag validator, what the Solid conformance conditional tests +
+    // caches use) is fully live.
+    if conditional::evaluate_read(
+        header_str(req_headers, header::IF_NONE_MATCH),
+        header_str(req_headers, header::IF_MODIFIED_SINCE),
+        &etag,
+        None,
+    ) == conditional::ReadPrecondition::NotModified
+    {
+        // 304 Not Modified: the shared headers above (validator + advertisements), NO body and NO
+        // representation metadata (RFC 9110 §15.4.5) — GET and HEAD are identical here.
+        return Ok((StatusCode::NOT_MODIFIED, out).into_response());
+    }
+
+    // Not a 304: materialise the body (negotiating a plain resource now) + its content type. For a
+    // container the body was already rendered above (reused, not re-rendered).
+    let (body, content_type) = match rendered {
+        Some(bc) => bc,
+        None => negotiate_body(
+            &resource.body,
+            &resource.meta.content_type,
+            accept,
+            &target.iri,
+        )?,
+    };
+
+    let total_len = body.len() as u64;
+    // `Range` is defined for GET (RFC 9110 §14.2); ignore it for HEAD so a HEAD never returns 206.
+    let outcome = if with_body {
+        range::evaluate(header_str(req_headers, header::RANGE), total_len)
+    } else {
+        RangeOutcome::Full
+    };
+
+    // Representation metadata — the full-response path only (never on a 304).
+    set_str(&mut out, header::CONTENT_TYPE, &content_type);
+    // Advertise byte-range support (RFC 9110 §14.3).
+    set_str(&mut out, header::ACCEPT_RANGES, "bytes");
 
     match outcome {
         RangeOutcome::Unsatisfiable => {
@@ -1432,6 +1480,47 @@ fn negotiate_body(
     let triples = parse_to_triples(stored_format, stored_body, base_iri)?;
     let bytes = serialize_triples(chosen, &triples)?;
     Ok((Bytes::from(bytes), chosen.media_type().to_string()))
+}
+
+/// The validator (ETag) the response serving this PLAIN resource under `accept` carries —
+/// representation-specific per RFC 9110 §8.8.3 (an entity-tag identifies a representation, not a
+/// resource), and computed WITHOUT serialising a body (the read-304 fast path):
+///
+/// - non-RDF stored content: no RDF conneg, a single representation ⇒ the stored tag, whatever the
+///   `Accept` (matches [`negotiate_body`]'s verbatim branch);
+/// - RDF served in its STORED format ⇒ the stored tag (the bytes ARE the stored representation);
+/// - RDF re-serialised into the OTHER format ⇒ the [`conditional::variant_etag`]
+///   `"<state>+<variant>"` tag, distinct per negotiated media type and derived from the stored
+///   state — so the tag a 200 carries for each negotiated type is exactly the tag that later 304s
+///   for that type, and the write path can round-trip its state part (`conditional` module doc);
+/// - an `Accept` matching NO producible type ⇒ 406 (no selected representation, no validator).
+///
+/// The format decision is the same [`negotiate_accept`] call [`negotiate_body`] makes, so the
+/// validator and the body it labels can never disagree.
+fn negotiated_validator(
+    stored_etag: &str,
+    stored_content_type: &str,
+    accept: Option<&str>,
+) -> Result<String, ServerError> {
+    let Ok(stored_format) = classify(Some(stored_content_type)) else {
+        // Non-RDF stored content (binary): served verbatim — one representation, the stored tag.
+        return Ok(stored_etag.to_string());
+    };
+    let chosen = negotiate_accept(accept, stored_format).ok_or(ServerError::NotAcceptable)?;
+    Ok(if chosen == stored_format {
+        stored_etag.to_string()
+    } else {
+        conditional::variant_etag(stored_etag, variant_suffix(chosen))
+    })
+}
+
+/// The short `+<variant>` suffix token for a negotiated [`RdfFormat`] (kept short and `+`-free so
+/// [`conditional`]'s state-part split stays unambiguous).
+fn variant_suffix(format: RdfFormat) -> &'static str {
+    match format {
+        RdfFormat::Turtle => "ttl",
+        RdfFormat::JsonLd => "jsonld",
+    }
 }
 
 /// Whether a POST asks for a CONTAINER child via `Link: <ldp#BasicContainer>; rel="type"` (or
@@ -2822,5 +2911,422 @@ mod tests {
                 "stored triple o{i} must be carried through once: {text}"
             );
         }
+    }
+
+    // --- Conditional GET → 304 Not Modified (RFC 9110 §13; bead vltw) ------------------------------
+
+    /// Turtle Content-Type headers for a write.
+    fn turtle_write_headers() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/turtle"),
+        );
+        h
+    }
+
+    /// Owner-writes a plain Turtle resource at `path` into a fresh owner-controlled store, returning
+    /// the ready state.
+    async fn state_with_owner_resource(
+        path: &str,
+        body: &'static str,
+    ) -> Arc<LdpState<CompositeStore<InMemorySparqClient, InMemoryBlobStore>>> {
+        let store = store_with_owner_root_acl().await;
+        let state = Arc::new(LdpState::new(store, "https://pod.example"));
+        let uri: axum::http::Uri = path.parse().unwrap();
+        put_handler(
+            State(state.clone()),
+            Extension(owner_token()),
+            uri,
+            turtle_write_headers(),
+            AxBytes::from(body),
+        )
+        .await
+        .expect("owner PUT must succeed");
+        state
+    }
+
+    /// The `ETag` header of a response as an owned `String`.
+    fn etag_of(resp: &Response) -> String {
+        resp.headers()
+            .get(header::ETAG)
+            .expect("a read response must carry an ETag")
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// The response body bytes.
+    async fn body_bytes(resp: Response) -> Vec<u8> {
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    async fn get_with(
+        state: &Arc<LdpState<CompositeStore<InMemorySparqClient, InMemoryBlobStore>>>,
+        token: VerifiedToken,
+        path: &str,
+        headers: HeaderMap,
+    ) -> Response {
+        let uri: axum::http::Uri = path.parse().unwrap();
+        get_handler(State(state.clone()), Extension(token), uri, headers)
+            .await
+            .expect("GET must not error")
+    }
+
+    #[tokio::test]
+    async fn get_if_none_match_matching_etag_is_304_empty_body_same_etag() {
+        let state = state_with_owner_resource(
+            "/alice/doc",
+            "<https://pod.example/alice/doc#me> <http://xmlns.com/foaf/0.1/name> \"X\" .",
+        )
+        .await;
+
+        // First an unconditional GET to capture the resource's ETag + body.
+        let ok = get_with(&state, owner_token(), "/alice/doc", HeaderMap::new()).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        let etag = etag_of(&ok);
+        let full_body = body_bytes(ok).await;
+        assert!(!full_body.is_empty(), "the 200 must have a body");
+
+        // Now a conditional GET echoing that ETag ⇒ 304 with the IDENTICAL ETag and NO body.
+        let mut cond = HeaderMap::new();
+        cond.insert(header::IF_NONE_MATCH, HeaderValue::from_str(&etag).unwrap());
+        let not_mod = get_with(&state, owner_token(), "/alice/doc", cond).await;
+        assert_eq!(not_mod.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            etag_of(&not_mod),
+            etag,
+            "the 304 ETag MUST equal the 200 ETag"
+        );
+        assert!(
+            not_mod.headers().get(header::CONTENT_TYPE).is_none(),
+            "a 304 carries no representation metadata"
+        );
+        assert!(
+            not_mod.headers().contains_key("wac-allow"),
+            "a 304 still carries WAC-Allow (required on GET/HEAD responses)"
+        );
+        assert!(
+            body_bytes(not_mod).await.is_empty(),
+            "a 304 carries no body"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_if_none_match_non_matching_is_200_with_body() {
+        let state = state_with_owner_resource(
+            "/alice/doc",
+            "<https://pod.example/alice/doc#me> <http://xmlns.com/foaf/0.1/name> \"X\" .",
+        )
+        .await;
+        let mut cond = HeaderMap::new();
+        cond.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_static("\"some-other-tag\""),
+        );
+        let resp = get_with(&state, owner_token(), "/alice/doc", cond).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(!body_bytes(resp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_if_none_match_star_on_existing_is_304() {
+        let state = state_with_owner_resource(
+            "/alice/doc",
+            "<https://pod.example/alice/doc#me> <http://xmlns.com/foaf/0.1/name> \"X\" .",
+        )
+        .await;
+        let mut cond = HeaderMap::new();
+        cond.insert(header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+        let resp = get_with(&state, owner_token(), "/alice/doc", cond).await;
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        assert!(body_bytes(resp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn head_if_none_match_matching_is_304() {
+        let state = state_with_owner_resource(
+            "/alice/doc",
+            "<https://pod.example/alice/doc#me> <http://xmlns.com/foaf/0.1/name> \"X\" .",
+        )
+        .await;
+        // Capture the ETag via HEAD.
+        let uri: axum::http::Uri = "/alice/doc".parse().unwrap();
+        let head = head_handler(
+            State(state.clone()),
+            Extension(owner_token()),
+            uri.clone(),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let etag = etag_of(&head);
+        let mut cond = HeaderMap::new();
+        cond.insert(header::IF_NONE_MATCH, HeaderValue::from_str(&etag).unwrap());
+        let not_mod = head_handler(State(state), Extension(owner_token()), uri, cond)
+            .await
+            .unwrap();
+        assert_eq!(not_mod.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(etag_of(&not_mod), etag);
+    }
+
+    #[tokio::test]
+    async fn get_range_plus_matching_if_none_match_yields_304_not_206() {
+        // RFC 9110: when a Range and a matching If-None-Match are BOTH present, the precondition wins
+        // — a 304, never a 206.
+        let state = state_with_owner_resource(
+            "/alice/doc",
+            "<https://pod.example/alice/doc#me> <http://xmlns.com/foaf/0.1/name> \"X\" .",
+        )
+        .await;
+        let etag = etag_of(&get_with(&state, owner_token(), "/alice/doc", HeaderMap::new()).await);
+        let mut cond = HeaderMap::new();
+        cond.insert(header::IF_NONE_MATCH, HeaderValue::from_str(&etag).unwrap());
+        cond.insert(header::RANGE, HeaderValue::from_static("bytes=0-3"));
+        let resp = get_with(&state, owner_token(), "/alice/doc", cond).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_MODIFIED,
+            "the matching If-None-Match must win over Range (no 206)"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_container_conditional_uses_representation_etag() {
+        // A container's validator is its RENDERED-representation ETag; a conditional GET echoing it
+        // must 304 (and it must equal the 200 ETag).
+        let store = store_with_owner_root_acl().await;
+        let state = Arc::new(LdpState::new(store, "https://pod.example"));
+        // Create a child so the container has non-trivial membership.
+        put_handler(
+            State(state.clone()),
+            Extension(owner_token()),
+            "/alice/c/child".parse().unwrap(),
+            turtle_write_headers(),
+            AxBytes::from("<https://pod.example/alice/c/child#i> <http://p> <http://o> ."),
+        )
+        .await
+        .expect("seed child");
+
+        let ok = get_with(&state, owner_token(), "/alice/c/", HeaderMap::new()).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        let etag = etag_of(&ok);
+        let mut cond = HeaderMap::new();
+        cond.insert(header::IF_NONE_MATCH, HeaderValue::from_str(&etag).unwrap());
+        let not_mod = get_with(&state, owner_token(), "/alice/c/", cond).await;
+        assert_eq!(not_mod.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(etag_of(&not_mod), etag, "container 304 ETag == 200 ETag");
+    }
+
+    #[tokio::test]
+    async fn unauthorized_caller_gets_denial_not_304_no_existence_leak() {
+        // A stranger with NO read access must get the auth failure (403 authenticated), NOT a 304 —
+        // a 304 would leak that the resource exists to a caller who cannot read it. Auth runs BEFORE
+        // the precondition, so `If-None-Match: *` cannot short-circuit to 304 for an unauthorized read.
+        let state = state_with_owner_resource(
+            "/alice/private",
+            "<https://pod.example/alice/private#me> <http://xmlns.com/foaf/0.1/name> \"secret\" .",
+        )
+        .await;
+        let stranger = VerifiedToken {
+            web_id: Some(STRANGER.into()),
+            ..VerifiedToken::default()
+        };
+        let mut cond = HeaderMap::new();
+        cond.insert(header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+        let uri: axum::http::Uri = "/alice/private".parse().unwrap();
+        let err = get_handler(State(state), Extension(stranger), uri, cond)
+            .await
+            .expect_err("an unauthorized read must be a denial, never a 304");
+        assert_eq!(
+            err.status(),
+            StatusCode::FORBIDDEN,
+            "the unauthorized caller must get 403, not 304"
+        );
+    }
+
+    // --- Representation-specific validators under content negotiation (RFC 9110 §8.8.3) ------------
+
+    const COND_DOC: &str =
+        "<https://pod.example/alice/doc#me> <http://xmlns.com/foaf/0.1/name> \"X\" .";
+
+    #[tokio::test]
+    async fn get_stored_tag_with_accept_jsonld_is_200_not_304() {
+        // (a) An ETag identifies a REPRESENTATION: a client holding the stored-Turtle tag that asks
+        // for JSON-LD does NOT hold that representation — it must get a fresh 200, never a 304.
+        let state = state_with_owner_resource("/alice/doc", COND_DOC).await;
+        let turtle_tag =
+            etag_of(&get_with(&state, owner_token(), "/alice/doc", HeaderMap::new()).await);
+
+        let mut cond = HeaderMap::new();
+        cond.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_str(&turtle_tag).unwrap(),
+        );
+        cond.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/ld+json"),
+        );
+        let resp = get_with(&state, owner_token(), "/alice/doc", cond).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a Turtle tag must not 304 a JSON-LD response"
+        );
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/ld+json"
+        );
+        assert_ne!(
+            etag_of(&resp),
+            turtle_tag,
+            "the negotiated representation carries its own validator"
+        );
+        assert!(!body_bytes(resp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_negotiated_variant_etag_304s_only_for_that_type() {
+        // (b)+(c) The ETag a 200 carries for EACH negotiated type is exactly the tag that later
+        // 304s for that type — and only for that type.
+        let state = state_with_owner_resource("/alice/doc", COND_DOC).await;
+        let turtle_tag =
+            etag_of(&get_with(&state, owner_token(), "/alice/doc", HeaderMap::new()).await);
+
+        // The JSON-LD 200's own tag…
+        let mut accept_jsonld = HeaderMap::new();
+        accept_jsonld.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/ld+json"),
+        );
+        let jsonld_tag =
+            etag_of(&get_with(&state, owner_token(), "/alice/doc", accept_jsonld).await);
+        assert_ne!(jsonld_tag, turtle_tag);
+
+        // …304s a JSON-LD conditional GET, echoing the SAME tag with no body…
+        let mut cond = HeaderMap::new();
+        cond.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_str(&jsonld_tag).unwrap(),
+        );
+        cond.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/ld+json"),
+        );
+        let not_mod = get_with(&state, owner_token(), "/alice/doc", cond).await;
+        assert_eq!(not_mod.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(etag_of(&not_mod), jsonld_tag);
+        assert!(body_bytes(not_mod).await.is_empty());
+
+        // …but never a TURTLE conditional GET (a different representation).
+        let mut cond_turtle = HeaderMap::new();
+        cond_turtle.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_str(&jsonld_tag).unwrap(),
+        );
+        let resp = get_with(&state, owner_token(), "/alice/doc", cond_turtle).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a JSON-LD tag must not 304 the stored-Turtle response"
+        );
+        assert_eq!(etag_of(&resp), turtle_tag);
+    }
+
+    #[tokio::test]
+    async fn put_if_match_round_trips_with_a_negotiated_variant_etag() {
+        // Writes guard resource STATE: the client that GETs the JSON-LD representation must be able
+        // to PUT with the ETag it received (If-Match on the state part) — and a variant of a STALE
+        // state must still 412.
+        let state = state_with_owner_resource("/alice/doc", COND_DOC).await;
+        let mut accept_jsonld = HeaderMap::new();
+        accept_jsonld.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/ld+json"),
+        );
+        let jsonld_tag =
+            etag_of(&get_with(&state, owner_token(), "/alice/doc", accept_jsonld).await);
+
+        // GET (JSON-LD) → If-Match PUT with the received tag: round-trips (state unchanged).
+        let mut write = turtle_write_headers();
+        write.insert(
+            header::IF_MATCH,
+            HeaderValue::from_str(&jsonld_tag).unwrap(),
+        );
+        let uri: axum::http::Uri = "/alice/doc".parse().unwrap();
+        let resp = put_handler(
+            State(state.clone()),
+            Extension(owner_token()),
+            uri.clone(),
+            write.clone(),
+            AxBytes::from(
+                "<https://pod.example/alice/doc#me> <http://xmlns.com/foaf/0.1/name> \"Y\" .",
+            ),
+        )
+        .await
+        .expect("If-Match with the negotiated variant tag must round-trip");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // The state has now CHANGED — the old variant tag is stale, so the same If-Match is a 412.
+        let err = put_handler(
+            State(state),
+            Extension(owner_token()),
+            uri,
+            write,
+            AxBytes::from(
+                "<https://pod.example/alice/doc#me> <http://xmlns.com/foaf/0.1/name> \"Z\" .",
+            ),
+        )
+        .await
+        .expect_err("a variant of a stale state must fail the precondition");
+        assert_eq!(err.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    #[test]
+    fn negotiated_validator_binary_keeps_the_stored_tag() {
+        // (d) A non-RDF (binary) resource is served verbatim whatever the Accept — ONE
+        // representation, so its validator stays the stored tag (current behaviour preserved).
+        let stored = "\"5-abc123\"";
+        assert_eq!(
+            negotiated_validator(stored, "image/png", Some("application/ld+json")).unwrap(),
+            stored
+        );
+        assert_eq!(
+            negotiated_validator(stored, "image/png", None).unwrap(),
+            stored
+        );
+        // And an RDF resource served in its stored format keeps the stored tag too.
+        assert_eq!(
+            negotiated_validator(stored, "text/turtle", Some("text/turtle")).unwrap(),
+            stored
+        );
+        // While the re-serialised representation gets the distinct variant tag.
+        assert_eq!(
+            negotiated_validator(stored, "text/turtle", Some("application/ld+json")).unwrap(),
+            "\"5-abc123+jsonld\""
+        );
+    }
+
+    #[tokio::test]
+    async fn get_unacceptable_accept_is_406_even_with_matching_if_none_match() {
+        // With no selectable representation there is nothing a conditional can apply to: the 406
+        // wins over a matching If-None-Match (no 304 for an unproducible representation).
+        let state = state_with_owner_resource("/alice/doc", COND_DOC).await;
+        let turtle_tag =
+            etag_of(&get_with(&state, owner_token(), "/alice/doc", HeaderMap::new()).await);
+        let mut cond = HeaderMap::new();
+        cond.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_str(&turtle_tag).unwrap(),
+        );
+        cond.insert(header::ACCEPT, HeaderValue::from_static("text/html"));
+        let uri: axum::http::Uri = "/alice/doc".parse().unwrap();
+        let err = get_handler(State(state), Extension(owner_token()), uri, cond)
+            .await
+            .expect_err("an unacceptable Accept must be a 406, not a 304");
+        assert_eq!(err.status(), StatusCode::NOT_ACCEPTABLE);
     }
 }

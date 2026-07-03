@@ -75,8 +75,14 @@ A coherent, compiling vertical slice with clean trait seams and unit tests:
     the templates. Spec-faithful: a non-empty `where` MUST have exactly one solution (zero or multiple ⇒
     409), template variables MUST occur in `where` and templates MUST NOT contain blank nodes (422). A
     non-`text/n3` PATCH is a 415.
-  - **Conditional requests** — strong `ETag` on responses; `If-Match` / `If-None-Match` honoured on
-    PUT/PATCH/DELETE (412 on mismatch; `If-None-Match: *` create-guard) —
+  - **Conditional requests** — strong, **representation-specific** `ETag`s (a content-negotiated
+    response carries a distinct `"<state>+<variant>"` tag, per RFC 9110 §8.8.3); `If-Match` /
+    `If-None-Match` honoured on PUT/PATCH/DELETE (412 on mismatch; `If-None-Match: *` create-guard;
+    write conditionals compare the STATE part, so `GET` → `If-Match` `PUT` round-trips whichever
+    format was read), and **conditional GET/HEAD** (`If-None-Match` with RFC 9110 weak comparison
+    against the negotiated representation's own tag, `If-Modified-Since` as the lower-precedence
+    fallback with a strict, fail-open IMF-fixdate parser) answering **304 Not Modified** with the
+    same validator + advertisement headers a 200 carries and no body —
     [`src/ldp/conditional.rs`](src/ldp/conditional.rs).
   - **Writes fail closed**: with no ACL engine yet, a mutation from a public/unauthenticated caller
     is rejected (403) rather than allowed — the WAC decision plugs into that seam.
