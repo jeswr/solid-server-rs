@@ -9,11 +9,20 @@
 //! awaited the previous one, so the op's sequential RTT depth EQUALS the pinned call totals.
 //!
 //! Terminology (matching §1.1): a resource whose governing ACL sits at ancestor index *k*
-//! (0 = its own `.acl`) costs, per read, `k+1` ACL probes + 1 target meta = **k+2 SPARQL queries**
-//! when the parsed-ACL cache is warm (k+3 cold: +1 for the found ACL's re-meta inside
-//! `store.read`), +1 blob get (+1 more cold, for the ACL bytes), +1 query for a container listing.
+//! (0 = its own `.acl`). BEFORE read-2 (pinned at the read-1 commit, `git log` this file) a read
+//! cost `k+1` sequential ACL probes + 1 target meta = **k+2 SPARQL queries** warm (k+3 cold), +1
+//! blob get (+1 cold), +1 query for a container listing. AFTER read-2 (the §3.1 combined read-plan
+//! query) the WHOLE metadata chain is ONE query — the pins below are the AFTER table, with each
+//! test doc recording its before→after delta (the deterministic evidence of the win):
 //!
-//! read-2 re-pins these after the combined read-plan query collapses the chain (queries/op → 1).
+//!   op                         queries before → after   blob gets
+//!   doc GET  warm (any k)              k+2 → 1              1
+//!   doc GET  cold ACL                  k+3 → 2              2   (ACL bytes ride read-3 next)
+//!   HEAD     warm                      k+2 → 1              1
+//!   GET 304  warm                      k+2 → 1              1
+//!   container GET warm                 k+3 → 2              1   (plan + ONE membership listing)
+//!
+//! Depth-independence is the point: the per-read query count no longer scales with k.
 
 mod common;
 
@@ -168,10 +177,11 @@ async fn fixture(h: &Harness) {
     assert_eq!(warm.status(), StatusCode::OK);
 }
 
-/// §1.1 row 2 — **doc GET, warm (k = 3)**: (k+1)=4 ACL probes + 1 target meta = **6−1 = 5 SPARQL
-/// queries (k+2)**, **1 blob get**, strictly sequential (`max_in_flight == 1` ⇒ RTT depth = 6).
+/// §3.7 row 1 — **doc GET, warm (k = 3)**: the ENTIRE metadata chain (target meta + all 4 ACL
+/// candidates) is ONE combined read-plan query, + **1 blob get**. Before read-2 this was 5 queries
+/// (k+2); the pin is now DEPTH-INDEPENDENT. `max_in_flight == 1` ⇒ RTT depth = 2.
 #[tokio::test]
-async fn get_doc_warm_k3_pins_k_plus_2_queries_1_blob_get() {
+async fn get_doc_warm_k3_pins_one_combined_query_1_blob_get() {
     let h = Harness::new().await;
     fixture(&h).await;
 
@@ -181,8 +191,8 @@ async fn get_doc_warm_k3_pins_k_plus_2_queries_1_blob_get() {
     assert_eq!(&body[..], TURTLE.as_bytes());
 
     assert_eq!(
-        d.sparql_queries, 5,
-        "warm doc GET at k=3 = k+2 queries: {d:?}"
+        d.sparql_queries, 1,
+        "warm doc GET = ONE combined read-plan query at any depth (was k+2 = 5): {d:?}"
     );
     assert_eq!(
         d.blob_gets, 1,
@@ -190,12 +200,13 @@ async fn get_doc_warm_k3_pins_k_plus_2_queries_1_blob_get() {
     );
     assert_eq!(d.sparql_updates, 0);
     assert_eq!(d.blob_puts, 0);
-    assert_eq!(d.max_in_flight, 1, "strictly sequential ⇒ RTT depth = 6");
+    assert_eq!(d.max_in_flight, 1, "strictly sequential ⇒ RTT depth = 2");
 }
 
-/// §1.1 rows 1+2 — **doc GET with an OWN `.acl` (k = 0), cold then warm**: cold = 1 probe + 1
-/// ACL re-meta (inside `store.read(acl)`) + 1 target meta = **3 queries (k+3)** + **2 blob gets**
-/// (ACL bytes + target bytes); warm = 1 probe + 1 target meta = **2 queries (k+2)** + **1 blob**.
+/// §3.7 rows 1+3 — **doc GET with an OWN `.acl` (k = 0), cold then warm**: cold = 1 combined
+/// read-plan query + 1 ACL re-meta (inside `store.read(acl)` on the parse-cache miss) = **2
+/// queries** + **2 blob gets** (ACL bytes + target bytes; was 3 queries — read-3 `read_at` for the
+/// ACL bytes takes this to 1); warm = **1 query** + **1 blob** (was 2).
 #[tokio::test]
 async fn get_doc_own_acl_cold_then_warm_pins_k0_counts() {
     let h = Harness::new().await;
@@ -225,8 +236,8 @@ async fn get_doc_own_acl_cold_then_warm_pins_k0_counts() {
     let (resp, cold) = h.measured("GET", "/alice/c/doc", &[]).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        cold.sparql_queries, 3,
-        "cold doc GET at k=0 = k+3 queries: {cold:?}"
+        cold.sparql_queries, 2,
+        "cold doc GET = the plan + the ACL re-meta on the parse miss (was k+3 = 3): {cold:?}"
     );
     assert_eq!(
         cold.blob_gets, 2,
@@ -238,8 +249,8 @@ async fn get_doc_own_acl_cold_then_warm_pins_k0_counts() {
     let (resp, warm) = h.measured("GET", "/alice/c/doc", &[]).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        warm.sparql_queries, 2,
-        "warm doc GET at k=0 = k+2 queries: {warm:?}"
+        warm.sparql_queries, 1,
+        "warm doc GET = ONE combined read-plan query (was k+2 = 2): {warm:?}"
     );
     assert_eq!(
         warm.blob_gets, 1,
@@ -248,8 +259,8 @@ async fn get_doc_own_acl_cold_then_warm_pins_k0_counts() {
     assert_eq!(warm.max_in_flight, 1);
 }
 
-/// **HEAD, warm (k = 3)** — same backend cost as GET today (the read path fetches the bytes for
-/// HEAD too): **k+2 = 5 queries**, **1 blob get**.
+/// **HEAD, warm (k = 3)** — same backend cost as GET (the read path fetches the bytes for HEAD
+/// too): **1 combined query** (was k+2 = 5), **1 blob get**.
 #[tokio::test]
 async fn head_doc_warm_k3_pins_same_as_get() {
     let h = Harness::new().await;
@@ -257,16 +268,19 @@ async fn head_doc_warm_k3_pins_same_as_get() {
 
     let (resp, d) = h.measured("HEAD", "/alice/c/doc", &[]).await;
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(d.sparql_queries, 5, "warm HEAD at k=3 = k+2 queries: {d:?}");
+    assert_eq!(
+        d.sparql_queries, 1,
+        "warm HEAD = ONE combined read-plan query (was k+2 = 5): {d:?}"
+    );
     assert_eq!(d.blob_gets, 1, "HEAD still fetches the bytes today: {d:?}");
     assert_eq!(d.max_in_flight, 1);
 }
 
-/// **304 path, warm (k = 3)** — a matching `If-None-Match` returns 304 but today still pays the
-/// FULL read chain (the precondition is evaluated after the store read): **k+2 = 5 queries**,
-/// **1 blob get**.
+/// **304 path, warm (k = 3)** — a matching `If-None-Match` returns 304; the metadata chain is
+/// **1 combined query** (was k+2 = 5). The body byte-fetch (**1 blob get**) still happens (the
+/// precondition is evaluated after the read — skipping it for plain resources is read-4 territory).
 #[tokio::test]
-async fn get_304_warm_k3_pins_full_read_chain() {
+async fn get_304_warm_k3_pins_one_combined_query() {
     let h = Harness::new().await;
     fixture(&h).await;
 
@@ -285,8 +299,8 @@ async fn get_304_warm_k3_pins_full_read_chain() {
         .await;
     assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
     assert_eq!(
-        d.sparql_queries, 5,
-        "304 path still pays k+2 queries today: {d:?}"
+        d.sparql_queries, 1,
+        "304 path = ONE combined read-plan query (was k+2 = 5): {d:?}"
     );
     assert_eq!(
         d.blob_gets, 1,
@@ -295,19 +309,19 @@ async fn get_304_warm_k3_pins_full_read_chain() {
     assert_eq!(d.max_in_flight, 1);
 }
 
-/// §1.1 row 3 — **container GET, warm (k = 2)**: (k+1)=3 probes + 1 target meta + 1 membership
-/// listing = **k+3 = 5 queries** (the listing is ONE query at any child count — the no-N+1 rule),
-/// **1 blob get**.
+/// §3.7 row 4 — **container GET, warm (k = 2)**: 1 combined read-plan query + 1 membership
+/// listing = **2 queries** (was k+3 = 5; the §3.1 membership-fold that would make it 1 is read-5,
+/// measure-first), **1 blob get**. The listing stays ONE query at any child count (no-N+1).
 #[tokio::test]
-async fn get_container_warm_k2_pins_k_plus_3_queries() {
+async fn get_container_warm_k2_pins_plan_plus_listing_queries() {
     let h = Harness::new().await;
     fixture(&h).await;
 
     let (resp, d) = h.measured("GET", "/alice/c/", &[]).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        d.sparql_queries, 5,
-        "warm container GET at k=2 = k+3 queries: {d:?}"
+        d.sparql_queries, 2,
+        "warm container GET = the plan + ONE membership listing (was k+3 = 5): {d:?}"
     );
     assert_eq!(d.blob_gets, 1, "container body bytes: {d:?}");
     assert_eq!(d.max_in_flight, 1);

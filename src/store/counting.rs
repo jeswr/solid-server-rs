@@ -20,7 +20,9 @@
 //! measured rather than asserted.
 //!
 //! ## Query-count mapping (per [`SparqClient`] method, mirroring `HttpSparqClient`)
-//! - `get_meta` / `exists` / `list_children` / `referenced_blob_keys`: **1 query**.
+//! - `get_meta` / `exists` / `list_children` / `referenced_blob_keys` / `read_plan`: **1 query**
+//!   (`read_plan` is the ONE combined read-plan SELECT on the live client — §3.1; the in-memory
+//!   double answers it in one atomic index pass, so the 1-query model holds for it too).
 //! - `put_meta` / `delete_meta` / `remove_child`: **1 update**.
 //! - `create_child`: **1 update + 1 query** (the guarded insert, then the create-marker ASK).
 //! - `delete_meta_if_empty`: **1 update**, then **1 query** (marker ASK) when the outcome is
@@ -37,7 +39,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use super::blob::{BlobEntry, BlobError, BlobStore};
-use super::sparq::{DeleteOutcome, ResourceMeta, SparqClient, SparqError};
+use super::sparq::{DeleteOutcome, ReadPlan, ResourceMeta, SparqClient, SparqError};
 
 /// Shared, lock-free counters for the backend seams. Cheap to clone via `Arc`; a test holds the
 /// `Arc` and diffs [`snapshot`](BackendCounters::snapshot)s around one operation.
@@ -230,6 +232,19 @@ impl<S: SparqClient> SparqClient for CountingSparqClient<S> {
         let _g = self.counters.op_guard();
         self.counters.count_queries(1);
         self.inner.referenced_blob_keys().await
+    }
+
+    async fn read_plan(
+        &self,
+        target: &str,
+        acl_candidates: &[String],
+    ) -> Result<ReadPlan, SparqError> {
+        let _g = self.counters.op_guard();
+        // ONE combined SELECT on the live client (§3.1) — the read-2 win this decorator exists to
+        // evidence. Forwarded to `inner` (never the default loop), so the wrapped client's
+        // one-round-trip override is what actually answers.
+        self.counters.count_queries(1);
+        self.inner.read_plan(target, acl_candidates).await
     }
 }
 

@@ -70,6 +70,8 @@ struct MockStore {
     delete_markers: HashMap<String, Vec<String>>,
     /// The last SPARQL string the mock received (so a test can assert on the query text/escaping).
     last_sparql: Option<String>,
+    /// Total protocol requests received (so a test can pin how many round-trips an op cost).
+    requests: usize,
 }
 
 #[derive(Clone)]
@@ -123,7 +125,11 @@ async fn handle_sparql(
         .unwrap_or("")
         .to_string();
     let sparql = String::from_utf8_lossy(&body).to_string();
-    state.store.lock().unwrap().last_sparql = Some(sparql.clone());
+    {
+        let mut store = state.store.lock().unwrap();
+        store.last_sparql = Some(sparql.clone());
+        store.requests += 1;
+    }
 
     if ct.starts_with("application/sparql-update") {
         apply_update(&state, &sparql);
@@ -296,6 +302,37 @@ fn answer_query(state: &MockState, sparql: &str) -> Response {
             store.meta.contains_key(&graph)
         };
         return results_json(&format!(r#"{{"head":{{}},"boolean":{boolean}}}"#));
+    }
+    if sparql.starts_with("SELECT ?g ?ct ?bk ?etag") {
+        // select_read_plan: `VALUES ?g { <target> <acl…> } GRAPH ?g { record… }` — one row per
+        // VALUES graph that has an index record.
+        let values = sparql
+            .find("VALUES ?g {")
+            .map(|p| p + "VALUES ?g {".len())
+            .and_then(|start| {
+                sparql[start..]
+                    .find('}')
+                    .map(|end| sparql[start..start + end].to_string())
+            })
+            .unwrap_or_default();
+        let rows: Vec<String> = extract_iris(&values)
+            .into_iter()
+            .filter_map(|g| {
+                store.meta.get(&g).map(|(ct, bk, et)| {
+                    format!(
+                        r#"{{"g":{{"type":"uri","value":{g}}},"ct":{{"type":"literal","value":{ct}}},"bk":{{"type":"literal","value":{bk}}},"etag":{{"type":"literal","value":{et}}}}}"#,
+                        g = json_str(&g),
+                        ct = json_str(ct),
+                        bk = json_str(bk),
+                        et = json_str(et),
+                    )
+                })
+            })
+            .collect();
+        return results_json(&format!(
+            r#"{{"head":{{"vars":["g","ct","bk","etag"]}},"results":{{"bindings":[{}]}}}}"#,
+            rows.join(",")
+        ));
     }
     if sparql.starts_with("SELECT ?ct") {
         // select_meta
@@ -617,6 +654,86 @@ async fn get_meta_of_absent_is_not_found() {
     let c = HttpSparqClient::new(url);
     let err = c.get_meta(RES).await.unwrap_err();
     assert!(matches!(err, SparqError::NotFound));
+}
+
+#[tokio::test]
+async fn read_plan_is_one_protocol_request_carrying_target_and_all_candidates() {
+    // read-2 (§3.1): the live client answers the ENTIRE per-read metadata chain — target meta +
+    // every ACL candidate's presence/etag — in ONE combined SELECT (one protocol request), and the
+    // rows map back onto the caller's candidate order.
+    let (url, state) = spawn_mock().await;
+    let c = HttpSparqClient::new(url);
+    // Present: the target and the ROOT acl. Absent: the two nearer candidates.
+    c.put_meta(RES, meta()).await.unwrap();
+    let root_acl_meta = ResourceMeta {
+        content_type: "text/turtle".into(),
+        blob_key: "blob-acl".into(),
+        etag: "\"etag-acl\"".into(),
+    };
+    c.put_meta("https://pod.example/.acl", root_acl_meta)
+        .await
+        .unwrap();
+
+    let candidates = vec![
+        format!("{RES}.acl"),
+        "https://pod.example/alice/.acl".to_string(),
+        "https://pod.example/.acl".to_string(),
+    ];
+    let before = state.store.lock().unwrap().requests;
+    let plan = c.read_plan(RES, &candidates).await.unwrap();
+    let after = state.store.lock().unwrap().requests;
+    assert_eq!(after - before, 1, "read_plan = ONE protocol request");
+    // The one request was the combined SELECT with a single VALUES block over all four graphs.
+    let sent = state.store.lock().unwrap().last_sparql.clone().unwrap();
+    assert!(sent.starts_with("SELECT ?g ?ct ?bk ?etag"), "{sent}");
+    assert_eq!(sent.matches("VALUES").count(), 1, "{sent}");
+
+    assert_eq!(
+        plan.target,
+        Some(meta()),
+        "the target row is the raw target's meta"
+    );
+    assert_eq!(
+        plan.acls,
+        vec![
+            (format!("{RES}.acl"), None),
+            ("https://pod.example/alice/.acl".to_string(), None),
+            (
+                "https://pod.example/.acl".to_string(),
+                Some("\"etag-acl\"".to_string())
+            ),
+        ],
+        "one entry per candidate, in order: absent ⇒ None, present ⇒ its etag"
+    );
+}
+
+#[tokio::test]
+async fn read_plan_of_a_fully_absent_chain_is_all_none() {
+    let (url, _state) = spawn_mock().await;
+    let c = HttpSparqClient::new(url);
+    let candidates = vec![format!("{RES}.acl"), "https://pod.example/.acl".to_string()];
+    let plan = c.read_plan(RES, &candidates).await.unwrap();
+    assert_eq!(plan.target, None, "absent target ⇒ None (the caller's 404)");
+    assert!(plan.acls.iter().all(|(_, etag)| etag.is_none()));
+}
+
+#[tokio::test]
+async fn read_plan_rejects_an_injection_iri_fail_closed() {
+    // An IRIREF-invalid candidate must reject the WHOLE plan build (fail-closed at the injection-
+    // safe builder) — no request reaches the endpoint.
+    let (url, state) = spawn_mock().await;
+    let c = HttpSparqClient::new(url);
+    let before = state.store.lock().unwrap().requests;
+    let err = c
+        .read_plan(RES, &["https://pod/x> } DROP GRAPH <y".to_string()])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SparqError::Backend(_)));
+    assert_eq!(
+        state.store.lock().unwrap().requests,
+        before,
+        "no request is issued for a rejected build"
+    );
 }
 
 #[tokio::test]

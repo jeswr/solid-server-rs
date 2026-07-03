@@ -26,6 +26,27 @@ pub struct ResourceMeta {
     pub etag: String,
 }
 
+/// The result of ONE combined read-plan lookup ([`SparqClient::read_plan`]) — the whole per-read
+/// metadata round-trip of the read path (`docs/design/backend-read-path.md` §3.1): the target's
+/// authoritative metadata AND the presence/etag of every ACL candidate on its resolution chain,
+/// answered together.
+///
+/// Two distinct IRI roles (load-bearing for `.acl` targets — the design's "two roles" note): the
+/// **target** is the RAW request target (for a GET of `foo.acl` that is `foo.acl` itself — the
+/// bytes to serve), while the **candidates** are derived from the PROTECTED resource (`foo`), so
+/// the ACL chain starts at `foo.acl`, never probes a non-existent `foo.acl.acl`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadPlan {
+    /// The target's authoritative metadata, or `None` if it is not indexed (⇒ 404 — decided by the
+    /// caller AFTER authorization, exactly as the sequential path did).
+    pub target: Option<ResourceMeta>,
+    /// One entry PER candidate, in the caller's (nearest-first) order: `(acl IRI, Some(etag))` when
+    /// that ACL is indexed, `(acl IRI, None)` when authoritatively absent. Presence here came from
+    /// SPARQ itself (never a cache), so an absent row is authoritatively absent — the "SPARQ is the
+    /// source of truth" invariant is intact.
+    pub acls: Vec<(String, Option<String>)>,
+}
+
 /// The result of an atomic empty-container delete ([`SparqClient::delete_meta_if_empty`] /
 /// [`super::Store::delete_container_if_empty`]).
 ///
@@ -143,6 +164,45 @@ pub trait SparqClient: Send + Sync {
     /// Fail-closed: any backend error propagates, so the reconciler ABORTS rather than treating a
     /// failed referenced-set query as "nothing is referenced" (which would delete the whole pod).
     async fn referenced_blob_keys(&self) -> Result<std::collections::HashSet<String>, SparqError>;
+
+    /// ONE combined read-plan lookup (read-2 — `docs/design/backend-read-path.md` §3.1): the
+    /// target's metadata + the presence/etag of every ACL candidate, in one backend round-trip.
+    ///
+    /// The candidate set is computed up front by the caller (pure string work over the PROTECTED
+    /// resource); probing every candidate is semantically identical to the sequential child→root
+    /// walk because each probe is an independent read and "nearest present wins" is decided by the
+    /// caller's ORDERING over the returned rows, not by call sequence.
+    ///
+    /// The DEFAULT implementation loops [`get_meta`](SparqClient::get_meta) — semantically exact,
+    /// one round-trip per IRI — so every existing impl (the embedded engine) works unchanged. The
+    /// in-memory double overrides it with one atomic index pass and the HTTP client overrides it
+    /// with the ONE combined `VALUES ?g { … }` SELECT (the RTT win). Fail-closed: any backend error
+    /// on any part of the plan fails the WHOLE plan — there is no per-candidate partial-degrade
+    /// path (design invariant 4).
+    async fn read_plan(
+        &self,
+        target: &str,
+        acl_candidates: &[String],
+    ) -> Result<ReadPlan, SparqError> {
+        let target_meta = match self.get_meta(target).await {
+            Ok(m) => Some(m),
+            Err(SparqError::NotFound) => None,
+            Err(e) => return Err(e),
+        };
+        let mut acls = Vec::with_capacity(acl_candidates.len());
+        for candidate in acl_candidates {
+            let etag = match self.get_meta(candidate).await {
+                Ok(m) => Some(m.etag),
+                Err(SparqError::NotFound) => None,
+                Err(e) => return Err(e),
+            };
+            acls.push((candidate.clone(), etag));
+        }
+        Ok(ReadPlan {
+            target: target_meta,
+            acls,
+        })
+    }
 }
 
 /// An in-memory [`SparqClient`] for tests and the M1/M2 boot-without-SPARQ path.
@@ -301,5 +361,26 @@ impl SparqClient for InMemorySparqClient {
         // Every metadata record's `blob_key` is a live reference. Mirrors the live path's
         // `SELECT DISTINCT ?bk` over the `pss:blobKey` predicate across all graphs.
         Ok(guard.meta.values().map(|m| m.blob_key.clone()).collect())
+    }
+
+    async fn read_plan(
+        &self,
+        target: &str,
+        acl_candidates: &[String],
+    ) -> Result<ReadPlan, SparqError> {
+        // ONE atomic index pass under the single lock — the in-memory analogue of the live
+        // client's ONE combined SELECT (one consistent snapshot of target + all candidates), so the
+        // counting decorator's 1-query model holds for this double too.
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| SparqError::Backend("poisoned".into()))?;
+        Ok(ReadPlan {
+            target: guard.meta.get(target).cloned(),
+            acls: acl_candidates
+                .iter()
+                .map(|c| (c.clone(), guard.meta.get(c).map(|m| m.etag.clone())))
+                .collect(),
+        })
     }
 }

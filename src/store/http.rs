@@ -65,7 +65,7 @@ use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
 use serde_json::Value;
 
-use super::sparq::{DeleteOutcome, ResourceMeta, SparqClient, SparqError};
+use super::sparq::{DeleteOutcome, ReadPlan, ResourceMeta, SparqClient, SparqError};
 use super::sparql;
 
 /// The maximum SPARQL response body this client will buffer (fail-closed bound — a runaway response
@@ -544,6 +544,55 @@ impl SparqClient for HttpSparqClient {
             }
         }
         Ok(keys)
+    }
+
+    async fn read_plan(
+        &self,
+        target: &str,
+        acl_candidates: &[String],
+    ) -> Result<ReadPlan, SparqError> {
+        // read-2 (§3.1): the ENTIRE per-read metadata chain — the target's record + every ACL
+        // candidate's presence/etag — in ONE combined SELECT (`VALUES ?g { … }`), replacing the
+        // k+2 sequential per-IRI queries. Fail-closed: a transport/backend/malformed-response
+        // failure fails the WHOLE plan (no per-candidate partial degrade — design invariant 4).
+        let q = sparql::select_read_plan(target, acl_candidates)?;
+        let (body, _ct) = self
+            .query_raw(&q, ACCEPT_RESULTS_JSON)
+            .await
+            .map_err(SparqHttpError::into_sparq)?;
+        let result = parse_select_json(&body).map_err(SparqHttpError::into_sparq)?;
+
+        // Key the rows by graph IRI. Every row of this SELECT must carry all four bindings — a row
+        // missing one is a malformed backend response (fatal), never silently dropped (dropping
+        // could hide a PRESENT own-ACL and wrongly inherit an ancestor's grants — fail-closed).
+        let mut by_graph: std::collections::HashMap<String, ResourceMeta> =
+            std::collections::HashMap::with_capacity(result.rows.len());
+        for row in result.rows {
+            let bind = |var: &str| -> Result<String, SparqError> {
+                row.get(var).cloned().ok_or_else(|| {
+                    SparqHttpError::Malformed(format!("read-plan row missing the '{var}' binding"))
+                        .into_sparq()
+                })
+            };
+            let g = bind("g")?;
+            let meta = ResourceMeta {
+                content_type: bind("ct")?,
+                blob_key: bind("bk")?,
+                etag: bind("etag")?,
+            };
+            // First row per graph wins (a well-formed index holds exactly one record per graph —
+            // `update_put_meta`/`update_create_child` keep the record single-valued; this mirrors
+            // `select_meta`'s LIMIT 1 determinism).
+            by_graph.entry(g).or_insert(meta);
+        }
+
+        Ok(ReadPlan {
+            target: by_graph.get(target).cloned(),
+            acls: acl_candidates
+                .iter()
+                .map(|c| (c.clone(), by_graph.get(c).map(|m| m.etag.clone())))
+                .collect(),
+        })
     }
 }
 

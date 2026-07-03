@@ -34,7 +34,9 @@ pub use reconcile::{
     reconcile_orphans, spawn_periodic, ReconcileError, ReconcileOptions, ReconcileReport,
     DEFAULT_GRACE,
 };
-pub use sparq::{DeleteOutcome, InMemorySparqClient, ResourceMeta, SparqClient, SparqError};
+pub use sparq::{
+    DeleteOutcome, InMemorySparqClient, ReadPlan, ResourceMeta, SparqClient, SparqError,
+};
 pub use sparql::{BodyObject, BuildError};
 
 use crate::error::{ServerError, ServerResult};
@@ -176,6 +178,43 @@ pub trait Store: Send + Sync {
     /// is NOT deleted. Do NOT introduce an emptiness check over this filtered list — use the atomic
     /// path.
     async fn list_children(&self, container: &str) -> ServerResult<Vec<ValidatedChildIri>>;
+
+    /// ONE combined read-plan lookup for the read path (read-2 —
+    /// `docs/design/backend-read-path.md` §3.1): the target's authoritative metadata + the
+    /// presence/etag of every ACL candidate, in a single index round-trip. See
+    /// [`SparqClient::read_plan`] for the contract (candidate ordering, the two IRI roles,
+    /// fail-closed on any backend error).
+    ///
+    /// The DEFAULT implementation loops [`meta`](Store::meta) (one round-trip per IRI) so every
+    /// [`Store`] impl — including the handler-level test doubles — keeps its exact per-IRI
+    /// error/presence semantics unchanged; [`CompositeStore`] overrides it to delegate to the
+    /// [`SparqClient`] seam, where the live client answers it in ONE combined query.
+    async fn read_plan(&self, target: &str, acl_candidates: &[String]) -> ServerResult<ReadPlan> {
+        let target_meta = self.meta(target).await?;
+        let mut acls = Vec::with_capacity(acl_candidates.len());
+        for candidate in acl_candidates {
+            let etag = self.meta(candidate).await?.map(|m| m.etag);
+            acls.push((candidate.clone(), etag));
+        }
+        Ok(ReadPlan {
+            target: target_meta,
+            acls,
+        })
+    }
+
+    /// Fetch a resource's bytes through ALREADY-HELD authoritative metadata (from THIS request's
+    /// [`read_plan`](Store::read_plan) round) — the §3.3 `read_at`: no second `get_meta`. Safe
+    /// because blob keys are minted UNIQUE PER WRITE (`CompositeStore::mint_blob_key`): the key
+    /// names an immutable object, so bytes fetched through a held pointer are exactly the bytes
+    /// that pointer committed with — never a torn read of a newer write.
+    ///
+    /// The DEFAULT implementation re-reads via [`read`](Store::read) (metadata + bytes — the
+    /// pre-read-2 cost and semantics), so non-composite [`Store`] impls (test doubles) behave
+    /// exactly as before; [`CompositeStore`] overrides it with the direct blob fetch.
+    async fn read_at(&self, iri: &str, meta: &ResourceMeta) -> ServerResult<Bytes> {
+        let _ = meta;
+        Ok(self.read(iri).await?.body)
+    }
 }
 
 /// The default [`Store`]: SPARQ (authoritative metadata) + a blob store (backup bytes).
@@ -431,6 +470,33 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
         // NotEmpty / NotFound: nothing was deleted. Deleted: the record AND the parent edge are gone
         // atomically (above); the now-orphaned bytes are the reconciler's responsibility (see above).
         Ok(outcome)
+    }
+
+    async fn read_plan(&self, target: &str, acl_candidates: &[String]) -> ServerResult<ReadPlan> {
+        // Delegate to the SparqClient seam: the live HTTP client answers this with ONE combined
+        // SELECT (§3.1); the in-memory double with one atomic index pass. Fail-closed: any backend
+        // error fails the whole plan.
+        self.sparq
+            .read_plan(target, acl_candidates)
+            .await
+            .map_err(|e| match e {
+                SparqError::NotFound => ServerError::NotFound,
+                SparqError::Backend(msg) => ServerError::Storage(msg),
+            })
+    }
+
+    async fn read_at(&self, iri: &str, meta: &ResourceMeta) -> ServerResult<Bytes> {
+        // The §3.3 direct byte fetch through the held pointer — NO second `get_meta`. The unique-
+        // per-write blob key names an immutable object, so these are exactly the bytes the held
+        // metadata committed with. `iri` is not needed here (the pointer is authoritative); it is
+        // part of the trait signature so the default (re-read) impl can exist for test doubles.
+        let _ = iri;
+        self.blob.get(&meta.blob_key).await.map_err(|e| match e {
+            // The index says it exists but bytes are missing: a reconciler-class inconsistency —
+            // the SAME mapping `read` uses, so error behaviour is unchanged.
+            BlobError::NotFound => ServerError::Storage("byte/index inconsistency".into()),
+            BlobError::Backend(msg) => ServerError::Storage(msg),
+        })
     }
 
     async fn list_children(&self, container: &str) -> ServerResult<Vec<ValidatedChildIri>> {

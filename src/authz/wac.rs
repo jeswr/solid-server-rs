@@ -61,6 +61,19 @@ pub enum ReadDecision {
     Forbidden,
 }
 
+/// One entry of the read path's ACL-candidate chain (nearest-first): the ACL document IRI to
+/// probe, plus the resource it would GOVERN if present (the base the rules match against — the
+/// protected resource for the own-ACL candidate, the ancestor container for an inherited one).
+/// Produced by [`WacAuthorizer::read_plan_candidates`]; consumed, zipped with the combined
+/// read-plan query's presence/etag rows, by [`WacAuthorizer::authorize_read_planned`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AclCandidate {
+    /// The candidate ACL document IRI (`<governed>.acl`).
+    pub acl: String,
+    /// The resource this ACL governs when present (the rule-matching base).
+    pub governed: String,
+}
+
 /// The EFFECTIVE ACL governing a resource, resolved ONCE (the walk + read + parse) so it can be
 /// evaluated against MULTIPLE requesters (e.g. a read's `user` + `public` audiences) without
 /// re-resolving. `None` (no governing ACL anywhere) is the fail-closed case: no grants for anyone.
@@ -233,6 +246,173 @@ impl<'a, S: Store> WacAuthorizer<'a, S> {
             })
         };
         Ok(ReadDecision::Allow(EffectivePermissions { user, public }))
+    }
+
+    /// The full ACL-candidate chain for `target`, NEAREST-FIRST — the up-front, pure-string
+    /// derivation the combined read-plan query (read-2, `docs/design/backend-read-path.md` §3.1)
+    /// needs: element 0 is the PROTECTED resource's OWN ACL (scope [`AclScope::AccessTo`]), the
+    /// rest are its ancestors' ACLs child→root (scope [`AclScope::Default`]).
+    ///
+    /// Derived from the PROTECTED resource, not the raw target (the design's "two IRI roles"): a
+    /// GET of `foo.acl` is governed by Control on `foo`, so its chain starts at `foo.acl` itself —
+    /// deriving from the raw target would probe a non-existent `foo.acl.acl` and change
+    /// ACL-resource authorization. Exactly the candidates the (private, sequential)
+    /// `resolve_effective_acl` walk visits, in the same order.
+    pub fn read_plan_candidates(&self, target: &str) -> Vec<AclCandidate> {
+        let protected = self.protected_resource(target);
+        let mut candidates = Vec::with_capacity(4);
+        candidates.push(AclCandidate {
+            acl: self.acl_for(&protected),
+            governed: protected.clone(),
+        });
+        for ancestor in self.ancestors_nearest_first(&protected) {
+            candidates.push(AclCandidate {
+                acl: self.acl_for(&ancestor),
+                governed: ancestor,
+            });
+        }
+        candidates
+    }
+
+    /// Single-pass READ authorization over an ALREADY-FETCHED read plan (read-2): identical
+    /// decision + `WAC-Allow` audiences to [`authorize_read`](Self::authorize_read), but the ACL
+    /// walk's presence/etag probes come from the caller's ONE combined [`crate::store::ReadPlan`]
+    /// round-trip instead of k+1 sequential per-candidate queries.
+    ///
+    /// `candidates` MUST be this authorizer's own
+    /// [`read_plan_candidates`](Self::read_plan_candidates) for the same target, and `plan_acls` the
+    /// [`crate::store::ReadPlan::acls`] produced FROM those candidates — the pairing is verified
+    /// entry-by-entry and any mismatch is a FATAL error (fail-closed), never a partial evaluation.
+    ///
+    /// SECURITY (the equivalence argument): the walk semantics are exactly the sequential
+    /// `resolve_effective_acl`'s —
+    /// - candidates are visited in the SAME nearest-first order; the FIRST present one governs
+    ///   (a closer ACL fully overrides a more distant one — no union across levels);
+    /// - presence comes from the plan, which consulted SPARQ itself (never a cache), so an absent
+    ///   row is authoritatively absent — identical to a per-candidate probe's `NotFound`;
+    /// - a present candidate's triples come from the SAME etag-gated parse cache / read+parse path
+    ///   (the private `read_acl_pinned` mirrors `read_acl` — a malformed ACL is
+    ///   PRESENT-but-granting-nothing, a vanished one is absent-keep-walking);
+    /// - no candidate present anywhere ⇒ `ResolvedAcl::none` (fail-closed, no grants);
+    /// - the decision + both `WAC-Allow` audiences are then computed by the SAME `modes_for` /
+    ///   `satisfies` helpers over the same parsed triples as
+    ///   [`authorize_read`](Self::authorize_read).
+    ///
+    /// The differential tests in this module run BOTH paths over the full WAC case matrix and
+    /// assert identical [`ReadDecision`]s.
+    pub async fn authorize_read_planned(
+        &self,
+        required: AccessMode,
+        web_id: Option<&str>,
+        origin: Option<&str>,
+        candidates: &[AclCandidate],
+        plan_acls: &[(String, Option<String>)],
+    ) -> Result<ReadDecision, ServerError> {
+        let resolved = self
+            .resolve_effective_acl_planned(candidates, plan_acls)
+            .await?;
+
+        // From here the logic is byte-identical to `authorize_read` (the same steps 1–3 over the
+        // same `ResolvedAcl` shape).
+        let user = resolved.modes_for(&Requester { web_id, origin });
+        if !satisfies(&user, required) {
+            return Ok(if web_id.is_none() {
+                ReadDecision::Unauthenticated
+            } else {
+                ReadDecision::Forbidden
+            });
+        }
+        let public = if web_id.is_none() {
+            user.clone()
+        } else {
+            resolved.modes_for(&Requester {
+                web_id: None,
+                origin,
+            })
+        };
+        Ok(ReadDecision::Allow(EffectivePermissions { user, public }))
+    }
+
+    /// Resolve the effective ACL from the plan's presence/etag rows — the in-memory walk over the
+    /// combined query's results (§3.1: "the resolver then walks the candidate list in memory,
+    /// nearest-first: first present row wins").
+    async fn resolve_effective_acl_planned(
+        &self,
+        candidates: &[AclCandidate],
+        plan_acls: &[(String, Option<String>)],
+    ) -> Result<ResolvedAcl, ServerError> {
+        // The plan rows MUST pair 1:1 with the candidates they were derived from. A mismatch is a
+        // programming error — FAIL CLOSED (refuse to authorize), never evaluate a partial/shifted
+        // chain.
+        if candidates.len() != plan_acls.len() {
+            return Err(ServerError::Storage(
+                "read-plan/candidate length mismatch".into(),
+            ));
+        }
+        for (idx, (candidate, (plan_iri, etag))) in
+            candidates.iter().zip(plan_acls.iter()).enumerate()
+        {
+            if candidate.acl != *plan_iri {
+                return Err(ServerError::Storage(
+                    "read-plan/candidate IRI mismatch".into(),
+                ));
+            }
+            // Authoritatively absent (the plan consulted SPARQ, not a cache) ⇒ keep walking —
+            // identical to the sequential walk's per-candidate `NotFound`.
+            let Some(etag) = etag else { continue };
+            // Present: obtain the parsed triples via the SAME etag-gated cache / read+parse path
+            // the sequential walk uses. `None` here means the ACL VANISHED between the plan and
+            // the read (a concurrent DELETE) — the sequential walk treats that exact case as
+            // absent-keep-walking (`read_acl`'s post-probe NotFound), so we do too.
+            if let Some(triples) = self.read_acl_pinned(&candidate.acl, etag).await? {
+                let scope = if idx == 0 {
+                    AclScope::AccessTo
+                } else {
+                    AclScope::Default
+                };
+                return Ok(ResolvedAcl::found(
+                    triples,
+                    candidate.governed.clone(),
+                    scope,
+                ));
+            }
+        }
+        // No candidate present anywhere ⇒ no grants (fail-closed) — identical to the walk.
+        Ok(ResolvedAcl::none())
+    }
+
+    /// Read + parse ONE known-present ACL whose CURRENT etag the read plan already holds — the
+    /// planned-path twin of [`read_acl`](Self::read_acl), minus the per-candidate `meta` probe the
+    /// plan replaced. Identical semantics:
+    ///  - cache HIT on `(acl, plan-etag)` ⇒ the cached parse (the etag-equality gate guarantees the
+    ///    bytes are unchanged — a rotated/removed ACL can never be served stale);
+    ///  - MISS ⇒ read the bytes + parse, refresh the cache under the etag of the bytes ACTUALLY
+    ///    read (a concurrent rotation just caches the newer bytes — never a stale parse);
+    ///  - the ACL vanished between the plan and the read ⇒ `Ok(None)` (treat as absent);
+    ///  - no cache attached ⇒ the plain read+parse (the pre-cache path);
+    ///  - a malformed body parses to an EMPTY triple set (PRESENT-but-granting-nothing,
+    ///    fail-closed) via the shared [`parse_acl_body`](Self::parse_acl_body);
+    ///  - any non-NotFound store error PROPAGATES (never treated as "no ACL" — fail-closed).
+    async fn read_acl_pinned(
+        &self,
+        acl: &str,
+        etag: &str,
+    ) -> Result<Option<Vec<oxrdf::Triple>>, ServerError> {
+        let Some(cache) = self.acl_cache else {
+            return self.read_and_parse_acl(acl).await;
+        };
+        let now = Self::now_secs();
+        if let Some(triples) = cache.get(acl, etag, now) {
+            return Ok(Some(triples));
+        }
+        let resource = match self.store.read(acl).await {
+            Ok(r) => r,
+            Err(ServerError::NotFound) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let triples = Self::parse_acl_body(&resource, acl);
+        cache.insert(acl, &resource.meta.etag, triples.clone(), now);
+        Ok(Some(triples))
     }
 
     /// The effective access modes a `WAC-Allow` header should advertise on a permitted read of
@@ -1411,6 +1591,277 @@ mod tests {
         }
         // A disabled cache never stored anything.
         assert_eq!(disabled.len(), 0);
+    }
+
+    // --- read-2: the PLANNED resolve is decision-equivalent to the sequential walk ----------------
+
+    /// Run BOTH read paths — the sequential [`WacAuthorizer::authorize_read`] and the planned
+    /// [`WacAuthorizer::authorize_read_planned`] over a REAL [`Store::read_plan`] round — for the
+    /// same `(target, required, web_id, origin)` and assert IDENTICAL [`ReadDecision`]s (incl. the
+    /// full `EffectivePermissions` on Allow). This is the security-critical equivalence of read-2:
+    /// the combined-query walk must be byte-for-byte the same decision as the sequential walk.
+    async fn assert_planned_matches_sequential(
+        wac: &WacAuthorizer<'_, TestStore>,
+        store: &TestStore,
+        target: &str,
+        required: AccessMode,
+        web_id: Option<&str>,
+        origin: Option<&str>,
+    ) {
+        let sequential = wac
+            .authorize_read(target, required, web_id, origin)
+            .await
+            .unwrap();
+        let candidates = wac.read_plan_candidates(target);
+        let acl_iris: Vec<String> = candidates.iter().map(|c| c.acl.clone()).collect();
+        let plan = store.read_plan(target, &acl_iris).await.unwrap();
+        let planned = wac
+            .authorize_read_planned(required, web_id, origin, &candidates, &plan.acls)
+            .await
+            .unwrap();
+        assert_eq!(
+            planned, sequential,
+            "planned read must equal the sequential walk for target={target} web_id={web_id:?} \
+             origin={origin:?}"
+        );
+    }
+
+    /// The full-matrix differential: every ACL shape the suite exercises — public-read /
+    /// origin-scoped-public / private / inherited-default / nearest-overrides / broken-fail-closed
+    /// / no-ACL-orphan / `.acl`-Control (the two-IRI-roles case) — through BOTH paths, uncached AND
+    /// cached (cold + warm), asserting identical decisions throughout.
+    #[tokio::test]
+    async fn planned_read_is_decision_equivalent_across_the_wac_matrix() {
+        const APP: &str = "https://app.example";
+        const OTHER: &str = "https://evil.example";
+        let s = store();
+        // public-read + owner-control + an origin-scoped public Append (own ACL, k=0).
+        let public_doc = "https://pod.example/alice/test/doc";
+        put_acl(
+            &s,
+            "https://pod.example/alice/test/doc.acl",
+            &format!(
+                r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+                @prefix foaf: <http://xmlns.com/foaf/0.1/>.
+                <#o> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <{public_doc}>; acl:mode acl:Read, acl:Write, acl:Control.
+                <#p> a acl:Authorization; acl:agentClass foaf:Agent; acl:accessTo <{public_doc}>; acl:mode acl:Read.
+                <#s> a acl:Authorization; acl:agentClass foaf:Agent; acl:origin <{APP}>; acl:accessTo <{public_doc}>; acl:mode acl:Append."#
+            ),
+        )
+        .await;
+        // private (only Alice; own ACL).
+        let secret = "https://pod.example/alice/test/secret";
+        put_acl(
+            &s,
+            "https://pod.example/alice/test/secret.acl",
+            &format!(
+                r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+                <#o> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <{secret}>; acl:mode acl:Read, acl:Write, acl:Control."#
+            ),
+        )
+        .await;
+        // inherited-default at depth (k>0): /alice/.acl governs /alice/inh/deeper/data.
+        put_acl(
+            &s,
+            "https://pod.example/alice/.acl",
+            &owner_default_acl("https://pod.example/alice/", ALICE),
+        )
+        .await;
+        let inherited = "https://pod.example/alice/inh/deeper/data";
+        // nearest-overrides: /alice/test/.acl (Alice only) overrides /alice/.acl for its subtree.
+        put_acl(
+            &s,
+            "https://pod.example/alice/test/.acl",
+            &owner_default_acl("https://pod.example/alice/test/", ALICE),
+        )
+        .await;
+        let overridden = "https://pod.example/alice/test/inh";
+        // broken own-ACL (fail-closed, must NOT fall through to /alice/.acl).
+        let broken = "https://pod.example/alice/broken";
+        put_acl(
+            &s,
+            "https://pod.example/alice/broken.acl",
+            "@@@ not valid turtle <<< broken",
+        )
+        .await;
+        // no-ACL orphan anywhere.
+        let orphan = "https://pod.example/zzz/orphan";
+        // the `.acl` documents themselves (Control-gated; candidates derive from the PROTECTED
+        // resource — the two-IRI-roles case).
+        let doc_acl = "https://pod.example/alice/test/doc.acl";
+        let container_acl = "https://pod.example/alice/test/.acl";
+
+        let cases: &[(&str, AccessMode, Option<&str>, Option<&str>)] = &[
+            (public_doc, AccessMode::Read, None, None),
+            (public_doc, AccessMode::Read, Some(ALICE), None),
+            (public_doc, AccessMode::Read, Some(ALICE), Some(APP)),
+            (public_doc, AccessMode::Read, Some(ALICE), Some(OTHER)),
+            (public_doc, AccessMode::Read, Some(BOB), Some(APP)),
+            (secret, AccessMode::Read, None, None),
+            (secret, AccessMode::Read, Some(BOB), None),
+            (secret, AccessMode::Read, Some(ALICE), None),
+            (inherited, AccessMode::Read, Some(ALICE), None),
+            (inherited, AccessMode::Read, Some(BOB), None),
+            (inherited, AccessMode::Read, None, None),
+            (overridden, AccessMode::Read, Some(ALICE), None),
+            (overridden, AccessMode::Read, Some(BOB), None),
+            (broken, AccessMode::Read, Some(ALICE), None),
+            (broken, AccessMode::Read, None, None),
+            (orphan, AccessMode::Read, None, None),
+            (orphan, AccessMode::Read, Some(BOB), None),
+            (doc_acl, AccessMode::Control, Some(ALICE), None),
+            (doc_acl, AccessMode::Control, Some(BOB), None),
+            (doc_acl, AccessMode::Control, None, None),
+            (container_acl, AccessMode::Control, Some(ALICE), None),
+            (container_acl, AccessMode::Control, Some(BOB), None),
+        ];
+
+        // UNCACHED: planned == sequential for every case.
+        let uncached = WacAuthorizer::new(&s, BASE);
+        for (target, mode, web_id, origin) in cases {
+            assert_planned_matches_sequential(&uncached, &s, target, *mode, *web_id, *origin).await;
+        }
+        // CACHED, cold then warm: the FIRST pass populates via the planned path (cold), the SECOND
+        // reuses the etag-gated parse (warm) — both must still equal the sequential walk.
+        let cache = AclCache::new(64);
+        let cached = WacAuthorizer::with_cache(&s, BASE, &cache);
+        for (target, mode, web_id, origin) in cases {
+            assert_planned_matches_sequential(&cached, &s, target, *mode, *web_id, *origin).await;
+            assert_planned_matches_sequential(&cached, &s, target, *mode, *web_id, *origin).await;
+        }
+    }
+
+    /// The candidate chain derives from the PROTECTED resource (the two-IRI-roles rule): for an
+    /// `.acl` target the chain starts at that `.acl` ITSELF (governing the stripped resource),
+    /// never at a non-existent `foo.acl.acl`; for a container its own `/.acl` comes first, then the
+    /// parents'.
+    #[test]
+    fn read_plan_candidates_derive_from_the_protected_resource() {
+        let s = store();
+        let wac = WacAuthorizer::new(&s, BASE);
+        // A document: own acl first, then ancestors nearest-first up to the root.
+        let doc = wac.read_plan_candidates("https://pod.example/a/b/doc");
+        assert_eq!(
+            doc.iter().map(|c| c.acl.as_str()).collect::<Vec<_>>(),
+            vec![
+                "https://pod.example/a/b/doc.acl",
+                "https://pod.example/a/b/.acl",
+                "https://pod.example/a/.acl",
+                "https://pod.example/.acl",
+            ]
+        );
+        assert_eq!(doc[0].governed, "https://pod.example/a/b/doc");
+        assert_eq!(doc[1].governed, "https://pod.example/a/b/");
+        // An `.acl` target: the chain is the PROTECTED resource's — element 0 is the target itself.
+        let acl = wac.read_plan_candidates("https://pod.example/a/b/doc.acl");
+        assert_eq!(
+            acl.iter().map(|c| c.acl.as_str()).collect::<Vec<_>>(),
+            vec![
+                "https://pod.example/a/b/doc.acl",
+                "https://pod.example/a/b/.acl",
+                "https://pod.example/a/.acl",
+                "https://pod.example/.acl",
+            ],
+            "an .acl target's chain starts at itself (never foo.acl.acl)"
+        );
+        assert_eq!(acl[0].governed, "https://pod.example/a/b/doc");
+        // A container: its own /.acl first, then the PARENT's.
+        let c = wac.read_plan_candidates("https://pod.example/a/b/");
+        assert_eq!(
+            c.iter().map(|c| c.acl.as_str()).collect::<Vec<_>>(),
+            vec![
+                "https://pod.example/a/b/.acl",
+                "https://pod.example/a/.acl",
+                "https://pod.example/.acl",
+            ]
+        );
+        // The root itself: only its own ACL.
+        let root = wac.read_plan_candidates("https://pod.example/");
+        assert_eq!(
+            root.iter().map(|c| c.acl.as_str()).collect::<Vec<_>>(),
+            vec!["https://pod.example/.acl"]
+        );
+    }
+
+    /// A mismatched plan (wrong length or wrong IRI pairing) is REFUSED fail-closed — never a
+    /// partial/shifted evaluation.
+    #[tokio::test]
+    async fn planned_read_refuses_a_mismatched_plan_fail_closed() {
+        let s = store();
+        let resource = "https://pod.example/alice/x";
+        put_acl(
+            &s,
+            "https://pod.example/alice/x.acl",
+            &format!(
+                r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+                <#o> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <{resource}>; acl:mode acl:Read."#
+            ),
+        )
+        .await;
+        let wac = WacAuthorizer::new(&s, BASE);
+        let candidates = wac.read_plan_candidates(resource);
+        // Wrong LENGTH (a truncated plan).
+        let short: Vec<(String, Option<String>)> = vec![(candidates[0].acl.clone(), None)];
+        let err = wac
+            .authorize_read_planned(AccessMode::Read, Some(ALICE), None, &candidates, &short)
+            .await
+            .expect_err("a truncated plan must be refused");
+        assert!(matches!(err, ServerError::Storage(_)));
+        // Wrong IRI pairing (a shifted plan).
+        let mut shifted: Vec<(String, Option<String>)> =
+            candidates.iter().map(|c| (c.acl.clone(), None)).collect();
+        shifted.swap(0, 1);
+        let err = wac
+            .authorize_read_planned(AccessMode::Read, Some(ALICE), None, &candidates, &shifted)
+            .await
+            .expect_err("a shifted plan must be refused");
+        assert!(matches!(err, ServerError::Storage(_)));
+    }
+
+    /// An ACL that VANISHES between the plan and the triple read (a concurrent DELETE) is treated
+    /// as absent-keep-walking — exactly the sequential walk's post-probe `NotFound` semantics: the
+    /// resolution falls through to the next present candidate.
+    #[tokio::test]
+    async fn planned_read_vanished_acl_falls_through_to_the_next_candidate() {
+        let s = store();
+        let resource = "https://pod.example/alice/v/data";
+        let own_acl = "https://pod.example/alice/v/data.acl";
+        // The own ACL would grant BOB; the ancestor grants ALICE (default).
+        put_acl(
+            &s,
+            own_acl,
+            &format!(
+                r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+                <#b> a acl:Authorization; acl:agent <{BOB}>; acl:accessTo <{resource}>; acl:mode acl:Read."#
+            ),
+        )
+        .await;
+        put_acl(
+            &s,
+            "https://pod.example/alice/.acl",
+            &owner_default_acl("https://pod.example/alice/", ALICE),
+        )
+        .await;
+        let wac = WacAuthorizer::new(&s, BASE);
+        let candidates = wac.read_plan_candidates(resource);
+        let acl_iris: Vec<String> = candidates.iter().map(|c| c.acl.clone()).collect();
+        // Take the plan WHILE the own ACL exists…
+        let plan = s.read_plan(resource, &acl_iris).await.unwrap();
+        assert!(plan.acls[0].1.is_some(), "own acl present in the plan");
+        // …then DELETE it before evaluation (the concurrent-DELETE window).
+        s.delete(own_acl, None).await.unwrap();
+        // Bob's own-ACL grant is GONE (the vanished ACL is not resurrected); the walk falls
+        // through to the ancestor default, which grants only Alice.
+        let bob = wac
+            .authorize_read_planned(AccessMode::Read, Some(BOB), None, &candidates, &plan.acls)
+            .await
+            .unwrap();
+        assert_eq!(bob, ReadDecision::Forbidden);
+        let alice = wac
+            .authorize_read_planned(AccessMode::Read, Some(ALICE), None, &candidates, &plan.acls)
+            .await
+            .unwrap();
+        assert!(matches!(alice, ReadDecision::Allow(_)));
     }
 
     /// A removed ACL is NEVER resurrected by the cache: populate the cache with an ALLOW via an own
