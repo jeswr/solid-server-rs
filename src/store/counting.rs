@@ -19,13 +19,14 @@
 //! (`sparql_queries + sparql_updates + blob ops`). That is the §1.1 "sequential RTT depth" column,
 //! measured rather than asserted.
 //!
-//! **The mark is a lifetime high-water, so a per-op reading MUST be operation-scoped:** measure a
-//! window with [`BackendCounters::measure`] (which resets the mark to the current in-flight level
-//! and returns a [`MeasureScope`]), not a raw `snapshot().since()` — otherwise a prior,
-//! already-completed OVERLAPPING op leaves the global high-water >1 and permanently contaminates
-//! every later strictly-sequential reading (the witness would report await-depth >1 for a
-//! genuinely serial op). `measure()` makes the witness sound in production, not only in isolated
-//! tests.
+//! **The global mark is a lifetime high-water, so a per-op reading MUST be operation-scoped:**
+//! measure a window with [`BackendCounters::measure`], which hands out a [`MeasureScope`] owning its
+//! OWN peak cell (every backend call `fetch_max`es the live in-flight count into every open window's
+//! cell). Do NOT read a raw `snapshot().since()` `max_in_flight` per op — that carries the global
+//! high-water, which a prior, already-completed OVERLAPPING op leaves >1, permanently contaminating
+//! every later strictly-sequential reading. Per-scope cells (not a destructively-reset shared mark)
+//! make the witness sound under real concurrency — overlapping windows each get their own correct
+//! peak, and one window can never erase another's.
 //!
 //! ## Query-count mapping (per [`SparqClient`] method, mirroring `HttpSparqClient`)
 //! - `get_meta` / `exists` / `list_children` / `referenced_blob_keys` / `read_plan`: **1 query**
@@ -41,7 +42,7 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -65,19 +66,24 @@ pub struct BackendCounters {
     blob_others: AtomicU64,
     /// Currently-outstanding backend calls (both seams).
     in_flight: AtomicU64,
-    /// High-water mark of `in_flight` — **1 ⇒ strictly sequential**, so an op's sequential RTT
-    /// depth equals its total backend-call count.
+    /// GLOBAL monotonic high-water mark of `in_flight` (never reset) — the lifetime peak, reported by
+    /// the raw [`snapshot`](BackendCounters::snapshot). For a PER-OP reading use [`measure`] instead,
+    /// which gives each window its own peak cell (below).
     max_in_flight: AtomicU64,
+    /// The peak cell of every ACTIVE measurement window ([`MeasureScope`]). Each `op_guard`
+    /// `fetch_max`es the current in-flight count into every registered cell, so overlapping windows
+    /// each record their OWN correct peak — WITHOUT any window destructively resetting a shared mark
+    /// (the race the old `reset_max_in_flight` had: a non-atomic load/store could erase a real peak).
+    /// A cell is registered by [`measure`](BackendCounters::measure) and removed on scope drop.
+    scopes: Mutex<Vec<Arc<AtomicU64>>>,
 }
 
 /// A point-in-time copy of the counters. Subtract two with [`CounterSnapshot::since`] to get the
 /// per-operation deltas a test pins. `max_in_flight` is NOT differenced (it is a high-water mark);
-/// `since` carries the LATER snapshot's value — which is a GLOBAL high-water for the counters'
-/// lifetime UNLESS the window was opened via [`BackendCounters::measure`] (or a
-/// [`BackendCounters::reset_max_in_flight`] immediately before the baseline snapshot), which resets
-/// the mark so the reading is OPERATION-SCOPED. Prefer `measure` for a sound per-op await-depth
-/// reading; a raw `snapshot().since()` `max_in_flight` can be contaminated by a prior, already-
-/// completed overlapping op.
+/// `since` carries the LATER snapshot's GLOBAL high-water for the counters' lifetime. For a sound
+/// OPERATION-SCOPED peak use [`BackendCounters::measure`] + [`MeasureScope::delta`] (which reads the
+/// window's OWN peak cell), not a raw `snapshot().since()` — the latter's `max_in_flight` can be
+/// contaminated by a prior, already-completed overlapping op.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CounterSnapshot {
     pub sparql_queries: u64,
@@ -128,36 +134,40 @@ impl BackendCounters {
         }
     }
 
-    /// Reset the concurrency high-water mark to the CURRENT in-flight level, so a FOLLOWING
-    /// measurement window records only that window's peak — a prior, already-completed overlapping
-    /// op can no longer contaminate a later per-op await-depth reading. (Without a reset,
-    /// `max_in_flight` is monotonic for the counters' lifetime.) Baselining to the *current*
-    /// in-flight count — not 0 — is deliberate: any genuinely-outstanding concurrency at window
-    /// start is real and should count toward the window's peak, only STALE history is dropped.
-    pub fn reset_max_in_flight(&self) {
-        let cur = self.in_flight.load(Ordering::SeqCst);
-        self.max_in_flight.store(cur, Ordering::SeqCst);
-    }
-
-    /// Open an OPERATION-SCOPED measurement window: reset the high-water mark to the current
-    /// in-flight level and capture the counter baseline. [`MeasureScope::delta`] then yields this
-    /// window's counter deltas AND its op-scoped peak concurrency (`max_in_flight`), the sound way
-    /// to read per-op await-depth in production (not just in isolated tests). Hold the scope across
-    /// the measured operation(s), then call `delta()`.
+    /// Open an OPERATION-SCOPED measurement window with its OWN peak cell. The window's
+    /// [`MeasureScope::delta`] yields the counter deltas since open AND *this window's* peak
+    /// concurrency — never a global high-water, and never a value another scope could erase. This is
+    /// the sound way to read per-op await-depth under concurrency (not just in isolated tests): each
+    /// window's peak is an INDEPENDENT cell that `op_guard` `fetch_max`es into, so nothing is reset.
+    ///
+    /// The cell is initialised to the concurrency ALREADY outstanding at open (genuine concurrency
+    /// counts) and registered under the scopes lock, so it cannot race an `op_guard` update: an
+    /// in-flight bump is either already visible in the initial `in_flight` load or lands on this cell
+    /// via `op_guard`'s `fetch_max` afterwards. Hold the scope across the measured operation(s), then
+    /// call `delta()`; the cell is de-registered on drop.
     pub fn measure(&self) -> MeasureScope<'_> {
-        self.reset_max_in_flight();
+        let mut scopes = self.scopes.lock().expect("scopes registry poisoned");
+        let peak = Arc::new(AtomicU64::new(self.in_flight.load(Ordering::SeqCst)));
+        scopes.push(Arc::clone(&peak));
+        drop(scopes);
         MeasureScope {
             counters: self,
+            peak,
             start: self.snapshot(),
         }
     }
 
-    /// RAII in-flight guard: increments the gauge (updating the high-water mark) for the duration
-    /// of one backend call. Two overlapping guards ⇒ `max_in_flight ≥ 2` (the sequentiality
-    /// witness flips only when calls genuinely overlap).
+    /// RAII in-flight guard: increments the gauge for the duration of one backend call and records
+    /// the resulting in-flight count into the GLOBAL high-water AND every ACTIVE measurement window's
+    /// own peak cell. Two overlapping guards ⇒ each open window's peak ≥ 2 (the sequentiality witness
+    /// flips only when calls genuinely overlap). The scopes lock serializes with `measure`/drop so a
+    /// peak raised during a window can never be lost.
     fn op_guard(self: &Arc<Self>) -> OpGuard {
         let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        for peak in self.scopes.lock().expect("scopes registry poisoned").iter() {
+            peak.fetch_max(now, Ordering::SeqCst);
+        }
         OpGuard {
             counters: Arc::clone(self),
         }
@@ -171,19 +181,35 @@ impl BackendCounters {
     }
 }
 
-/// An operation-scoped measurement window (from [`BackendCounters::measure`]). Resets the
-/// concurrency high-water mark on creation so [`delta`](Self::delta) reports the peak concurrency
-/// DURING this window only, and yields counter deltas relative to the window start.
+/// An operation-scoped measurement window (from [`BackendCounters::measure`]). Owns an INDEPENDENT
+/// peak cell that every `op_guard` `fetch_max`es into for the window's lifetime, so
+/// [`delta`](Self::delta) reports the peak concurrency DURING this window only — with no shared
+/// high-water reset, and no way for a concurrent scope to erase this window's real peak.
 pub struct MeasureScope<'a> {
     counters: &'a BackendCounters,
+    /// This window's OWN peak-concurrency cell (registered in `counters.scopes` for its lifetime).
+    peak: Arc<AtomicU64>,
     start: CounterSnapshot,
 }
 
 impl MeasureScope<'_> {
     /// The window's deltas: counter fields since the window start, and the op-scoped peak
-    /// `max_in_flight` recorded since the window reset (NOT a global high-water).
+    /// `max_in_flight` from THIS window's own cell (NOT the global high-water).
     pub fn delta(&self) -> CounterSnapshot {
-        self.counters.snapshot().since(&self.start)
+        let mut d = self.counters.snapshot().since(&self.start);
+        d.max_in_flight = self.peak.load(Ordering::SeqCst);
+        d
+    }
+}
+
+impl Drop for MeasureScope<'_> {
+    fn drop(&mut self) {
+        // De-register this window's peak cell (by identity) so `op_guard` stops updating it.
+        self.counters
+            .scopes
+            .lock()
+            .expect("scopes registry poisoned")
+            .retain(|p| !Arc::ptr_eq(p, &self.peak));
     }
 }
 
@@ -487,6 +513,61 @@ mod tests {
         assert!(
             raw.max_in_flight >= 2,
             "unscoped since() is contaminated by the prior overlap ({raw:?}) — the reason measure() exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_scopes_each_keep_their_own_peak_no_reset_erasure() {
+        // The MEASUREMENT Medium (per-scope cells, not a destructively-reset shared mark): a REAL
+        // peak raised during window A must NEVER be erased by another window B opening. The old
+        // `reset_max_in_flight` stored the current in-flight count into a SHARED cell on every
+        // `measure()`, so B opening while quiescent would overwrite A's real peak with 0. This test
+        // pins the correct per-scope behaviour (and would FAIL against that reset design).
+        let counters = BackendCounters::new();
+
+        // Window A opens while quiescent (its own peak cell starts at 0).
+        let scope_a = counters.measure();
+        // A REAL peak of 2 occurs DURING A (two concurrent in-flight guards), then clears.
+        {
+            let _g1 = counters.op_guard(); // in_flight 1 → A's cell fetch_max 1
+            let _g2 = counters.op_guard(); // in_flight 2 → A's cell fetch_max 2
+        }
+        // Window B opens while quiescent (in_flight back to 0). A shared-reset design would store 0
+        // here, ERASING A's peak; independent per-scope cells do not.
+        let scope_b = counters.measure();
+
+        assert_eq!(
+            scope_a.delta().max_in_flight,
+            2,
+            "window A's real peak of 2 must survive window B opening (no shared-reset erasure)"
+        );
+        assert_eq!(
+            scope_b.delta().max_in_flight,
+            0,
+            "window B saw no in-flight calls of its own ⇒ its own peak is 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_opened_during_in_flight_counts_the_outstanding_concurrency() {
+        // A window opened while calls are already outstanding counts that GENUINE concurrency in its
+        // peak (only STALE history is excluded). This is the coordinator's "measure() concurrent
+        // with a backend call" race made deterministic: opening with 2 in flight ⇒ peak ≥ 2, and a
+        // later `op_guard` during the window still lands on this window's own cell.
+        let counters = BackendCounters::new();
+        let sparq = CountingSparqClient::new(InMemorySparqClient::new(), Arc::clone(&counters));
+
+        let g1 = counters.op_guard(); // in_flight 1
+        let g2 = counters.op_guard(); // in_flight 2
+        let scope = counters.measure(); // opens with 2 outstanding → own cell initialised to 2
+        drop(g2);
+        drop(g1);
+        // A further sequential call inside the window updates THIS window's cell (still ≤ its peak).
+        sparq.exists("https://p/x").await.unwrap();
+        assert_eq!(
+            scope.delta().max_in_flight,
+            2,
+            "a window opened with 2 outstanding calls counts them as its peak"
         );
     }
 }
