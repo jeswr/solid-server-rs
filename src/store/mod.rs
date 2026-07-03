@@ -159,8 +159,17 @@ pub trait Store: Send + Sync {
 
     /// List the direct children of a container — the authoritative `ldp:contains` membership — each as a
     /// [`ValidatedChildIri`] (RFC-3987-validated at THIS boundary, so a malformed/injected row never
-    /// flows unchecked into the container-listing render; see [`ValidatedChildIri`]). Consumed by the
-    /// container-listing render; the empty-container check uses only its length.
+    /// flows unchecked into the container-listing render; see [`ValidatedChildIri`]).
+    ///
+    /// SCOPE (load-bearing): this method is for the container-listing **render ONLY**. Because a
+    /// malformed stored membership row is FAIL-CLOSED OMITTED here, this list is NOT authoritative for
+    /// **emptiness** — a container with a (malformed) membership edge would appear shorter/empty in
+    /// THIS filtered view. The empty-container DELETE decision therefore does NOT use this method: it
+    /// goes through [`delete_container_if_empty`](Store::delete_container_if_empty) →
+    /// `SparqClient::delete_meta_if_empty`, which counts ALL raw membership edges at the SPARQ level
+    /// (atomically, with no filtering), so a malformed edge still keeps the container non-empty and it
+    /// is NOT deleted. Do NOT introduce an emptiness check over this filtered list — use the atomic
+    /// path.
     async fn list_children(&self, container: &str) -> ServerResult<Vec<ValidatedChildIri>>;
 }
 
