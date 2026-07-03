@@ -75,6 +75,14 @@ pub struct BackendCounters {
     /// in-flight increment that has not yet reached the scope peaks (the boundary race a lock-free
     /// increment + a separate scopes lock had), and no window can erase another's peak.
     conc: Mutex<Conc>,
+    /// TEST-ONLY instrumentation seam (zero-cost in non-test builds: the field does not exist).
+    /// When a test installs a flag here, `op_guard` sets it IMMEDIATELY BEFORE attempting the
+    /// `conc` lock — i.e. after everything `op_guard` does outside the critical section (which is
+    /// nothing; that emptiness is exactly what the boundary-race test pins). A test holding the
+    /// lock can therefore wait on this flag as a DETERMINISTIC proof that another thread has
+    /// reached the lock-acquisition boundary and is blocked there, instead of sleeping.
+    #[cfg(test)]
+    boundary_probe: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// The lock-protected concurrency state (see [`BackendCounters::conc`]): the live in-flight count +
@@ -174,6 +182,14 @@ impl BackendCounters {
     /// each open window's peak ≥ 2. The lock is released BEFORE the backend call runs (only the
     /// counter arithmetic is under it — deadlock-free, never held across an `.await`).
     fn op_guard(self: &Arc<Self>) -> OpGuard {
+        // TEST-ONLY: announce arrival at the lock-acquisition boundary (see `boundary_probe`).
+        // This is the LAST thing before the lock attempt, so once a test observes the flag, every
+        // pre-lock effect of `op_guard` (there must be none — the invariant under test) has
+        // already happened-before the observation.
+        #[cfg(test)]
+        if let Some(probe) = self.boundary_probe.get() {
+            probe.store(true, Ordering::SeqCst);
+        }
         let mut conc = self.conc.lock().expect("conc lock poisoned");
         conc.in_flight += 1;
         let now = conc.in_flight;
@@ -612,37 +628,51 @@ mod tests {
     /// window a reader could catch. The old design incremented `in_flight` LOCK-FREE before taking a
     /// separate scopes lock, so here it would show `in_flight == 1` while the scope peak was still 0
     /// (the boundary under-report) — this test's `in_flight == 0` assertion pins that against
-    /// regression. The 30 ms wait lets the spawned thread reach (and block on) the lock; the op does
-    /// nothing else first, so this is reliable in practice.
+    /// regression.
+    ///
+    /// Readiness is DETERMINISTIC, not sleep-based: the test installs the cfg(test)-only
+    /// `boundary_probe`, which `op_guard` sets as its very last action BEFORE attempting the lock.
+    /// The main thread spins until the probe fires, so by the time it asserts, the worker has
+    /// provably executed ALL of `op_guard`'s pre-lock code (i.e. actually attempted the boundary) —
+    /// any regressed pre-lock counter mutation would be sequenced-before the probe store and thus
+    /// visible to the assertions. No scheduler timing is relied on.
     #[test]
     fn boundary_increment_and_peak_update_are_one_critical_section() {
         use std::sync::atomic::AtomicBool;
         use std::thread;
-        use std::time::Duration;
 
         let counters = BackendCounters::new();
+        // Install the boundary probe BEFORE any op_guard can run.
+        let probe = Arc::new(AtomicBool::new(false));
+        counters
+            .boundary_probe
+            .set(Arc::clone(&probe))
+            .expect("boundary probe installed exactly once");
+
         let scope = counters.measure(); // window open, own peak cell = 0
 
         // Hold the critical-section lock, so any `op_guard` must block BEFORE it can touch in_flight
         // or the scope peaks.
         let guard = counters.conc.lock().expect("conc lock poisoned");
 
-        let started = Arc::new(AtomicBool::new(false));
         let c2 = Arc::clone(&counters);
-        let started2 = Arc::clone(&started);
         let worker = thread::spawn(move || {
-            started2.store(true, Ordering::SeqCst);
             // BLOCKS on conc.lock() inside op_guard (the test thread holds it). Once it proceeds, the
             // whole critical section (in_flight += 1 + peak fan-out) runs atomically.
             let _g = c2.op_guard();
-            thread::sleep(Duration::from_millis(20)); // keep the guard (and in_flight) alive briefly
         });
 
-        // Wait until the worker is running and (about to be) blocked on the lock.
-        while !started.load(Ordering::SeqCst) {
-            std::hint::spin_loop();
+        // DETERMINISTIC readiness: wait until the worker has reached op_guard's lock-acquisition
+        // boundary (the probe is stored immediately before the lock attempt). After this, the
+        // worker's only remaining path is THROUGH the lock we hold — it is blocked at the boundary.
+        while !probe.load(Ordering::SeqCst) {
+            thread::yield_now();
         }
-        thread::sleep(Duration::from_millis(30));
+        // Sanity: the worker cannot have completed — its critical section needs the lock we hold.
+        assert!(
+            !worker.is_finished(),
+            "worker must be blocked at the lock-acquisition boundary while we hold the lock"
+        );
 
         // The blocked op has NOT entered its critical section: in_flight is still 0 AND the scope
         // peak is still 0 — the two move together, never separately (the fix). (Old lock-free
