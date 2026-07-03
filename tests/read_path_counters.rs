@@ -119,16 +119,18 @@ impl Harness {
             .unwrap()
     }
 
-    /// Measure ONE request's backend-counter deltas.
+    /// Measure ONE request's backend-counter deltas over an OPERATION-SCOPED window (`measure()`),
+    /// so `max_in_flight` is this request's peak concurrency — NOT a global high-water that a prior
+    /// (e.g. the fixture's PUTs) overlapping op could contaminate.
     async fn measured(
         &self,
         method: &str,
         path: &str,
         extra: &[(&str, &str)],
     ) -> (axum::http::Response<Body>, CounterSnapshot) {
-        let before = self.counters.snapshot();
+        let scope = self.counters.measure();
         let resp = self.request(method, path, None, extra, Body::empty()).await;
-        (resp, self.counters.snapshot().since(&before))
+        (resp, scope.delta())
     }
 }
 

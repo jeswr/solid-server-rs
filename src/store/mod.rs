@@ -26,7 +26,9 @@ use bytes::Bytes;
 use oxrdf::NamedNode;
 
 pub use blob::{BlobEntry, BlobError, BlobStore, InMemoryBlobStore};
-pub use counting::{BackendCounters, CounterSnapshot, CountingBlobStore, CountingSparqClient};
+pub use counting::{
+    BackendCounters, CounterSnapshot, CountingBlobStore, CountingSparqClient, MeasureScope,
+};
 #[cfg(feature = "embedded-sparq")]
 pub use embedded::EmbeddedSparqClient;
 pub use http::{HttpSparqClient, SparqHttpError};

@@ -13,11 +13,19 @@
 //!
 //! ## The await-depth (sequential-RTT) witness
 //! Both decorators share one [`BackendCounters`] and wrap every backend call in an in-flight
-//! guard. [`CounterSnapshot::max_in_flight`] is the high-water mark of concurrently-outstanding
-//! backend calls: when it reads **1** for an operation, every backend call strictly awaited the
-//! previous one — so the operation's **sequential RTT depth equals its total backend-call count**
+//! guard. `max_in_flight` is the high-water mark of concurrently-outstanding backend calls: when it
+//! reads **1** for an operation, every backend call strictly awaited the previous one — so the
+//! operation's **sequential RTT depth equals its total backend-call count**
 //! (`sparql_queries + sparql_updates + blob ops`). That is the §1.1 "sequential RTT depth" column,
 //! measured rather than asserted.
+//!
+//! **The mark is a lifetime high-water, so a per-op reading MUST be operation-scoped:** measure a
+//! window with [`BackendCounters::measure`] (which resets the mark to the current in-flight level
+//! and returns a [`MeasureScope`]), not a raw `snapshot().since()` — otherwise a prior,
+//! already-completed OVERLAPPING op leaves the global high-water >1 and permanently contaminates
+//! every later strictly-sequential reading (the witness would report await-depth >1 for a
+//! genuinely serial op). `measure()` makes the witness sound in production, not only in isolated
+//! tests.
 //!
 //! ## Query-count mapping (per [`SparqClient`] method, mirroring `HttpSparqClient`)
 //! - `get_meta` / `exists` / `list_children` / `referenced_blob_keys` / `read_plan`: **1 query**
@@ -64,7 +72,12 @@ pub struct BackendCounters {
 
 /// A point-in-time copy of the counters. Subtract two with [`CounterSnapshot::since`] to get the
 /// per-operation deltas a test pins. `max_in_flight` is NOT differenced (it is a high-water mark);
-/// `since` carries the LATER snapshot's value.
+/// `since` carries the LATER snapshot's value — which is a GLOBAL high-water for the counters'
+/// lifetime UNLESS the window was opened via [`BackendCounters::measure`] (or a
+/// [`BackendCounters::reset_max_in_flight`] immediately before the baseline snapshot), which resets
+/// the mark so the reading is OPERATION-SCOPED. Prefer `measure` for a sound per-op await-depth
+/// reading; a raw `snapshot().since()` `max_in_flight` can be contaminated by a prior, already-
+/// completed overlapping op.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CounterSnapshot {
     pub sparql_queries: u64,
@@ -115,6 +128,30 @@ impl BackendCounters {
         }
     }
 
+    /// Reset the concurrency high-water mark to the CURRENT in-flight level, so a FOLLOWING
+    /// measurement window records only that window's peak — a prior, already-completed overlapping
+    /// op can no longer contaminate a later per-op await-depth reading. (Without a reset,
+    /// `max_in_flight` is monotonic for the counters' lifetime.) Baselining to the *current*
+    /// in-flight count — not 0 — is deliberate: any genuinely-outstanding concurrency at window
+    /// start is real and should count toward the window's peak, only STALE history is dropped.
+    pub fn reset_max_in_flight(&self) {
+        let cur = self.in_flight.load(Ordering::SeqCst);
+        self.max_in_flight.store(cur, Ordering::SeqCst);
+    }
+
+    /// Open an OPERATION-SCOPED measurement window: reset the high-water mark to the current
+    /// in-flight level and capture the counter baseline. [`MeasureScope::delta`] then yields this
+    /// window's counter deltas AND its op-scoped peak concurrency (`max_in_flight`), the sound way
+    /// to read per-op await-depth in production (not just in isolated tests). Hold the scope across
+    /// the measured operation(s), then call `delta()`.
+    pub fn measure(&self) -> MeasureScope<'_> {
+        self.reset_max_in_flight();
+        MeasureScope {
+            counters: self,
+            start: self.snapshot(),
+        }
+    }
+
     /// RAII in-flight guard: increments the gauge (updating the high-water mark) for the duration
     /// of one backend call. Two overlapping guards ⇒ `max_in_flight ≥ 2` (the sequentiality
     /// witness flips only when calls genuinely overlap).
@@ -131,6 +168,22 @@ impl BackendCounters {
     }
     fn count_update(&self) {
         self.sparql_updates.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// An operation-scoped measurement window (from [`BackendCounters::measure`]). Resets the
+/// concurrency high-water mark on creation so [`delta`](Self::delta) reports the peak concurrency
+/// DURING this window only, and yields counter deltas relative to the window start.
+pub struct MeasureScope<'a> {
+    counters: &'a BackendCounters,
+    start: CounterSnapshot,
+}
+
+impl MeasureScope<'_> {
+    /// The window's deltas: counter fields since the window start, and the op-scoped peak
+    /// `max_in_flight` recorded since the window reset (NOT a global high-water).
+    pub fn delta(&self) -> CounterSnapshot {
+        self.counters.snapshot().since(&self.start)
     }
 }
 
@@ -383,5 +436,57 @@ mod tests {
         sparq.exists("https://p/x").await.unwrap();
         drop(g);
         assert!(counters.snapshot().max_in_flight >= 2);
+    }
+
+    #[tokio::test]
+    async fn scoped_measurement_is_not_contaminated_by_a_prior_overlap() {
+        // The MEASUREMENT fix (roborev Medium): a scoped `measure()` window must report only ITS
+        // OWN peak concurrency, not the counters' lifetime global high-water. Here a PRIOR op
+        // overlaps (global max → 2); a later, strictly-SEQUENTIAL op measured via `measure()` must
+        // still read `max_in_flight == 1`.
+        let counters = BackendCounters::new();
+        let sparq = CountingSparqClient::new(InMemorySparqClient::new(), Arc::clone(&counters));
+
+        // Prior overlap → the GLOBAL high-water is now 2.
+        {
+            let g = counters.op_guard();
+            sparq.exists("https://p/prior").await.unwrap();
+            drop(g);
+        }
+        assert!(
+            counters.snapshot().max_in_flight >= 2,
+            "sanity: the prior overlap raised the GLOBAL high-water"
+        );
+
+        // A later strictly-sequential op, measured in its OWN scope, sees peak = 1 (not the stale 2).
+        let scope = counters.measure();
+        sparq.exists("https://p/a").await.unwrap();
+        sparq.exists("https://p/b").await.unwrap();
+        let d = scope.delta();
+        assert_eq!(d.sparql_queries, 2, "two sequential queries in the window");
+        assert_eq!(
+            d.max_in_flight, 1,
+            "op-scoped peak is 1 — the prior overlap must NOT contaminate this window: {d:?}"
+        );
+
+        // CONTRAST — an UNSCOPED reading of the same sequential window IS contaminated: capture the
+        // global high-water BEFORE opening the scope (still 2 from the prior overlap) and diff with a
+        // raw since(), which carries the later snapshot's global mark. This is exactly the bug
+        // `measure()` fixes (and why the harness must use `measure()`, not `snapshot().since()`).
+        let counters2 = BackendCounters::new();
+        let sparq2 = CountingSparqClient::new(InMemorySparqClient::new(), Arc::clone(&counters2));
+        {
+            let g = counters2.op_guard();
+            sparq2.exists("https://p/prior").await.unwrap();
+            drop(g);
+        }
+        let before = counters2.snapshot(); // global mark already 2 — no reset
+        sparq2.exists("https://p/a").await.unwrap(); // one strictly-sequential call
+        let raw = counters2.snapshot().since(&before);
+        assert_eq!(raw.sparql_queries, 1);
+        assert!(
+            raw.max_in_flight >= 2,
+            "unscoped since() is contaminated by the prior overlap ({raw:?}) — the reason measure() exists"
+        );
     }
 }
