@@ -401,7 +401,7 @@ fn parse_current(current_strong: &str) -> Option<&str> {
 /// tag with `+<variant>` appended INSIDE the quotes — `"7-1a2b"` + `jsonld` ⇒ `"7-1a2b+jsonld"`.
 /// Stays a valid strong opaque-tag (RFC 9110 §8.8.3: `+` and `/` are legal `etagc`). The base tags
 /// this server mints (`"<len>-<hash>"`) never contain `+`, so the suffix parses back unambiguously
-/// (see [`state_part`]).
+/// (see the private `state_part`).
 pub fn variant_etag(stored: &str, variant: &str) -> String {
     match stored.strip_suffix('"') {
         Some(head) => format!("{head}+{variant}\""),
