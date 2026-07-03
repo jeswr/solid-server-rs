@@ -2725,6 +2725,114 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
+    #[tokio::test]
+    async fn post_slug_percent_encoded_dot_acl_mints_no_load_bearing_acl() {
+        // Adversarial regression pin: a %-encoded Slug (`secret%2Eacl`) must NOT reconstitute a
+        // load-bearing `.acl`. `sanitise_slug` is a strict whitelist that DROPS `%` (never decodes it),
+        // so the minted name is `secret2Eacl` — an ordinary, non-ACL resource. Two properties are
+        // pinned: (a) the POST is ALLOWED (it is not a `.acl` — no over-blocking), and (b) whatever it
+        // minted is NOT consulted by WAC as the sibling `…/secret`'s own ACL, so Bob gains nothing.
+        // This locks in the sanitise-then-name order (never decode-then-check) that keeps the encoded
+        // form off the escalation path.
+        let store = store_alice_container_bob_append_only().await;
+        let state = Arc::new(LdpState::new(store, "https://pod.example"));
+        let uri: axum::http::Uri = "/alice/c/".parse().unwrap();
+        let resp = post_handler(
+            State(state.clone()),
+            Extension(bob_token()),
+            uri,
+            post_turtle_headers_with_slug("secret%2Eacl"),
+            bob_self_control_acl_body(),
+        )
+        .await
+        .expect("a %-encoded slug is dropped to a benign name and is allowed");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        // No literal `.acl` sibling was created.
+        assert!(
+            !state
+                .store
+                .exists("https://pod.example/alice/c/secret.acl")
+                .await
+                .unwrap(),
+            "the encoded form must NOT reconstitute a literal secret.acl"
+        );
+        // Bob still cannot read Alice's private sibling — nothing load-bearing was planted.
+        let get_uri: axum::http::Uri = "/alice/c/secret".parse().unwrap();
+        let get_err = get_handler(
+            State(state),
+            Extension(bob_token()),
+            get_uri,
+            HeaderMap::new(),
+        )
+        .await
+        .expect_err("Bob must gain no read access via an encoded-slug POST");
+        assert_eq!(get_err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn post_slug_path_escape_tail_dot_acl_is_denied() {
+        // A directory-traversal-styled Slug (`..%2f..%2fsecret.acl`): the `%` and `/` are dropped by
+        // the whitelist (no escape out of the container), but the surviving tail still ends in `.acl`
+        // (`..2f..2fsecret.acl`), so the auxiliary-mint guard MUST refuse it — an Append-only caller
+        // cannot smuggle a load-bearing `.acl` past the chokepoint via traversal syntax.
+        let store = store_alice_container_bob_append_only().await;
+        let state = Arc::new(LdpState::new(store, "https://pod.example"));
+        let uri: axum::http::Uri = "/alice/c/".parse().unwrap();
+        let err = post_handler(
+            State(state.clone()),
+            Extension(bob_token()),
+            uri,
+            post_turtle_headers_with_slug("..%2f..%2fsecret.acl"),
+            bob_self_control_acl_body(),
+        )
+        .await
+        .expect_err("a path-escape slug whose sanitised tail is .acl must be denied");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        // Nothing ending in `.acl` was written anywhere under the container.
+        assert!(
+            !state
+                .store
+                .exists("https://pod.example/alice/c/..2f..2fsecret.acl")
+                .await
+                .unwrap(),
+            "no .acl-tailed resource may have been written"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_container_child_dot_acl_slug_is_denied() {
+        // A CONTAINER-typed POST (`Link: ldp:BasicContainer`) with `Slug: secret.acl` mints
+        // `…/secret.acl/` (trailing slash). The guard strips one trailing slash before matching the
+        // final segment, so the container variant is caught exactly like the document variant — an
+        // Append-only caller cannot mint a `.acl` container child either.
+        let store = store_alice_container_bob_append_only().await;
+        let state = Arc::new(LdpState::new(store, "https://pod.example"));
+        let uri: axum::http::Uri = "/alice/c/".parse().unwrap();
+        let mut headers = post_turtle_headers_with_slug("secret.acl");
+        headers.insert(
+            header::LINK,
+            HeaderValue::from_static("<http://www.w3.org/ns/ldp#BasicContainer>; rel=\"type\""),
+        );
+        let err = post_handler(
+            State(state.clone()),
+            Extension(bob_token()),
+            uri,
+            headers,
+            AxBytes::from(""),
+        )
+        .await
+        .expect_err("a container-child .acl slug must be denied");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !state
+                .store
+                .exists("https://pod.example/alice/c/secret.acl/")
+                .await
+                .unwrap(),
+            "no .acl container child may have been written"
+        );
+    }
+
     // --- container listing render (Optimization #1: O(N) de-dup, byte-identical output) -----------
 
     /// Count occurrences of `needle` in `hay` (a tiny substring counter for the listing-body asserts).
