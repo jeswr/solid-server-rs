@@ -32,7 +32,7 @@
 //! ### The snapshot-staleness race (Finding 1 — why the re-check + the ATOMIC CAS-delete exist)
 //! The blob list in step 2 is a SNAPSHOT; by the time the delete loop reaches a key, the store's view may
 //! have moved on. The composite store now mints UNIQUE-PER-WRITE blob keys
-//! ([`super::CompositeStore::mint_blob_key`]), so a recreate/overwrite gets a DIFFERENT key and can no
+//! (`CompositeStore::mint_blob_key`), so a recreate/overwrite gets a DIFFERENT key and can no
 //! longer reuse a candidate's key — the primary clobber path is closed at the root. These re-checks + the
 //! atomic CAS are retained as DEFENCE-IN-DEPTH for any backend/path where a key could still be reused: a
 //! recreate landing between the snapshot and the delete would otherwise make the GC clobber newly-written
@@ -52,7 +52,7 @@
 //! per write: clock granularity (two writes in one tick), a clock rollback (NTP step), or coarse backend
 //! timestamp precision can give a recreate the SAME `last_modified` as the bytes it replaced. A
 //! timestamp-keyed CAS would then see "unchanged" and DELETE the recreate's live bytes. So the witness is
-//! the in-memory store's monotonic [`BlobEntry::generation`] — strictly increasing on EVERY write, so a
+//! the in-memory store's monotonic [`BlobEntry::generation`](crate::store::BlobEntry::generation) — strictly increasing on EVERY write, so a
 //! same-timestamp overwrite still has a strictly different generation and the CAS correctly refuses. The
 //! `last_modified` is still consulted, but ONLY for the time-based age/grace check (correct for "old
 //! enough" / inside-the-grace-window); it is NEVER the delete witness. A real `object_store` backend uses
@@ -71,7 +71,7 @@
 //! ANY point is caught: list→stat by the fresh-vs-snapshot mismatch, stat→delete by the atomic CAS.
 //!
 //! The **unique-per-write blob keys** the composite store now mints
-//! ([`super::CompositeStore::mint_blob_key`]) close the reuse race at its ROOT (an overwrite never reuses
+//! (`CompositeStore::mint_blob_key`) close the reuse race at its ROOT (an overwrite never reuses
 //! a candidate's key, so the GC can never target live bytes). The atomic CAS + re-checks here are kept as
 //! defence-in-depth and as the strictly-stronger path for a backend that DOES expose a write version.
 //!

@@ -169,7 +169,7 @@ impl<'a, S: Store> WacAuthorizer<'a, S> {
     /// [`effective_permissions`](Self::effective_permissions) (a SECOND `WacAuthorizer`, a second
     /// `protected_resource`, and — for an authenticated requester — a SECOND full ACL walk/read/parse
     /// to compute the public set). This resolves the effective ACL EXACTLY ONCE
-    /// ([`resolve_effective_acl`](Self::resolve_effective_acl) — the only walk/read/parse) and derives
+    /// (`resolve_effective_acl` — the only walk/read/parse) and derives
     /// BOTH audiences from that shared, already-parsed resolution via pure rule-matching:
     ///
     /// - the requester's modes (`user`) are the gate input AND the `WAC-Allow` `user` audience;
@@ -190,7 +190,7 @@ impl<'a, S: Store> WacAuthorizer<'a, S> {
     /// `public`/`user` sets are computed by the SAME helpers (`modes_for`, `satisfies`) the split path
     /// used, against the SAME `protected_resource` and the SAME parsed ACL triples, so the gate and the
     /// advertisement are unchanged — including fail-closed on a missing/broken ACL
-    /// ([`ResolvedAcl::none`] / an empty-triples `Some` both yield empty modes, which `satisfies`
+    /// (`ResolvedAcl::none` / an empty-triples `Some` both yield empty modes, which `satisfies`
     /// rejects for any required mode) and the origin-scoped public set.
     pub async fn authorize_read(
         &self,

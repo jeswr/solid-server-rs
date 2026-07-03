@@ -98,7 +98,7 @@ pub trait Store: Send + Sync {
     /// ORPHANED (no index row references them) and GC'd by the reconciler's orphaned-bytes sweep. We
     /// leave the bytes to the reconciler rather than delete them inline because the blob store is a
     /// separate system (its `delete` is unconditional). Since the composite store now mints UNIQUE
-    /// blob keys per write ([`CompositeStore::mint_blob_key`]), a concurrent same-IRI recreate gets a
+    /// blob keys per write (`CompositeStore::mint_blob_key`), a concurrent same-IRI recreate gets a
     /// DIFFERENT key, so an inline delete of THIS container's key could no longer clobber a recreate's
     /// bytes — but leaving them to the reconciler keeps the path uniform and side-effect-free (the sweep
     /// only GCs bytes with NO index row). Transient orphan until a sweep runs — space only, never an

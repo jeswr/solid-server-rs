@@ -42,7 +42,7 @@ pub enum BlobError {
 ///   clock-independently. For the in-memory store it is a store-wide monotonic counter stamped on each
 ///   write; a real `object_store` backend maps it to the backend's native version/ETag/generation (the
 ///   `M2-next:` seam below). `None` ⇒ the backend exposes no write version ⇒ the reconciler cannot do a
-///   safe CAS and MUST instead rely on unique-per-write keys (documented in [`delete_if_unchanged`]).
+///   safe CAS and MUST instead rely on unique-per-write keys (documented in `delete_if_unchanged`).
 #[derive(Debug, Clone)]
 pub struct BlobEntry {
     /// The opaque storage key the bytes live under.
@@ -100,7 +100,7 @@ pub trait BlobStore: Send + Sync {
     /// The reconciler uses this to RE-STAT a candidate orphan immediately before deleting it: the
     /// [`list`](BlobStore::list) snapshot taken at sweep start can be stale by the time the delete loop
     /// reaches a key. The composite store now mints UNIQUE-PER-WRITE blob keys
-    /// ([`super::CompositeStore::mint_blob_key`]) so a recreate gets a DIFFERENT key and can no longer
+    /// (`CompositeStore::mint_blob_key`) so a recreate gets a DIFFERENT key and can no longer
     /// collide on a candidate's key — but this re-stat + the CAS below remain a defence-in-depth for any
     /// backend or path where a key could still be reused. Re-stat lets the reconciler notice "this key's
     /// bytes are now NEWER than my snapshot saw" (⇒ rewritten ⇒ skip) — see
@@ -135,7 +135,7 @@ pub trait BlobStore: Send + Sync {
     /// correct for "old enough"; it is never the delete witness.)
     ///
     /// # Why a CAS at all (the residual stat→delete TOCTOU)
-    /// The composite store now mints UNIQUE-PER-WRITE keys ([`super::CompositeStore::mint_blob_key`]), so
+    /// The composite store now mints UNIQUE-PER-WRITE keys (`CompositeStore::mint_blob_key`), so
     /// the primary clobber path — a same-IRI overwrite REUSING a candidate's key — no longer arises (a
     /// recreate gets a fresh key). This atomic CAS is retained as DEFENCE-IN-DEPTH: any path or backend
     /// that could still present a key collision is covered. The reconciler re-stats a candidate just
@@ -160,7 +160,7 @@ pub trait BlobStore: Send + Sync {
     /// precondition on the backends that support it: S3 conditional writes / object versioning). On a
     /// backend WITHOUT a conditional delete (and no native version ⇒ [`BlobEntry::generation`] is `None`),
     /// safety rests on the **unique-per-write blob keys** the composite store now mints
-    /// ([`super::CompositeStore::mint_blob_key`]): an overwrite never reuses a candidate's key, so the
+    /// (`CompositeStore::mint_blob_key`): an overwrite never reuses a candidate's key, so the
     /// reconciler can never target live bytes and the delete is safe to be unconditional.
     async fn delete_if_unchanged(
         &self,

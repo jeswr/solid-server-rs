@@ -161,7 +161,7 @@ pub struct LdpState<S: Store> {
     /// The per-instance ETag-keyed parsed-ACL cache (read-path optimisation #3). Shared across all
     /// requests (it lives in the server-lifetime `Arc<LdpState>`), so a hot resource's UNCHANGED `.acl`
     /// is parsed once and reused — keyed by `(acl-iri, etag)`, never authoritative (see
-    /// [`crate::acl_cache`]). Default-on at [`AclCache::new`]`(`[`DEFAULT_ACL_CACHE_CAPACITY`]`)`;
+    /// [`crate::acl_cache`]). Default-on at [`AclCache::new`]`(`[`DEFAULT_ACL_CACHE_CAPACITY`](crate::acl_cache::DEFAULT_ACL_CACHE_CAPACITY)`)`;
     /// `SOLID_SERVER_ACL_CACHE_CAPACITY=0` ([`AclCache::disabled`]) yields byte-identical pre-cache
     /// behaviour. Configured at router assembly via [`set_acl_cache`](Self::set_acl_cache).
     pub acl_cache: AclCache,

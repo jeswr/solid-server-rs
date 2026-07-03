@@ -293,7 +293,7 @@ impl ConnectionLimiter {
 
     /// Wrap an `axum-server` acceptor so each accepted connection holds a connection permit for its
     /// lifetime — the connection-cap for the TLS serve path, with NO handshake timeout (rely on the
-    /// underlying acceptor's own bound). Prefer [`wrap_acceptor_with_handshake_timeout`].
+    /// underlying acceptor's own bound). Prefer [`wrap_acceptor_with_handshake_timeout`](Self::wrap_acceptor_with_handshake_timeout).
     pub fn wrap_acceptor<A>(&self, inner: A) -> ConnectionLimitAcceptor<A> {
         self.wrap_acceptor_with_handshake_timeout(inner, None)
     }

@@ -113,7 +113,7 @@ where
 ///
 /// ## Auth split on the notification surface
 /// - `POST /.notifications/WebSocketChannel2023/` is AUTH-GATED (same DPoP middleware as the LDP
-///   routes) so it sees a [`VerifiedToken`] and can fail-closed on an anonymous caller.
+///   routes) so it sees a `VerifiedToken` and can fail-closed on an anonymous caller.
 /// - `GET …/receive` (the WS upgrade) and `GET /.well-known/solid` (discovery) are PUBLIC: a browser
 ///   WebSocket cannot carry the DPoP header, and discovery is public like a storage description. The
 ///   receive-token + per-resource WAC seam (`sparq#992`) is documented in `notifications::ws`.

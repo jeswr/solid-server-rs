@@ -128,7 +128,7 @@ impl NotificationHub {
         }
     }
 
-    /// Mint a fresh receive token for `(web_id, topic)`, valid for [`RECEIVE_TOKEN_TTL`]. Called by
+    /// Mint a fresh receive token for `(web_id, topic)`, valid for `RECEIVE_TOKEN_TTL`. Called by
     /// the authenticated subscribe handler; the token is embedded in the returned `receiveFrom` URL.
     ///
     /// The token is 256 bits from a cryptographically-secure RNG (the in-tree rustls/aws-lc-rs
@@ -157,7 +157,7 @@ impl NotificationHub {
     /// entry found during lookup is pruned (lazy expiry).
     ///
     /// The token is REUSABLE until expiry (it is NOT consumed here) so a client can reconnect within
-    /// the TTL window — see [`RECEIVE_TOKEN_TTL`]. Never logs the token.
+    /// the TTL window — see `RECEIVE_TOKEN_TTL`. Never logs the token.
     pub async fn validate_receive_token(&self, token: &str, topic: &str) -> bool {
         let mut tokens = self.receive_tokens.lock().await;
         let now = Instant::now();
