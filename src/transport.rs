@@ -84,6 +84,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::rate_limit::is_internal_ip;
 
+/// The per-source live-connection map: a count of currently-open connections keyed by source IP. Shared
+/// (behind `Arc<Mutex<_>>`) between the [`ConnectionLimiter`] and the [`IpConnGuard`]s that decrement it
+/// on connection close. Aliased so the (otherwise clippy-`type_complexity`) shared type is named once.
+type PerIpConnMap = HashMap<IpAddr, usize>;
+
 // --- Env var names --------------------------------------------------------------------------------
 
 /// Env var: the HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS` advertised to clients (max simultaneously
@@ -319,7 +324,7 @@ pub struct ConnectionLimiter {
     /// Live-connection counts per source IP (only populated when the per-source cap is enabled AND the
     /// peer IP is known + non-exempt). A single `Mutex` is fine: connection ACCEPTS are rare relative to
     /// requests, and each critical section is a tiny map lookup + integer step (no I/O, no `.await`).
-    per_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    per_ip: Arc<Mutex<PerIpConnMap>>,
 }
 
 impl ConnectionLimiter {
@@ -467,7 +472,7 @@ impl ConnectionLimiter {
 /// the guard drops with the accept future / served stream, releasing the source's slot.
 pub struct IpConnGuard {
     /// `Some((map, ip))` ⇒ this guard holds a tracked slot for `ip`; `None` ⇒ a no-op (disabled/exempt).
-    tracked: Option<(Arc<Mutex<HashMap<IpAddr, usize>>>, IpAddr)>,
+    tracked: Option<(Arc<Mutex<PerIpConnMap>>, IpAddr)>,
 }
 
 impl IpConnGuard {
@@ -477,7 +482,7 @@ impl IpConnGuard {
     }
 
     /// A guard tracking one live connection for `ip`; drop decrements the count in `map`.
-    fn tracked(map: Arc<Mutex<HashMap<IpAddr, usize>>>, ip: IpAddr) -> Self {
+    fn tracked(map: Arc<Mutex<PerIpConnMap>>, ip: IpAddr) -> Self {
         Self {
             tracked: Some((map, ip)),
         }
