@@ -2,10 +2,10 @@
 # Beyond ~50k req/s — per-request syscall reduction + I/O-runtime evaluation (design proposal)
 
 > **Status: PROPOSAL (proceed-and-document).** Maintainer-requested. This is the throughput/I/O
-> half of a two-proposal pair; the auth half is
-> [`docs/design/high-throughput-pop-auth.md`](./high-throughput-pop-auth.md) (high-throughput
-> proof-of-possession auth — **authored in parallel on a sibling branch; the link resolves once
-> both proposals merge**). The seam between them is **connection amortization**: HTTP/2
+> half of a two-proposal pair; the auth half is `docs/design/high-throughput-pop-auth.md`
+> (high-throughput proof-of-possession auth — **authored in parallel on a sibling branch and
+> not yet in this checkout; convert these plain-text references to links once both proposals
+> merge**). The seam between them is **connection amortization**: HTTP/2
 > multiplexing + TLS session resumption amortize both the TLS handshake (this doc) *and* a
 > connection-bound PoP check (that doc) across many requests on one connection. Nothing here
 > changes LDP/auth/WAC semantics; every phase re-runs the CTH (41/41) and the adversarial
@@ -79,7 +79,7 @@ Reading it as a lever map, per regime:
   redundant token re-verify is already cached away — `bench/ROUND3.md`). Syscall/allocator work
   addresses only the remaining ~26% band, so the *authed* ceiling moves at most ~1.3× from
   everything in this doc combined. Moving the authed ceiling materially is the **sibling
-  proposal's job** ([`high-throughput-pop-auth.md`](./high-throughput-pop-auth.md)): faster or
+  proposal's job** (`high-throughput-pop-auth.md`, in flight — see the status note): faster or
   amortized PoP, batch verification, session-bound credentials. The shared lever is
   **connection amortization** (§4 phase 1, item P1.3): one TLS handshake + one
   connection-level auth establishment, many cheap requests.
@@ -341,8 +341,8 @@ transport crate-boundary and keeps the CTH + adversarial suites as the invariant
   protection; sharding it re-opens the replay window across shards (same reasoning as the
   fail-closed capacity behaviour in `bench/AUTH-BASELINE.md`).
 - **Accept the crypto floor in this workstream.** 49.9% of authed active CPU is ES256; no I/O
-  work changes that. That budget belongs to
-  [`high-throughput-pop-auth.md`](./high-throughput-pop-auth.md).
+  work changes that. That budget belongs to `high-throughput-pop-auth.md` (in flight — see the
+  status note).
 
 ## 6. Follow-up beads (build-ready)
 
