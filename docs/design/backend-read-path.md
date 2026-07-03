@@ -98,11 +98,20 @@ in-process (`NotificationHub`). Rate-limit/overload state is in-process.
 
 ### 3.1 One combined read-plan query (the F1 fix: the walk becomes one RTT)
 
-The ACL-candidate set is **computable up front** from the target IRI alone
-(`acl_for(target)` + `ancestors_nearest_first` — pure string work). The walk only *stops
-early* as an optimization; probing every candidate is semantically identical because each
-probe is an independent read and "nearest present wins" is decided by ordering, not by
-sequence. So fold the entire walk **plus the target's own metadata** into ONE SPARQL query:
+The ACL-candidate set is **computable up front** from the target IRI alone — but from the
+**protected resource**, not the raw target: candidates are
+`acl_for(protected_resource(target))` + `ancestors_nearest_first(protected_resource(target))`
+(pure string work). The `protected_resource` mapping is load-bearing for `.acl` targets: a
+GET of `foo.acl` is governed by `acl:Control` on **`foo`**, so its candidate set starts at
+`foo.acl` itself — computing candidates from the raw target would probe the non-existent
+`foo.acl.acl` and change ACL-resource authorization. The read plan therefore carries TWO
+distinct IRI roles: the **target row** (the raw target, e.g. `foo.acl` — the bytes to
+serve) and the **candidate rows** (derived from the protected resource); explicit parity
+tests for GET/HEAD on `.acl` resources are part of the read-2 equivalence gate. The walk
+only *stops early* as an optimization; probing every candidate is semantically identical
+because each probe is an independent read and "nearest present wins" is decided by
+ordering, not by sequence. So fold the entire walk **plus the target's own metadata** into
+ONE SPARQL query:
 
 ```sparql
 SELECT ?g ?ct ?bk ?etag WHERE {
@@ -210,12 +219,22 @@ request, not a server-side TTL.
 ### 3.6 Request coalescing (single-flight) for hot resources
 
 Concurrent reads of the same target each pay their own combined query + blob fetch. A
-single-flight layer keyed by target IRI shares the **fetch** (the combined query result and
-the blob bytes) among concurrent waiters, while each waiter computes its **own** decision
-with its own principal (the shared artifact is authoritative metadata + bytes — principal-
-independent; the decision never is, per `decisions/0002`'s lesson). Deterministic effect:
-under an N-concurrent same-IRI burst, backend queries drop from N to 1 per coalescing
-window. This is a bounded map of in-flight fetches (weak — entries removed on completion),
+single-flight layer keyed by target IRI shares the fetches among concurrent waiters, in two
+stages that respect invariant 5:
+
+- **read-plan stage (pre-auth, shareable unconditionally):** the combined query result
+  (authoritative metadata + ACL etags) is principal-independent and precedes authorization
+  today anyway — concurrent waiters share one in-flight query.
+- **blob stage (post-auth only):** the target blob fetch is started — and joined — only by
+  waiters whose **own** authorization decision has already allowed the read. An
+  unauthorized burst therefore still coalesces the metadata query but never triggers or
+  amplifies blob-store traffic (the §3.2 anti-amplification posture is preserved); once one
+  authorized waiter has started the fetch, later authorized waiters share it.
+
+Each waiter always computes its **own** decision with its own principal (the shared
+artifacts are metadata + bytes — principal-independent; the decision never is, per
+`decisions/0002`'s lesson). Deterministic effect: under an N-concurrent same-IRI burst of
+authorized reads, backend queries drop from N to 1 per coalescing window. This is a bounded map of in-flight fetches (weak — entries removed on completion),
 not a cache; it adds no staleness surface. Worth building only after §3.1/§3.4 land and the
 counters (§7) show residual duplicate in-flight fetches on realistic traces.
 
