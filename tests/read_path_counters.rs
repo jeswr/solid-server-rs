@@ -12,17 +12,24 @@
 //! (0 = its own `.acl`). BEFORE read-2 (pinned at the read-1 commit, `git log` this file) a read
 //! cost `k+1` sequential ACL probes + 1 target meta = **k+2 SPARQL queries** warm (k+3 cold), +1
 //! blob get (+1 cold), +1 query for a container listing. AFTER read-2 (the §3.1 combined read-plan
-//! query) the WHOLE metadata chain is ONE query — the pins below are the AFTER table, with each
-//! test doc recording its before→after delta (the deterministic evidence of the win):
+//! query) the O(depth) ACL WALK collapses into ONE combined query — the pins below are the AFTER
+//! table, each test recording its before→after delta (the deterministic evidence of the win):
 //!
 //!   op                         queries before → after   blob gets
-//!   doc GET  warm (any k)              k+2 → 1              1
+//!   doc GET  warm (any k)              k+2 → 2              1
 //!   doc GET  cold ACL                  k+3 → 2              2   (ACL bytes ride read-3 next)
-//!   HEAD     warm                      k+2 → 1              1
-//!   GET 304  warm                      k+2 → 1              1
-//!   container GET warm                 k+3 → 2              1   (plan + ONE membership listing)
+//!   HEAD     warm                      k+2 → 2              1
+//!   GET 304  warm                      k+2 → 2              1
+//!   container GET warm                 k+3 → 3              1   (plan + found-ACL re-confirm + listing)
 //!
-//! Depth-independence is the point: the per-read query count no longer scales with k.
+//! Depth-independence is the point: the per-read query count no longer scales with k — it is a flat
+//! `plan(1) + found-ACL existence re-confirm(1) [+ container listing(1)]`. The found-ACL re-confirm
+//! is a LIVE index probe (`WacAuthorizer::read_acl_confirmed`), REQUIRED for fail-closed-on-delete:
+//! the combined query's plan-time etag is not a safe cache gate (a delete-after-plan would grant
+//! from a stale cache), so the ONE governing ACL is re-confirmed live while the k absent-candidate
+//! probes stay collapsed into the plan. The walk-collapse win is real and depth-independent; the
+//! honest warm count is 2, not 1 (an earlier pin of 1 trusted the plan-time etag, the roborev
+//! Medium). read-3 removes the remaining cold duplicate `get_meta`.
 
 mod common;
 
@@ -177,11 +184,12 @@ async fn fixture(h: &Harness) {
     assert_eq!(warm.status(), StatusCode::OK);
 }
 
-/// §3.7 row 1 — **doc GET, warm (k = 3)**: the ENTIRE metadata chain (target meta + all 4 ACL
-/// candidates) is ONE combined read-plan query, + **1 blob get**. Before read-2 this was 5 queries
-/// (k+2); the pin is now DEPTH-INDEPENDENT. `max_in_flight == 1` ⇒ RTT depth = 2.
+/// §3.7 row 1 — **doc GET, warm (k = 3)**: the O(depth) ACL walk collapses into ONE combined
+/// read-plan query; the ONE governing ACL is then re-confirmed live (fail-closed on delete) — so
+/// **2 SPARQL queries** (plan + found-ACL re-confirm), + **1 blob get**. Before read-2 this was 5
+/// (k+2); the pin is now DEPTH-INDEPENDENT (flat 2 at any k). `max_in_flight == 1` ⇒ RTT depth = 3.
 #[tokio::test]
-async fn get_doc_warm_k3_pins_one_combined_query_1_blob_get() {
+async fn get_doc_warm_k3_pins_plan_plus_confirm_query_1_blob_get() {
     let h = Harness::new().await;
     fixture(&h).await;
 
@@ -191,8 +199,8 @@ async fn get_doc_warm_k3_pins_one_combined_query_1_blob_get() {
     assert_eq!(&body[..], TURTLE.as_bytes());
 
     assert_eq!(
-        d.sparql_queries, 1,
-        "warm doc GET = ONE combined read-plan query at any depth (was k+2 = 5): {d:?}"
+        d.sparql_queries, 2,
+        "warm doc GET = plan + found-ACL live re-confirm, depth-independent (was k+2 = 5): {d:?}"
     );
     assert_eq!(
         d.blob_gets, 1,
@@ -200,13 +208,14 @@ async fn get_doc_warm_k3_pins_one_combined_query_1_blob_get() {
     );
     assert_eq!(d.sparql_updates, 0);
     assert_eq!(d.blob_puts, 0);
-    assert_eq!(d.max_in_flight, 1, "strictly sequential ⇒ RTT depth = 2");
+    assert_eq!(d.max_in_flight, 1, "strictly sequential ⇒ RTT depth = 3");
 }
 
 /// §3.7 rows 1+3 — **doc GET with an OWN `.acl` (k = 0), cold then warm**: cold = 1 combined
-/// read-plan query + 1 ACL re-meta (inside `store.read(acl)` on the parse-cache miss) = **2
-/// queries** + **2 blob gets** (ACL bytes + target bytes; was 3 queries — read-3 `read_at` for the
-/// ACL bytes takes this to 1); warm = **1 query** + **1 blob** (was 2).
+/// read-plan query + 1 live found-ACL re-confirm (its parse-cache miss fetches the bytes via
+/// `read_at` — no duplicate `get_meta`) = **2 queries** + **2 blob gets** (ACL bytes + target
+/// bytes); warm = **2 queries** (plan + the cache-hit re-confirm) + **1 blob**. The found-ACL
+/// re-confirm is the fail-closed-on-delete probe (was, insecurely, elided to warm = 1).
 #[tokio::test]
 async fn get_doc_own_acl_cold_then_warm_pins_k0_counts() {
     let h = Harness::new().await;
@@ -237,7 +246,7 @@ async fn get_doc_own_acl_cold_then_warm_pins_k0_counts() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         cold.sparql_queries, 2,
-        "cold doc GET = the plan + the ACL re-meta on the parse miss (was k+3 = 3): {cold:?}"
+        "cold doc GET = plan + found-ACL live re-confirm (parse miss reads via read_at): {cold:?}"
     );
     assert_eq!(
         cold.blob_gets, 2,
@@ -249,8 +258,8 @@ async fn get_doc_own_acl_cold_then_warm_pins_k0_counts() {
     let (resp, warm) = h.measured("GET", "/alice/c/doc", &[]).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        warm.sparql_queries, 1,
-        "warm doc GET = ONE combined read-plan query (was k+2 = 2): {warm:?}"
+        warm.sparql_queries, 2,
+        "warm doc GET = plan + found-ACL cache-hit re-confirm (was k+2 = 2): {warm:?}"
     );
     assert_eq!(
         warm.blob_gets, 1,
@@ -260,7 +269,7 @@ async fn get_doc_own_acl_cold_then_warm_pins_k0_counts() {
 }
 
 /// **HEAD, warm (k = 3)** — same backend cost as GET (the read path fetches the bytes for HEAD
-/// too): **1 combined query** (was k+2 = 5), **1 blob get**.
+/// too): **2 queries** (plan + found-ACL re-confirm, was k+2 = 5), **1 blob get**.
 #[tokio::test]
 async fn head_doc_warm_k3_pins_same_as_get() {
     let h = Harness::new().await;
@@ -269,18 +278,18 @@ async fn head_doc_warm_k3_pins_same_as_get() {
     let (resp, d) = h.measured("HEAD", "/alice/c/doc", &[]).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        d.sparql_queries, 1,
-        "warm HEAD = ONE combined read-plan query (was k+2 = 5): {d:?}"
+        d.sparql_queries, 2,
+        "warm HEAD = plan + found-ACL re-confirm (was k+2 = 5): {d:?}"
     );
     assert_eq!(d.blob_gets, 1, "HEAD still fetches the bytes today: {d:?}");
     assert_eq!(d.max_in_flight, 1);
 }
 
-/// **304 path, warm (k = 3)** — a matching `If-None-Match` returns 304; the metadata chain is
-/// **1 combined query** (was k+2 = 5). The body byte-fetch (**1 blob get**) still happens (the
-/// precondition is evaluated after the read — skipping it for plain resources is read-4 territory).
+/// **304 path, warm (k = 3)** — a matching `If-None-Match` returns 304; the metadata cost is
+/// **2 queries** (plan + found-ACL re-confirm, was k+2 = 5). The body byte-fetch (**1 blob get**)
+/// still happens (the precondition is evaluated after the read — skipping it is read-4 territory).
 #[tokio::test]
-async fn get_304_warm_k3_pins_one_combined_query() {
+async fn get_304_warm_k3_pins_plan_plus_confirm_query() {
     let h = Harness::new().await;
     fixture(&h).await;
 
@@ -299,8 +308,8 @@ async fn get_304_warm_k3_pins_one_combined_query() {
         .await;
     assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
     assert_eq!(
-        d.sparql_queries, 1,
-        "304 path = ONE combined read-plan query (was k+2 = 5): {d:?}"
+        d.sparql_queries, 2,
+        "304 path = plan + found-ACL re-confirm (was k+2 = 5): {d:?}"
     );
     assert_eq!(
         d.blob_gets, 1,
@@ -309,19 +318,20 @@ async fn get_304_warm_k3_pins_one_combined_query() {
     assert_eq!(d.max_in_flight, 1);
 }
 
-/// §3.7 row 4 — **container GET, warm (k = 2)**: 1 combined read-plan query + 1 membership
-/// listing = **2 queries** (was k+3 = 5; the §3.1 membership-fold that would make it 1 is read-5,
-/// measure-first), **1 blob get**. The listing stays ONE query at any child count (no-N+1).
+/// §3.7 row 4 — **container GET, warm (k = 2)**: 1 combined read-plan query + 1 found-ACL live
+/// re-confirm + 1 membership listing = **3 queries** (was k+3 = 5; the §3.1 membership-fold that
+/// would drop the listing is read-5, measure-first), **1 blob get**. The listing stays ONE query at
+/// any child count (no-N+1).
 #[tokio::test]
-async fn get_container_warm_k2_pins_plan_plus_listing_queries() {
+async fn get_container_warm_k2_pins_plan_confirm_listing_queries() {
     let h = Harness::new().await;
     fixture(&h).await;
 
     let (resp, d) = h.measured("GET", "/alice/c/", &[]).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        d.sparql_queries, 2,
-        "warm container GET = the plan + ONE membership listing (was k+3 = 5): {d:?}"
+        d.sparql_queries, 3,
+        "warm container GET = plan + found-ACL re-confirm + ONE membership listing (was k+3 = 5): {d:?}"
     );
     assert_eq!(d.blob_gets, 1, "container body bytes: {d:?}");
     assert_eq!(d.max_in_flight, 1);
