@@ -64,18 +64,28 @@ pub struct BackendCounters {
     blob_puts: AtomicU64,
     /// Every other blob-store call (`exists` / `delete` / `list` / `stat` / CAS-delete).
     blob_others: AtomicU64,
-    /// Currently-outstanding backend calls (both seams).
-    in_flight: AtomicU64,
-    /// GLOBAL monotonic high-water mark of `in_flight` (never reset) — the lifetime peak, reported by
-    /// the raw [`snapshot`](BackendCounters::snapshot). For a PER-OP reading use [`measure`] instead,
-    /// which gives each window its own peak cell (below).
+    /// GLOBAL monotonic high-water mark of concurrency (never reset) — the lifetime peak, reported by
+    /// the raw [`snapshot`](BackendCounters::snapshot). Written under the `conc` lock (below), read
+    /// lock-free here for observability. For a PER-OP reading use [`measure`], not this.
     max_in_flight: AtomicU64,
-    /// The peak cell of every ACTIVE measurement window ([`MeasureScope`]). Each `op_guard`
-    /// `fetch_max`es the current in-flight count into every registered cell, so overlapping windows
-    /// each record their OWN correct peak — WITHOUT any window destructively resetting a shared mark
-    /// (the race the old `reset_max_in_flight` had: a non-atomic load/store could erase a real peak).
-    /// A cell is registered by [`measure`](BackendCounters::measure) and removed on scope drop.
-    scopes: Mutex<Vec<Arc<AtomicU64>>>,
+    /// The concurrency state that MUST move as one unit: the current in-flight count AND every active
+    /// measurement window's peak cell, behind ONE lock. `op_guard` bumps `in_flight` and fans the new
+    /// count into `max_in_flight` + every scope cell in a SINGLE critical section, and
+    /// [`MeasureScope::delta`] reads its cell under the same lock — so no reader can observe an
+    /// in-flight increment that has not yet reached the scope peaks (the boundary race a lock-free
+    /// increment + a separate scopes lock had), and no window can erase another's peak.
+    conc: Mutex<Conc>,
+}
+
+/// The lock-protected concurrency state (see [`BackendCounters::conc`]): the live in-flight count +
+/// the peak cell of every active measurement window. Kept together so the in-flight increment and
+/// the per-window peak fan-out are ONE atomic-with-respect-to-the-lock step.
+#[derive(Debug, Default)]
+struct Conc {
+    /// Currently-outstanding backend calls (both seams).
+    in_flight: u64,
+    /// One peak cell per active [`MeasureScope`] (registered by `measure`, removed on scope drop).
+    scopes: Vec<Arc<AtomicU64>>,
 }
 
 /// A point-in-time copy of the counters. Subtract two with [`CounterSnapshot::since`] to get the
@@ -140,16 +150,16 @@ impl BackendCounters {
     /// the sound way to read per-op await-depth under concurrency (not just in isolated tests): each
     /// window's peak is an INDEPENDENT cell that `op_guard` `fetch_max`es into, so nothing is reset.
     ///
-    /// The cell is initialised to the concurrency ALREADY outstanding at open (genuine concurrency
-    /// counts) and registered under the scopes lock, so it cannot race an `op_guard` update: an
-    /// in-flight bump is either already visible in the initial `in_flight` load or lands on this cell
-    /// via `op_guard`'s `fetch_max` afterwards. Hold the scope across the measured operation(s), then
-    /// call `delta()`; the cell is de-registered on drop.
+    /// The cell is initialised — UNDER the `conc` lock — to the concurrency ALREADY outstanding at
+    /// open (genuine concurrency counts), so it cannot race an `op_guard`: an in-flight bump is
+    /// either already reflected in the `in_flight` read here, or lands on this cell via `op_guard`'s
+    /// fan-out (which takes the same lock) afterwards. Hold the scope across the measured
+    /// operation(s), then call `delta()`; the cell is de-registered on drop.
     pub fn measure(&self) -> MeasureScope<'_> {
-        let mut scopes = self.scopes.lock().expect("scopes registry poisoned");
-        let peak = Arc::new(AtomicU64::new(self.in_flight.load(Ordering::SeqCst)));
-        scopes.push(Arc::clone(&peak));
-        drop(scopes);
+        let mut conc = self.conc.lock().expect("conc lock poisoned");
+        let peak = Arc::new(AtomicU64::new(conc.in_flight));
+        conc.scopes.push(Arc::clone(&peak));
+        drop(conc);
         MeasureScope {
             counters: self,
             peak,
@@ -157,17 +167,21 @@ impl BackendCounters {
         }
     }
 
-    /// RAII in-flight guard: increments the gauge for the duration of one backend call and records
-    /// the resulting in-flight count into the GLOBAL high-water AND every ACTIVE measurement window's
-    /// own peak cell. Two overlapping guards ⇒ each open window's peak ≥ 2 (the sequentiality witness
-    /// flips only when calls genuinely overlap). The scopes lock serializes with `measure`/drop so a
-    /// peak raised during a window can never be lost.
+    /// RAII in-flight guard. In ONE critical section under the `conc` lock it bumps `in_flight` and
+    /// fans the resulting count into the GLOBAL high-water AND every ACTIVE window's peak cell — so a
+    /// reader can NEVER observe an in-flight increment that has not yet reached the scope peaks (the
+    /// boundary race a lock-free increment + a separate scopes lock had). Two overlapping guards ⇒
+    /// each open window's peak ≥ 2. The lock is released BEFORE the backend call runs (only the
+    /// counter arithmetic is under it — deadlock-free, never held across an `.await`).
     fn op_guard(self: &Arc<Self>) -> OpGuard {
-        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut conc = self.conc.lock().expect("conc lock poisoned");
+        conc.in_flight += 1;
+        let now = conc.in_flight;
         self.max_in_flight.fetch_max(now, Ordering::SeqCst);
-        for peak in self.scopes.lock().expect("scopes registry poisoned").iter() {
+        for peak in &conc.scopes {
             peak.fetch_max(now, Ordering::SeqCst);
         }
+        drop(conc);
         OpGuard {
             counters: Arc::clone(self),
         }
@@ -187,7 +201,7 @@ impl BackendCounters {
 /// high-water reset, and no way for a concurrent scope to erase this window's real peak.
 pub struct MeasureScope<'a> {
     counters: &'a BackendCounters,
-    /// This window's OWN peak-concurrency cell (registered in `counters.scopes` for its lifetime).
+    /// This window's OWN peak-concurrency cell (registered in `counters.conc.scopes` for its life).
     peak: Arc<AtomicU64>,
     start: CounterSnapshot,
 }
@@ -195,9 +209,21 @@ pub struct MeasureScope<'a> {
 impl MeasureScope<'_> {
     /// The window's deltas: counter fields since the window start, and the op-scoped peak
     /// `max_in_flight` from THIS window's own cell (NOT the global high-water).
+    ///
+    /// The peak is read UNDER the `conc` lock, so it cannot observe a half-applied `op_guard`
+    /// critical section (an in-flight increment whose peak fan-out has not yet run) — the boundary
+    /// race. Holding the lock means every completed increment's fan-out is already visible; the load
+    /// then returns the settled peak. The lock is dropped before the (sync, lock-free) counter
+    /// snapshot, so nothing is held across other work.
     pub fn delta(&self) -> CounterSnapshot {
+        let peak = {
+            let conc = self.counters.conc.lock().expect("conc lock poisoned");
+            let p = self.peak.load(Ordering::SeqCst);
+            drop(conc);
+            p
+        };
         let mut d = self.counters.snapshot().since(&self.start);
-        d.max_in_flight = self.peak.load(Ordering::SeqCst);
+        d.max_in_flight = peak;
         d
     }
 }
@@ -206,9 +232,10 @@ impl Drop for MeasureScope<'_> {
     fn drop(&mut self) {
         // De-register this window's peak cell (by identity) so `op_guard` stops updating it.
         self.counters
-            .scopes
+            .conc
             .lock()
-            .expect("scopes registry poisoned")
+            .expect("conc lock poisoned")
+            .scopes
             .retain(|p| !Arc::ptr_eq(p, &self.peak));
     }
 }
@@ -219,7 +246,13 @@ struct OpGuard {
 
 impl Drop for OpGuard {
     fn drop(&mut self) {
-        self.counters.in_flight.fetch_sub(1, Ordering::SeqCst);
+        // Decrement in_flight under the SAME lock op_guard increments it (the count only ever moves
+        // under `conc`). The peak cells are high-water marks, so a decrement never lowers them.
+        self.counters
+            .conc
+            .lock()
+            .expect("conc lock poisoned")
+            .in_flight -= 1;
     }
 }
 
@@ -568,6 +601,71 @@ mod tests {
             scope.delta().max_in_flight,
             2,
             "a window opened with 2 outstanding calls counts them as its peak"
+        );
+    }
+
+    /// The BOUNDARY-race regression (roborev Medium). A DOCUMENTED TARGETED barrier test (not a pure
+    /// scheduler-adversarial one): it holds the `conc` critical-section lock on the test thread and
+    /// spawns a real OS thread whose backend op must BLOCK entering `op_guard`. Because the in-flight
+    /// increment AND the per-scope peak fan-out are now ONE critical section under that lock, while
+    /// the lock is held NEITHER moves — there is no "in_flight raised but peak not yet updated"
+    /// window a reader could catch. The old design incremented `in_flight` LOCK-FREE before taking a
+    /// separate scopes lock, so here it would show `in_flight == 1` while the scope peak was still 0
+    /// (the boundary under-report) — this test's `in_flight == 0` assertion pins that against
+    /// regression. The 30 ms wait lets the spawned thread reach (and block on) the lock; the op does
+    /// nothing else first, so this is reliable in practice.
+    #[test]
+    fn boundary_increment_and_peak_update_are_one_critical_section() {
+        use std::sync::atomic::AtomicBool;
+        use std::thread;
+        use std::time::Duration;
+
+        let counters = BackendCounters::new();
+        let scope = counters.measure(); // window open, own peak cell = 0
+
+        // Hold the critical-section lock, so any `op_guard` must block BEFORE it can touch in_flight
+        // or the scope peaks.
+        let guard = counters.conc.lock().expect("conc lock poisoned");
+
+        let started = Arc::new(AtomicBool::new(false));
+        let c2 = Arc::clone(&counters);
+        let started2 = Arc::clone(&started);
+        let worker = thread::spawn(move || {
+            started2.store(true, Ordering::SeqCst);
+            // BLOCKS on conc.lock() inside op_guard (the test thread holds it). Once it proceeds, the
+            // whole critical section (in_flight += 1 + peak fan-out) runs atomically.
+            let _g = c2.op_guard();
+            thread::sleep(Duration::from_millis(20)); // keep the guard (and in_flight) alive briefly
+        });
+
+        // Wait until the worker is running and (about to be) blocked on the lock.
+        while !started.load(Ordering::SeqCst) {
+            std::hint::spin_loop();
+        }
+        thread::sleep(Duration::from_millis(30));
+
+        // The blocked op has NOT entered its critical section: in_flight is still 0 AND the scope
+        // peak is still 0 — the two move together, never separately (the fix). (Old lock-free
+        // increment would make in_flight == 1 here while the peak stayed 0.)
+        assert_eq!(
+            guard.in_flight, 0,
+            "the blocked op must not have incremented in_flight ahead of the peak fan-out"
+        );
+        assert_eq!(
+            scope.peak.load(Ordering::SeqCst),
+            0,
+            "no half-applied peak while the increment is blocked behind the lock"
+        );
+
+        drop(guard); // release → the worker's critical section runs atomically
+        worker.join().expect("worker thread panicked");
+
+        // After the atomic critical section, the peak reflects the call — observed via delta (which
+        // reads under the same lock, so it can never catch a half-applied update).
+        assert_eq!(
+            scope.delta().max_in_flight,
+            1,
+            "the atomic critical section applied BOTH the increment and the peak update"
         );
     }
 }
