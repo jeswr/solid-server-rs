@@ -4,7 +4,8 @@
 > **Status: PROPOSAL (proceed-and-document).** Maintainer-requested. This is the throughput/I/O
 > half of a two-proposal pair; the auth half is
 > [`docs/design/high-throughput-pop-auth.md`](./high-throughput-pop-auth.md) (high-throughput
-> proof-of-possession auth). The seam between them is **connection amortization**: HTTP/2
+> proof-of-possession auth — **authored in parallel on a sibling branch; the link resolves once
+> both proposals merge**). The seam between them is **connection amortization**: HTTP/2
 > multiplexing + TLS session resumption amortize both the TLS handshake (this doc) *and* a
 > connection-bound PoP check (that doc) across many requests on one connection. Nothing here
 > changes LDP/auth/WAC semantics; every phase re-runs the CTH (41/41) and the adversarial
@@ -80,8 +81,8 @@ Reading it as a lever map, per regime:
   everything in this doc combined. Moving the authed ceiling materially is the **sibling
   proposal's job** ([`high-throughput-pop-auth.md`](./high-throughput-pop-auth.md)): faster or
   amortized PoP, batch verification, session-bound credentials. The shared lever is
-  **connection amortization** (§4.2): one TLS handshake + one connection-level auth
-  establishment, many cheap requests.
+  **connection amortization** (§4 phase 1, item P1.3): one TLS handshake + one
+  connection-level auth establishment, many cheap requests.
 - **Regime C — cache-miss / real backends.** The entire baseline runs on in-memory doubles.
   With the live `HttpSparqClient` (SPARQL 1.1 over HTTP, hyper-util pooled client —
   `src/store/http.rs`) and `object_store` S3, a miss pays **network round-trips measured in
