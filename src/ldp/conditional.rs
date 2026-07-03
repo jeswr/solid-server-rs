@@ -12,6 +12,26 @@
 //! **weak comparison** (§13.1.2), so a `W/`-prefixed validator matches by its opaque tag. The
 //! wildcard `*` is handled per spec: `If-None-Match: *` ⇒ "only if it does NOT exist" (the create
 //! guard); `If-Match: *` ⇒ "only if it DOES exist".
+//!
+//! ## Representation-variant tags: `"<state>+<variant>"`
+//!
+//! An entity-tag identifies a **representation**, not a resource (RFC 9110 §8.8.3). This server
+//! stores ONE representation per resource but content-negotiates RDF (Turtle ↔ JSON-LD), so a GET
+//! whose negotiated format differs from the stored one is served a DIFFERENT representation — and
+//! must carry a different validator, or a client holding the Turtle tag would get a spurious 304
+//! for a JSON-LD body it never saw. The handler therefore mints [`variant_etag`]: the stored
+//! (state) tag plus a `+<variant>` suffix inside the quotes (`"7-1a2b"` → `"7-1a2b+jsonld"`). The
+//! base tags this server mints (`"<len>-<hash>"`) never contain `+`, so the suffix is unambiguous.
+//!
+//! The two comparison audiences then differ deliberately:
+//!
+//! - **Read preconditions** ([`evaluate_read`]) compare EXACTLY against the negotiated
+//!   representation's tag — a Turtle tag never 304s a JSON-LD response.
+//! - **Write preconditions** ([`evaluate`]) compare the **STATE part** (the tag with any
+//!   `+<variant>` suffix stripped): every negotiated variant of one stored state is equally
+//!   current, so a client may round-trip `GET` (any `Accept`) → `If-Match` PUT/PATCH/DELETE with
+//!   the ETag it received. A write conditional guards resource STATE, not the wire format the
+//!   client happened to read it in.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -46,11 +66,14 @@ pub fn evaluate(
 ) -> Precondition {
     // --- If-Match: proceed only if the current representation matches one of the listed tags, by
     // STRONG comparison (RFC 9110 §13.1.1) — a weak (`W/`) validator never satisfies If-Match.
+    // Writes guard resource STATE, so the comparison is on the state part: a `+<variant>` tag a
+    // client received from a content-negotiated GET matches the stored state it derives from (the
+    // GET → If-Match round-trip; see the module doc).
     if let Some(im) = if_match {
         let ok = match current {
             // `If-Match: *` ⇒ the resource must exist.
             _ if is_wildcard(im) => current.is_some(),
-            Some(cur) => tag_list(im).any(|t| t.matches_strong(cur)),
+            Some(cur) => tag_list(im).any(|t| t.matches_strong_state(cur)),
             // No current representation can match a concrete tag list.
             None => false,
         };
@@ -60,12 +83,13 @@ pub fn evaluate(
     }
 
     // --- If-None-Match: proceed only if NONE of the listed tags match (the create / no-overwrite
-    // guard), by WEAK comparison (RFC 9110 §13.1.2). `If-None-Match: *` ⇒ the resource must NOT
-    // exist.
+    // guard), by WEAK comparison (RFC 9110 §13.1.2) on the state part (any negotiated variant of
+    // the current state is "current" for a write guard). `If-None-Match: *` ⇒ the resource must
+    // NOT exist.
     if let Some(inm) = if_none_match {
         let matched = match current {
             _ if is_wildcard(inm) => current.is_some(),
-            Some(cur) => tag_list(inm).any(|t| t.matches_weak(cur)),
+            Some(cur) => tag_list(inm).any(|t| t.matches_weak_state(cur)),
             None => false,
         };
         if matched {
@@ -111,7 +135,10 @@ pub enum ReadPrecondition {
 /// when `If-None-Match` is absent).
 ///
 /// - **`If-None-Match`** uses WEAK comparison for GET/HEAD (§13.1.2): a `W/`-prefixed inbound tag
-///   matches by its opaque value, and `*` matches the (existing) resource. A match ⇒ 304.
+///   matches by its opaque value, and `*` matches the (existing) resource. A match ⇒ 304. The
+///   opaque comparison is EXACT — `current_etag` is the negotiated representation's own tag
+///   (variant suffix included), so a tag for a DIFFERENT negotiated representation of the same
+///   state never produces a 304 (the client does not hold this representation).
 /// - **`If-Modified-Since`** (only when `If-None-Match` is absent): if the resource's `last_modified`
 ///   is `≤` the header date, the representation has NOT changed ⇒ 304. When the store surfaces no
 ///   modification time (`last_modified` is `None`) or the date is unparseable, the condition CANNOT be
@@ -165,35 +192,99 @@ fn system_time_to_unix(t: SystemTime) -> Option<i64> {
 }
 
 /// Parse an HTTP **IMF-fixdate** (RFC 9110 §5.6.7 — the format a sender MUST produce), e.g.
-/// `Sun, 06 Nov 1994 08:49:37 GMT`, to whole seconds since the Unix epoch. Returns `None` for any
-/// value that is not a well-formed IMF-fixdate (the obsolete RFC 850 / asctime forms are not parsed —
-/// a conforming client always sends IMF-fixdate; accepting the legacy forms is a possible follow-up).
+/// `Sun, 06 Nov 1994 08:49:37 GMT`, to whole seconds since the Unix epoch.
+///
+/// STRICT: the grammar is fixed-width (exactly 29 ASCII bytes after trimming), every field is
+/// enforced at its exact position and width (two-digit day/time components, four-digit year, the
+/// literal `", "` / `" "` / `":"` separators, the `GMT` zone), the calendar is validated for real
+/// (day within the month's true length, leap years included), and the leading day-name must be the
+/// ACTUAL weekday of the date (a wrong or arbitrary day-name token is malformed — RFC 9110 §5.6.7
+/// fixes `day-name` to the day of week). Anything else — the obsolete RFC 850 / asctime forms,
+/// non-fixed-width fields, negative components, a leap-second `:60` — returns `None`, and the
+/// caller FAILS OPEN to a fresh 200 (never a spurious 304), so strictness costs at most a cache
+/// miss.
 ///
 /// No third-party date crate is pulled in for this: the grammar is fixed-width and the epoch
 /// conversion is the standard days-from-civil algorithm, so a small self-contained parser is exact
 /// and keeps the dependency surface unchanged.
 fn parse_http_date(value: &str) -> Option<i64> {
-    // `Sun, 06 Nov 1994 08:49:37 GMT`
+    // `Sun, 06 Nov 1994 08:49:37 GMT` — positions:
+    //  0123456789012345678901234567 8
+    //  Sun ,  06 Nov  1994 08:49:37  GMT
     let v = value.trim();
-    let rest = v.split_once(", ")?.1; // drop the day-name + ", "
-    let mut parts = rest.split(' ');
-    let day: u32 = parts.next()?.parse().ok()?;
-    let month = month_from_abbrev(parts.next()?)?;
-    let year: i64 = parts.next()?.parse().ok()?;
-    let time = parts.next()?;
-    let gmt = parts.next()?;
-    if gmt != "GMT" || parts.next().is_some() {
+    if !v.is_ascii() {
+        return None; // also guarantees the byte slicing below is char-safe
+    }
+    let b = v.as_bytes();
+    if b.len() != 29
+        || &b[3..5] != b", "
+        || b[7] != b' '
+        || b[11] != b' '
+        || b[16] != b' '
+        || b[19] != b':'
+        || b[22] != b':'
+        || &b[25..29] != b" GMT"
+    {
         return None;
     }
-    let mut hms = time.split(':');
-    let hh: i64 = hms.next()?.parse().ok()?;
-    let mm: i64 = hms.next()?.parse().ok()?;
-    let ss: i64 = hms.next()?.parse().ok()?;
-    if hms.next().is_some() || !(1..=31).contains(&day) || hh > 23 || mm > 59 || ss > 60 {
+    let day = two_digits(b, 5)?;
+    let month = month_from_abbrev(&v[8..11])?;
+    let year = four_digits(b, 12)?;
+    let hh = two_digits(b, 17)?;
+    let mm = two_digits(b, 20)?;
+    let ss = two_digits(b, 23)?;
+    if day == 0 || day > days_in_month(year, month) || hh > 23 || mm > 59 || ss > 59 {
         return None;
     }
     let days = days_from_civil(year, month, day);
-    Some(days * 86_400 + hh * 3_600 + mm * 60 + ss)
+    if day_name_for(days) != &v[0..3] {
+        return None; // day-name inconsistent with the actual date (or not a day-name at all)
+    }
+    Some(days * 86_400 + i64::from(hh) * 3_600 + i64::from(mm) * 60 + i64::from(ss))
+}
+
+/// Exactly two ASCII digits at `b[at..at+2]`, as a number.
+fn two_digits(b: &[u8], at: usize) -> Option<u32> {
+    let (d1, d2) = (b[at], b[at + 1]);
+    if d1.is_ascii_digit() && d2.is_ascii_digit() {
+        Some(u32::from(d1 - b'0') * 10 + u32::from(d2 - b'0'))
+    } else {
+        None
+    }
+}
+
+/// Exactly four ASCII digits at `b[at..at+4]`, as a year.
+fn four_digits(b: &[u8], at: usize) -> Option<i64> {
+    let mut acc: i64 = 0;
+    for &d in &b[at..at + 4] {
+        if !d.is_ascii_digit() {
+            return None;
+        }
+        acc = acc * 10 + i64::from(d - b'0');
+    }
+    Some(acc)
+}
+
+/// The true length of `month` in `year` (proleptic Gregorian, leap years included).
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// The IMF-fixdate day-name for a day count since the Unix epoch (1970-01-01 was a Thursday).
+fn day_name_for(days_since_epoch: i64) -> &'static str {
+    const NAMES: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    NAMES[days_since_epoch.rem_euclid(7) as usize]
 }
 
 /// Map a three-letter English month abbreviation to its 1-based number.
@@ -237,15 +328,48 @@ struct InboundTag<'a> {
 }
 
 impl InboundTag<'_> {
-    /// STRONG comparison (for `If-Match`): both validators must be strong and the opaque tags equal.
-    /// The server's stored tag is always strong, so a weak inbound tag never matches strongly.
-    fn matches_strong(&self, current_strong: &str) -> bool {
-        !self.weak && self.opaque == current_strong
+    /// STRONG comparison on the STATE part (for the WRITE path's `If-Match`): both validators must
+    /// be strong and the state parts equal — a `+<variant>` tag from a content-negotiated GET
+    /// matches the stored state it derives from (the GET → `If-Match` round-trip). The server's
+    /// stored tag is always strong, so a weak inbound tag never matches strongly.
+    fn matches_strong_state(&self, current_strong: &str) -> bool {
+        !self.weak && state_part(self.opaque) == state_part(current_strong)
     }
 
-    /// WEAK comparison (for `If-None-Match`): the opaque tags are equal regardless of strength.
+    /// WEAK comparison on the STATE part (for the WRITE path's `If-None-Match` guard): state parts
+    /// equal regardless of strength.
+    fn matches_weak_state(&self, current_strong: &str) -> bool {
+        state_part(self.opaque) == state_part(current_strong)
+    }
+
+    /// WEAK comparison, EXACT opaque tags (for the READ path's `If-None-Match`): the inbound tag
+    /// must equal the negotiated representation's own tag — variant suffix included — so a tag for
+    /// a different negotiated representation of the same state never yields a 304.
     fn matches_weak(&self, current_strong: &str) -> bool {
         self.opaque == current_strong
+    }
+}
+
+/// Mint the representation-variant entity-tag for a content-negotiated response: the stored (state)
+/// tag with `+<variant>` appended INSIDE the quotes — `"7-1a2b"` + `jsonld` ⇒ `"7-1a2b+jsonld"`.
+/// Stays a valid strong opaque-tag (RFC 9110 §8.8.3: `+` and `/` are legal `etagc`). The base tags
+/// this server mints (`"<len>-<hash>"`) never contain `+`, so the suffix parses back unambiguously
+/// (see [`state_part`]).
+pub fn variant_etag(stored: &str, variant: &str) -> String {
+    match stored.strip_suffix('"') {
+        Some(head) => format!("{head}+{variant}\""),
+        // Defensive: an unquoted tag (never minted by this server) still gets a distinct value.
+        None => format!("{stored}+{variant}"),
+    }
+}
+
+/// The STATE part of an entity-tag minted by this server: everything before the first `+`
+/// (dropping any `+<variant>` representation suffix; the closing quote is normalised away on both
+/// sides so a suffixed and an unsuffixed tag of the same state compare equal).
+fn state_part(tag: &str) -> &str {
+    match tag.split_once('+') {
+        Some((head, _)) => head,
+        None => tag.trim_end_matches('"'),
     }
 }
 
@@ -509,5 +633,125 @@ mod tests {
         assert_eq!(parse_http_date("Sun, 06 Nov 1994 25:49:37 GMT"), None); // bad hour
         assert_eq!(parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT extra"), None);
         // trailing junk
+    }
+
+    #[test]
+    fn parse_http_date_enforces_strict_imf_fixdate_grammar() {
+        // Non-fixed-width day (single digit) — the grammar is exactly 2DIGIT.
+        assert_eq!(parse_http_date("Sun, 6 Nov 1994 08:49:37 GMT"), None);
+        // Negative / non-digit components.
+        assert_eq!(parse_http_date("Sun, -6 Nov 1994 08:49:37 GMT"), None);
+        assert_eq!(parse_http_date("Sun, 06 Nov 1994 08:4x:37 GMT"), None);
+        // The obsolete RFC 850 / two-digit-year / asctime forms.
+        assert_eq!(parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT"), None);
+        assert_eq!(parse_http_date("Sun, 06 Nov 94 08:49:37 GMT"), None);
+        assert_eq!(parse_http_date("Sun Nov  6 08:49:37 1994"), None);
+        // Wrong separators at the fixed positions.
+        assert_eq!(parse_http_date("Sun; 06 Nov 1994 08:49:37 GMT"), None);
+        assert_eq!(parse_http_date("Sun, 06 Nov 1994 08-49-37 GMT"), None);
+        // Case-sensitive tokens.
+        assert_eq!(parse_http_date("sun, 06 Nov 1994 08:49:37 GMT"), None);
+        assert_eq!(parse_http_date("Sun, 06 NOV 1994 08:49:37 GMT"), None);
+        // A leap-second `:60` is rejected (strict; fails open to a 200).
+        assert_eq!(parse_http_date("Sun, 06 Nov 1994 08:49:60 GMT"), None);
+        // Non-ASCII input of plausible shape must not panic (byte-slicing guard) and must fail.
+        assert_eq!(parse_http_date("Sün, 06 Nov 1994 08:49:37 GMT"), None);
+    }
+
+    #[test]
+    fn parse_http_date_validates_the_real_calendar() {
+        // Day zero / day beyond the month's true length.
+        assert_eq!(parse_http_date("Wed, 00 Nov 1994 08:49:37 GMT"), None);
+        assert_eq!(parse_http_date("Thu, 31 Nov 1994 08:49:37 GMT"), None); // Nov has 30 days
+                                                                            // Feb 29 exists only in a leap year.
+        assert_eq!(parse_http_date("Mon, 29 Feb 1999 00:00:00 GMT"), None);
+        assert_eq!(parse_http_date("Tue, 29 Feb 1900 00:00:00 GMT"), None); // century, not leap
+        assert_eq!(
+            parse_http_date("Tue, 29 Feb 2000 00:00:00 GMT"), // 400-year rule: leap
+            Some(951_782_400)
+        );
+    }
+
+    #[test]
+    fn parse_http_date_requires_the_correct_weekday() {
+        // 1994-11-06 was a Sunday: the correct day-name parses…
+        assert!(parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").is_some());
+        // …a real-but-WRONG day-name is malformed…
+        assert_eq!(parse_http_date("Mon, 06 Nov 1994 08:49:37 GMT"), None);
+        // …and an arbitrary token is malformed.
+        assert_eq!(parse_http_date("Xyz, 06 Nov 1994 08:49:37 GMT"), None);
+    }
+
+    // --- Representation-variant tags (`"<state>+<variant>"`) ---------------------------------------
+
+    /// The JSON-LD variant of [`TAG`], as the handler mints for a content-negotiated response.
+    fn tag_variant() -> String {
+        variant_etag(TAG, "jsonld")
+    }
+
+    #[test]
+    fn variant_etag_appends_inside_the_quotes() {
+        assert_eq!(variant_etag("\"7-1a2b\"", "jsonld"), "\"7-1a2b+jsonld\"");
+        assert_eq!(variant_etag("\"7-1a2b\"", "ttl"), "\"7-1a2b+ttl\"");
+        // Defensive unquoted fallback still yields a distinct value.
+        assert_eq!(variant_etag("bare", "jsonld"), "bare+jsonld");
+    }
+
+    #[test]
+    fn write_if_match_accepts_a_variant_tag_of_the_current_state() {
+        // GET (Accept: JSON-LD) → variant tag → If-Match PUT with it must round-trip: the state is
+        // unchanged, so the write proceeds.
+        assert_eq!(
+            evaluate(Some(&tag_variant()), None, Some(TAG)),
+            Precondition::Proceed
+        );
+    }
+
+    #[test]
+    fn write_if_match_rejects_a_variant_of_a_stale_state() {
+        // The variant derives from a DIFFERENT (old) state ⇒ 412.
+        let stale = variant_etag(OTHER, "jsonld");
+        assert_eq!(
+            evaluate(Some(&stale), None, Some(TAG)),
+            Precondition::Failed
+        );
+    }
+
+    #[test]
+    fn write_if_match_still_rejects_a_weak_variant_tag() {
+        // Strong comparison: a weak validator never satisfies If-Match, variant or not.
+        let weak = format!("W/{}", tag_variant());
+        assert_eq!(evaluate(Some(&weak), None, Some(TAG)), Precondition::Failed);
+    }
+
+    #[test]
+    fn write_if_none_match_guard_matches_a_variant_of_the_current_state() {
+        // The no-overwrite guard: a variant of the CURRENT state is "current" ⇒ Failed (412).
+        assert_eq!(
+            evaluate(None, Some(&tag_variant()), Some(TAG)),
+            Precondition::Failed
+        );
+    }
+
+    #[test]
+    fn read_comparison_is_exact_per_representation() {
+        // The read path compares EXACT opaque tags against the negotiated representation's own
+        // validator. A client holding the STORED (Turtle) tag asking for the JSON-LD variant does
+        // NOT hold that representation ⇒ Proceed (200), never 304.
+        let served_variant = tag_variant();
+        assert_eq!(
+            evaluate_read(Some(TAG), None, &served_variant, None),
+            ReadPrecondition::Proceed
+        );
+        // And vice versa: a variant tag never 304s the stored representation.
+        assert_eq!(
+            evaluate_read(Some(&served_variant), None, TAG, None),
+            ReadPrecondition::Proceed
+        );
+        // Holding the variant tag AND being served that variant ⇒ 304.
+        assert_eq!(
+            evaluate_read(Some(&served_variant), None, &served_variant, None),
+            ReadPrecondition::NotModified
+        );
     }
 }

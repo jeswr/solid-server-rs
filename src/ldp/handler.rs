@@ -390,14 +390,23 @@ pub(crate) async fn serve_read<S: Store>(
     // Compute the response validator (ETag) that a 200 would carry FIRST, so a 304 short-circuit uses
     // the IDENTICAL tag (RFC 9110 §13 — the 304 validator must equal the 200's for the same state).
     //
-    // ETag: a CONTAINER's body is GENERATED from LIVE membership (the `ldp:contains` listing), so its
-    // validator MUST be derived from the FINAL RENDERED representation — not the stored-metadata ETag,
-    // which never changes when a child is added/removed (the stale-validator bug: the body would
-    // change while the ETag did not, breaking conditional requests / caches). We render it here (a 200
-    // needs it anyway) and derive the validator from it. GET and HEAD compute the SAME `body`, so they
-    // agree on the validator. A PLAIN resource keeps its stored-metadata ETag (its bytes ARE the stored
-    // representation), available WITHOUT negotiating/serialising the body — so a matching read
-    // precondition can return 304 while SKIPPING body negotiation + Range (the read-304 fast path).
+    // ETag: an entity-tag identifies a REPRESENTATION, not a resource (RFC 9110 §8.8.3), so the
+    // validator must be specific to the representation this request negotiates.
+    //
+    // - A CONTAINER's body is GENERATED from LIVE membership (the `ldp:contains` listing), so its
+    //   validator is derived from the FINAL RENDERED representation — not the stored-metadata ETag,
+    //   which never changes when a child is added/removed (the stale-validator bug). We render it
+    //   here (a 200 needs it anyway) and hash it; the negotiated format changes the bytes, so the
+    //   tag is representation-specific for free. GET and HEAD compute the SAME body, so they agree.
+    // - A PLAIN resource served VERBATIM (stored format, or non-RDF bytes) keeps its stored-metadata
+    //   ETag. A content-NEGOTIATED (re-serialised) RDF response gets the `"<state>+<variant>"` tag
+    //   ([`conditional::variant_etag`]) — computed from the Accept header ALONE, WITHOUT serialising
+    //   the body, so a matching read precondition can 304 while SKIPPING negotiation + Range (the
+    //   read-304 fast path). A client holding the Turtle tag but asking for JSON-LD therefore gets a
+    //   fresh 200, never a 304 for a representation it doesn't hold; the write path accepts either
+    //   tag's STATE part for If-Match (the GET → PUT round-trip — see `conditional`'s module doc).
+    //   An Accept that matches NO producible type is a 406 here, BEFORE the precondition check (a
+    //   conditional applies to the selected representation; with none selectable there is no 304).
     let (rendered, etag): (Option<(Bytes, String)>, String) = if target.is_container {
         let (body, content_type) = render_container(
             state,
@@ -410,7 +419,8 @@ pub(crate) async fn serve_read<S: Store>(
         let etag = representation_etag(&body);
         (Some((body, content_type)), etag)
     } else {
-        (None, resource.meta.etag.clone())
+        let etag = negotiated_validator(&resource.meta.etag, &resource.meta.content_type, accept)?;
+        (None, etag)
     };
 
     // The response headers shared by the 304 short-circuit and the full 200/206/416 path: the
@@ -1470,6 +1480,47 @@ fn negotiate_body(
     let triples = parse_to_triples(stored_format, stored_body, base_iri)?;
     let bytes = serialize_triples(chosen, &triples)?;
     Ok((Bytes::from(bytes), chosen.media_type().to_string()))
+}
+
+/// The validator (ETag) the response serving this PLAIN resource under `accept` carries —
+/// representation-specific per RFC 9110 §8.8.3 (an entity-tag identifies a representation, not a
+/// resource), and computed WITHOUT serialising a body (the read-304 fast path):
+///
+/// - non-RDF stored content: no RDF conneg, a single representation ⇒ the stored tag, whatever the
+///   `Accept` (matches [`negotiate_body`]'s verbatim branch);
+/// - RDF served in its STORED format ⇒ the stored tag (the bytes ARE the stored representation);
+/// - RDF re-serialised into the OTHER format ⇒ the [`conditional::variant_etag`]
+///   `"<state>+<variant>"` tag, distinct per negotiated media type and derived from the stored
+///   state — so the tag a 200 carries for each negotiated type is exactly the tag that later 304s
+///   for that type, and the write path can round-trip its state part (`conditional` module doc);
+/// - an `Accept` matching NO producible type ⇒ 406 (no selected representation, no validator).
+///
+/// The format decision is the same [`negotiate_accept`] call [`negotiate_body`] makes, so the
+/// validator and the body it labels can never disagree.
+fn negotiated_validator(
+    stored_etag: &str,
+    stored_content_type: &str,
+    accept: Option<&str>,
+) -> Result<String, ServerError> {
+    let Ok(stored_format) = classify(Some(stored_content_type)) else {
+        // Non-RDF stored content (binary): served verbatim — one representation, the stored tag.
+        return Ok(stored_etag.to_string());
+    };
+    let chosen = negotiate_accept(accept, stored_format).ok_or(ServerError::NotAcceptable)?;
+    Ok(if chosen == stored_format {
+        stored_etag.to_string()
+    } else {
+        conditional::variant_etag(stored_etag, variant_suffix(chosen))
+    })
+}
+
+/// The short `+<variant>` suffix token for a negotiated [`RdfFormat`] (kept short and `+`-free so
+/// [`conditional`]'s state-part split stays unambiguous).
+fn variant_suffix(format: RdfFormat) -> &'static str {
+    match format {
+        RdfFormat::Turtle => "ttl",
+        RdfFormat::JsonLd => "jsonld",
+    }
 }
 
 /// Whether a POST asks for a CONTAINER child via `Link: <ldp#BasicContainer>; rel="type"` (or
@@ -3095,5 +3146,187 @@ mod tests {
             StatusCode::FORBIDDEN,
             "the unauthorized caller must get 403, not 304"
         );
+    }
+
+    // --- Representation-specific validators under content negotiation (RFC 9110 §8.8.3) ------------
+
+    const COND_DOC: &str =
+        "<https://pod.example/alice/doc#me> <http://xmlns.com/foaf/0.1/name> \"X\" .";
+
+    #[tokio::test]
+    async fn get_stored_tag_with_accept_jsonld_is_200_not_304() {
+        // (a) An ETag identifies a REPRESENTATION: a client holding the stored-Turtle tag that asks
+        // for JSON-LD does NOT hold that representation — it must get a fresh 200, never a 304.
+        let state = state_with_owner_resource("/alice/doc", COND_DOC).await;
+        let turtle_tag =
+            etag_of(&get_with(&state, owner_token(), "/alice/doc", HeaderMap::new()).await);
+
+        let mut cond = HeaderMap::new();
+        cond.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_str(&turtle_tag).unwrap(),
+        );
+        cond.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/ld+json"),
+        );
+        let resp = get_with(&state, owner_token(), "/alice/doc", cond).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a Turtle tag must not 304 a JSON-LD response"
+        );
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/ld+json"
+        );
+        assert_ne!(
+            etag_of(&resp),
+            turtle_tag,
+            "the negotiated representation carries its own validator"
+        );
+        assert!(!body_bytes(resp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_negotiated_variant_etag_304s_only_for_that_type() {
+        // (b)+(c) The ETag a 200 carries for EACH negotiated type is exactly the tag that later
+        // 304s for that type — and only for that type.
+        let state = state_with_owner_resource("/alice/doc", COND_DOC).await;
+        let turtle_tag =
+            etag_of(&get_with(&state, owner_token(), "/alice/doc", HeaderMap::new()).await);
+
+        // The JSON-LD 200's own tag…
+        let mut accept_jsonld = HeaderMap::new();
+        accept_jsonld.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/ld+json"),
+        );
+        let jsonld_tag =
+            etag_of(&get_with(&state, owner_token(), "/alice/doc", accept_jsonld).await);
+        assert_ne!(jsonld_tag, turtle_tag);
+
+        // …304s a JSON-LD conditional GET, echoing the SAME tag with no body…
+        let mut cond = HeaderMap::new();
+        cond.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_str(&jsonld_tag).unwrap(),
+        );
+        cond.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/ld+json"),
+        );
+        let not_mod = get_with(&state, owner_token(), "/alice/doc", cond).await;
+        assert_eq!(not_mod.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(etag_of(&not_mod), jsonld_tag);
+        assert!(body_bytes(not_mod).await.is_empty());
+
+        // …but never a TURTLE conditional GET (a different representation).
+        let mut cond_turtle = HeaderMap::new();
+        cond_turtle.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_str(&jsonld_tag).unwrap(),
+        );
+        let resp = get_with(&state, owner_token(), "/alice/doc", cond_turtle).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a JSON-LD tag must not 304 the stored-Turtle response"
+        );
+        assert_eq!(etag_of(&resp), turtle_tag);
+    }
+
+    #[tokio::test]
+    async fn put_if_match_round_trips_with_a_negotiated_variant_etag() {
+        // Writes guard resource STATE: the client that GETs the JSON-LD representation must be able
+        // to PUT with the ETag it received (If-Match on the state part) — and a variant of a STALE
+        // state must still 412.
+        let state = state_with_owner_resource("/alice/doc", COND_DOC).await;
+        let mut accept_jsonld = HeaderMap::new();
+        accept_jsonld.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/ld+json"),
+        );
+        let jsonld_tag =
+            etag_of(&get_with(&state, owner_token(), "/alice/doc", accept_jsonld).await);
+
+        // GET (JSON-LD) → If-Match PUT with the received tag: round-trips (state unchanged).
+        let mut write = turtle_write_headers();
+        write.insert(
+            header::IF_MATCH,
+            HeaderValue::from_str(&jsonld_tag).unwrap(),
+        );
+        let uri: axum::http::Uri = "/alice/doc".parse().unwrap();
+        let resp = put_handler(
+            State(state.clone()),
+            Extension(owner_token()),
+            uri.clone(),
+            write.clone(),
+            AxBytes::from(
+                "<https://pod.example/alice/doc#me> <http://xmlns.com/foaf/0.1/name> \"Y\" .",
+            ),
+        )
+        .await
+        .expect("If-Match with the negotiated variant tag must round-trip");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // The state has now CHANGED — the old variant tag is stale, so the same If-Match is a 412.
+        let err = put_handler(
+            State(state),
+            Extension(owner_token()),
+            uri,
+            write,
+            AxBytes::from(
+                "<https://pod.example/alice/doc#me> <http://xmlns.com/foaf/0.1/name> \"Z\" .",
+            ),
+        )
+        .await
+        .expect_err("a variant of a stale state must fail the precondition");
+        assert_eq!(err.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    #[test]
+    fn negotiated_validator_binary_keeps_the_stored_tag() {
+        // (d) A non-RDF (binary) resource is served verbatim whatever the Accept — ONE
+        // representation, so its validator stays the stored tag (current behaviour preserved).
+        let stored = "\"5-abc123\"";
+        assert_eq!(
+            negotiated_validator(stored, "image/png", Some("application/ld+json")).unwrap(),
+            stored
+        );
+        assert_eq!(
+            negotiated_validator(stored, "image/png", None).unwrap(),
+            stored
+        );
+        // And an RDF resource served in its stored format keeps the stored tag too.
+        assert_eq!(
+            negotiated_validator(stored, "text/turtle", Some("text/turtle")).unwrap(),
+            stored
+        );
+        // While the re-serialised representation gets the distinct variant tag.
+        assert_eq!(
+            negotiated_validator(stored, "text/turtle", Some("application/ld+json")).unwrap(),
+            "\"5-abc123+jsonld\""
+        );
+    }
+
+    #[tokio::test]
+    async fn get_unacceptable_accept_is_406_even_with_matching_if_none_match() {
+        // With no selectable representation there is nothing a conditional can apply to: the 406
+        // wins over a matching If-None-Match (no 304 for an unproducible representation).
+        let state = state_with_owner_resource("/alice/doc", COND_DOC).await;
+        let turtle_tag =
+            etag_of(&get_with(&state, owner_token(), "/alice/doc", HeaderMap::new()).await);
+        let mut cond = HeaderMap::new();
+        cond.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_str(&turtle_tag).unwrap(),
+        );
+        cond.insert(header::ACCEPT, HeaderValue::from_static("text/html"));
+        let uri: axum::http::Uri = "/alice/doc".parse().unwrap();
+        let err = get_handler(State(state), Extension(owner_token()), uri, cond)
+            .await
+            .expect_err("an unacceptable Accept must be a 406, not a 304");
+        assert_eq!(err.status(), StatusCode::NOT_ACCEPTABLE);
     }
 }
