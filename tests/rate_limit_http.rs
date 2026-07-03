@@ -69,6 +69,7 @@ fn app_with_rate_limit(
             exempt_loopback,
             /* exempt_internal = */ false,
         )),
+        body_limit_bytes: solid_server_rs::body_limit::DEFAULT_MAX_BODY_BYTES,
     };
     build_router_with_overload(AppState::new(ctx, ldp), overload)
 }

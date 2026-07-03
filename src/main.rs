@@ -45,6 +45,7 @@ use solid_server_rs::auth::AuthContext;
 use solid_server_rs::auth_cache::{
     ProofPolicy, SharedReplay, VerifiedTokenCache, DEFAULT_CACHE_CAPACITY,
 };
+use solid_server_rs::body_limit;
 use solid_server_rs::ldp::handler::LdpState;
 use solid_server_rs::overload::{self, AdmissionControl};
 use solid_server_rs::rate_limit::{self, RateConfig, RateLimiter};
@@ -392,10 +393,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // --- Explicit request-body size limit. -------------------------------------------------------
+    // An audited, configurable ceiling on per-request body buffering (a body over it ⇒ 413), replacing
+    // reliance on axum's implicit 2 MiB default. Always finite (no unlimited mode). The resident-memory
+    // ceiling for body buffering is `max_concurrency × body_limit`.
+    let body_limit_bytes = body_limit::max_body_bytes_from_env();
+    eprintln!(
+        "  BODY-LIMIT: max request body {body_limit_bytes} bytes (over ⇒ 413). Aggregate body-buffer \
+         ceiling ≈ max_concurrency ({max_concurrency}) × {body_limit_bytes} bytes."
+    );
+
     let overload_config = OverloadConfig {
         admission,
         request_timeout,
         rate_limiter,
+        body_limit_bytes,
     };
 
     // --- Transport-layer DoS hardening (HTTP/2 caps + slowloris timeout + connection cap). --------
@@ -405,7 +417,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the plain-HTTP path cannot configure them (axum::serve exposes neither). All defaults are
     // deliberately lenient so they never trip the conformance harness. See `solid_server_rs::transport`.
     let transport_config = TransportConfig::from_env();
-    let connection_limiter = ConnectionLimiter::new(transport_config.max_connections);
+    // Global connection cap + the per-SOURCE (per-IP) cap: the global cap alone lets one source hold
+    // all slots, so pair it with a per-IP cap (default-on, internal-IP-exempt) that bounds any single
+    // source well below the global ceiling.
+    let connection_limiter = ConnectionLimiter::new(transport_config.max_connections)
+        .with_per_ip_cap(
+            transport_config.max_connections_per_ip,
+            transport_config.conn_exempt_internal,
+        );
     // Log honestly per serve mode (roborev Low): the transport caps are ACTIVE only when terminating
     // TLS in-process. In plain-HTTP mode they are NOT enforced — say so, so an operator behind a
     // reverse proxy does not believe the in-process caps are on.
@@ -413,8 +432,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "  TRANSPORT (TLS path, ACTIVE): HTTP/2 max_concurrent_streams={}, rapid-reset cap \
              (CVE-2023-44487)={} (hyper default 20 unless overridden), slowloris header-read \
-             timeout={}, max concurrent connections={}, handshake timeout={}, h2 keep-alive \
-             ping={} (reclaims a DEAD-peer connection, not a live-idle one).",
+             timeout={}, max concurrent connections={} (per-source cap={}, exempt-internal={}), \
+             handshake timeout={}, h2 keep-alive ping={} (reclaims a DEAD-peer connection, not a \
+             live-idle one).",
             transport_config.h2_max_concurrent_streams,
             match transport_config.h2_max_pending_reset_streams {
                 Some(n) => format!("{n} (override)"),
@@ -422,6 +442,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             fmt_opt_secs(transport_config.header_read_timeout),
             connection_limiter.max_connections(),
+            match connection_limiter.max_per_ip() {
+                Some(n) => format!("{n}/IP"),
+                None => "DISABLED".to_string(),
+            },
+            transport_config.conn_exempt_internal,
             fmt_opt_secs(transport_config.handshake_timeout),
             fmt_opt_secs(transport_config.keep_alive_timeout),
         );

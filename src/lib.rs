@@ -47,6 +47,7 @@ pub mod app;
 pub mod auth;
 pub mod auth_cache;
 pub mod authz;
+pub mod body_limit;
 pub mod error;
 pub mod ldp;
 pub mod notifications;

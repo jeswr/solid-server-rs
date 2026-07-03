@@ -49,6 +49,7 @@ fn app_with_admission(max_concurrency: usize) -> (axum::Router, AdmissionControl
         admission: admission.clone(),
         request_timeout: None,
         rate_limiter: None,
+        body_limit_bytes: solid_server_rs::body_limit::DEFAULT_MAX_BODY_BYTES,
     };
     let app = build_router_with_overload(AppState::new(ctx, ldp), overload);
     (app, admission)
