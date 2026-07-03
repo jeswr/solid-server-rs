@@ -81,8 +81,10 @@ pub struct BackendCounters {
     /// nothing; that emptiness is exactly what the boundary-race test pins). A test holding the
     /// lock can therefore wait on this flag as a DETERMINISTIC proof that another thread has
     /// reached the lock-acquisition boundary and is blocked there, instead of sleeping.
+    /// Installable and replaceable per test (not one-shot), so tests sharing a counters
+    /// instance can each install their own probe.
     #[cfg(test)]
-    boundary_probe: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>>,
+    boundary_probe: std::sync::Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 /// The lock-protected concurrency state (see [`BackendCounters::conc`]): the live in-flight count +
@@ -187,7 +189,12 @@ impl BackendCounters {
         // pre-lock effect of `op_guard` (there must be none — the invariant under test) has
         // already happened-before the observation.
         #[cfg(test)]
-        if let Some(probe) = self.boundary_probe.get() {
+        if let Some(probe) = self
+            .boundary_probe
+            .lock()
+            .expect("boundary probe lock poisoned")
+            .as_ref()
+        {
             probe.store(true, Ordering::SeqCst);
         }
         let mut conc = self.conc.lock().expect("conc lock poisoned");
@@ -644,10 +651,10 @@ mod tests {
         let counters = BackendCounters::new();
         // Install the boundary probe BEFORE any op_guard can run.
         let probe = Arc::new(AtomicBool::new(false));
-        counters
+        *counters
             .boundary_probe
-            .set(Arc::clone(&probe))
-            .expect("boundary probe installed exactly once");
+            .lock()
+            .expect("boundary probe lock poisoned") = Some(Arc::clone(&probe));
 
         let scope = counters.measure(); // window open, own peak cell = 0
 
