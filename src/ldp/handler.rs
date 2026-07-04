@@ -250,6 +250,9 @@ impl<S: Store> LdpState<S> {
     /// depends on the patch CONTENT — an insert-only patch needs only `acl:Append`, a patch with any
     /// delete needs `acl:Write`). For an `.acl` target the required mode is overridden to
     /// [`AccessMode::Control`] regardless (managing access rules is always the Control privilege).
+    ///
+    /// write-2: the ACL walk is PLANNED — one combined [`Store::read_plan`] round-trip replaces the
+    /// sequential k+1 per-candidate probes (see [`authorize_planned_iri`](Self::authorize_planned_iri)).
     async fn authorize_mode(
         &self,
         target: &LdpTarget,
@@ -263,9 +266,8 @@ impl<S: Store> LdpState<S> {
         } else {
             required
         };
-        let wac = WacAuthorizer::with_cache(&self.store, &self.base_url, &self.acl_cache);
-        match wac
-            .authorize(&target.iri, required, token.web_id.as_deref(), origin)
+        match self
+            .authorize_planned_iri(&target.iri, required, token, origin)
             .await?
         {
             Decision::Allow(modes) => Ok(modes),
@@ -277,6 +279,8 @@ impl<S: Store> LdpState<S> {
     /// Run WAC for an EXPLICIT (`target_iri`, mode), where `target_iri` may be a synthetic container
     /// IRI (e.g. the parent of the resource being created/deleted, which is itself a valid container
     /// path). Returns the granted modes on Allow, or the spec 401/403 on deny.
+    ///
+    /// write-2: planned walk — see [`authorize_planned_iri`](Self::authorize_planned_iri).
     async fn authorize_iri(
         &self,
         target_iri: &str,
@@ -284,15 +288,58 @@ impl<S: Store> LdpState<S> {
         token: &VerifiedToken,
         origin: Option<&str>,
     ) -> Result<(), ServerError> {
-        let wac = WacAuthorizer::with_cache(&self.store, &self.base_url, &self.acl_cache);
-        match wac
-            .authorize(target_iri, required, token.web_id.as_deref(), origin)
+        match self
+            .authorize_planned_iri(target_iri, required, token, origin)
             .await?
         {
             Decision::Allow(_) => Ok(()),
             Decision::Unauthenticated => Err(self.unauthenticated()),
             Decision::Forbidden => Err(ServerError::Forbidden),
         }
+    }
+
+    /// The shared write-path PLANNED authorization core (write-2, `docs/design/backend-read-path.md`
+    /// §3.1 applied to the write verbs): derive the ACL-candidate chain, fetch every candidate's
+    /// presence/etag in ONE combined [`Store::read_plan`] round-trip (replacing the sequential k+1
+    /// per-candidate `meta` probes the [`WacAuthorizer::authorize`] walk pays), then decide via
+    /// [`WacAuthorizer::authorize_planned`] — whose in-memory walk + LIVE found-ACL re-confirm is
+    /// differentially tested bit-for-bit against the sequential walk for every [`AccessMode`].
+    ///
+    /// The plan is principal-independent METADATA (existence/etag rows only — no resource bytes,
+    /// no grants), so fetching it before the decision leaks nothing to the client; the decision
+    /// itself — including the fail-closed delete-after-plan re-confirm and the 401-vs-403 split —
+    /// is unchanged from the sequential path.
+    ///
+    /// The plan's TARGET-row slot is deliberately the FIRST ACL CANDIDATE, NOT the raw target
+    /// (unlike the read path, which reuses the target row for its 404): a write authorization
+    /// needs ONLY the ACL rows, and the sequential walk it replaces never touched the TARGET's
+    /// index record — so the planned decision must not either. Passing the raw target would make
+    /// the authorization fail on a target-record backend fault, turning the UNIFORM 401/403
+    /// denial an unauthorized caller must see into a 500 existence/state ORACLE (pinned by the
+    /// `patch_*_faulting_target_read_*` tests). With the first candidate in the slot the plan's
+    /// `VALUES` set is exactly the candidate ACLs (the slot IRI is already candidate 0 — no extra
+    /// row on the wire), its target row is ignored, and an ACL-probe fault still fails the plan
+    /// (fail-closed) exactly as the sequential walk's ACL probes did.
+    async fn authorize_planned_iri(
+        &self,
+        target_iri: &str,
+        required: AccessMode,
+        token: &VerifiedToken,
+        origin: Option<&str>,
+    ) -> Result<Decision, ServerError> {
+        let wac = WacAuthorizer::with_cache(&self.store, &self.base_url, &self.acl_cache);
+        let candidates = wac.read_plan_candidates(target_iri);
+        let acl_iris: Vec<String> = candidates.iter().map(|c| c.acl.clone()).collect();
+        // candidates[0] always exists (the chain starts at the protected resource's own ACL).
+        let plan = self.store.read_plan(&acl_iris[0], &acl_iris).await?;
+        wac.authorize_planned(
+            required,
+            token.web_id.as_deref(),
+            origin,
+            &candidates,
+            &plan.acls,
+        )
+        .await
     }
 
     /// Authorize CREATION of a new resource at `target` — WAC creation grants live on the PARENT

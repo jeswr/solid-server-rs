@@ -14,16 +14,22 @@
 //! Fixture depth matches the read tests: the governing ACL is the root `<base>/.acl`, so a doc at
 //! `/alice/c/doc` has k = 3 (candidates doc.acl → /alice/c/.acl → /alice/.acl → /.acl ✓).
 //!
-//! MEASURED write-1 BASELINE pins (the sequential walk, before the write-2 collapse — the numbers
-//! the next round must beat; each sequential walk from a resource at ACL-ancestor index k costs
-//! k+1 per-candidate probes):
+//! Pinned counts AFTER write-2 (the planned-walk collapse: each sequential walk of k+1 probes
+//! becomes a flat `plan(1) + found-ACL live re-confirm(1)` — MEASURED before → after, both sides
+//! observed by running this file at the write-1 baseline commit and at write-2, `git log` this
+//! file):
 //!
-//!   op                                   queries   of which walk probes
-//!   PUT overwrite (target exists, k=3)       6     4 (doc.acl → … → /.acl ✓)
-//!   PUT create    (parent walk)              12    3 (from /alice/c/)
-//!   POST create   (container target)         6     3 (from /alice/c/)
-//!   DELETE doc    (k=3)                      10    4 + 3 (target AND parent walks)
-//!   PATCH insert  (existing doc, k=3)        5     4
+//!   op                                   queries before → after   walks collapsed
+//!   PUT overwrite (target exists, k=3)            6 → 4           1 (target: 4→2)
+//!   PUT create    (parent walk)                  12 → 11          1 (parent: 3→2)
+//!   POST create   (container target)              6 → 5           1 (container: 3→2)
+//!   DELETE doc    (k=3)                          10 → 7           2 (target 4→2, parent 3→2)
+//!   PATCH insert  (existing doc, k=3)             5 → 3           1 (target: 4→2)
+//!
+//! The win is DEPTH-INDEPENDENT: the sequential side grows with k (a deeper resource pays a longer
+//! walk), the planned side is flat 2 at any k. The creation paths' remaining per-ancestor
+//! EXISTENCE probes (`nearest_existing_container` / `ensure_ancestor_containers`) are a separate
+//! follow-up lever (write-3), deliberately not folded here (one concern per commit).
 //!
 //! `max_in_flight == 1` in every scenario is the await-depth witness (strictly sequential).
 
@@ -168,9 +174,10 @@ async fn fixture(h: &Harness) {
     assert_eq!(warm.status(), StatusCode::OK);
 }
 
-/// **PUT overwrite (k = 3, warm ACL cache).** BASELINE: the sequential k+1 = 4 per-candidate walk
-/// probes + the handler's own existence `meta` + the slash-semantics conflict probe = 6 queries,
-/// GROWING with k.
+/// **PUT overwrite (k = 3, warm ACL cache).** The write-authz walk is now PLANNED: 1 combined
+/// read-plan query + 1 found-ACL live re-confirm, depth-independent (was the sequential k+1 = 4
+/// per-candidate probes). Remaining queries: the handler's own existence `meta` + the
+/// slash-semantics conflict probe. MEASURED before → after: 6 → 4 queries.
 #[tokio::test]
 async fn put_overwrite_k3_counts() {
     let h = Harness::new().await;
@@ -186,16 +193,18 @@ async fn put_overwrite_k3_counts() {
         .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT, "overwrite 204");
     assert_eq!(
-        d.sparql_queries, 6,
-        "PUT overwrite = existence meta + sequential walk (k+1 = 4) + slash probe: {d:?}"
+        d.sparql_queries, 4,
+        "PUT overwrite = existence meta + planned walk (plan + re-confirm) + slash probe, depth-independent (was 6): {d:?}"
     );
     assert_eq!(d.blob_puts, 1, "one body write: {d:?}");
     assert_eq!(d.sparql_updates, 1, "one meta upsert: {d:?}");
     assert_eq!(d.max_in_flight, 1, "strictly sequential");
 }
 
-/// **PUT create (warm).** BASELINE: the nearest-existing-ancestor probe chain + the sequential
-/// walk from the parent (3 probes) + slash probe + ensure-ancestors + create = 12 queries.
+/// **PUT create (k = 3 from the parent, warm).** Authorization runs against the nearest EXISTING
+/// ancestor container (`/alice/c/`), found by upward existence probes, then the walk from it is
+/// PLANNED (plan + re-confirm — was the sequential k+1 = 3 probes from the parent). before →
+/// after: 10 → 7 queries (the create path's ancestor-existence probes are a separate follow-up).
 #[tokio::test]
 async fn put_create_k3_counts() {
     let h = Harness::new().await;
@@ -211,16 +220,17 @@ async fn put_create_k3_counts() {
         .await;
     assert_eq!(resp.status(), StatusCode::CREATED, "create 201");
     assert_eq!(
-        d.sparql_queries, 12,
-        "PUT create = existence meta + nearest-ancestor probe + sequential parent walk (3) + slash probe + ensure-ancestors + create: {d:?}"
+        d.sparql_queries, 11,
+        "PUT create = existence meta + nearest-ancestor probe + planned parent walk (2, was sequential 3) + slash probe + ensure-ancestors + create (was 12): {d:?}"
     );
     assert_eq!(d.blob_puts, 1, "one body write: {d:?}");
     assert_eq!(d.sparql_updates, 1, "the create transaction: {d:?}");
     assert_eq!(d.max_in_flight, 1, "strictly sequential");
 }
 
-/// **POST create into `/alice/c/` (warm).** BASELINE: the container's sequential walk (3 probes:
-/// c/.acl, alice/.acl, /.acl ✓) + container-shape/existence + slug probes + create = 6 queries.
+/// **POST create into `/alice/c/` (warm).** The container's write-authz walk is PLANNED
+/// (plan + re-confirm — was the sequential 3 probes: c/.acl, alice/.acl, /.acl ✓). MEASURED
+/// before → after: 6 → 5.
 #[tokio::test]
 async fn post_create_counts() {
     let h = Harness::new().await;
@@ -231,16 +241,16 @@ async fn post_create_counts() {
         .await;
     assert_eq!(resp.status(), StatusCode::CREATED, "post 201");
     assert_eq!(
-        d.sparql_queries, 6,
-        "POST = sequential container walk (3) + container-shape/existence + slug probes + create: {d:?}"
+        d.sparql_queries, 5,
+        "POST = planned container walk (2, was sequential 3) + container-shape/existence + slug probes + create (was 6): {d:?}"
     );
     assert_eq!(d.blob_puts, 1, "one body write: {d:?}");
     assert_eq!(d.max_in_flight, 1, "strictly sequential");
 }
 
-/// **DELETE doc (k = 3, warm).** BASELINE: DELETE runs TWO sequential authorizations — Write on
-/// the TARGET (4 probes) AND Write on the PARENT container (3 probes) — = 10 queries total, the
-/// most walk-heavy verb.
+/// **DELETE doc (k = 3, warm).** DELETE runs TWO authorizations — Write on the TARGET (walk 4→2)
+/// and Write on the PARENT container (walk 3→2) — BOTH now PLANNED. MEASURED before → after:
+/// 10 → 7 (the largest single-verb win: two walks collapsed).
 #[tokio::test]
 async fn delete_doc_k3_counts() {
     let h = Harness::new().await;
@@ -251,16 +261,16 @@ async fn delete_doc_k3_counts() {
         .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT, "delete 204");
     assert_eq!(
-        d.sparql_queries, 10,
-        "DELETE = sequential target walk (4) + sequential parent walk (3) + existence/aux probes: {d:?}"
+        d.sparql_queries, 7,
+        "DELETE = planned target walk (2) + planned parent walk (2) + existence/aux probes, depth-independent (was 10): {d:?}"
     );
     assert_eq!(d.blob_puts, 0, "no body write: {d:?}");
     assert_eq!(d.max_in_flight, 1, "strictly sequential");
 }
 
-/// **PATCH insert-only on the existing doc (k = 3, warm).** BASELINE: PATCH's content-derived
-/// required mode (Append for insert-only) authorizes via the sequential k+1 = 4 walk probes +
-/// the target read meta = 5 queries.
+/// **PATCH insert-only on the existing doc (k = 3, warm).** PATCH's content-derived required mode
+/// (Append for insert-only) authorizes via the SAME planned walk (plan + re-confirm — was the
+/// sequential k+1 = 4 probes). MEASURED before → after: 5 → 3.
 #[tokio::test]
 async fn patch_insert_existing_k3_counts() {
     let h = Harness::new().await;
@@ -275,8 +285,8 @@ _:patch a solid:InsertDeletePatch;\n\
         .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT, "patch 204");
     assert_eq!(
-        d.sparql_queries, 5,
-        "PATCH = sequential walk (4) + target read meta: {d:?}"
+        d.sparql_queries, 3,
+        "PATCH = planned walk (2) + target read meta, depth-independent (was 5): {d:?}"
     );
     assert_eq!(d.blob_puts, 1, "one rewritten body: {d:?}");
     assert_eq!(d.max_in_flight, 1, "strictly sequential");
