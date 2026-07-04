@@ -1,0 +1,283 @@
+// AUTHORED-BY Claude Fable 5
+//! write-1 (`docs/design/backend-read-path.md` §7 discipline, applied to the WRITE verbs): PINNED
+//! deterministic backend round-trip counts per WRITE operation, measured end-to-end through the
+//! assembled router (auth → WAC → LDP → store) with the counting decorators at the
+//! `SparqClient`/`BlobStore` seams — the write-path sibling of `read_path_counters.rs`.
+//!
+//! These pins are the MEASURE-FIRST baseline for the write-path walk-collapse round: the read path
+//! (read-2) already folds its O(depth) ACL walk into ONE combined `Store::read_plan` query, but the
+//! WRITE verbs (PUT/POST/DELETE/PATCH) still authorize via the SEQUENTIAL
+//! `WacAuthorizer::authorize` walk — k+1 per-candidate `meta` probes for a resource whose governing
+//! ACL sits at ancestor index k — plus, on the CREATE paths, a second sequential walk from the
+//! parent and per-ancestor existence probes.
+//!
+//! Fixture depth matches the read tests: the governing ACL is the root `<base>/.acl`, so a doc at
+//! `/alice/c/doc` has k = 3 (candidates doc.acl → /alice/c/.acl → /alice/.acl → /.acl ✓).
+//!
+//! MEASURED write-1 BASELINE pins (the sequential walk, before the write-2 collapse — the numbers
+//! the next round must beat; each sequential walk from a resource at ACL-ancestor index k costs
+//! k+1 per-candidate probes):
+//!
+//!   op                                   queries   of which walk probes
+//!   PUT overwrite (target exists, k=3)       6     4 (doc.acl → … → /.acl ✓)
+//!   PUT create    (parent walk)              12    3 (from /alice/c/)
+//!   POST create   (container target)         6     3 (from /alice/c/)
+//!   DELETE doc    (k=3)                      10    4 + 3 (target AND parent walks)
+//!   PATCH insert  (existing doc, k=3)        5     4
+//!
+//! `max_in_flight == 1` in every scenario is the await-depth witness (strictly sequential).
+
+mod common;
+
+use std::sync::Arc;
+
+use axum::body::{Body, Bytes};
+use axum::http::{Request, StatusCode};
+use common::{jwks_provider, mint_access_token, mint_dpop_proof, KeyKit, BASE_URL};
+use solid_oidc_verifier::config::VerifierConfig;
+use solid_oidc_verifier::replay::InMemoryReplayStore;
+use solid_oidc_verifier::verifier::Verifier;
+use solid_server_rs::app::{build_router, AppState};
+use solid_server_rs::auth::AuthContext;
+use solid_server_rs::ldp::handler::LdpState;
+use solid_server_rs::store::{
+    BackendCounters, CompositeStore, CounterSnapshot, CountingBlobStore, CountingSparqClient,
+    InMemoryBlobStore, InMemorySparqClient, Store,
+};
+use tower::ServiceExt;
+
+const TURTLE: &str =
+    "<https://pod.example/alice/c/doc#it> <http://xmlns.com/foaf/0.1/name> \"Doc\" .";
+
+type CountedStore =
+    CompositeStore<CountingSparqClient<InMemorySparqClient>, CountingBlobStore<InMemoryBlobStore>>;
+
+/// The counting harness — identical assembly to `read_path_counters.rs`.
+struct Harness {
+    app: axum::Router,
+    issuer_key: KeyKit,
+    client_key: KeyKit,
+    counters: Arc<BackendCounters>,
+}
+
+impl Harness {
+    async fn new() -> Self {
+        let issuer_key = KeyKit::generate();
+        let client_key = KeyKit::generate();
+        let config = VerifierConfig::new(vec![common::ISSUER.to_string()], BASE_URL);
+        let replay = InMemoryReplayStore::with_window(config.replay_ttl());
+        let verifier = Verifier::new(config, jwks_provider(&issuer_key), replay).unwrap();
+        let ctx = AuthContext::new(verifier, BASE_URL);
+
+        let counters = BackendCounters::new();
+        let store = CompositeStore::new(
+            CountingSparqClient::new(InMemorySparqClient::new(), Arc::clone(&counters)),
+            CountingBlobStore::new(InMemoryBlobStore::new(), Arc::clone(&counters)),
+        );
+        seed_root_owner_acl(&store, BASE_URL, common::WEBID).await;
+        let ldp = LdpState::new(store, BASE_URL);
+        let app = build_router(AppState::new(ctx, ldp));
+        Self {
+            app,
+            issuer_key,
+            client_key,
+            counters,
+        }
+    }
+
+    async fn request(
+        &self,
+        method: &str,
+        path: &str,
+        content_type: Option<&str>,
+        body: Body,
+    ) -> axum::http::Response<Body> {
+        let access = mint_access_token(&self.issuer_key, &self.client_key.thumbprint);
+        let htu = format!("{BASE_URL}{path}");
+        let proof = mint_dpop_proof(&self.client_key, method, &htu, &access);
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("DPoP {access}"))
+            .header("dpop", proof);
+        if let Some(ct) = content_type {
+            builder = builder.header("content-type", ct);
+        }
+        self.app
+            .clone()
+            .oneshot(builder.body(body).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// Measure ONE request's backend-counter deltas over an OPERATION-SCOPED window.
+    async fn measured(
+        &self,
+        method: &str,
+        path: &str,
+        content_type: Option<&str>,
+        body: Body,
+    ) -> (axum::http::Response<Body>, CounterSnapshot) {
+        let scope = self.counters.measure();
+        let resp = self.request(method, path, content_type, body).await;
+        (resp, scope.delta())
+    }
+}
+
+/// Seed the ROOT owner ACL — same fixture as `read_path_counters.rs`.
+async fn seed_root_owner_acl(store: &CountedStore, base_url: &str, owner_webid: &str) {
+    let base = base_url.trim_end_matches('/');
+    let root = format!("{base}/");
+    let acl_iri = format!("{root}.acl");
+    let acl_body = format!(
+        r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#owner> a acl:Authorization;
+         acl:agent <{owner_webid}>;
+         acl:accessTo <{root}>;
+         acl:default <{root}>;
+         acl:mode acl:Read, acl:Write, acl:Control."#
+    );
+    store
+        .write(&acl_iri, Bytes::from(acl_body), "text/turtle")
+        .await
+        .expect("seed root acl");
+}
+
+/// Standard fixture: container `/alice/c/` + doc `/alice/c/doc` inheriting the root ACL (k = 3 for
+/// the doc), then one un-measured GET so the parsed-ACL cache is WARM for every measured op.
+async fn fixture(h: &Harness) {
+    let mk = h
+        .request(
+            "PUT",
+            "/alice/c/",
+            Some("text/turtle"),
+            Body::from("<#c> <http://xmlns.com/foaf/0.1/name> \"C\" ."),
+        )
+        .await;
+    assert_eq!(mk.status(), StatusCode::CREATED);
+    let put = h
+        .request(
+            "PUT",
+            "/alice/c/doc",
+            Some("text/turtle"),
+            Body::from(TURTLE),
+        )
+        .await;
+    assert_eq!(put.status(), StatusCode::CREATED);
+    let warm = h.request("GET", "/alice/c/doc", None, Body::empty()).await;
+    assert_eq!(warm.status(), StatusCode::OK);
+}
+
+/// **PUT overwrite (k = 3, warm ACL cache).** BASELINE: the sequential k+1 = 4 per-candidate walk
+/// probes + the handler's own existence `meta` + the slash-semantics conflict probe = 6 queries,
+/// GROWING with k.
+#[tokio::test]
+async fn put_overwrite_k3_counts() {
+    let h = Harness::new().await;
+    fixture(&h).await;
+
+    let (resp, d) = h
+        .measured(
+            "PUT",
+            "/alice/c/doc",
+            Some("text/turtle"),
+            Body::from(TURTLE),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "overwrite 204");
+    assert_eq!(
+        d.sparql_queries, 6,
+        "PUT overwrite = existence meta + sequential walk (k+1 = 4) + slash probe: {d:?}"
+    );
+    assert_eq!(d.blob_puts, 1, "one body write: {d:?}");
+    assert_eq!(d.sparql_updates, 1, "one meta upsert: {d:?}");
+    assert_eq!(d.max_in_flight, 1, "strictly sequential");
+}
+
+/// **PUT create (warm).** BASELINE: the nearest-existing-ancestor probe chain + the sequential
+/// walk from the parent (3 probes) + slash probe + ensure-ancestors + create = 12 queries.
+#[tokio::test]
+async fn put_create_k3_counts() {
+    let h = Harness::new().await;
+    fixture(&h).await;
+
+    let (resp, d) = h
+        .measured(
+            "PUT",
+            "/alice/c/new",
+            Some("text/turtle"),
+            Body::from(TURTLE),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED, "create 201");
+    assert_eq!(
+        d.sparql_queries, 12,
+        "PUT create = existence meta + nearest-ancestor probe + sequential parent walk (3) + slash probe + ensure-ancestors + create: {d:?}"
+    );
+    assert_eq!(d.blob_puts, 1, "one body write: {d:?}");
+    assert_eq!(d.sparql_updates, 1, "the create transaction: {d:?}");
+    assert_eq!(d.max_in_flight, 1, "strictly sequential");
+}
+
+/// **POST create into `/alice/c/` (warm).** BASELINE: the container's sequential walk (3 probes:
+/// c/.acl, alice/.acl, /.acl ✓) + container-shape/existence + slug probes + create = 6 queries.
+#[tokio::test]
+async fn post_create_counts() {
+    let h = Harness::new().await;
+    fixture(&h).await;
+
+    let (resp, d) = h
+        .measured("POST", "/alice/c/", Some("text/turtle"), Body::from(TURTLE))
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED, "post 201");
+    assert_eq!(
+        d.sparql_queries, 6,
+        "POST = sequential container walk (3) + container-shape/existence + slug probes + create: {d:?}"
+    );
+    assert_eq!(d.blob_puts, 1, "one body write: {d:?}");
+    assert_eq!(d.max_in_flight, 1, "strictly sequential");
+}
+
+/// **DELETE doc (k = 3, warm).** BASELINE: DELETE runs TWO sequential authorizations — Write on
+/// the TARGET (4 probes) AND Write on the PARENT container (3 probes) — = 10 queries total, the
+/// most walk-heavy verb.
+#[tokio::test]
+async fn delete_doc_k3_counts() {
+    let h = Harness::new().await;
+    fixture(&h).await;
+
+    let (resp, d) = h
+        .measured("DELETE", "/alice/c/doc", None, Body::empty())
+        .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "delete 204");
+    assert_eq!(
+        d.sparql_queries, 10,
+        "DELETE = sequential target walk (4) + sequential parent walk (3) + existence/aux probes: {d:?}"
+    );
+    assert_eq!(d.blob_puts, 0, "no body write: {d:?}");
+    assert_eq!(d.max_in_flight, 1, "strictly sequential");
+}
+
+/// **PATCH insert-only on the existing doc (k = 3, warm).** BASELINE: PATCH's content-derived
+/// required mode (Append for insert-only) authorizes via the sequential k+1 = 4 walk probes +
+/// the target read meta = 5 queries.
+#[tokio::test]
+async fn patch_insert_existing_k3_counts() {
+    let h = Harness::new().await;
+    fixture(&h).await;
+
+    let patch = "@prefix solid: <http://www.w3.org/ns/solid/terms#>.\n\
+@prefix foaf: <http://xmlns.com/foaf/0.1/>.\n\
+_:patch a solid:InsertDeletePatch;\n\
+  solid:inserts { <https://pod.example/alice/c/doc#it> foaf:nick \"D\" . }.\n";
+    let (resp, d) = h
+        .measured("PATCH", "/alice/c/doc", Some("text/n3"), Body::from(patch))
+        .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "patch 204");
+    assert_eq!(
+        d.sparql_queries, 5,
+        "PATCH = sequential walk (4) + target read meta: {d:?}"
+    );
+    assert_eq!(d.blob_puts, 1, "one rewritten body: {d:?}");
+    assert_eq!(d.max_in_flight, 1, "strictly sequential");
+}
