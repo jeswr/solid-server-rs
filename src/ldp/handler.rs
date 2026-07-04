@@ -442,6 +442,71 @@ impl<S: Store> LdpState<S> {
         Ok(())
     }
 
+    /// EXISTENCE-NON-DISCLOSURE — the **V6** POST descendant-existence closure (decisions/0003).
+    ///
+    /// A POST authorizes `acl:Append` on the target container. For a MISSING target (a not-yet-existing
+    /// sub-container, or a reserved non-container path), that target has no own `.acl`, so the required
+    /// `acl:Append` is satisfied via the target's INHERITED `acl:default` (from an ancestor container).
+    /// The POST handler then branches on existence — a 404 for a missing container, or 404/405 for a
+    /// non-container — while an EXISTING sibling that carries its OWN restrictive `.acl` denying the
+    /// requester is a 403 at authorization (its own ACL overrides the inherited default). That
+    /// 403-vs-404/405 split is an existence oracle: an agent holding `acl:default acl:Append` over a
+    /// subtree (the realistic "drop a file anywhere under `/c/`" grant) — but NO `acl:Read` — can name a
+    /// specific descendant and learn whether it exists (403 ⇒ exists-and-locked, 404/405 ⇒ free) even
+    /// for descendants it may not access. The verifier execution-proved this on PR #3.
+    ///
+    /// Closure (mirrors the **V4** conditional-channel Read-gate): the POST existence BRANCH (the
+    /// 404/405 status that discloses whether the named target exists) is an existence disclosure and so
+    /// REQUIRES the target's READ-mode — `acl:Read` for a normal resource, but `acl:Control` for an `.acl`
+    /// target (reading an `.acl`'s representation/existence is itself a Control operation; `Control` does
+    /// NOT imply `Read`, so a Control-only holder — who IS entitled to know the `.acl`'s existence — must
+    /// not be folded). This is EXACTLY the read-mode `guard_conditional_requires_read` computes, kept in
+    /// lock-step so the two existence-disclosure gates cannot drift. When the (already-authorized)
+    /// requester's granted modes do NOT include that read-mode, the handler returns the requester's
+    /// DENIAL code (401 anonymous / 403 authenticated) — the SAME byte-identical denial an
+    /// existing-but-forbidden sibling returns — INSTEAD of the existence-revealing 404/405, so missing and
+    /// forbidden are indistinguishable. A requester WITH the read-mode (the pod owner, or any
+    /// inheritable-Read holder — including the CTH `post-target-not-found` `clients.alice`, authorized via
+    /// the test container's inherited `acl:default`) keeps the true 404/405: they could GET/read the
+    /// target and learn its existence anyway, so the status discloses nothing new. The SUCCESS path (a
+    /// POST into an EXISTING container → 201) is NOT gated — an `acl:Append`-only drop-box writer must
+    /// still create members in a container that exists; only the existence-disclosing 404/405 branches are
+    /// folded. `granted` is the mode set the POST authorization already returned (no extra ACL resolution).
+    ///
+    /// Why the read-mode (not "`acl:accessTo` on the container") is the correct distinguisher: the CTH's
+    /// authorized POSTer reaches a MISSING target whose nearest existing ancestor (a freshly-created test
+    /// container) has NO own `.acl`, so it holds NO `accessTo` there — its authorization, like a
+    /// drop-box's, is via inherited `acl:default`. An `accessTo`-vs-`default` split would therefore fold
+    /// the legitimate owner (breaking the CTH 404) AND would leave the oracle OPEN for an
+    /// `acl:accessTo acl:Append`-WITHOUT-Read holder (still 403-vs-404 across an existing-locked vs a
+    /// missing child). The read-mode is the property that both (a) the owner genuinely holds and (b) an
+    /// existence-probing writer genuinely lacks. One narrow residual survives — a Read-holder-via-
+    /// inheritance who is SEPARATELY denied on a specific existing child by that child's own restrictive
+    /// `.acl` can still distinguish THAT child (403) from a missing one (404); this is WAC-inherent
+    /// (a per-child `.acl` legitimately overrides inheritance) and documented in decisions/0003.
+    fn guard_post_existence_requires_read(
+        &self,
+        target_iri: &str,
+        granted: &std::collections::BTreeSet<AccessMode>,
+        token: &VerifiedToken,
+    ) -> Result<(), ServerError> {
+        // The mode that governs reading THIS target's representation/existence: Control for an `.acl`
+        // (Control does NOT imply Read), else Read — identical to `guard_conditional_requires_read`.
+        let read_mode = if crate::authz::is_acl_resource(target_iri) {
+            AccessMode::Control
+        } else {
+            AccessMode::Read
+        };
+        if !granted.contains(&read_mode) {
+            return Err(if token.web_id.is_none() {
+                self.unauthenticated()
+            } else {
+                ServerError::Forbidden
+            });
+        }
+        Ok(())
+    }
+
     /// Whether the conditional precondition header `name` carries a CONCRETE entity-tag validator (a
     /// quoted ETag, or a list of them) rather than the bare `*` wildcard. An ABSENT header carries
     /// none; a bare `*` is existence-only (not content-derived) so it is NOT ETag-bearing; anything
@@ -900,7 +965,9 @@ pub async fn post_handler<S: Store>(
     // accept `[403]` for a real container and `[403, 404]` for a fictive one — authorize-first 403 is
     // within both).
     let origin = request_origin(&headers);
-    state.authorize("POST", &container, &token, origin).await?;
+    // Capture the FULL granted mode set (not just pass/fail): the existence-non-disclosure V6 Read-gate
+    // below folds the 404/405 existence branches unless the requester holds `acl:Read` on the target.
+    let granted = state.authorize("POST", &container, &token, origin).await?;
 
     // POST creates a CHILD in a CONTAINER — the target must be a container (trailing-slash path).
     // A POST to a non-container target is NOT a containment operation: per the Solid Protocol
@@ -908,6 +975,11 @@ pub async fn post_handler<S: Store>(
     // 405 Method-Not-Allowed when a plain resource is there (POST does not create a child of a
     // resource). (This supersedes the earlier 409 — a 409 is not the spec-accepted status here.)
     if !container.is_container {
+        // EXISTENCE-NON-DISCLOSURE (V6, decisions/0003): the non-container existence branch (405 when a
+        // resource is present, 404 when absent) DISCLOSES whether the named target exists. Fold it to
+        // the requester's denial unless they hold Read on the target — BEFORE the existence probe, so
+        // the deny path performs no target-dependent lookup (structural, per the ADR's timing note).
+        state.guard_post_existence_requires_read(&container.iri, &granted, &token)?;
         return if state.store.exists(&container.iri).await? {
             Err(ServerError::MethodNotAllowed)
         } else {
@@ -916,8 +988,30 @@ pub async fn post_handler<S: Store>(
     }
     // The container must exist (the authoritative index check) — never create a child + a containment
     // edge under a missing container. A missing container is a 404 (`post-target-not-found`).
-    if !state.store.exists(&container.iri).await? {
-        return Err(ServerError::NotFound);
+    //
+    // EXISTENCE-NON-DISCLOSURE (V6): this existence probe is a TARGET-DEPENDENT lookup, so for a
+    // requester who lacks the target's read-mode NEITHER of its non-create outcomes may be observable —
+    // not the 404 (missing) NOR a backend-fault 5xx. A bare `?` here would let a `store.exists` error
+    // escape as a 500 that an existing-but-forbidden sibling — denied at authorization, which reads only
+    // `.acl` records and never probes the target — does NOT produce, i.e. a backend-error existence/state
+    // oracle of the `patch_*_faulting_target_read` class. So BOTH the missing case AND a probe fault are
+    // folded to the requester's uniform denial (via the same read-mode gate); a read-mode holder — who is
+    // entitled to the target's state — gets the true 404 / the surfaced backend error. An EXISTING
+    // container falls through to the 201 create below (an Append-only writer legitimately creates
+    // members), so ONLY the non-create outcomes are gated — never the success path.
+    match state.store.exists(&container.iri).await {
+        // The container exists → fall through to the 201 create path below.
+        Ok(true) => {}
+        Ok(false) => {
+            state.guard_post_existence_requires_read(&container.iri, &granted, &token)?;
+            return Err(ServerError::NotFound);
+        }
+        Err(e) => {
+            // A backend fault on the existence probe: fold a non-read-mode requester to their uniform
+            // denial FIRST (so the 5xx is never observable to them), else surface the real error.
+            state.guard_post_existence_requires_read(&container.iri, &granted, &token)?;
+            return Err(e);
+        }
     }
 
     // A POST write MUST carry a Content-Type (Solid Protocol — `content-type-reject`): ABSENT ⇒ 400.
@@ -3403,6 +3497,383 @@ mod tests {
         // HEAD likewise.
         let head = run_verb(&state, "HEAD", MISSING, alice).await;
         assert_eq!(head.status, 404, "HEAD must also be a true 404 for Alice");
+    }
+
+    // --- V6: POST descendant-existence oracle (acl:default-Append drop-box) closed -----------------
+    //
+    // The PR #3 verifier execution-proved a SECOND existence oracle beyond the matrix above: an agent
+    // holding `acl:default acl:Append` on a container `/c/` (append FLOWS TO DESCENDANTS — the realistic
+    // "drop a file anywhere under /c/" grant, unlike the matrix's pure `acl:accessTo`-Append drop-box
+    // which cannot name a descendant) could POST to a SPECIFIC sub-container name and distinguish 403
+    // (exists, its own `.acl` denies him) from 404 (missing → inherited default authorizes, then the
+    // container-exists check 404s). The V6 closure Read-gates the POST existence branch: a requester
+    // WITHOUT `acl:Read` on the target gets the byte-identical denial for missing AND locked, so the
+    // status reveals nothing; a Read holder (the owner / the CTH `post-target-not-found` client) keeps
+    // the true 404. See `guard_post_existence_requires_read` + decisions/0003.
+
+    const DAVE: &str = "https://pod.example/dave/profile/card#me";
+    const EVE: &str = "https://pod.example/eve/profile/card#me";
+
+    /// The exact fixture the PR #3 verifier used. `/alice/c/` exists; its `.acl` grants:
+    ///  - ALICE (OWNER): `acl:accessTo` + `acl:default` Read/Write/Control (inheritable Read),
+    ///  - BOB (STRANGER): `acl:default acl:Append` ONLY — the drop-anywhere grant (flows to descendants,
+    ///    NO Read, NO `accessTo` on the container),
+    ///  - CAROL: `acl:accessTo acl:Append` + `acl:default acl:Append` — an accessTo-Append POSTer still
+    ///    WITHOUT Read (proves the Read-gate folds her too, where an accessTo-vs-default split wouldn't).
+    ///  - DAVE: `acl:default acl:Write` (no Read) — a write-anywhere holder. POST to a NON-container
+    ///    requires `acl:Write` (not Append), so DAVE is the principal that actually reaches (and is
+    ///    folded by) the non-container 404/405 branch — an Append-only holder is denied at authorization.
+    ///  - EVE: `acl:default acl:Control` (no Read) — reaches a POST to a `.acl` target (which requires
+    ///    Control) and MUST keep the true 404/405 there, since Control governs an `.acl`'s existence.
+    ///
+    /// An EXISTING sub-container `/alice/c/hidden/` carries its OWN restrictive `.acl` (Alice only) so
+    /// Bob/Carol are DENIED there (its `accessTo` overrides the inherited default). `/alice/c/ghost/` is
+    /// never created (missing). An EXISTING open plain resource `/alice/c/opendoc` (no own `.acl`) lets a
+    /// no-Read writer inherit Write but not Read — for the non-container 405 branch.
+    async fn store_dropbox_default_append_locked_subcontainer(
+    ) -> Arc<LdpState<CompositeStore<InMemorySparqClient, InMemoryBlobStore>>> {
+        let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        store
+            .write(
+                "https://pod.example/alice/c/",
+                AxBytes::from(String::new()),
+                "text/turtle",
+            )
+            .await
+            .expect("seed container");
+        let c_acl = format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#alice> a acl:Authorization; acl:agent <{OWNER}>; acl:accessTo <https://pod.example/alice/c/>; acl:default <https://pod.example/alice/c/>; acl:mode acl:Read, acl:Write, acl:Control.
+<#bob> a acl:Authorization; acl:agent <{STRANGER}>; acl:default <https://pod.example/alice/c/>; acl:mode acl:Append.
+<#carol> a acl:Authorization; acl:agent <{CAROL}>; acl:accessTo <https://pod.example/alice/c/>; acl:default <https://pod.example/alice/c/>; acl:mode acl:Append.
+<#dave> a acl:Authorization; acl:agent <{DAVE}>; acl:default <https://pod.example/alice/c/>; acl:mode acl:Write.
+<#eve> a acl:Authorization; acl:agent <{EVE}>; acl:default <https://pod.example/alice/c/>; acl:mode acl:Control."#
+        );
+        store
+            .write(
+                "https://pod.example/alice/c/.acl",
+                AxBytes::from(c_acl),
+                "text/turtle",
+            )
+            .await
+            .expect("seed container acl");
+        // Existing LOCKED sub-container with its OWN restrictive `.acl` (Alice only → Bob/Carol denied).
+        store
+            .write(
+                "https://pod.example/alice/c/hidden/",
+                AxBytes::from(String::new()),
+                "text/turtle",
+            )
+            .await
+            .expect("seed hidden subcontainer");
+        let hidden_acl = format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#alice> a acl:Authorization; acl:agent <{OWNER}>; acl:accessTo <https://pod.example/alice/c/hidden/>; acl:default <https://pod.example/alice/c/hidden/>; acl:mode acl:Read, acl:Write, acl:Control."#
+        );
+        store
+            .write(
+                "https://pod.example/alice/c/hidden/.acl",
+                AxBytes::from(hidden_acl),
+                "text/turtle",
+            )
+            .await
+            .expect("seed hidden acl");
+        // Existing OPEN plain resource (no own `.acl`) — a no-Read writer inherits Append but not Read.
+        store
+            .write(
+                "https://pod.example/alice/c/opendoc",
+                AxBytes::from(
+                    "<https://pod.example/alice/c/opendoc#me> <http://p> <http://o> .".to_string(),
+                ),
+                "text/turtle",
+            )
+            .await
+            .expect("seed opendoc");
+        Arc::new(LdpState::new(store, "https://pod.example"))
+    }
+
+    #[tokio::test]
+    async fn v6_post_default_append_dropbox_existence_oracle_closed() {
+        // Bob holds `acl:default acl:Append` over /alice/c/ (drop-anywhere) but NO Read. Probing a
+        // specific descendant CONTAINER name must NOT reveal existence: a MISSING sub-container (ghost/)
+        // and an EXISTING-but-locked one (hidden/, own `.acl` denies Bob) MUST be BYTE-IDENTICAL denials
+        // — before this closure ghost/ was a 404 and hidden/ a 403 (the proven oracle).
+        let state = store_dropbox_default_append_locked_subcontainer().await;
+        let on_missing = run_verb(&state, "POST", "/alice/c/ghost/", bob()).await;
+        let on_locked = run_verb(&state, "POST", "/alice/c/hidden/", bob()).await;
+        assert_eq!(
+            on_missing, on_locked,
+            "POST to a MISSING sub-container must be BYTE-IDENTICAL to an EXISTING-but-locked one \
+             (else it is an existence oracle).\n missing: {on_missing:?}\n locked:  {on_locked:?}"
+        );
+        assert_eq!(
+            on_missing.status, 403,
+            "the folded denial is 403 for authenticated Bob, never the 404 that reveals absence"
+        );
+        assert_ne!(
+            on_missing.status, 404,
+            "a no-Read drop-box writer must NEVER see the 404 existence signal"
+        );
+        assert!(
+            on_missing.location.is_none(),
+            "a folded POST denial must carry no Location"
+        );
+    }
+
+    #[tokio::test]
+    async fn v6_post_write_without_read_non_container_branch_closed() {
+        // The NON-container existence branch (405 when a resource is present, 404 when absent) is folded
+        // for a no-Read WRITER. NB: POST to a non-container requires `acl:Write` (not Append), so the
+        // principal that reaches this branch is DAVE (`acl:default acl:Write`, no Read) — an Append-only
+        // holder is denied at authorization and never gets here (which is why the earlier Append-only
+        // version of this test did not actually exercise the guard: roborev #4549 Low). DAVE POSTing to a
+        // MISSING plain path (ghostdoc → was 404) and to an EXISTING open plain resource (opendoc → was
+        // 405, he inherits Write not Read) both fold to 403, indistinguishable from one another.
+        let state = store_dropbox_default_append_locked_subcontainer().await;
+        let dave = VerifiedToken {
+            web_id: Some(DAVE.into()),
+            ..VerifiedToken::default()
+        };
+        let on_missing_doc = run_verb(&state, "POST", "/alice/c/ghostdoc", dave.clone()).await;
+        let on_open_doc = run_verb(&state, "POST", "/alice/c/opendoc", dave).await;
+        assert_eq!(
+            on_missing_doc.status, 403,
+            "a MISSING non-container POST (was 404) folds to 403 for a Write-without-Read writer: {on_missing_doc:?}"
+        );
+        assert_eq!(
+            on_open_doc.status, 403,
+            "an EXISTING open non-container POST (was 405) folds to 403 for a Write-without-Read writer: {on_open_doc:?}"
+        );
+        assert_eq!(
+            on_missing_doc, on_open_doc,
+            "the non-container 404 and 405 branches must both fold to the SAME denial (no oracle)"
+        );
+    }
+
+    #[tokio::test]
+    async fn v6_post_control_holder_on_acl_target_keeps_true_existence_status() {
+        // The `.acl` Control-as-read case (roborev #4549 Medium): a POST to a `.acl` target requires
+        // `acl:Control` (any operation on an `.acl` is Control), and reading an `.acl`'s existence is
+        // ALSO governed by Control — so a Control-holder WITHOUT Read must keep the true 404/405, NOT be
+        // folded (a naive Read-only gate would wrongly fold them). EVE holds `acl:default acl:Control`
+        // (no Read); POSTing to a MISSING `.acl` target she gets the true 404 (a `.acl` is a non-container
+        // → the 404 absent / 405 present branch). Anyone WITHOUT Control is already denied at
+        // authorization (POST-to-`.acl` requires Control), so the guard never wrongly discloses to a
+        // non-entitled principal.
+        let state = store_dropbox_default_append_locked_subcontainer().await;
+        let eve = VerifiedToken {
+            web_id: Some(EVE.into()),
+            ..VerifiedToken::default()
+        };
+        // A MISSING `.acl` target: EVE (Control, the `.acl` read-mode) must see the TRUE 404, not a fold.
+        let on_missing_acl = run_verb(&state, "POST", "/alice/c/ghostdoc.acl", eve).await;
+        assert_eq!(
+            on_missing_acl.status, 404,
+            "a Control-holder POSTing to a missing `.acl` keeps the true 404 (Control governs `.acl` \
+             existence — must not be folded like a plain Read-less writer): {on_missing_acl:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v6_post_owner_still_gets_true_404_on_missing_subcontainer() {
+        // CTH preservation (`post-target-not-found`): the OWNER (Alice, inheritable Read via `acl:default`)
+        // POSTing to a genuinely-missing sub-container gets a TRUE 404 — the Read-gate folds ONLY non-Read
+        // requesters, never a Read holder. Alice reaches the missing target exactly as the CTH's
+        // `clients.alice` does: authorized via inherited `acl:default`, holding NO `accessTo` there (so an
+        // accessTo-based distinguisher would have WRONGLY folded her → this is why Read is the right gate).
+        let state = store_dropbox_default_append_locked_subcontainer().await;
+        let alice = VerifiedToken {
+            web_id: Some(OWNER.into()),
+            ..VerifiedToken::default()
+        };
+        let got = run_verb(&state, "POST", "/alice/c/ghost/", alice).await;
+        assert_eq!(
+            got.status, 404,
+            "an authorized-Read owner must keep the true 404 on a missing POST target (CTH): {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v6_post_accessto_append_without_read_is_also_folded() {
+        // Carol holds `acl:accessTo acl:Append` on the container (a "genuine POSTer" by an accessTo-vs-
+        // default distinguisher) PLUS `acl:default acl:Append` (so she can reach a sub-container) but NO
+        // Read. An accessTo-vs-default split would hand her a 404 on ghost/ and thereby REOPEN the oracle
+        // (she still gets 403 on hidden/). The Read-gate correctly folds her too: ghost/ == hidden/ == 403.
+        let state = store_dropbox_default_append_locked_subcontainer().await;
+        let carol = VerifiedToken {
+            web_id: Some(CAROL.into()),
+            ..VerifiedToken::default()
+        };
+        let on_missing = run_verb(&state, "POST", "/alice/c/ghost/", carol.clone()).await;
+        let on_locked = run_verb(&state, "POST", "/alice/c/hidden/", carol).await;
+        assert_eq!(
+            on_missing, on_locked,
+            "accessTo-Append-WITHOUT-Read: missing must equal locked (oracle closed for her too):\n \
+             missing: {on_missing:?}\n locked: {on_locked:?}"
+        );
+        assert_eq!(
+            on_missing.status, 403,
+            "accessTo-Append-without-Read folds to 403 on a missing child (Read is the gate, not accessTo)"
+        );
+    }
+
+    #[tokio::test]
+    async fn v6_post_append_only_dropbox_create_into_existing_container_still_201() {
+        // The Read-gate folds ONLY the existence-disclosing 404/405 branches — the SUCCESS path is
+        // untouched. An `acl:Append`-only drop-box writer (no Read) POSTing INTO the EXISTING container he
+        // holds Append on still mints a member → 201. (Reuses the canonical Append-only fixture.)
+        let store = store_alice_container_bob_append_only().await;
+        let state = Arc::new(LdpState::new(store, "https://pod.example"));
+        let got = run_verb(&state, "POST", "/alice/c/", bob()).await;
+        assert_eq!(
+            got.status, 201,
+            "an Append-only drop-box POST into an EXISTING container must still succeed (201): {got:?}"
+        );
+        assert!(
+            got.location.is_some(),
+            "a successful drop-box POST must return a Location"
+        );
+    }
+
+    // --- V6 (roborev job 4551, Medium): the missing-container existence probe must not leak a backend
+    //     fault as a 500 to a no-read requester (a `patch_*_faulting_target_read`-class oracle) ---------
+
+    /// A [`Store`] whose `exists` FAULTS (a non-`NotFound` backend inconsistency) while it serves a real
+    /// container `.acl` at `/alice/c/.acl` so authorization reaches a genuine allow. The `.acl` grants
+    /// ALICE (`OWNER`) `acl:default` Read/Write/Control and BOB (`STRANGER`) `acl:default acl:Append` only
+    /// (no Read) — both inherit onto the descendant `/alice/c/ghost/`. A POST to that (would-be) missing
+    /// container passes authorization (both hold Append via inherited default), THEN the existence probe
+    /// faults: a no-Read Bob MUST be folded to 403 (never the 500), while the Read-holding owner gets the
+    /// 500 surfaced post-auth (entitled to the target's state).
+    struct PostExistsFaultyStore;
+
+    impl PostExistsFaultyStore {
+        fn container_acl() -> String {
+            format!(
+                r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#alice> a acl:Authorization; acl:agent <{OWNER}>; acl:default <https://pod.example/alice/c/>; acl:mode acl:Read, acl:Write, acl:Control.
+<#bob> a acl:Authorization; acl:agent <{STRANGER}>; acl:default <https://pod.example/alice/c/>; acl:mode acl:Append."#
+            )
+        }
+        fn acl_meta() -> ResourceMeta {
+            ResourceMeta {
+                content_type: "text/turtle".into(),
+                blob_key: "k".into(),
+                etag: "\"acl\"".into(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Store for PostExistsFaultyStore {
+        async fn read(&self, iri: &str) -> ServerResult<Resource> {
+            if iri == "https://pod.example/alice/c/.acl" {
+                return Ok(Resource {
+                    body: AxBytes::from(Self::container_acl()),
+                    meta: Self::acl_meta(),
+                });
+            }
+            Err(ServerError::NotFound)
+        }
+        async fn meta(&self, iri: &str) -> ServerResult<Option<ResourceMeta>> {
+            if iri == "https://pod.example/alice/c/.acl" {
+                return Ok(Some(Self::acl_meta()));
+            }
+            Ok(None)
+        }
+        async fn exists(&self, _iri: &str) -> ServerResult<bool> {
+            // The backend inconsistency the test injects: the existence probe FAULTS (non-NotFound), so a
+            // bare `?` at the call site would 500. authorization never calls `exists` (it reads only ACL
+            // records via `meta`/`read`), so the fault surfaces ONLY at the post-auth existence check.
+            Err(ServerError::Storage(
+                "simulated backend inconsistency".into(),
+            ))
+        }
+        async fn write(
+            &self,
+            _iri: &str,
+            _body: AxBytes,
+            _content_type: &str,
+        ) -> ServerResult<ResourceMeta> {
+            panic!("write must not be reached: the faulted exists probe folds/surfaces first");
+        }
+        async fn create_in_container(
+            &self,
+            _container: &str,
+            _child: &str,
+            _body: AxBytes,
+            _content_type: &str,
+        ) -> ServerResult<ResourceMeta> {
+            panic!("create_in_container must not be reached on a faulted exists probe");
+        }
+        async fn delete(&self, _iri: &str, _parent: Option<&str>) -> ServerResult<()> {
+            Ok(())
+        }
+        async fn delete_container_if_empty(
+            &self,
+            _iri: &str,
+            _parent: Option<&str>,
+        ) -> ServerResult<DeleteOutcome> {
+            Ok(DeleteOutcome::NotFound)
+        }
+        async fn list_children(
+            &self,
+            _container: &str,
+        ) -> ServerResult<Vec<crate::store::ValidatedChildIri>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn v6_post_no_read_writer_exists_fault_folds_to_denial_not_500() {
+        // roborev 4551 (Medium): a no-Read drop-box writer (Bob, `acl:default acl:Append`) POSTing to a
+        // container whose existence probe FAULTS must get the uniform denial (403), NOT a 500 — else the
+        // backend fault is an existence/state oracle (an existing-but-forbidden sibling denies at
+        // authorization with NO target probe, so it can never 500). The store PANICS if a write is reached.
+        let state = Arc::new(LdpState::new(PostExistsFaultyStore, "https://pod.example"));
+        let uri: axum::http::Uri = "/alice/c/ghost/".parse().unwrap();
+        let err = post_handler(
+            State(state),
+            Extension(bob()),
+            uri,
+            turtle_headers(),
+            request_body_bytes(),
+        )
+        .await
+        .expect_err("a no-Read writer's faulting existence probe must be a denial, never a 500");
+        assert_eq!(
+            err.status(),
+            StatusCode::FORBIDDEN,
+            "a no-Read writer's faulting existence probe must fold to 403, never leak a 500: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v6_post_authorized_reader_exists_fault_surfaces_500_post_auth() {
+        // The control (mirrors patch_authorized_caller_with_faulting_target_read_gets_500_surfaced_post_auth):
+        // the OWNER (Alice, inheritable Read) is ENTITLED to the target's state, so a faulting existence
+        // probe surfaces the real 500 AFTER authorization — it is NOT folded. The store PANICS on write,
+        // proving the error surfaced before any create.
+        let state = Arc::new(LdpState::new(PostExistsFaultyStore, "https://pod.example"));
+        let alice = VerifiedToken {
+            web_id: Some(OWNER.into()),
+            ..VerifiedToken::default()
+        };
+        let uri: axum::http::Uri = "/alice/c/ghost/".parse().unwrap();
+        let err = post_handler(
+            State(state),
+            Extension(alice),
+            uri,
+            turtle_headers(),
+            request_body_bytes(),
+        )
+        .await
+        .expect_err("a Read-holding owner sees the surfaced backend error");
+        assert_eq!(
+            err.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a Read-holding owner is entitled to the surfaced backend error (500), post-auth: {err:?}"
+        );
     }
 
     // --- V1: PUT-create now requires target Write (the drop-box trade-off) -------------------------

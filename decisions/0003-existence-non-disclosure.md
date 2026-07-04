@@ -18,19 +18,30 @@ to create new members, yet must learn NOTHING about which member names already e
 This server already evaluated authorization BEFORE the existence check on GET/HEAD/DELETE and on a
 delete-bearing PATCH (so those paths fold a missing-but-would-be-readable target's denial uniformly,
 and the WAC resolver reads only `.acl` resources — never the target's own bytes). This ADR closes the
-**remaining five** existence side-channels (V1–V5), all of the "create-rights-on-parent,
-no-rights-on-target" shape, and states the invariant that governs all of them.
+existence side-channels of the "create-rights-on-parent, no-rights-on-target" shape (V1–V5), plus the
+`acl:default acl:Append` "drop-anywhere" descendant-existence oracle the PR #3 adversarial verify later
+execution-proved (V6), and states the invariant that governs all of them.
 
 ## Decision — the invariant
 
-> **A `404` is served ONLY to a requester who holds the operation's required mode.** Every other
+> **A `404` is served ONLY to a requester who holds the operation's required mode — and, on a branch
+> whose STATUS itself discloses existence, only to one who holds `acl:Read` on the target.** Every other
 > requester — anonymous, or authenticated-but-lacking-the-mode — receives their DENIAL code (401 if
 > anonymous, 403 if authenticated) for BOTH "forbidden-existing" AND "not-found", **byte-identically**:
 > same status, same body, same headers (`Location`, `ETag`, `WWW-Authenticate`). The rule applies
 > across GET / HEAD / PUT / POST / PATCH / DELETE **and** the conditional / header channels, so no
-> single verb or header is an existence oracle — with ONE narrow, WAC-inherent residual on the
+> single verb or header is an existence oracle — with TWO narrow, WAC-inherent residuals: one on the
 > PUT/PATCH **create-vs-overwrite** membership axis (see "Residual — the create/overwrite membership
-> asymmetry" below).
+> asymmetry" below), and one on the **POST inherited-Read descendant-existence** axis (see "Residual —
+> the POST inherited-Read descendant existence asymmetry" below).
+
+The **existence-disclosing STATUS** qualifier is why POST needs the extra `acl:Read` gate (V6 below):
+a POST authorizes only `acl:Append`, which for a MISSING target is satisfied via the target's INHERITED
+`acl:default` — an Append-holder can therefore NAME a descendant and read its existence out of the
+404/405-vs-403 split without ever holding Read. The V4 conditional channel is the exact same shape (a
+`Write`-without-`Read` holder reading existence/ETag out of a 412-vs-2xx), and is closed the same way:
+**a branch whose status DISCLOSES existence requires `acl:Read`, not merely the operation's write-mode.**
+GET/HEAD already require Read intrinsically, so their authorized-reader 404 is unaffected.
 
 Equivalently: **`404` means "you were allowed to know, and it isn't there."**
 
@@ -53,10 +64,11 @@ There are three ways to make missing and forbidden indistinguishable, and only o
 So the implementation folds *the missing case up into the denial*, never the forbidden case down into
 a 404.
 
-## The five closures (V1–V5)
+## The closures (V1–V6)
 
 The adversary throughout is the drop-box writer: `acl:Append` on the parent, no `acl:Read`/`Write` on
-the target.
+the target. V1–V5 close the `acl:accessTo acl:Append` shape; V6 (added after the PR #3 verify) closes the
+`acl:default acl:Append` "drop-anywhere" shape that flows to descendants.
 
 ### V1 — PUT create-vs-forbidden-overwrite
 
@@ -152,6 +164,86 @@ by V4. Together these Read-gate the container ETag end-to-end. The invariant is 
 emission site and `representation_etag`: if a future change emits a container's representation ETag
 outside a Read-gated path, the gate MUST be re-established there.
 
+### V6 — POST descendant-existence via inherited `acl:default` (the drop-anywhere grant)
+
+**Discovered by the PR #3 adversarial verify (execution-proved), after V1–V5 landed.** The matrix's
+drop-box adversary holds `acl:accessTo acl:Append` on `/c/` — a grant that does NOT flow to descendants,
+so that adversary cannot even NAME a sub-container as a POST target (a POST to `/c/sub/` resolves
+`/c/sub/`'s effective ACL via the `acl:default` scope, which an `accessTo`-only rule never matches, so it
+is a uniform 403). But a **realistic** "drop a file anywhere under `/c/`" grant is `acl:default acl:Append`
+— which DOES flow to every descendant. With it:
+
+**Before:** for an agent (Bob) holding `acl:default acl:Append` on `/c/` (no Read):
+- `POST /c/hidden/` where `hidden/` EXISTS with its OWN restrictive `.acl` denying Bob → **403** (the
+  child's `accessTo` overrides the inherited default at authorization).
+- `POST /c/ghost/` where `ghost/` is MISSING → the inherited `acl:default acl:Append` authorizes the
+  POST, then the container-exists check returns **404**.
+
+The 403-vs-404 split lets Bob enumerate which descendant names exist — even ones he may not access. The
+identical split exists on the non-container branch (`405` for an existing plain resource he inherits
+Append on, `404` for a missing one).
+
+**Fix:** the POST **existence branch** (the 404 for a missing container, and the 404/405 for a
+non-container) is an existence DISCLOSURE, so it requires the target's READ-mode — `acl:Read` for a normal
+resource, but `acl:Control` for an `.acl` target (reading an `.acl`'s existence is a Control operation;
+`Control` does not imply `Read`, so a Control-only holder — who IS entitled to know the `.acl`'s existence
+— must not be folded). This is EXACTLY the read-mode the V4 conditional-channel gate
+(`guard_conditional_requires_read`) computes, kept in lock-step. When the (already-authorized) requester's
+granted modes do NOT include that read-mode, the handler returns the requester's DENIAL (401 anon / 403
+authenticated) — byte-identical to an existing-but-forbidden sibling — INSTEAD of the 404/405. A read-mode
+holder (the pod owner, or any inheritable-Read holder) keeps the true 404/405: they could GET/read the
+target and learn its existence anyway. The **success path is NOT gated** — a POST into an EXISTING
+container still returns 201 for an `acl:Append`-only writer, so the drop-box create workflow is intact;
+only the existence-disclosing 404/405 branches fold. Enforced in `post_handler` via
+`guard_post_existence_requires_read`, BEFORE the existence probe on the non-container branch. NB the
+required mode to even REACH each branch differs — POST to a **container** requires `acl:Append`, to a
+**non-container** requires `acl:Write`, and to an **`.acl`** requires `acl:Control` — but the gate is
+uniform: whatever governs READING that target's existence.
+
+**The backend-fault sub-channel (closed too).** The missing-**container** branch must PROBE existence
+(`store.exists`) to decide create-vs-not — it cannot run the gate first, because an EXISTING container is
+the 201 success path an Append-only writer is entitled to. That probe is a TARGET-dependent lookup, so a
+`store.exists` FAULT would otherwise escape as a 500 to a no-read requester — a 500 an
+existing-but-forbidden sibling (denied at authorization, which reads only `.acl` records and never probes
+the target) can never produce, i.e. a backend-error existence/state oracle of the same class the
+`patch_*_faulting_target_read` tests pin. So the probe folds BOTH its non-create outcomes — the `Ok(false)`
+missing case AND an `Err` fault — through the read-mode gate; a read-mode holder (entitled to the target's
+state) still gets the true 404 / the surfaced 500. The non-container branch needs no such handling: its
+gate runs before the probe, so a no-read requester never reaches the `exists` call.
+
+**Why `acl:Read`, not "`acl:accessTo` on the container" (the discarded distinguisher).** The obvious
+alternative — grant the 404 only to a requester with a genuine `acl:accessTo` container-write right, fold
+everyone authorized merely by inherited `acl:default` — is WRONG on two counts, both verified against the
+CTH:
+- It **breaks the CTH.** `protocol/writing-resource/post-target-not-found` POSTs (as the OWNER
+  `clients.alice`) to a reserved child of a **freshly `createContainer()`'d** test container that has NO
+  own `.acl`; Alice's authorization there is via the pod root's inherited `acl:default`, so she holds NO
+  `accessTo` on the nearest existing ancestor. An `accessTo`-based fold would 403 her → the required 404
+  fails.
+- It **does not even close the oracle.** An agent holding `acl:accessTo acl:Append` on `/c/` (a "genuine
+  POSTer" by that distinguisher) but no Read STILL gets 403 on an existing-locked child and would get 404
+  on a missing one — the split just moves to a different grant shape. `acl:Read` is the one property that
+  the legitimate owner genuinely holds and an existence-probing writer genuinely lacks, and it aligns V6
+  with V4/V5 (existence/content disclosure ⇒ Read).
+
+### Residual — the POST inherited-Read descendant existence asymmetry (LOW, accepted; inherent to WAC)
+
+V6 fully closes the oracle for any requester who lacks Read on the target — the proven, realistic drop-box
+case. One narrow principal still distinguishes: a requester who holds `acl:Read` on a subtree **via an
+ancestor's `acl:default`** but is SEPARATELY denied on a specific EXISTING child by that child's OWN
+restrictive `.acl` gets a **403** on that locked child versus a **404** on a missing sibling — revealing
+that one child's existence. This is **inherent to Web Access Control**, exactly like the V1
+create/overwrite residual: a per-child `.acl` legitimately OVERRIDES inherited access (that is the whole
+point of `accessTo`), and `acl:default` (which flows to descendants) and a child's own `accessTo` are
+INDEPENDENTLY grantable, so the "inherits Read from the parent, denied by the child's own ACL" shape is
+expressible and cannot be authorized away without either (a) dropping the child-`.acl`-overrides-parent
+rule — which breaks WAC — or (b) folding the authorized-reader 404 itself — reopening the disclosure for
+the very reader the CTH requires it for. The exposure is **bounded**: it needs that specific split (an
+owner who grants Read over a subtree via `acl:default` yet writes a child `.acl` that excludes that same
+reader — unusual), it reveals only **existence** of that one child (never content — V4/V5 hold), and only
+to a principal already trusted to READ the surrounding subtree. It is therefore **accepted** rather than
+closed — hence the second narrowing of the invariant above.
+
 ### The coarse timing channel
 
 The under-authorized denial is returned **before** any target-dependent `meta()`/read/existence probe
@@ -161,7 +253,7 @@ missing and forbidden branches. **Microsecond-level parity is explicitly OUT OF 
 resolution, cache hits, and allocator behaviour all vary; a constant-time guarantee is not attempted and
 not claimed. The closure is structural (no target probe on the deny path), not chrono-constant.
 
-## Conformance latitude (why V1–V5 keep the CTH at 41/41)
+## Conformance latitude (why V1–V6 keep the CTH at 41/41)
 
 The Solid Conformance Test Harness leaves exactly the latitude these closures need (see
 `solid/specification#311` on the under-determined create/deny status codes):
@@ -183,6 +275,14 @@ The Solid Conformance Test Harness leaves exactly the latitude these closures ne
   `clients.alice` GETs/POSTs a missing target → 404), and `containment.feature:122`. Our rule keeps the
   404 for a requester holding the required mode — V1–V5 only change the *under-authorized* requester's
   response.
+- **V6 specifically keeps `post-target-not-found` green.** That scenario POSTs (as the OWNER
+  `clients.alice`) to a reserved child of a freshly-created test container → expects 404 (Scenario 1) or
+  `[404, 405]` (Scenarios 2–4). Alice holds inheritable `acl:Read` on the test subtree (she is the pod
+  owner via the root ACL's `acl:default`), so V6's Read-gate leaves her true 404/405 UNTOUCHED. The
+  **POST-fictive deny** rows an under-authorized writer hits are set-valued (`[401, 404]` / `[403, 404]`),
+  so V6's fold of a no-Read writer to 401/403 lands inside every such set. No CTH row expects an
+  Append-only-without-Read POSTer to receive a 404/405 on a missing/reserved target, so the fold breaks
+  nothing.
 - The **exact 401-vs-403 split** is unchanged: `write-access-public` GET = 401, `write-access-bob`
   GET = 403; the folded missing→denial uses the requester's own code (401 anon / 403 authenticated).
 - V2's opaque `Location` still satisfies `post-uri-assignment-slug.feature` (`Location contains
@@ -211,6 +311,23 @@ Each is pinned by a test in `src/ldp/handler.rs` (`mod tests`):
   `v4_write_without_read_conditional_delete_is_denied`); an UNCONDITIONAL write by a Write holder still
   succeeds (`v4_write_without_read_unconditional_put_still_succeeds`).
 - **V5** the container membership ETag reaches only a reader (`v5_container_etag_only_reaches_a_reader`).
+- **V6** an `acl:default acl:Append` (no-Read) writer cannot distinguish a missing sub-container from an
+  existing-but-locked one — byte-identical 403 on both, on the container branch
+  (`v6_post_default_append_dropbox_existence_oracle_closed`); the non-container branch (which requires
+  `acl:Write`) folds a Write-without-Read writer likewise
+  (`v6_post_write_without_read_non_container_branch_closed`); the accessTo-Append-without-Read POSTer is
+  folded too, so the discarded accessTo-distinguisher cannot reopen it
+  (`v6_post_accessto_append_without_read_is_also_folded`); the OWNER (inheritable Read) keeps the true 404
+  (`v6_post_owner_still_gets_true_404_on_missing_subcontainer`, the CTH `post-target-not-found` analog); a
+  Control-holder POSTing to an `.acl` target keeps the true 404/405 — the gate uses the target's read-mode
+  (Control for an `.acl`, not Read), so a Control-only holder is never wrongly folded
+  (`v6_post_control_holder_on_acl_target_keeps_true_existence_status`); a `store.exists` fault on the
+  missing-container probe folds to the no-read requester's denial rather than leaking a 500, while the
+  Read-holding owner still gets the surfaced 500 post-auth
+  (`v6_post_no_read_writer_exists_fault_folds_to_denial_not_500`,
+  `v6_post_authorized_reader_exists_fault_surfaces_500_post_auth`); and the Append-only drop-box create
+  into an EXISTING container still succeeds — the success path is not gated
+  (`v6_post_append_only_dropbox_create_into_existing_container_still_201`).
 
 ## Consequences
 
@@ -218,6 +335,11 @@ Each is pinned by a test in `src/ldp/handler.rs` (`mod tests`):
   here. POST mints a collision-free opaque name, so the drop-box workflow is fully supported.
 - A POST `Location` is now always opaque-suffixed (`…/<slug>-<opaque>`), never the verbatim Slug. Client
   code must read the `Location` header (it always could; the Slug was only ever a hint).
+- An `acl:default acl:Append` "drop-anywhere" grant (V6) lets an agent POST members into any EXISTING
+  descendant container it inherits Append on (→ 201), but no longer lets it enumerate which descendant
+  names exist: a POST to a missing/locked descendant is now the requester's uniform denial unless it also
+  holds `acl:Read` on the target.
 - Conformance is unchanged at **41/41** (the closures live inside the harness's set-valued / hint
-  latitude; re-run `cargo build --release && ./conformance/run.sh`).
+  latitude; V6 preserves `post-target-not-found`'s owner-404 via the Read-gate — re-run
+  `cargo build --release && ./conformance/run.sh`, esp. `post-target-not-found`, before final arming).
 - Microsecond timing parity is out of scope (above); the closure is structural.
