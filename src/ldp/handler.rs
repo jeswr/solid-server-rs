@@ -509,6 +509,19 @@ pub(crate) async fn serve_read<S: Store>(
     // those advertisements exactly like a 200 (they describe the RESOURCE, not the representation).
     let mut out = HeaderMap::new();
     set_str(&mut out, header::ETAG, &etag);
+    // `Vary: Accept` (RFC 9110 §12.5.5): the representation AND its `ETag` above were selected using
+    // the request's `Accept` header (RDF conneg Turtle↔JSON-LD; a container's rendered body is
+    // likewise Accept-driven), so a shared cache MUST key on `Accept` too — otherwise it could serve
+    // a Turtle response (or a Turtle-tagged 304) to a client that asked for JSON-LD, or vice versa
+    // (the roborev finding on 1e5a47d this closes: representation-specific validators were added
+    // without the matching `Vary`, leaving caches free to conflate negotiated representations).
+    // Emitted UNCONDITIONALLY on every read response that reaches this point (200/304/206/416) —
+    // including for a verbatim non-RDF resource, where it is merely conservative (the representation
+    // never changes shape, but declaring the dependency is always safe per RFC 9110 §12.5.5). The
+    // CORS middleware (the outermost layer) MERGES its own `Vary: Origin` onto whatever the handler
+    // sets rather than overwriting it (see `cors::merge_vary`), so the wire value ends up
+    // `Accept, Origin`.
+    set_str(&mut out, header::VARY, "Accept");
     // Method advertisement on the read response: `Allow` (the LDP verb set — `read-method-allow`
     // asserts GET/HEAD responses carry `Allow` listing GET + HEAD) + `Accept-Post` (containers only)
     // + `Accept-Patch`. (OPTIONS itself is answered by the CORS layer, which short-circuits every
@@ -3089,6 +3102,38 @@ mod tests {
         assert!(
             body_bytes(not_mod).await.is_empty(),
             "a 304 carries no body"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_200_and_304_both_carry_vary_accept() {
+        // RFC 9110 §12.5.5 (roborev finding on 1e5a47d): the representation — and hence its `ETag`
+        // — was selected using `Accept`, so BOTH the 200 and the 304 that shares its validator must
+        // declare that dependency via `Vary: Accept`, or a shared cache could conflate a Turtle
+        // response with a JSON-LD one for the same resource state.
+        let state = state_with_owner_resource(
+            "/alice/doc",
+            "<https://pod.example/alice/doc#me> <http://xmlns.com/foaf/0.1/name> \"X\" .",
+        )
+        .await;
+
+        let ok = get_with(&state, owner_token(), "/alice/doc", HeaderMap::new()).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(
+            ok.headers().get(header::VARY).unwrap(),
+            "Accept",
+            "a 200 must declare Vary: Accept"
+        );
+        let etag = etag_of(&ok);
+
+        let mut cond = HeaderMap::new();
+        cond.insert(header::IF_NONE_MATCH, HeaderValue::from_str(&etag).unwrap());
+        let not_mod = get_with(&state, owner_token(), "/alice/doc", cond).await;
+        assert_eq!(not_mod.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            not_mod.headers().get(header::VARY).unwrap(),
+            "Accept",
+            "a 304 must ALSO declare Vary: Accept — it shares the 200's negotiated validator"
         );
     }
 

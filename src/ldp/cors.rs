@@ -272,6 +272,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merges_a_handler_set_vary_accept_with_vary_origin() {
+        // The LDP read handler sets `Vary: Accept` (content negotiation — bead vltw); this CORS
+        // middleware runs OUTERMOST and must MERGE its own `Vary: Origin` onto that rather than
+        // clobber it, so a cache correctly keys on BOTH headers.
+        let app = Router::new()
+            .route(
+                "/r",
+                get(|| async {
+                    let mut resp = "ok".into_response();
+                    resp.headers_mut()
+                        .insert(header::VARY, HeaderValue::from_static("Accept"));
+                    resp
+                }),
+            )
+            .layer(axum::middleware::from_fn(cors_middleware));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/r")
+                    .header("origin", "https://tester")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let vary = resp
+            .headers()
+            .get(header::VARY)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            vary.contains("Accept"),
+            "must keep the handler's Vary: Accept, got {vary:?}"
+        );
+        assert!(
+            vary.contains("Origin"),
+            "must ALSO add Vary: Origin, got {vary:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn plain_options_without_acrm_passes_through_to_the_handler() {
         // A non-preflight OPTIONS (no Access-Control-Request-Method) is NOT short-circuited — it
         // reaches the inner service (here the route has no OPTIONS handler → 405, but the point is the
