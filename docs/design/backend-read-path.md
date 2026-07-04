@@ -420,6 +420,8 @@ never a merge gate**, reported with run context — unchanged discipline
 | read-7-embedded-bench | run the §7 table + advisory timings on `PSS_SPARQ_BACKEND=embedded` (extends 0001 follow-up (3): full CTH on embedded) | read-2..4 | measurement |
 | read-8-decide-seam | `SparqClient::decide` family per §5.2 + differential-oracle harness vs the in-Rust `WacAuthorizer` | **gated on sparq#992** | deterministic + parity |
 | read-9-speculative | `SOLID_SERVER_SPECULATIVE_READ` overlap flag (default OFF, §3.2) | read-2..4 | deterministic |
+| write-2-planned-authz | **LANDED** — the read-2 walk collapse applied to the WRITE verbs: `WacAuthorizer::authorize_planned` (mode-generic, same planned resolver + LIVE found-ACL re-confirm) + the handler's `authorize_planned_iri` (the shared PUT/POST/DELETE/PATCH authz core; the plan's target-row slot is the FIRST ACL CANDIDATE, never the raw target, so a target-record fault cannot turn the uniform 401/403 denial into a 500 oracle). Full-cross-product differential vs the sequential `authorize` (8 ACL shapes × 4 modes × 3 principals × 3 origins, uncached + cached) + mismatched-plan and cached-delete-after-plan fail-closed tests. Per-op queries pinned in `tests/write_path_counters.rs` (measured before → after in its module doc); each write walk is now flat 2 at any depth | read-2 | deterministic (queries/op, depth-independent) |
+| write-3-create-probes | fold the creation paths' remaining per-ancestor EXISTENCE probes (`nearest_existing_container` / `ensure_ancestor_containers`) into one combined round | write-2 | deterministic |
 
 Ordering rationale: read-1..4 are transport-independent and benefit both modes; read-7
 promotes embedded with evidence; read-8 is the maintainer's target architecture and retires

@@ -174,6 +174,51 @@ impl<'a, S: Store> WacAuthorizer<'a, S> {
         })
     }
 
+    /// Mode-generic authorization over an ALREADY-FETCHED read plan (write-2 — the write-path
+    /// sibling of [`authorize_read_planned`](Self::authorize_read_planned)): identical
+    /// [`Decision`] to [`authorize`](Self::authorize), but the O(depth) sequential ACL walk's
+    /// presence/etag probes come from the caller's ONE combined [`crate::store::ReadPlan`]
+    /// round-trip instead of k+1 per-candidate queries.
+    ///
+    /// `candidates` MUST be this authorizer's own
+    /// [`read_plan_candidates`](Self::read_plan_candidates) for the same target, and `plan_acls`
+    /// the [`crate::store::ReadPlan::acls`](crate::store::ReadPlan) produced FROM those
+    /// candidates — the pairing is verified entry-by-entry by the shared planned resolver and any
+    /// mismatch is FATAL (fail-closed), never a partial evaluation.
+    ///
+    /// SECURITY (the equivalence argument): the effective-ACL resolution is the SAME
+    /// `resolve_effective_acl_planned` the READ path uses — nearest-first, absent-per-plan skipped,
+    /// the ONE found ACL re-confirmed with a LIVE probe (`read_acl_confirmed`, fail-closed on
+    /// delete-after-plan), no-candidate ⇒ `ResolvedAcl::none` (no grants). The decision is then
+    /// computed by the SAME `modes_for` / `satisfies` helpers over the same parsed triples as
+    /// [`authorize`](Self::authorize) — including the 401-vs-403 split on `web_id` — so the
+    /// planned decision is bit-for-bit the sequential one. The differential tests in this module
+    /// run BOTH paths over the full WAC case matrix for EVERY [`AccessMode`] (not just Read) and
+    /// assert identical [`Decision`]s.
+    pub async fn authorize_planned(
+        &self,
+        required: AccessMode,
+        web_id: Option<&str>,
+        origin: Option<&str>,
+        candidates: &[AclCandidate],
+        plan_acls: &[(String, Option<String>)],
+    ) -> Result<Decision, ServerError> {
+        let resolved = self
+            .resolve_effective_acl_planned(candidates, plan_acls)
+            .await?;
+        // From here the logic is byte-identical to `authorize` (the same modes_for + satisfies +
+        // 401/403 split over the same `ResolvedAcl` shape).
+        let granted = resolved.modes_for(&Requester { web_id, origin });
+        if satisfies(&granted, required) {
+            return Ok(Decision::Allow(granted));
+        }
+        Ok(if web_id.is_none() {
+            Decision::Unauthenticated
+        } else {
+            Decision::Forbidden
+        })
+    }
+
     /// Single-pass READ authorization (Optimization #2): resolve the target's effective ACL ONCE and
     /// derive BOTH the access decision AND the `WAC-Allow` audiences from that single resolution.
     ///
@@ -1763,6 +1808,237 @@ mod tests {
             assert_planned_matches_sequential(&cached, &s, target, *mode, *web_id, *origin).await;
             assert_planned_matches_sequential(&cached, &s, target, *mode, *web_id, *origin).await;
         }
+    }
+
+    // --- write-2: the mode-generic PLANNED authorize is decision-equivalent to `authorize` -------
+
+    /// Run BOTH mode-generic paths — the sequential [`WacAuthorizer::authorize`] and the planned
+    /// [`WacAuthorizer::authorize_planned`] over a REAL [`Store::read_plan`] round — for the same
+    /// `(target, required, web_id, origin)` and assert IDENTICAL [`Decision`]s (incl. the granted
+    /// mode set on Allow). This is the security-critical equivalence of write-2: the write verbs'
+    /// planned walk must decide byte-for-byte like the sequential walk, for EVERY mode.
+    async fn assert_planned_authorize_matches_sequential(
+        wac: &WacAuthorizer<'_, TestStore>,
+        store: &TestStore,
+        target: &str,
+        required: AccessMode,
+        web_id: Option<&str>,
+        origin: Option<&str>,
+    ) {
+        let sequential = wac
+            .authorize(target, required, web_id, origin)
+            .await
+            .unwrap();
+        let candidates = wac.read_plan_candidates(target);
+        let acl_iris: Vec<String> = candidates.iter().map(|c| c.acl.clone()).collect();
+        let plan = store.read_plan(target, &acl_iris).await.unwrap();
+        let planned = wac
+            .authorize_planned(required, web_id, origin, &candidates, &plan.acls)
+            .await
+            .unwrap();
+        assert_eq!(
+            planned, sequential,
+            "planned authorize must equal the sequential walk for target={target} \
+             required={required:?} web_id={web_id:?} origin={origin:?}"
+        );
+    }
+
+    /// The full-matrix mode-generic differential: the SAME ACL shapes as the read matrix —
+    /// public-read / origin-scoped-public-Append / private / inherited-default / nearest-overrides
+    /// / broken-fail-closed / no-ACL-orphan / `.acl`-Control — crossed with EVERY [`AccessMode`]
+    /// (Read, Write, Append, Control), every principal (anonymous, owner, other), and every origin
+    /// (none, matching, foreign), through BOTH paths, uncached AND cached (cold + warm). This is
+    /// the write-verb (PUT/POST/DELETE/PATCH) decision surface, exhaustively equal.
+    #[tokio::test]
+    async fn planned_authorize_is_decision_equivalent_across_modes_and_the_wac_matrix() {
+        const APP: &str = "https://app.example";
+        const OTHER: &str = "https://evil.example";
+        let s = store();
+        let public_doc = "https://pod.example/alice/test/doc";
+        put_acl(
+            &s,
+            "https://pod.example/alice/test/doc.acl",
+            &format!(
+                r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+                @prefix foaf: <http://xmlns.com/foaf/0.1/>.
+                <#o> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <{public_doc}>; acl:mode acl:Read, acl:Write, acl:Control.
+                <#p> a acl:Authorization; acl:agentClass foaf:Agent; acl:accessTo <{public_doc}>; acl:mode acl:Read.
+                <#s> a acl:Authorization; acl:agentClass foaf:Agent; acl:origin <{APP}>; acl:accessTo <{public_doc}>; acl:mode acl:Append."#
+            ),
+        )
+        .await;
+        let secret = "https://pod.example/alice/test/secret";
+        put_acl(
+            &s,
+            "https://pod.example/alice/test/secret.acl",
+            &format!(
+                r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+                <#o> a acl:Authorization; acl:agent <{ALICE}>; acl:accessTo <{secret}>; acl:mode acl:Read, acl:Write, acl:Control."#
+            ),
+        )
+        .await;
+        put_acl(
+            &s,
+            "https://pod.example/alice/.acl",
+            &owner_default_acl("https://pod.example/alice/", ALICE),
+        )
+        .await;
+        let inherited = "https://pod.example/alice/inh/deeper/data";
+        put_acl(
+            &s,
+            "https://pod.example/alice/test/.acl",
+            &owner_default_acl("https://pod.example/alice/test/", ALICE),
+        )
+        .await;
+        let overridden = "https://pod.example/alice/test/inh";
+        let broken = "https://pod.example/alice/broken";
+        put_acl(
+            &s,
+            "https://pod.example/alice/broken.acl",
+            "@@@ not valid turtle <<< broken",
+        )
+        .await;
+        let orphan = "https://pod.example/zzz/orphan";
+        let doc_acl = "https://pod.example/alice/test/doc.acl";
+        let container_acl = "https://pod.example/alice/test/.acl";
+
+        let targets = [
+            public_doc,
+            secret,
+            inherited,
+            overridden,
+            broken,
+            orphan,
+            doc_acl,
+            container_acl,
+        ];
+        let modes = [
+            AccessMode::Read,
+            AccessMode::Write,
+            AccessMode::Append,
+            AccessMode::Control,
+        ];
+        let principals = [None, Some(ALICE), Some(BOB)];
+        let origins = [None, Some(APP), Some(OTHER)];
+
+        // UNCACHED: planned == sequential for the full cross-product.
+        let uncached = WacAuthorizer::new(&s, BASE);
+        for target in targets {
+            for mode in modes {
+                for web_id in principals {
+                    for origin in origins {
+                        assert_planned_authorize_matches_sequential(
+                            &uncached, &s, target, mode, web_id, origin,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+        // CACHED, cold then warm — both must still equal the sequential walk.
+        let cache = AclCache::new(64);
+        let cached = WacAuthorizer::with_cache(&s, BASE, &cache);
+        for target in targets {
+            for mode in modes {
+                for web_id in principals {
+                    assert_planned_authorize_matches_sequential(
+                        &cached, &s, target, mode, web_id, None,
+                    )
+                    .await;
+                    assert_planned_authorize_matches_sequential(
+                        &cached, &s, target, mode, web_id, None,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    /// `authorize_planned` REFUSES a plan that does not pair 1:1 with the candidates — fail-closed
+    /// (an error, never a partial/shifted evaluation) — the write-verb twin of the read guard.
+    #[tokio::test]
+    async fn planned_authorize_refuses_a_mismatched_plan_fail_closed() {
+        let s = store();
+        put_acl(
+            &s,
+            "https://pod.example/alice/.acl",
+            &owner_default_acl("https://pod.example/alice/", ALICE),
+        )
+        .await;
+        let target = "https://pod.example/alice/deep/doc";
+        let wac = WacAuthorizer::new(&s, BASE);
+        let candidates = wac.read_plan_candidates(target);
+        let acl_iris: Vec<String> = candidates.iter().map(|c| c.acl.clone()).collect();
+        let plan = s.read_plan(target, &acl_iris).await.unwrap();
+
+        // Too short.
+        let short = plan.acls[..plan.acls.len() - 1].to_vec();
+        assert!(wac
+            .authorize_planned(AccessMode::Write, Some(ALICE), None, &candidates, &short)
+            .await
+            .is_err());
+        // Shifted IRIs.
+        let mut shifted = plan.acls.clone();
+        shifted.swap(0, 1);
+        assert!(wac
+            .authorize_planned(AccessMode::Write, Some(ALICE), None, &candidates, &shifted)
+            .await
+            .is_err());
+    }
+
+    /// A governing ACL that the plan saw PRESENT (and whose parse is CACHED) but is DELETED before
+    /// `authorize_planned` evaluates must NOT grant a WRITE from the stale cache — the live
+    /// re-confirm fails closed, bit-for-bit with the sequential walk. This is the
+    /// delete-after-plan window for the WRITE verbs (the fail-open a stale plan-time etag would
+    /// reintroduce).
+    #[tokio::test]
+    async fn planned_authorize_cached_acl_deleted_after_plan_fails_closed() {
+        let s = store();
+        let acl_iri = "https://pod.example/alice/.acl";
+        put_acl(
+            &s,
+            acl_iri,
+            &owner_default_acl("https://pod.example/alice/", ALICE),
+        )
+        .await;
+        let target = "https://pod.example/alice/doc";
+
+        let cache = AclCache::new(64);
+        let wac = WacAuthorizer::with_cache(&s, BASE, &cache);
+        // Warm the parse cache + take the plan while the ACL is PRESENT.
+        assert!(matches!(
+            wac.authorize(target, AccessMode::Write, Some(ALICE), None)
+                .await
+                .unwrap(),
+            Decision::Allow(_)
+        ));
+        let candidates = wac.read_plan_candidates(target);
+        let acl_iris: Vec<String> = candidates.iter().map(|c| c.acl.clone()).collect();
+        let plan = s.read_plan(target, &acl_iris).await.unwrap();
+
+        // DELETE the governing ACL after the plan (cache still holds the parse).
+        s.delete(acl_iri, None).await.unwrap();
+
+        let planned = wac
+            .authorize_planned(
+                AccessMode::Write,
+                Some(ALICE),
+                None,
+                &candidates,
+                &plan.acls,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            planned,
+            Decision::Forbidden,
+            "a write must NEVER be granted from a cached parse of a deleted ACL"
+        );
+        let sequential = wac
+            .authorize(target, AccessMode::Write, Some(ALICE), None)
+            .await
+            .unwrap();
+        assert_eq!(planned, sequential, "fail-closed on both paths");
     }
 
     /// The candidate chain derives from the PROTECTED resource (the two-IRI-roles rule): for an
