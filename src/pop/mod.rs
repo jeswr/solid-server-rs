@@ -45,6 +45,7 @@
 
 pub mod cert_bound;
 pub mod conn;
+pub mod sk;
 
 use cert_bound::{verify_cert_binding, CertBindingOutcome, CertThumbprint};
 

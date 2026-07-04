@@ -243,6 +243,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // in the TLS handshake + the per-connection cert-binding dispatch in auth). Default OFF ⇒ the TLS +
     // plain serve paths are byte-identical to pre-Tier-1b. Only meaningful on the in-process TLS path.
     let mtls_bound_tokens = tls::mtls_bound_tokens_from_env();
+    // PoP Tier 2 (DPoP-SK): the negotiated symmetric session fast path (`SOLID_SERVER_DPOP_SK`).
+    // Default OFF ⇒ byte-identical to pre-Tier-2 (no routes, no metadata member, Signature headers
+    // ignored). The `cb=tls-exporter` flavour additionally REQUIRES in-process TLS termination (the
+    // acceptor exports the keying material); behind a TLS-terminating proxy only `cb=none` is
+    // offered — the DPoP-SK spec forbids advertising tls-exporter there.
+    let dpop_sk = solid_server_rs::pop::sk::dpop_sk_from_env();
+    let sk_exporter_active = dpop_sk && matches!(tls_mode, TlsMode::Tls { .. });
+    let sk_state = dpop_sk.then(|| {
+        Arc::new(solid_server_rs::pop::sk::SkState::new(
+            solid_server_rs::pop::sk::SkConfig {
+                exporter_available: sk_exporter_active,
+                ..solid_server_rs::pop::sk::SkConfig::default()
+            },
+        ))
+    });
 
     // --- Auth: REAL network-backed verification (delegated to solid-oidc-verifier). ----------------
     // The NetworkJwksProvider does OIDC discovery + JWKS fetch over the DNS-pinned SSRF-guarded path.
@@ -358,6 +373,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_mtls_bound_tokens(mtls_bound_tokens)
         }
     };
+    // PoP Tier 2 (DPoP-SK): hand the session state to the auth layer (the attestation dispatch) —
+    // `None` (flag off) keeps the middleware byte-identical. `crate::app` mounts the
+    // `/.pop/session` routes + the RFC 9728 metadata off this same handle.
+    let auth = auth.with_dpop_sk(sk_state);
+    if dpop_sk {
+        eprintln!(
+            "  AUTH: DPoP-SK (PoP Tier 2) ENABLED — one DPoP proof at POST /.pop/session, then \
+             per-request RFC 9421 hmac-sha256 attestation. Channel bindings offered: {}. DPoP \
+             remains the mandatory, always-accepted baseline.",
+            if sk_exporter_active {
+                "tls-exporter + none (in-process TLS 1.3 exporter)"
+            } else {
+                "none only (no in-process TLS — tls-exporter not advertised)"
+            }
+        );
+    }
 
     // --- Overload protection (admission control + request timeout). -------------------------------
     // Admission control sheds excess load (503 + jittered Retry-After) at a configurable concurrency
@@ -730,13 +761,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // limiter reads the direct peer IP from it. axum-server supports the connect-info make
             // service. Without this the limiter would see no peer IP and FAIL OPEN (proceed to auth).
             //
-            // PoP Tier-1b: when the mTLS flag is on, wrap the connection-cap acceptor with the
+            // PoP Tier-1b / Tier-2: when the mTLS flag is on (Tier 1b) OR the DPoP-SK exporter path
+            // is active (Tier 2 on in-process TLS), wrap the connection-cap acceptor with the
             // `ConnPopAcceptor` OUTERMOST — it reads the peer client certificate ONCE per connection
             // (after the handshake) and injects a `ConnPop` into every request so the auth layer can
-            // match a cert-bound token against it. When off, the serve path is byte-identical (no wrap),
-            // so the `.map` type differs between branches — hence the duplicated serve call.
-            if mtls_bound_tokens {
-                let mut server = base.map(solid_server_rs::pop::conn::ConnPopAcceptor::new);
+            // match a cert-bound token against it; with the SK exporter enabled it ALSO exports the
+            // DPoP-SK keying material once per connection and injects a `ConnSk` (connection id +
+            // establishment-path EKM). With neither flag, the serve path is byte-identical (no
+            // wrap), so the `.map` type differs between branches — hence the duplicated serve call.
+            // (With SK-only, the injected `ConnPop` carries no cert and the mTLS dispatch stays off —
+            // the cert path is untouched.)
+            if mtls_bound_tokens || sk_exporter_active {
+                let mut server = base.map(move |acceptor| {
+                    solid_server_rs::pop::conn::ConnPopAcceptor::new(acceptor)
+                        .with_sk_exporter(sk_exporter_active)
+                });
                 transport_config.apply_to_builder(server.http_builder());
                 server
                     .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())

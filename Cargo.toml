@@ -151,6 +151,13 @@ getrandom = "0.2"
 sha2 = "0.10"
 base64 = "0.22"
 url = "2"
+# PoP Tier 2 (DPoP-SK, `SOLID_SERVER_DPOP_SK`): HKDF-SHA256 session-key derivation + the
+# per-request HMAC-SHA256 attestation verify (`src/pop/sk/derive.rs`). `aws-lc-rs` is ALREADY the
+# process-wide rustls crypto provider (resolved transitively via rustls/axum-server and installed
+# by `main`), so naming it directly at the resolved 1.x line adds NO new crate — it only makes the
+# existing provider's vetted `hkdf`/`hmac` primitives callable from this crate (the design-doc §7
+# choice: "HMAC verify via aws-lc-rs/ring HMAC"; house rule — never hand-roll crypto).
+aws-lc-rs = "1"
 # Constant-time byte comparison for the RFC 8705 certificate-thumbprint match (`src/pop/cert_bound.rs`,
 # the tiered proof-of-possession T1a increment). `subtle` is the vetted, no-`unsafe`, no-`std`-required
 # primitive for this (AGENTS.md: security-critical compares go through a vetted library, never a

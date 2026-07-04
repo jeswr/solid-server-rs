@@ -651,6 +651,14 @@ impl<Io: crate::pop::conn::PeerCertDer> crate::pop::conn::PeerCertDer for Permit
     }
 }
 
+/// Forward the DPoP-SK TLS-exporter read (PoP Tier 2) through the connection-cap wrapper, exactly
+/// like the peer-certificate delegation above — purely a delegation to the inner TLS stream.
+impl<Io: crate::pop::conn::TlsExporter> crate::pop::conn::TlsExporter for PermittedStream<Io> {
+    fn export_ekm_32(&self, label: &[u8]) -> Option<[u8; 32]> {
+        self.inner.export_ekm_32(label)
+    }
+}
+
 impl<Io: AsyncRead + Unpin> AsyncRead for PermittedStream<Io> {
     fn poll_read(
         mut self: Pin<&mut Self>,

@@ -1,8 +1,9 @@
 <!-- AUTHORED-BY Claude Fable 5 -->
 # High-throughput proof-of-possession authentication — design proposal
 
-> **Status: PROPOSAL (proceed-and-document).** Maintainer-requested design. Nothing here is
-> implemented; the follow-up build steps are at the end. DPoP as mandated by Solid-OIDC remains the
+> **Status: DESIGN + PHASED BUILD (proceed-and-document).** Maintainer-requested design; the
+> per-bead build status lives in §10 (Tier 1b and the Tier-2 DPoP-SK server side are LANDED,
+> both env-gated OFF by default). DPoP as mandated by Solid-OIDC remains the
 > untouched interop baseline throughout — everything below is a *negotiated, optional* fast path.
 >
 > Every RFC/standard claim below was verified against the primary source on 2026-07-03; each is
@@ -541,9 +542,12 @@ it as of 2026-07 — flagged as a search result, not an exhaustive registry audi
    service wrapper), the auth confirmation dispatch (`AuthContext::authenticate_with_cert` → `pop::dispatch`,
    flag-gated so flag-off is byte-identical, fail-closed on no-cert/wrong-cert/malformed/multi-binding),
    and the fail-closed tests (`tests/pop_mtls.rs` — cert-bound w/o cert, wrong cert, matching cert,
-   malformed, multi-binding, DPoP-unchanged, flag-off, resumption re-bind). REMAINING: (a) the RFC 9728
-   `/.well-known/oauth-protected-resource` metadata endpoint + the `resource_metadata` challenge param
-   (the challenge builder is single-sourced in the verifier, so this pairs with bead 1's verifier change);
+   malformed, multi-binding, DPoP-unchanged, flag-off, resumption re-bind). REMAINING: (a) ~~the RFC 9728
+   `/.well-known/oauth-protected-resource` metadata endpoint~~ — LANDED with Tier 2 (bead 6:
+   `pop::sk::handlers::protected_resource_metadata_json`, mounted when either PoP tier is enabled;
+   advertises `tls_client_certificate_bound_access_tokens` + the `pop_session` member) — the
+   `resource_metadata` challenge param remains (the challenge builder is single-sourced in the
+   verifier, so it pairs with bead 1's verifier change);
    (b) a live client-cert TLS handshake IT (needs a cert-presenting test client + observing the injected
    `ConnPop` end-to-end, and is only end-to-end-meaningful once bead 1's verify-path admission lands);
    (c) CTH green both toggles (docker-gated locally). The per-(conn,token) match cache is deferred (the
@@ -552,10 +556,23 @@ it as of 2026-07 — flagged as a search result, not an exhaustive registry audi
    cert-bound token mint, end-to-end IT (gated like `PSS_IT_KEYCLOAK`).
 4. **Bench: Tier-1 vs DPoP** — extend `bench/run-auth.sh` with an mTLS client; record
    `bench/POP-TIERS.md` (timing advisory).
-5. **DPoP-SK spec draft** — write `docs/design/dpop-sk-spec.md` → w3id profile doc (§4/§5 as
-   base); adversarial review round before any code.
-6. **solid-server-rs Tier 2 implementation** (after 5) — `pop_session.rs` + client helper in a
-   `@jeswr/…` package for the suite apps.
+5. **DPoP-SK spec draft** — DONE (published as the `jeswr/dpop-sk-spec` CG-shaped draft,
+   <https://jeswr.github.io/dpop-sk-spec/>, incl. the adversarial review round — see [[DPOP-SK]];
+   the key-derivation correction A14 is reflected in §2.C/§4.1 above).
+6. **solid-server-rs Tier 2 implementation** — **SERVER SIDE LANDED** (`feat/pop-tier2-dpop-sk`):
+   `src/pop/sk/` (derive/window/sig/store/verify/handlers) + the auth-middleware dispatch +
+   `POST|DELETE /.pop/session` + the RFC 9728 document, env-gated `SOLID_SERVER_DPOP_SK`
+   (default OFF, byte-identical off; mirrors the Tier-1b gating). Both flavours: `cb=none`
+   (browser) always when enabled; `cb=tls-exporter` derives from live rustls
+   `export_keying_material` under the dedicated `EXPERIMENTAL-dpop-sk-v1` label — TLS 1.3-only,
+   in-process-TLS-only (behind the Caddy-terminated deployment it is neither advertised nor
+   establishable, fail-closed; the acceptor injects a per-connection `ConnSk` and sessions are
+   connection-pinned). The spec's Appendix-A worked example is reproduced byte-for-byte in the
+   unit suites, and the negative set (replay in/below window, mutated components, wrong exporter
+   label, cross-connection reuse, stripping/downgrade, alg mismatch, dual-mechanism exclusivity)
+   is covered in `tests/pop_dpop_sk.rs`. REMAINING: the client helper `@jeswr/…` package for the
+   suite apps, a live-TLS exporter IT (pairs with bead 2(b)'s handshake IT), CTH green with the
+   flag on (docker-gated), and the bead-4 bench extension measuring the tier.
 7. **EdDSA DPoP proof support bench** (verifier already policy-gates algs) — measure Ed25519 vs
    P-256 verify under aws-lc-rs before deciding.
 8. **PSS (TS server) counterpart design** — CORE-PSS, maintainer-gated (proxy-termination

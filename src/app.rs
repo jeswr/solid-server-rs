@@ -44,6 +44,10 @@ use crate::notifications::ws::{
     SUBSCRIPTION_PATH, WELL_KNOWN_SOLID_PATH,
 };
 use crate::overload::{admission_middleware, AdmissionControl};
+use crate::pop::sk::handlers::{
+    establish_handler, protected_resource_metadata_json, terminate_handler, SkRouteState,
+};
+use crate::pop::sk::{OAUTH_PROTECTED_RESOURCE_PATH, SESSION_ENDPOINT_PATH};
 use crate::rate_limit::{rate_limit_middleware, RateLimiter};
 use crate::store::Store;
 
@@ -296,10 +300,59 @@ where
         .route(WELL_KNOWN_SOLID_PATH, get(storage_description_handler))
         .with_state(notify_state);
 
-    Router::new()
-        .merge(subscribe)
-        .merge(public_notify)
-        .merge(protected)
+    let mut router = Router::new().merge(subscribe).merge(public_notify);
+
+    // PoP Tier 2 (DPoP-SK, `SOLID_SERVER_DPOP_SK`) — the session establishment/termination
+    // endpoint, mounted ONLY when the tier is enabled so a flag-off build's route table (and the
+    // LDP wildcard's coverage of `/.pop/session`) is byte-identical to pre-Tier-2.
+    //
+    // POST (establishment) sits BEHIND the same DPoP auth middleware as the LDP routes, so the
+    // handler receives a fully verified token — establishment is exactly as strong as any DPoP
+    // request. DELETE (termination) is authenticated by its own DPoP-SK attestation, which the
+    // SAME middleware verifies (the SK dispatch runs inside it); the handler then requires the
+    // `SkSession` marker. The 401 challenge is single-sourced from the verifier as everywhere.
+    if let Some(sk) = auth.sk() {
+        let sk_routes = Router::new()
+            .route(
+                SESSION_ENDPOINT_PATH,
+                post(establish_handler).delete(terminate_handler),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                auth.clone(),
+                auth_middleware::<J, R>,
+            ))
+            .with_state(SkRouteState {
+                sk: sk.clone(),
+                challenge: auth.unauthenticated_challenge(),
+            });
+        router = router.merge(sk_routes);
+    }
+
+    // RFC 9728 protected-resource metadata — the PoP negotiation/advertisement surface. Mounted
+    // only when a PoP tier beyond baseline DPoP is enabled (mTLS-bound tokens and/or DPoP-SK), so
+    // the default build's public surface is unchanged. The document is static per boot; built once.
+    if auth.mtls_bound_tokens() || auth.sk().is_some() {
+        let body = Arc::new(protected_resource_metadata_json(
+            &auth.base_url,
+            auth.mtls_bound_tokens(),
+            auth.sk().map(Arc::as_ref),
+        ));
+        let metadata = Router::new().route(
+            OAUTH_PROTECTED_RESOURCE_PATH,
+            get(move || {
+                let body = body.clone();
+                async move {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        (*body).clone(),
+                    )
+                }
+            }),
+        );
+        router = router.merge(metadata);
+    }
+
+    router.merge(protected)
 }
 
 /// The health/readiness routes: `GET /livez` (process up) + `GET /readyz` (ready to serve). Both are

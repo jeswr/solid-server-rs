@@ -30,6 +30,8 @@ use crate::error::ServerError;
 use crate::ldp::target::parse_target;
 use crate::pop::cert_bound::{CertBindingOutcome, CertThumbprint};
 use crate::pop::conn::ConnPop;
+use crate::pop::sk::verify::{verify_attested_request, SkDecision};
+use crate::pop::sk::{ConnSk, SkSession, SkState};
 use crate::pop::{dispatch as pop_dispatch, Confirmation, PopRoute};
 
 /// Everything the auth layer needs: the verifier and the server's public base URL.
@@ -59,6 +61,12 @@ pub struct AuthContext<J: JwksProvider, R: ReplayStore> {
     /// multi-binding token is refused, and a DPoP/public token is unchanged. See
     /// [`finalize_pop`](Self::finalize_pop).
     mtls_bound_tokens: bool,
+    /// PoP Tier 2 (DPoP-SK, `SOLID_SERVER_DPOP_SK`): the shared session state. **Default `None`**
+    /// — when unset, the middleware runs the pre-Tier-2 path byte-for-byte (any `Signature*`
+    /// headers are ignored and DPoP remains the only accepted PoP). When set, a request bearing a
+    /// `dpop-sk`-tagged RFC 9421 signature is processed under the DPoP-SK profile EXCLUSIVELY
+    /// (see [`crate::pop::sk::verify`]); everything else is unchanged.
+    sk: Option<Arc<SkState>>,
 }
 
 /// The token cache + the shared replay handle it marks `jti`s through (the SAME store the verifier
@@ -77,6 +85,7 @@ impl<J: JwksProvider, R: ReplayStore> AuthContext<J, R> {
             base_url: base_url.into(),
             cache: None,
             mtls_bound_tokens: false,
+            sk: None,
         }
     }
 
@@ -94,6 +103,7 @@ impl<J: JwksProvider, R: ReplayStore> AuthContext<J, R> {
             base_url: base_url.into(),
             cache: Some(TokenCache { cache, replay }),
             mtls_bound_tokens: false,
+            sk: None,
         }
     }
 
@@ -104,6 +114,26 @@ impl<J: JwksProvider, R: ReplayStore> AuthContext<J, R> {
     pub fn with_mtls_bound_tokens(mut self, enabled: bool) -> Self {
         self.mtls_bound_tokens = enabled;
         self
+    }
+
+    /// Enable the PoP Tier-2 DPoP-SK fast path (`SOLID_SERVER_DPOP_SK`) by supplying the shared
+    /// session state. `None` (the default) is byte-identical to the pre-Tier-2 middleware. A
+    /// builder-style setter, mirroring [`with_mtls_bound_tokens`](Self::with_mtls_bound_tokens).
+    pub fn with_dpop_sk(mut self, sk: Option<Arc<SkState>>) -> Self {
+        self.sk = sk;
+        self
+    }
+
+    /// The DPoP-SK state, when the tier is enabled (used by `crate::app` to mount the
+    /// establishment routes + advertise the profile in the RFC 9728 metadata).
+    pub fn sk(&self) -> Option<&Arc<SkState>> {
+        self.sk.as_ref()
+    }
+
+    /// Whether the PoP Tier-1b mTLS cert-bound-token dispatch is enabled (used by `crate::app`
+    /// for the RFC 9728 `tls_client_certificate_bound_access_tokens` metadata member).
+    pub fn mtls_bound_tokens(&self) -> bool {
+        self.mtls_bound_tokens
     }
 
     /// Verify the request and return the caller's [`VerifiedToken`] (possibly public), or the
@@ -390,6 +420,51 @@ where
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
 
+    // PoP Tier 2 (DPoP-SK) — the negotiated symmetric fast path, gated on `with_dpop_sk`. A
+    // request bearing a `dpop-sk`-tagged RFC 9421 signature is processed under that profile
+    // EXCLUSIVELY: on success the session's stored VerifiedToken is injected exactly as a DPoP
+    // verification would inject it (downstream WAC/LDP unchanged); on ANY failure the response is
+    // the standard 401 DPoP challenge (the client falls back to re-establishment or plain DPoP —
+    // both full-strength PoP; never bearer). A request WITHOUT the tag — including every request
+    // on a flag-off build — falls through to the unchanged DPoP path below, so stripping the
+    // signature headers can only ever force full DPoP, not weaken anything.
+    if let Some(sk) = ctx.sk.as_ref() {
+        // The absolute target URI, reconstructed by the SERVER from its configured public origin
+        // + the request's path-and-query (never from client-controlled Host/Forwarded headers).
+        let target_uri = format!(
+            "{}{}",
+            ctx.base_url,
+            req.uri()
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or("/")
+        );
+        let conn_sk = req.extensions().get::<ConnSk>().cloned();
+        match verify_attested_request(
+            sk,
+            req.headers(),
+            &method,
+            &target_uri,
+            conn_sk.as_ref(),
+            now_secs(),
+        ) {
+            SkDecision::NotApplicable => {} // not under the profile: the DPoP baseline gates it
+            SkDecision::Verified { token, session_id } => {
+                req.extensions_mut().insert(token);
+                req.extensions_mut().insert(SkSession { session_id });
+                return next.run(req).await;
+            }
+            SkDecision::Deny => {
+                return ServerError::Unauthorized {
+                    status: 401,
+                    message: "Invalid DPoP-SK attestation.".to_string(),
+                    www_authenticate: ctx.unauthenticated_challenge(),
+                }
+                .into_response()
+            }
+        }
+    }
+
     // Distinguish an ABSENT auth header (⇒ public) from one that is PRESENT but unparseable
     // (non-UTF-8 bytes). A present-but-invalid credential must NOT be silently downgraded to public
     // access — that is a fail-open. Reject it as a 400.
@@ -440,9 +515,11 @@ fn header_string(req: &Request, name: axum::http::HeaderName) -> Result<Option<S
 /// header, split on the FIRST space, lowercase the scheme, trim the token -- so the cache key is the
 /// byte-identical token the verifier verifies on a miss (a divergent parse could key the cache by a
 /// different string than the one verified, splitting the cache or, worse, reusing a verification for a
-/// token that was never verified). It is consulted ONLY for the cache fast-path; the verifier remains
-/// the sole authority on every miss, so this never makes a security decision on its own.
-fn dpop_scheme_access_token(header: &str) -> Option<&str> {
+/// token that was never verified). It is consulted ONLY for the cache fast-path — plus the DPoP-SK
+/// layer (`crate::pop::sk`), which needs the SAME byte-exact token string for its token-hash
+/// binding; the verifier remains the sole authority on every miss, so this never makes a security
+/// decision on its own.
+pub(crate) fn dpop_scheme_access_token(header: &str) -> Option<&str> {
     let trimmed = header.trim();
     let sp = trimmed.find(' ')?;
     let scheme = &trimmed[..sp];
