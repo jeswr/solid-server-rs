@@ -52,6 +52,11 @@ pub mod error;
 pub mod ldp;
 pub mod notifications;
 pub mod overload;
+/// Tiered proof-of-possession (RFC 8705 cert-bound tokens, later DPoP-SK) — the negotiated,
+/// opt-in fast paths that keep DPoP as the mandatory Solid-OIDC baseline. See
+/// [`docs/design/high-throughput-pop-auth.md`]. T1a lands the confirmation dispatch + cert-bound
+/// verification core; the acceptor + verifier wiring are tracked follow-ups.
+pub mod pop;
 pub mod rate_limit;
 /// The distributed (shared) Redis-backed DPoP-`jti` replay store — the horizontal-scaling enabler.
 /// Behind the opt-in `redis-replay` feature (OFF by default → byte-identical default build/conformance).

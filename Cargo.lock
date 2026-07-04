@@ -2290,6 +2290,7 @@ dependencies = [
  "solid-oidc-verifier",
  "sparq-core",
  "sparq-engine",
+ "subtle",
  "thiserror",
  "tokio",
  "tokio-rustls",

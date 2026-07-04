@@ -126,6 +126,13 @@ getrandom = "0.2"
 sha2 = "0.10"
 base64 = "0.22"
 url = "2"
+# Constant-time byte comparison for the RFC 8705 certificate-thumbprint match (`src/pop/cert_bound.rs`,
+# the tiered proof-of-possession T1a increment). `subtle` is the vetted, no-`unsafe`, no-`std`-required
+# primitive for this (AGENTS.md: security-critical compares go through a vetted library, never a
+# hand-rolled `==`). It is ALREADY resolved in the non-dev tree (transitively via `aws-lc-rs`/the
+# crypto stack), so naming it directly at the resolved version adds NO new crate — it only makes the
+# existing dep callable from the cert-bound verification core.
+subtle = "2.6"
 # Distributed (shared) DPoP `jti` replay store — the horizontal-scaling enabler (`src/redis_replay.rs`).
 # Behind the OPT-IN `redis-replay` feature so the DEFAULT build/conformance is byte-identical and adds
 # NO new crate unless an operator wants the shared store. We use the SYNCHRONOUS (blocking) `redis`
