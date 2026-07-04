@@ -46,14 +46,42 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use axum_server::tls_rustls::RustlsConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 /// Env var naming the PEM **certificate chain** file (leaf first). Set together with [`ENV_TLS_KEY`].
 pub const ENV_TLS_CERT: &str = "SOLID_SERVER_TLS_CERT";
 /// Env var naming the PEM **private key** file (PKCS#8 or PKCS#1). Set together with [`ENV_TLS_CERT`].
 pub const ENV_TLS_KEY: &str = "SOLID_SERVER_TLS_KEY";
+
+/// Env var enabling the PoP Tier-1b RFC 8705 mTLS-bound-token path: when set truthy AND in-process
+/// TLS is on, the TLS handshake REQUESTS (but does not REQUIRE) a client certificate, so a cert-bound
+/// token can be matched against the presented cert's `cnf.x5t#S256` thumbprint. **Default OFF** — when
+/// unset/falsy the TLS + plain serve paths are byte-identical to the pre-Tier-1b behaviour (no client
+/// cert requested, no confirmation dispatch). See [`mtls_bound_tokens_from_env`] +
+/// [`build_rustls_config`]. Design: `docs/design/high-throughput-pop-auth.md` §7 (bead 2).
+pub const ENV_MTLS_BOUND_TOKENS: &str = "SOLID_SERVER_MTLS_BOUND_TOKENS";
+
+/// Whether the RFC 8705 mTLS-bound-token path is enabled ([`ENV_MTLS_BOUND_TOKENS`]). Truthy =
+/// `1`/`true`/`yes`/`on` (case-insensitive, trimmed); everything else (absent, empty, `0`, `false`,
+/// any other string) ⇒ **OFF** (the fail-safe default — a typo never silently enables a security path
+/// that requests client certs). Mirrors the affirmative-opt-in grammar the rest of the server uses.
+pub fn mtls_bound_tokens_from_env() -> bool {
+    matches!(
+        std::env::var(ENV_MTLS_BOUND_TOKENS)
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some(s) if s.eq_ignore_ascii_case("1")
+            || s.eq_ignore_ascii_case("true")
+            || s.eq_ignore_ascii_case("yes")
+            || s.eq_ignore_ascii_case("on")
+    )
+}
 
 /// The ALPN protocols advertised in the TLS handshake, in server preference order: HTTP/2 (`h2`)
 /// FIRST, then HTTP/1.1. An `h2`-capable client negotiates HTTP/2 (multiplexing + header
@@ -217,7 +245,20 @@ fn trim_os(value: &OsStr) -> OsString {
 /// 4. rustls can build a `ServerConfig` from the bytes ([`TlsConfigError::Malformed`]).
 ///
 /// On [`TlsMode::Plain`] this returns `Ok(None)` — there is nothing to build.
-pub async fn build_rustls_config(mode: &TlsMode) -> Result<Option<RustlsConfig>, TlsConfigError> {
+///
+/// `mtls_bound_tokens` selects the client-certificate posture (PoP Tier-1b, [`ENV_MTLS_BOUND_TOKENS`]):
+/// - `false` (**the default**) — the byte-identical pre-Tier-1b path: `RustlsConfig::from_pem`, which
+///   builds a `ServerConfig` with `with_no_client_auth()` (no `CertificateRequest` is sent, so no
+///   client presents a cert). Nothing about the handshake changes.
+/// - `true` — build the `ServerConfig` ourselves with a client-certificate verifier that REQUESTS (but
+///   does NOT require) a client certificate and does NOT chain-validate it (RFC 8705 §2.2 self-signed
+///   flavour: trust is the `cnf.x5t#S256` thumbprint match enforced downstream, NOT the chain). Key
+///   POSSESSION is still proven by the handshake `CertificateVerify` signature (verified against the
+///   presented cert's own key). Plain-DPoP clients that present NO cert are unaffected (optional auth).
+pub async fn build_rustls_config(
+    mode: &TlsMode,
+    mtls_bound_tokens: bool,
+) -> Result<Option<RustlsConfig>, TlsConfigError> {
     let (cert_path, key_path) = match mode {
         TlsMode::Plain => return Ok(None),
         TlsMode::Tls {
@@ -235,19 +276,172 @@ pub async fn build_rustls_config(mode: &TlsMode) -> Result<Option<RustlsConfig>,
         return Err(TlsConfigError::NoCryptoProvider);
     }
 
-    // `from_pem` builds a rustls ServerConfig (using the installed default provider) and surfaces a
-    // malformed-PEM / key-mismatch as an io::Error — mapped to a clear Malformed boot error.
-    let config = RustlsConfig::from_pem(cert, key)
-        .await
-        .map_err(|source| TlsConfigError::Malformed { source })?;
+    let config = if mtls_bound_tokens {
+        // Tier-1b: build our own ServerConfig with the optional self-signed client-cert verifier. This
+        // path cannot use `RustlsConfig::from_pem` (it hard-codes `with_no_client_auth`), so we parse
+        // the PEM ourselves and hand the built config to `RustlsConfig::from_config`.
+        let server_config = build_mtls_server_config(&cert, &key)?;
+        RustlsConfig::from_config(Arc::new(server_config))
+    } else {
+        // Default path — byte-identical to pre-Tier-1b. `from_pem` builds a rustls ServerConfig (using
+        // the installed default provider, `with_no_client_auth`) and surfaces a malformed-PEM /
+        // key-mismatch as an io::Error — mapped to a clear Malformed boot error.
+        RustlsConfig::from_pem(cert, key)
+            .await
+            .map_err(|source| TlsConfigError::Malformed { source })?
+    };
 
     // Own the ALPN advertisement explicitly (do not inherit axum-server's `from_pem` default): set
     // `[h2, http/1.1]` so an h2-capable client gets HTTP/2 and an h1-only client negotiates down. This
     // is a documented, tested transport invariant of THIS crate (see the module + `ALPN_PROTOCOLS`
     // docs) — re-asserting it here means a dependency bump or a future ACME/`from_config` cert path
-    // can never silently change the advertised protocol set.
+    // (incl. the mTLS branch above) can never silently change the advertised protocol set.
     set_alpn_protocols(&config);
     Ok(Some(config))
+}
+
+/// Build the Tier-1b mTLS `ServerConfig`: our own leaf cert/key + the optional self-signed
+/// client-certificate verifier ([`SelfSignedOptionalClientCertVerifier`]). Uses the process-wide
+/// default crypto provider (installed in `main`) both for the config builder and for the verifier's
+/// handshake-signature algorithms, so exactly one provider is in play.
+fn build_mtls_server_config(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> Result<rustls::ServerConfig, TlsConfigError> {
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .ok_or(TlsConfigError::NoCryptoProvider)?
+        .clone();
+
+    let cert_chain = load_cert_chain(cert_pem)?;
+    let key = load_private_key(key_pem)?;
+
+    let verifier = Arc::new(SelfSignedOptionalClientCertVerifier {
+        provider: provider.clone(),
+    });
+
+    // `builder_with_provider(..).with_safe_default_protocol_versions()` pins the SAME provider the
+    // verifier uses. `.with_client_cert_verifier` installs the optional cert request; `.with_single_cert`
+    // supplies our leaf cert + key. Any mismatch/malformed input surfaces as a clear Malformed error.
+    rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| TlsConfigError::Malformed {
+            source: io::Error::other(e),
+        })?
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(cert_chain, key)
+        .map_err(|e| TlsConfigError::Malformed {
+            source: io::Error::other(e),
+        })
+}
+
+/// Parse a PEM certificate chain (leaf first) into DER. A PEM with no CERTIFICATE block is a Malformed
+/// boot error (an empty chain would fail deep inside rustls with an opaque message).
+fn load_cert_chain(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, TlsConfigError> {
+    let certs = rustls_pemfile::certs(&mut &pem[..])
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| TlsConfigError::Malformed {
+            source: io::Error::other(e),
+        })?;
+    if certs.is_empty() {
+        return Err(TlsConfigError::Malformed {
+            source: io::Error::other("TLS certificate PEM contains no CERTIFICATE block"),
+        });
+    }
+    Ok(certs)
+}
+
+/// Parse the FIRST PEM private key (PKCS#8 / PKCS#1 / SEC1) into DER. Absent ⇒ a Malformed boot error.
+fn load_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, TlsConfigError> {
+    rustls_pemfile::private_key(&mut &pem[..])
+        .map_err(|e| TlsConfigError::Malformed {
+            source: io::Error::other(e),
+        })?
+        .ok_or_else(|| TlsConfigError::Malformed {
+            source: io::Error::other("TLS private-key PEM contains no PRIVATE KEY block"),
+        })
+}
+
+/// The RFC 8705 §2.2 **self-signed-flavour** optional client-certificate verifier.
+///
+/// Two deliberate, load-bearing choices:
+/// - **Optional** ([`offer_client_auth`](Self) = true, [`client_auth_mandatory`](Self) = false): the
+///   handshake REQUESTS a client cert but a client presenting NONE is still accepted — so plain-DPoP
+///   clients (the vast majority) are completely unaffected when the mTLS flag is on. A cert-bound token
+///   presented on a connection with no client cert is rejected LATER, at the auth layer (fail-closed),
+///   not by refusing the handshake.
+/// - **No chain validation** ([`verify_client_cert`](Self) accepts any well-formed cert): per RFC 8705
+///   §2.2, trust is NOT the certificate chain — it is the `cnf.x5t#S256` thumbprint match, enforced
+///   downstream in [`crate::pop`]. Accepting any presented cert here is therefore correct AND minimises
+///   surface (no CA/PKI lifecycle). Crucially, key **possession is STILL proven**: the TLS handshake's
+///   `CertificateVerify` signature is verified against the presented cert's OWN public key by
+///   [`verify_tls12_signature`](Self)/[`verify_tls13_signature`](Self) below (delegated to the crypto
+///   provider's real verifiers) — only chain/PKI validation is skipped, never the possession proof.
+#[derive(Debug)]
+struct SelfSignedOptionalClientCertVerifier {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::server::danger::ClientCertVerifier for SelfSignedOptionalClientCertVerifier {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        // No CA roots hinted — self-signed flavour trusts the thumbprint, not a CA.
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        // Accept any well-formed presented certificate: trust is the downstream `cnf.x5t#S256`
+        // thumbprint match (RFC 8705 §2.2), NOT the chain. Possession is proven by the signature
+        // checks below, which rustls always runs when a cert is presented.
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        // Real possession proof: verify the CertificateVerify signature against the presented cert's
+        // own public key using the crypto provider's algorithms (NOT a blanket accept).
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+
+    fn offer_client_auth(&self) -> bool {
+        true // REQUEST a client cert (so a cert-bound client can present one)…
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        false // …but do NOT require it — plain-DPoP clients presenting none are still admitted.
+    }
 }
 
 /// Re-assert the advertised ALPN protocols ([`ALPN_PROTOCOLS`]) on a built [`RustlsConfig`].
@@ -412,7 +606,7 @@ mod tests {
 
     #[tokio::test]
     async fn plain_mode_builds_no_config() {
-        assert!(build_rustls_config(&TlsMode::Plain)
+        assert!(build_rustls_config(&TlsMode::Plain, false)
             .await
             .unwrap()
             .is_none());
@@ -424,7 +618,7 @@ mod tests {
             cert_path: PathBuf::from("/nonexistent/does-not-exist-cert.pem"),
             key_path: PathBuf::from("/nonexistent/does-not-exist-key.pem"),
         };
-        let err = build_rustls_config(&mode).await.unwrap_err();
+        let err = build_rustls_config(&mode, false).await.unwrap_err();
         match err {
             TlsConfigError::Unreadable { which, path, .. } => {
                 assert_eq!(which, "certificate");
@@ -446,7 +640,7 @@ mod tests {
             cert_path: cert.clone(),
             key_path: key.clone(),
         };
-        let err = build_rustls_config(&mode).await.unwrap_err();
+        let err = build_rustls_config(&mode, false).await.unwrap_err();
         let _ = tokio::fs::remove_dir_all(&dir).await;
         match err {
             TlsConfigError::Empty { which, .. } => assert_eq!(which, "certificate"),
@@ -471,7 +665,7 @@ mod tests {
             cert_path: cert_path.clone(),
             key_path: key_path.clone(),
         };
-        let config = build_rustls_config(&mode)
+        let config = build_rustls_config(&mode, false)
             .await
             .expect("build config")
             .expect("tls mode yields a config");
@@ -497,7 +691,16 @@ mod tests {
         // fixture cert. To keep this dependency-free and deterministic we shell out to openssl, which
         // is present on the dev/CI boxes (the bench/conformance cert scripts already require it).
         use std::process::Command;
-        let dir = std::env::temp_dir().join(format!("ssrs-tls-mint-{}", std::process::id()));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // UNIQUE per call (not just per pid): several tests mint a cert CONCURRENTLY, so a pid-only dir
+        // races (one caller's `remove_dir_all` deletes another's cert mid-read). A monotonic counter
+        // gives each call its own dir.
+        static MINT_SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ssrs-tls-mint-{}-{}",
+            std::process::id(),
+            MINT_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let cert = dir.join("c.pem");
         let key = dir.join("k.pem");
@@ -559,11 +762,111 @@ mod tests {
             cert_path: cert.clone(),
             key_path: key.clone(),
         };
-        let err = build_rustls_config(&mode).await.unwrap_err();
+        let err = build_rustls_config(&mode, false).await.unwrap_err();
         let _ = tokio::fs::remove_dir_all(&dir).await;
         assert!(
             matches!(err, TlsConfigError::Malformed { .. }),
             "expected Malformed, got {err:?}"
         );
+    }
+
+    #[test]
+    fn mtls_flag_parses_affirmative_opt_in_only() {
+        // Truthy tokens (case-insensitive, trimmed) enable; everything else stays OFF (fail-safe).
+        for on in ["1", "true", "TRUE", "Yes", " on ", "On"] {
+            std::env::set_var(ENV_MTLS_BOUND_TOKENS, on);
+            assert!(mtls_bound_tokens_from_env(), "{on:?} should enable mTLS");
+        }
+        for off in [
+            "", " ", "0", "false", "no", "off", "enabled", "2", "garbage",
+        ] {
+            std::env::set_var(ENV_MTLS_BOUND_TOKENS, off);
+            assert!(
+                !mtls_bound_tokens_from_env(),
+                "{off:?} must NOT enable mTLS"
+            );
+        }
+        std::env::remove_var(ENV_MTLS_BOUND_TOKENS);
+        assert!(
+            !mtls_bound_tokens_from_env(),
+            "absent ⇒ OFF (the default posture)"
+        );
+    }
+
+    #[tokio::test]
+    async fn mtls_config_builds_optional_client_auth_and_keeps_alpn() {
+        // With the mTLS flag ON, the built ServerConfig must (a) still advertise ALPN [h2, http/1.1]
+        // exactly (transport contract preserved on the new build path), and (b) request client auth
+        // OPTIONALLY — `client_auth_mandatory() == false` so a plain-DPoP client presenting NO cert is
+        // still admitted (the fail-closed reject for a cert-bound-token-without-cert happens at the
+        // AUTH layer, never by refusing the handshake). We assert the verifier's optional posture
+        // directly (a full handshake is covered by the ignored live TLS integration test).
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (cert, key) = self_signed_localhost_pem();
+        // The raw builder succeeds (valid leaf cert/key + the optional self-signed client verifier).
+        build_mtls_server_config(&cert, &key).expect("mTLS config builds");
+
+        // The verifier posture is optional (not mandatory) — a plain client presenting no cert is
+        // admitted; assert directly on the verifier type.
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .expect("provider installed")
+            .clone();
+        let verifier = SelfSignedOptionalClientCertVerifier { provider };
+        use rustls::server::danger::ClientCertVerifier as _;
+        assert!(
+            verifier.offer_client_auth(),
+            "must REQUEST a client cert so a cert-bound client can present one"
+        );
+        assert!(
+            !verifier.client_auth_mandatory(),
+            "must NOT require a client cert — plain-DPoP clients are unaffected (fail-closed happens at auth)"
+        );
+
+        // The full path builds a config and advertises the owned ALPN set.
+        let dir = std::env::temp_dir().join(format!("ssrs-mtls-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let cert_path = dir.join("c.pem");
+        let key_path = dir.join("k.pem");
+        tokio::fs::write(&cert_path, &cert).await.unwrap();
+        tokio::fs::write(&key_path, &key).await.unwrap();
+        let mode = TlsMode::Tls {
+            cert_path,
+            key_path,
+        };
+        // mtls = true path: builds a config and advertises the owned ALPN set.
+        let config = build_rustls_config(&mode, true)
+            .await
+            .expect("build mTLS config")
+            .expect("tls mode yields a config");
+        let inner = config.get_inner();
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        assert_eq!(
+            inner.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            "mTLS build path must still advertise ALPN [h2, http/1.1]"
+        );
+    }
+
+    #[tokio::test]
+    async fn mtls_off_and_on_both_build_a_usable_config() {
+        // The default (flag-off) path and the flag-on path both yield a Some(config) for a valid
+        // cert/key — the flag never breaks the ability to serve TLS, it only changes the client-auth
+        // posture. (Byte-identical-when-off for the DPoP path is asserted at the auth layer; here we
+        // assert the TLS build succeeds either way.)
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (cert, key) = self_signed_localhost_pem();
+        let dir = std::env::temp_dir().join(format!("ssrs-mtls2-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let cert_path = dir.join("c.pem");
+        let key_path = dir.join("k.pem");
+        tokio::fs::write(&cert_path, &cert).await.unwrap();
+        tokio::fs::write(&key_path, &key).await.unwrap();
+        let mode = TlsMode::Tls {
+            cert_path,
+            key_path,
+        };
+        assert!(build_rustls_config(&mode, false).await.unwrap().is_some());
+        assert!(build_rustls_config(&mode, true).await.unwrap().is_some());
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

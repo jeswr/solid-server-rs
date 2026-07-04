@@ -604,6 +604,7 @@ mod tests {
             client_id: Some("conformance-alice".into()),
             scopes: vec![],
             cnf_jkt: Some(jkt.to_string()),
+            cnf_x5t_s256: None,
             expiry: Some(exp),
         }
     }

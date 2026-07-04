@@ -519,13 +519,27 @@ it as of 2026-07 — flagged as a search result, not an exhaustive registry audi
 
 ## 10. Build-ready follow-up work (proposed beads)
 
-1. **`solid-oidc-verifier`: `cnf.x5t#S256` confirmation support** — `Confirmation` enum +
-   `client_cert_x5t_s256` request input + exhaustive tests (mismatch/absent/mixed-cnf/downgrade).
-   Security-critical; no new deps. (Blocks 2.)
-2. **solid-server-rs Tier 1** — optional-client-cert rustls config (env-gated), acceptor
-   `ConnPop` extension (cert hash once/conn), auth dispatch + per-conn match cache, RFC 9728
-   metadata endpoint + `resource_metadata` challenge param, fail-closed tests (cert-bound token
-   w/o cert, wrong cert, resumption, no-downgrade), CTH green both toggles.
+1. **`solid-oidc-verifier`: `cnf.x5t#S256` confirmation support** — PARTIALLY LANDED (`main@321db01`):
+   the READ side ships — `VerifiedToken.cnf_x5t_s256: Option<X5tS256>` (three-state
+   `Thumbprint`/`Malformed`) + the `cnf_x5t_s256_thumbprint()` accessor + exhaustive extract tests. The
+   VERIFY-PATH admission still to land (the owner-gated remainder): an `AuthRequest.client_cert_x5t_s256`
+   input + a path that ACCEPTS a cert-bound token presented as `Bearer` under `require_dpop=true` (today
+   `verify()` rejects it at the DPoP-scheme/`must_dpop` gate, so live end-to-end cert-bound acceptance in
+   the Solid posture is blocked on this). Security-critical; no new deps.
+2. **solid-server-rs Tier 1b** — LANDED (`feat/pop-auth-tier1b`): the optional-client-cert rustls config
+   (env-gated `SOLID_SERVER_MTLS_BOUND_TOKENS`, self-signed flavour — requests-not-requires a cert, no
+   chain validation, possession still proven by the handshake `CertificateVerify`), the acceptor
+   `ConnPop` extension (`src/pop/conn.rs` — cert hashed ONCE per connection, injected via a per-connection
+   service wrapper), the auth confirmation dispatch (`AuthContext::authenticate_with_cert` → `pop::dispatch`,
+   flag-gated so flag-off is byte-identical, fail-closed on no-cert/wrong-cert/malformed/multi-binding),
+   and the fail-closed tests (`tests/pop_mtls.rs` — cert-bound w/o cert, wrong cert, matching cert,
+   malformed, multi-binding, DPoP-unchanged, flag-off, resumption re-bind). REMAINING: (a) the RFC 9728
+   `/.well-known/oauth-protected-resource` metadata endpoint + the `resource_metadata` challenge param
+   (the challenge builder is single-sourced in the verifier, so this pairs with bead 1's verifier change);
+   (b) a live client-cert TLS handshake IT (needs a cert-presenting test client + observing the injected
+   `ConnPop` end-to-end, and is only end-to-end-meaningful once bead 1's verify-path admission lands);
+   (c) CTH green both toggles (docker-gated locally). The per-(conn,token) match cache is deferred (the
+   per-request cost is already a 32-byte memcmp).
 3. **Keycloak wiring + IT** — a `conformance`-style service client with self-signed cert,
    cert-bound token mint, end-to-end IT (gated like `PSS_IT_KEYCLOAK`).
 4. **Bench: Tier-1 vs DPoP** — extend `bench/run-auth.sh` with an mTLS client; record

@@ -42,6 +42,17 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", 
 # stack. PEM cert/key are loaded from file paths via `RustlsConfig::from_pem`. Config-gated: only
 # linked into the serve path when both TLS env vars are set (plain TCP otherwise).
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+# PoP Tier-1b (mTLS-bound tokens, `SOLID_SERVER_MTLS_BOUND_TOKENS=1`). BOTH crates are ALREADY resolved
+# in the tree (transitively via axum-server's tls-rustls stack + the dev TLS tests), so promoting them
+# to non-dev [dependencies] adds NO new crate to the build — it only makes the existing types nameable
+# from this crate's mTLS serve path. `rustls-pemfile` parses the PEM cert-chain + key into the DER
+# types `ServerConfig::builder().with_client_cert_verifier(..).with_single_cert(..)` needs (the mTLS
+# path can't use axum-server's `RustlsConfig::from_pem`, which hard-codes `with_no_client_auth`).
+# `tokio-rustls` (matching the in-tree rustls 0.23 / aws-lc-rs) names `server::TlsStream` so the
+# per-connection acceptor can read `peer_certificates()` ONCE after the handshake. Both stay behind the
+# mTLS env flag: the default (flag-off) TLS + plain serve paths are byte-identical.
+rustls-pemfile = "2"
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 # Auth: consume the standalone DPoP/Solid-OIDC verifier as a git dependency — do NOT reimplement.
 # The verifier's M2 landed the DNS-pinned SSRF-guarded network adapters (`NetworkJwksProvider` +
 # `NetworkWebIdResolver` over `SafeFetcher`); we enable its `network` feature so the binary performs
@@ -66,7 +77,20 @@ axum-server = { version = "0.8", default-features = false, features = ["tls-rust
 # NB: `hickory-resolver 0.26.1` declares MSRV `rust-version = 1.88`, so this crate's `rust-version`
 # is bumped to `1.88` to match (local toolchain is 1.89).
 # FOLLOW-UP: re-pin to a tagged release once the verifier cuts one.
-solid-oidc-verifier = { git = "https://github.com/jeswr/solid-oidc-verifier", rev = "b14625339333daa7ab932687c5b7f64c9b1ecba5", features = ["network"] }
+# Re-pinned `b146253 → 321db01` (verifier `main`) for the PoP Tier-1b mTLS wiring: this rev surfaces
+# the RFC 8705 `cnf.x5t#S256` mTLS certificate-thumbprint binding on `VerifiedToken` — the new
+# `cnf_x5t_s256: Option<X5tS256>` field (three-state `Thumbprint(String)` / `Malformed`, so a caller
+# can fail closed on a PRESENT-but-malformed binding rather than collapse it to "unbound") + the
+# `cnf_x5t_s256_thumbprint()` convenience accessor + the `X5tS256` re-export. This is the READ side of
+# design §10 bead 1 (`solid-oidc-verifier` cert-bound support). The verifier's PUBLIC verify path is
+# otherwise UNCHANGED — `Verifier::verify` still runs the full RFC-9068 + RFC-9449 DPoP checks and, in
+# particular, still REJECTS a cert-bound-only token presented as `Bearer` under `require_dpop=true`
+# (the Solid posture): the verify-path admission of a cert-bound Bearer token (a new
+# `AuthRequest.client_cert_x5t_s256` input + the §3 compare) is the REMAINING owner-gated bead-1
+# follow-up. So Tier-1b lands the fail-closed transport + dispatch + RFC 9728 scaffolding; live
+# end-to-end cert-bound acceptance is unblocked when that verifier follow-up lands. Everything else in
+# this crate compiles unchanged (additive field on a pre-1.0 struct consumers read, never construct).
+solid-oidc-verifier = { git = "https://github.com/jeswr/solid-oidc-verifier", rev = "321db01f48b58f7277e4c9e762fb00d7e43334db", features = ["network"] }
 # EMBEDDED SPARQ (opt-in `embedded-sparq` feature): the SPARQ query engine consumed DIRECTLY as a
 # library (NOT over its HTTP service) for the in-process data path. `sparq-core` gives the
 # `Graph` store (`load_str`/`open`/`save`/`apply_delta`) and `sparq-engine` the query/update
@@ -159,8 +183,8 @@ http-body-util = "0.1"
 # HTTPS listener. tokio-rustls is the canonical rustls+tokio adapter and is ALREADY in the resolved
 # tree (pulled in transitively by axum-server's tls-rustls feature), so this adds NO new crate —
 # it only makes the existing dep nameable from the test. Matches the in-tree rustls 0.23 / aws-lc-rs.
-tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
-rustls-pemfile = "2"
+# (`tokio-rustls` + `rustls-pemfile` are now non-dev [dependencies] above — the mTLS serve path names
+# them — so the dev TLS tests reuse those; no separate dev entry needed.)
 # The (default-`#[ignore]`d) live WebSocketChannel2023 handshake test drives a real WebSocket client
 # against the bound axum `…/receive` endpoint. tokio-tungstenite is ALREADY in the resolved tree
 # (pulled in by axum's `ws` feature), so naming it here adds NO new crate to the build. `futures-util`

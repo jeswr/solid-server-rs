@@ -44,6 +44,7 @@
 //!   a multi-binding token is refused rather than partially satisfied — the fail-closed choice.
 
 pub mod cert_bound;
+pub mod conn;
 
 use cert_bound::{verify_cert_binding, CertBindingOutcome, CertThumbprint};
 
