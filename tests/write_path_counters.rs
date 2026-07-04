@@ -203,8 +203,9 @@ async fn put_overwrite_k3_counts() {
 
 /// **PUT create (k = 3 from the parent, warm).** Authorization runs against the nearest EXISTING
 /// ancestor container (`/alice/c/`), found by upward existence probes, then the walk from it is
-/// PLANNED (plan + re-confirm — was the sequential k+1 = 3 probes from the parent). before →
-/// after: 10 → 7 queries (the create path's ancestor-existence probes are a separate follow-up).
+/// PLANNED (plan + re-confirm — was the sequential k+1 = 3 probes from the parent). MEASURED
+/// before → after: 12 → 11 queries (the create path's ancestor-existence probes are a separate
+/// follow-up).
 #[tokio::test]
 async fn put_create_k3_counts() {
     let h = Harness::new().await;
