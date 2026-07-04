@@ -11,6 +11,7 @@ in-memory store (no S3, no live SPARQ), so later optimization rounds have a base
 | `run.sh` (+ `run-auth.sh`) | real HTTPS via `oha` | `oha`, a running server, self-signed cert | this file |
 | **`run-bench.sh`** (`examples/bench_harness`) | in-process `tower::Service` oneshot | nothing but `cargo` | [`HARNESS.md`](./HARNESS.md) |
 | **`run-adversarial.sh`** (`examples/adversarial_bench` + `tests/adversarial_invariants`) | in-process | nothing but `cargo` | [`ADVERSARIAL-BENCH.md`](./ADVERSARIAL-BENCH.md) |
+| **`syscalls.sh`** (`examples/syscall_load`) | real plain-HTTP, one keep-alive conn | Linux + `strace`/`perf` (the EC2 lane) | [`SYSCALLS.md`](./SYSCALLS.md) |
 
 The **`run-bench.sh` / `run-adversarial.sh`** harnesses are the dependency-light, always-runnable
 complement to the `oha` HTTPS sweep: they drive the full application stack (auth → WAC → store) over

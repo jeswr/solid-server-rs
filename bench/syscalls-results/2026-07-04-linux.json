@@ -1,0 +1,779 @@
+{
+  "kind": "solid-server-rs syscalls-per-request (Linux)",
+  "generated_by": "bench/syscalls.sh + bench/syscalls-report.py",
+  "generated_unix": 1783199060,
+  "generated_utc": "2026-07-04T21:04:20Z",
+  "git_sha": "b50baf9",
+  "host": {
+    "kernel": "6.1.175-219.359.amzn2023.x86_64",
+    "arch": "x86_64",
+    "cpu_model": "Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz",
+    "cores": 4,
+    "instance": "ip-172-31-9-231.eu-west-2.compute.internal",
+    "strace": "strace -- version 6.12",
+    "perf": "perf version 6.1.175-219.359.amzn2023.x86_64",
+    "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26)"
+  },
+  "params": {
+    "n": 5000,
+    "perf_n": 50000,
+    "warmup": 200,
+    "idle_secs": 5,
+    "listing_children": 100,
+    "transport": "plain HTTP/1.1, single keep-alive connection, loopback",
+    "store": "in-memory doubles (PSS_SPARQ_BACKEND=memory), bench-seeded",
+    "auth": "mock loopback OIDC issuer; DPoP-bound at+jwt; token cache ON (default)"
+  },
+  "metric_classes": {
+    "deterministic": [
+      "scenarios.*.reps[].by_syscall.*.calls / per_request",
+      "scenarios.*.reps[].total_syscalls / syscalls_per_request",
+      "scenarios.*.reps[].bytes_per_request"
+    ],
+    "advisory": [
+      "perf.* (sampled CPU shares, perf stat counters)"
+    ]
+  },
+  "caveats": [
+    "strace slows the traced server heavily; reactor-amortized syscalls (epoll_wait, timer maintenance) can BATCH differently under trace \u2014 per-request I/O syscalls (read/recvfrom/write/sendto/writev) are robust, amortized ones are approximate.",
+    "idle_baseline shows the background syscall rate the counts sit on; at the configured N its contribution per request is negligible but nonzero.",
+    "t3-class EC2 exposes no hardware PMU: perf uses software counters/cpu-clock sampling."
+  ],
+  "idle_baseline": {
+    "duration_secs": 5,
+    "total_syscalls": 905,
+    "syscalls_per_sec": 181.0,
+    "by_syscall": {
+      "accept4": 2,
+      "epoll_ctl": 1,
+      "epoll_wait": 296,
+      "futex": 4,
+      "recvfrom": 201,
+      "write": 201,
+      "writev": 200
+    }
+  },
+  "scenarios": {
+    "anon-doc": {
+      "reps": [
+        {
+          "n": 5000,
+          "statuses": {
+            "200": 5000
+          },
+          "bytes_per_request": 116.0,
+          "reconnects": 0,
+          "total_syscalls": 22407,
+          "syscalls_per_request": 4.4814,
+          "by_syscall": {
+            "epoll_wait": {
+              "calls": 6751,
+              "errors": 0,
+              "per_request": 1.3502
+            },
+            "recvfrom": {
+              "calls": 5202,
+              "errors": 0,
+              "per_request": 1.0404
+            },
+            "writev": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "write": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "madvise": {
+              "calls": 42,
+              "errors": 0,
+              "per_request": 0.0084
+            },
+            "futex": {
+              "calls": 6,
+              "errors": 0,
+              "per_request": 0.0012
+            },
+            "accept4": {
+              "calls": 2,
+              "errors": 1,
+              "per_request": 0.0004
+            },
+            "epoll_ctl": {
+              "calls": 2,
+              "errors": 0,
+              "per_request": 0.0004
+            },
+            "shutdown": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "close": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            }
+          }
+        },
+        {
+          "n": 5000,
+          "statuses": {
+            "200": 5000
+          },
+          "bytes_per_request": 116.0,
+          "reconnects": 0,
+          "total_syscalls": 22301,
+          "syscalls_per_request": 4.4602,
+          "by_syscall": {
+            "epoll_wait": {
+              "calls": 6683,
+              "errors": 0,
+              "per_request": 1.3366
+            },
+            "recvfrom": {
+              "calls": 5202,
+              "errors": 0,
+              "per_request": 1.0404
+            },
+            "writev": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "write": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "futex": {
+              "calls": 6,
+              "errors": 0,
+              "per_request": 0.0012
+            },
+            "madvise": {
+              "calls": 4,
+              "errors": 0,
+              "per_request": 0.0008
+            },
+            "epoll_ctl": {
+              "calls": 2,
+              "errors": 0,
+              "per_request": 0.0004
+            },
+            "accept4": {
+              "calls": 2,
+              "errors": 1,
+              "per_request": 0.0004
+            },
+            "close": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "shutdown": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            }
+          }
+        }
+      ]
+    },
+    "listing": {
+      "reps": [
+        {
+          "n": 5000,
+          "statuses": {
+            "200": 5000
+          },
+          "bytes_per_request": 5199.0,
+          "reconnects": 0,
+          "total_syscalls": 22432,
+          "syscalls_per_request": 4.4864,
+          "by_syscall": {
+            "epoll_wait": {
+              "calls": 6816,
+              "errors": 0,
+              "per_request": 1.3632
+            },
+            "recvfrom": {
+              "calls": 5202,
+              "errors": 0,
+              "per_request": 1.0404
+            },
+            "writev": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "write": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "futex": {
+              "calls": 6,
+              "errors": 0,
+              "per_request": 0.0012
+            },
+            "accept4": {
+              "calls": 2,
+              "errors": 1,
+              "per_request": 0.0004
+            },
+            "epoll_ctl": {
+              "calls": 2,
+              "errors": 0,
+              "per_request": 0.0004
+            },
+            "madvise": {
+              "calls": 2,
+              "errors": 0,
+              "per_request": 0.0004
+            },
+            "shutdown": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "close": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            }
+          }
+        },
+        {
+          "n": 5000,
+          "statuses": {
+            "200": 5000
+          },
+          "bytes_per_request": 5199.0,
+          "reconnects": 0,
+          "total_syscalls": 22224,
+          "syscalls_per_request": 4.4448,
+          "by_syscall": {
+            "epoll_wait": {
+              "calls": 6609,
+              "errors": 0,
+              "per_request": 1.3218
+            },
+            "recvfrom": {
+              "calls": 5202,
+              "errors": 0,
+              "per_request": 1.0404
+            },
+            "writev": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "write": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "futex": {
+              "calls": 6,
+              "errors": 0,
+              "per_request": 0.0012
+            },
+            "accept4": {
+              "calls": 2,
+              "errors": 1,
+              "per_request": 0.0004
+            },
+            "epoll_ctl": {
+              "calls": 2,
+              "errors": 0,
+              "per_request": 0.0004
+            },
+            "shutdown": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "close": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "madvise": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            }
+          }
+        }
+      ]
+    },
+    "authed-doc": {
+      "reps": [
+        {
+          "n": 5000,
+          "statuses": {
+            "200": 5000
+          },
+          "bytes_per_request": 118.0,
+          "reconnects": 0,
+          "total_syscalls": 26726,
+          "syscalls_per_request": 5.3452,
+          "by_syscall": {
+            "epoll_wait": {
+              "calls": 10485,
+              "errors": 0,
+              "per_request": 2.097
+            },
+            "recvfrom": {
+              "calls": 5202,
+              "errors": 0,
+              "per_request": 1.0404
+            },
+            "writev": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "write": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "futex": {
+              "calls": 426,
+              "errors": 0,
+              "per_request": 0.0852
+            },
+            "getrandom": {
+              "calls": 200,
+              "errors": 0,
+              "per_request": 0.04
+            },
+            "madvise": {
+              "calls": 7,
+              "errors": 0,
+              "per_request": 0.0014
+            },
+            "accept4": {
+              "calls": 2,
+              "errors": 1,
+              "per_request": 0.0004
+            },
+            "epoll_ctl": {
+              "calls": 2,
+              "errors": 0,
+              "per_request": 0.0004
+            },
+            "close": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "shutdown": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            }
+          }
+        },
+        {
+          "n": 5000,
+          "statuses": {
+            "200": 5000
+          },
+          "bytes_per_request": 118.0,
+          "reconnects": 0,
+          "total_syscalls": 26735,
+          "syscalls_per_request": 5.347,
+          "by_syscall": {
+            "epoll_wait": {
+              "calls": 10489,
+              "errors": 0,
+              "per_request": 2.0978
+            },
+            "recvfrom": {
+              "calls": 5202,
+              "errors": 0,
+              "per_request": 1.0404
+            },
+            "writev": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "write": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "futex": {
+              "calls": 428,
+              "errors": 0,
+              "per_request": 0.0856
+            },
+            "getrandom": {
+              "calls": 200,
+              "errors": 0,
+              "per_request": 0.04
+            },
+            "madvise": {
+              "calls": 10,
+              "errors": 0,
+              "per_request": 0.002
+            },
+            "epoll_ctl": {
+              "calls": 2,
+              "errors": 0,
+              "per_request": 0.0004
+            },
+            "accept4": {
+              "calls": 2,
+              "errors": 1,
+              "per_request": 0.0004
+            },
+            "close": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "shutdown": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            }
+          }
+        }
+      ]
+    },
+    "put": {
+      "reps": [
+        {
+          "n": 5000,
+          "statuses": {
+            "204": 5000
+          },
+          "bytes_per_request": 0.0,
+          "reconnects": 0,
+          "total_syscalls": 41639,
+          "syscalls_per_request": 8.3278,
+          "by_syscall": {
+            "futex": {
+              "calls": 10692,
+              "errors": 2,
+              "per_request": 2.1384
+            },
+            "epoll_wait": {
+              "calls": 10320,
+              "errors": 0,
+              "per_request": 2.064
+            },
+            "write": {
+              "calls": 5204,
+              "errors": 0,
+              "per_request": 1.0408
+            },
+            "recvfrom": {
+              "calls": 5202,
+              "errors": 0,
+              "per_request": 1.0404
+            },
+            "writev": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "getrandom": {
+              "calls": 5000,
+              "errors": 0,
+              "per_request": 1.0
+            },
+            "madvise": {
+              "calls": 15,
+              "errors": 0,
+              "per_request": 0.003
+            },
+            "accept4": {
+              "calls": 2,
+              "errors": 1,
+              "per_request": 0.0004
+            },
+            "epoll_ctl": {
+              "calls": 2,
+              "errors": 0,
+              "per_request": 0.0004
+            },
+            "shutdown": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "close": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            }
+          }
+        },
+        {
+          "n": 5000,
+          "statuses": {
+            "204": 5000
+          },
+          "bytes_per_request": 0.0,
+          "reconnects": 0,
+          "total_syscalls": 40657,
+          "syscalls_per_request": 8.1314,
+          "by_syscall": {
+            "futex": {
+              "calls": 10568,
+              "errors": 2,
+              "per_request": 2.1136
+            },
+            "epoll_wait": {
+              "calls": 10079,
+              "errors": 0,
+              "per_request": 2.0158
+            },
+            "write": {
+              "calls": 5002,
+              "errors": 0,
+              "per_request": 1.0004
+            },
+            "recvfrom": {
+              "calls": 5001,
+              "errors": 0,
+              "per_request": 1.0002
+            },
+            "writev": {
+              "calls": 5000,
+              "errors": 0,
+              "per_request": 1.0
+            },
+            "getrandom": {
+              "calls": 5000,
+              "errors": 0,
+              "per_request": 1.0
+            },
+            "madvise": {
+              "calls": 4,
+              "errors": 0,
+              "per_request": 0.0008
+            },
+            "shutdown": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "close": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "epoll_ctl": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            }
+          }
+        }
+      ]
+    }
+  },
+  "perf_advisory": {
+    "anon-doc": {
+      "n": 50000,
+      "kernel_cpu_percent": null,
+      "perf_stat": [
+        " Performance counter stats for process id '42686':",
+        "           2951.11 msec task-clock:u                     #    0.429 CPUs utilized",
+        "                 0      context-switches:u               #    0.000 /sec",
+        "                 0      cpu-migrations:u                 #    0.000 /sec",
+        "                17      page-faults:u                    #    5.761 /sec",
+        "   <not supported>      cycles:u",
+        "   <not supported>      instructions:u",
+        "   <not supported>      branches:u",
+        "   <not supported>      branch-misses:u",
+        "       6.885378719 seconds time elapsed"
+      ],
+      "top_dso": [
+        "    93.79%    86.35%  solid-server-rs",
+        "            |",
+        "            |--4.28%--0x1",
+        "            |          |",
+        "            |           --0.92%--tokio::runtime::scheduler::multi_thread::worker::Context::run",
+        "            |",
+        "            |--3.67%--solid_server_rs::authz::wac::WacAuthorizer<S>::read_plan_candidates",
+        "            |          |"
+      ],
+      "top_symbols": [
+        "     8.96%     1.32%  tokio-rt-worker  solid-server-rs   [.] alloc::fmt::format::format_inner",
+        "            |",
+        "             --7.64%--alloc::fmt::format::format_inner",
+        "                       |",
+        "                        --6.62%--core::fmt::write",
+        "                                  |",
+        "                                   --5.09%--<alloc::string::String as core::fmt::Write>::write_str",
+        "                                             |",
+        "                                              --4.07%--<alloc::raw_vec::RawVecInner<_>>::reserve::do_reserve_and_handle::<alloc::alloc::Global>",
+        "                                                        |",
+        "                                                         --2.75%--<alloc::raw_vec::RawVecInner>::finish_grow",
+        "                                                                   |",
+        "                                                                    --1.02%--mi_theap_umalloc",
+        "     6.72%     1.02%  tokio-rt-worker  solid-server-rs   [.] core::fmt::write",
+        "            |",
+        "             --5.70%--core::fmt::write",
+        "                       |",
+        "                        --5.09%--<alloc::string::String as core::fmt::Write>::write_str",
+        "                                  |",
+        "                                   --4.07%--<alloc::raw_vec::RawVecInner<_>>::reserve::do_reserve_and_handle::<alloc::alloc::Global>"
+      ]
+    },
+    "listing": {
+      "n": 50000,
+      "kernel_cpu_percent": null,
+      "perf_stat": [
+        " Performance counter stats for process id '42686':",
+        "           6230.69 msec task-clock:u                     #    0.582 CPUs utilized",
+        "                 0      context-switches:u               #    0.000 /sec",
+        "                 0      cpu-migrations:u                 #    0.000 /sec",
+        "                11      page-faults:u                    #    1.765 /sec",
+        "   <not supported>      cycles:u",
+        "   <not supported>      instructions:u",
+        "   <not supported>      branches:u",
+        "   <not supported>      branch-misses:u",
+        "      10.698875315 seconds time elapsed"
+      ],
+      "top_dso": [
+        "    96.50%    90.49%  solid-server-rs",
+        "            |",
+        "            |--9.47%--0x2e302e302e373231",
+        "            |          |",
+        "            |           --7.48%--solid_server_rs::ldp::handler::representation_etag",
+        "            |",
+        "            |--7.20%--oxiri::is_iunreserved_or_sub_delims",
+        "            |"
+      ],
+      "top_symbols": [
+        "     9.59%     0.00%  tokio-rt-worker  [unknown]         [.] 0x2e302e302e373231",
+        "            |",
+        "            ---0x2e302e302e373231",
+        "               |",
+        "                --7.48%--solid_server_rs::ldp::handler::representation_etag",
+        "     8.32%     8.32%  tokio-rt-worker  solid-server-rs   [.] oxiri::Iri<T>::parse",
+        "            |",
+        "             --6.76%--oxiri::Iri<T>::parse",
+        "     8.12%     0.60%  tokio-rt-worker  solid-server-rs   [.] <oxttl::trig::TurtleTerm as core::fmt::Display>::fmt",
+        "            |",
+        "             --7.52%--<oxttl::trig::TurtleTerm as core::fmt::Display>::fmt",
+        "                       |",
+        "                       |--1.67%--std::io::Write::write_fmt",
+        "                       |",
+        "                       |--1.19%--core::fmt::write",
+        "                       |",
+        "                        --1.19%--solid_server_rs::ldp::content::serialize_triples",
+        "     7.48%     6.96%  tokio-rt-worker  solid-server-rs   [.] solid_server_rs::ldp::handler::representation_etag",
+        "            |",
+        "             --6.96%--0x2e302e302e373231"
+      ]
+    },
+    "authed-doc": {
+      "n": 50000,
+      "kernel_cpu_percent": null,
+      "perf_stat": [
+        " Performance counter stats for process id '42686':",
+        "          11332.72 msec task-clock:u                     #    0.403 CPUs utilized",
+        "                 0      context-switches:u               #    0.000 /sec",
+        "                 0      cpu-migrations:u                 #    0.000 /sec",
+        "               388      page-faults:u                    #   34.237 /sec",
+        "   <not supported>      cycles:u",
+        "   <not supported>      instructions:u",
+        "   <not supported>      branches:u",
+        "   <not supported>      branch-misses:u",
+        "      28.118616425 seconds time elapsed"
+      ],
+      "top_dso": [
+        "    96.10%    93.13%  solid-server-rs",
+        "            |",
+        "            |--14.00%--__ecp_nistz256_mul_montx",
+        "            |",
+        "            |--7.97%--__ecp_nistz256_sqr_montx",
+        "            |",
+        "            |--5.70%--0x5500000000000000",
+        "            |          aws_lc_rs::ec::signature::EcdsaVerificationAlgorithm::verify_ecdsa"
+      ],
+      "top_symbols": [
+        "    14.00%    14.00%  tokio-rt-worker  solid-server-rs   [.] __ecp_nistz256_mul_montx",
+        "            |",
+        "            ---__ecp_nistz256_mul_montx",
+        "     8.02%     8.02%  tokio-rt-worker  solid-server-rs   [.] __ecp_nistz256_sqr_montx",
+        "            |",
+        "             --7.97%--__ecp_nistz256_sqr_montx",
+        "     6.03%     0.02%  tokio-rt-worker  solid-server-rs   [.] aws_lc_rs::ec::signature::EcdsaVerificationAlgorithm::verify_ecdsa",
+        "            |",
+        "             --6.01%--aws_lc_rs::ec::signature::EcdsaVerificationAlgorithm::verify_ecdsa",
+        "                       |",
+        "                        --5.78%--aws_lc_0_41_0_EVP_DigestVerify",
+        "                                  |",
+        "                                   --5.58%--aws_lc_0_41_0_EVP_DigestVerifyFinal",
+        "                                             |",
+        "                                              --5.39%--aws_lc_0_41_0_ECDSA_verify",
+        "                                                        |",
+        "                                                         --4.76%--aws_lc_0_41_0_ecdsa_do_verify_no_self_test",
+        "                                                                   |",
+        "                                                                    --4.51%--aws_lc_0_41_0_ec_point_mul_scalar_public",
+        "                                                                              |"
+      ]
+    },
+    "put": {
+      "n": 50000,
+      "kernel_cpu_percent": null,
+      "perf_stat": [
+        " Performance counter stats for process id '42686':",
+        "          13574.63 msec task-clock:u                     #    0.456 CPUs utilized",
+        "                 0      context-switches:u               #    0.000 /sec",
+        "                 0      cpu-migrations:u                 #    0.000 /sec",
+        "               543      page-faults:u                    #   40.001 /sec",
+        "   <not supported>      cycles:u",
+        "   <not supported>      instructions:u",
+        "   <not supported>      branches:u",
+        "   <not supported>      branch-misses:u",
+        "      29.756097786 seconds time elapsed"
+      ],
+      "top_dso": [
+        "    95.30%    91.55%  solid-server-rs",
+        "            |",
+        "            |--11.78%--__ecp_nistz256_mul_montx",
+        "            |",
+        "            |--6.95%--__ecp_nistz256_sqr_montx",
+        "            |",
+        "            |--4.81%--0x5500000000000000",
+        "            |          aws_lc_rs::ec::signature::EcdsaVerificationAlgorithm::verify_ecdsa"
+      ],
+      "top_symbols": [
+        "    11.79%    11.79%  tokio-rt-worker  solid-server-rs   [.] __ecp_nistz256_mul_montx",
+        "            |",
+        "             --11.78%--__ecp_nistz256_mul_montx",
+        "     7.05%     7.05%  tokio-rt-worker  solid-server-rs   [.] __ecp_nistz256_sqr_montx",
+        "            |",
+        "             --6.95%--__ecp_nistz256_sqr_montx",
+        "     5.30%     0.00%  tokio-rt-worker  solid-server-rs   [.] aws_lc_rs::ec::signature::EcdsaVerificationAlgorithm::verify_ecdsa",
+        "            |",
+        "            ---aws_lc_rs::ec::signature::EcdsaVerificationAlgorithm::verify_ecdsa",
+        "               |",
+        "                --4.99%--aws_lc_0_41_0_EVP_DigestVerify",
+        "                          |",
+        "                           --4.83%--aws_lc_0_41_0_EVP_DigestVerifyFinal",
+        "                                     |",
+        "                                      --4.52%--aws_lc_0_41_0_ECDSA_verify",
+        "                                                |",
+        "                                                 --4.06%--aws_lc_0_41_0_ecdsa_do_verify_no_self_test",
+        "                                                           |",
+        "                                                            --3.73%--aws_lc_0_41_0_ec_point_mul_scalar_public",
+        "                                                                      |"
+      ]
+    }
+  }
+}
