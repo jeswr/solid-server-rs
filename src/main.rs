@@ -218,6 +218,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Resolve EARLY so a misconfiguration (one TLS var without the other) fails fast at boot, before
     // we stand up auth/storage. Filesystem + PEM validation happens just before binding, below.
     let tls_mode = tls::mode_from_env().map_err(|e| format!("TLS configuration error: {e}"))?;
+    // PoP Tier-1b: whether to enable the RFC 8705 mTLS-bound-token path (optional client-cert request
+    // in the TLS handshake + the per-connection cert-binding dispatch in auth). Default OFF ⇒ the TLS +
+    // plain serve paths are byte-identical to pre-Tier-1b. Only meaningful on the in-process TLS path.
+    let mtls_bound_tokens = tls::mtls_bound_tokens_from_env();
 
     // --- Auth: REAL network-backed verification (delegated to solid-oidc-verifier). ----------------
     // The NetworkJwksProvider does OIDC discovery + JWKS fetch over the DNS-pinned SSRF-guarded path.
@@ -316,7 +320,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 0 => cache DISABLED: the pre-round-3 full-verify-every-request path.
         0 => {
             eprintln!("  AUTH: verified-access-token cache DISABLED (full verify per request).");
-            AuthContext::new(verifier, base_url.clone())
+            AuthContext::new(verifier, base_url.clone()).with_mtls_bound_tokens(mtls_bound_tokens)
         }
         cap => {
             eprintln!(
@@ -330,6 +334,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let max_entry_ttl = jwks_cache_ttl.as_secs() as i64;
             let cache = VerifiedTokenCache::with_max_entry_ttl(cap, proof_policy, max_entry_ttl);
             AuthContext::with_cache(verifier, base_url.clone(), cache, cache_replay)
+                .with_mtls_bound_tokens(mtls_bound_tokens)
         }
     };
 
@@ -608,7 +613,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build the rustls config (reads + validates the PEM files) for TLS mode; `None` for plain mode.
     // Done after the router is assembled but before binding, so a bad cert/key fails at boot.
-    let rustls_config = tls::build_rustls_config(&tls_mode)
+    let rustls_config = tls::build_rustls_config(&tls_mode, mtls_bound_tokens)
         .await
         .map_err(|e| format!("TLS configuration error: {e}"))?;
 
@@ -629,7 +634,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cert_path.display(),
             key_path.display()
         );
+        if mtls_bound_tokens {
+            eprintln!(
+                "  mTLS (PoP Tier-1b): RFC 8705 cert-bound tokens ENABLED — the handshake REQUESTS an \
+                 optional client certificate (plain-DPoP clients unaffected); a cert-bound token is \
+                 matched against the presented cert fail-closed."
+            );
+        }
     } else {
+        if mtls_bound_tokens {
+            eprintln!(
+                "  WARNING: SOLID_SERVER_MTLS_BOUND_TOKENS is set but in-process TLS is OFF — the mTLS \
+                 cert-bound path needs in-process TLS to see a client certificate, so it is INACTIVE on \
+                 the plain-HTTP path (a cert-bound token would be denied fail-closed). Set \
+                 SOLID_SERVER_TLS_CERT + _KEY to enable it."
+            );
+        }
         eprintln!("  TLS: plain HTTP — terminate TLS at a reverse proxy (set SOLID_SERVER_TLS_CERT + _KEY to enable in-process HTTPS).");
     }
     if allow_loopback {
@@ -677,21 +697,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             //      `auto::Builder` axum-server serves with — preserving rustls TLS + h2/http1.1 ALPN
             //      exactly (the rustls config owns ALPN; we touch only the hyper protocol knobs).
             let handshake_timeout = transport_config.handshake_timeout;
-            let mut server = axum_server::from_tcp_rustls(std_listener, config)?
+            let base = axum_server::from_tcp_rustls(std_listener, config)?
                 .handle(handle)
-                .map(|acceptor| {
+                .map(move |acceptor| {
                     connection_limiter
                         .wrap_acceptor_with_handshake_timeout(acceptor, handshake_timeout)
                 });
-            transport_config.apply_to_builder(server.http_builder());
 
             // `into_make_service_with_connect_info::<SocketAddr>()` (NOT plain `into_make_service`) so
             // each request carries `ConnectInfo<SocketAddr>` in its extensions — the pre-crypto rate
             // limiter reads the direct peer IP from it. axum-server supports the connect-info make
             // service. Without this the limiter would see no peer IP and FAIL OPEN (proceed to auth).
-            server
-                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                .await?;
+            //
+            // PoP Tier-1b: when the mTLS flag is on, wrap the connection-cap acceptor with the
+            // `ConnPopAcceptor` OUTERMOST — it reads the peer client certificate ONCE per connection
+            // (after the handshake) and injects a `ConnPop` into every request so the auth layer can
+            // match a cert-bound token against it. When off, the serve path is byte-identical (no wrap),
+            // so the `.map` type differs between branches — hence the duplicated serve call.
+            if mtls_bound_tokens {
+                let mut server = base.map(solid_server_rs::pop::conn::ConnPopAcceptor::new);
+                transport_config.apply_to_builder(server.http_builder());
+                server
+                    .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                    .await?;
+            } else {
+                let mut server = base;
+                transport_config.apply_to_builder(server.http_builder());
+                server
+                    .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                    .await?;
+            }
         }
         // Plain TCP (dev/test behaviour). Graceful shutdown on Ctrl-C.
         //

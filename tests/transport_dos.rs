@@ -69,7 +69,7 @@ async fn boot_hardened_server(
         cert_path: CERT_PATH.into(),
         key_path: KEY_PATH.into(),
     };
-    let rustls_config = build_rustls_config(&mode)
+    let rustls_config = build_rustls_config(&mode, false)
         .await
         .expect("build rustls config")
         .expect("tls mode yields a config");

@@ -641,6 +641,16 @@ impl<Io> PermittedStream<Io> {
     }
 }
 
+/// Forward the peer-certificate read through the connection-cap wrapper so the PoP Tier-1b acceptor
+/// ([`crate::pop::conn::ConnPopAcceptor`]) can read the client cert from a `PermittedStream<TlsStream>`
+/// exactly as it would from the bare TLS stream. Purely a delegation — the permit/per-IP guards do not
+/// affect the certificate.
+impl<Io: crate::pop::conn::PeerCertDer> crate::pop::conn::PeerCertDer for PermittedStream<Io> {
+    fn peer_cert_der(&self) -> Option<Vec<u8>> {
+        self.inner.peer_cert_der()
+    }
+}
+
 impl<Io: AsyncRead + Unpin> AsyncRead for PermittedStream<Io> {
     fn poll_read(
         mut self: Pin<&mut Self>,

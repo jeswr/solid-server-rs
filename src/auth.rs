@@ -21,13 +21,16 @@ use axum::response::{IntoResponse, Response};
 use solid_oidc_verifier::config::JwksProvider;
 use solid_oidc_verifier::error::{ErrorKind, VerifyError};
 use solid_oidc_verifier::replay::ReplayStore;
-use solid_oidc_verifier::verifier::{AuthRequest, Verifier};
+use solid_oidc_verifier::verifier::{AuthRequest, Verifier, X5tS256};
 
 pub use solid_oidc_verifier::verifier::VerifiedToken;
 
 use crate::auth_cache::{CacheDecision, VerifiedTokenCache};
 use crate::error::ServerError;
 use crate::ldp::target::parse_target;
+use crate::pop::cert_bound::{CertBindingOutcome, CertThumbprint};
+use crate::pop::conn::ConnPop;
+use crate::pop::{dispatch as pop_dispatch, Confirmation, PopRoute};
 
 /// Everything the auth layer needs: the verifier and the server's public base URL.
 ///
@@ -47,6 +50,15 @@ pub struct AuthContext<J: JwksProvider, R: ReplayStore> {
     /// building one `Arc<InMemoryReplayStore>`, giving the verifier `SharedReplay<_>` over it and the
     /// cache a clone of the same `Arc`. This `replay` handle is exactly that clone.
     cache: Option<TokenCache<R>>,
+    /// PoP Tier-1b: whether the RFC 8705 mTLS cert-bound-token confirmation dispatch is ACTIVE (the
+    /// `SOLID_SERVER_MTLS_BOUND_TOKENS` flag, wired in `main`). **Default `false`** — when off,
+    /// [`authenticate`](Self::authenticate) runs the pre-Tier-1b path byte-for-byte (no confirmation
+    /// dispatch; the presented certificate is ignored). When on, a *successfully verified* token's `cnf`
+    /// confirmation is dispatched via [`crate::pop`]: a cert-bound token is matched against the
+    /// connection's presented certificate (fail-closed), a malformed cert binding is rejected, a
+    /// multi-binding token is refused, and a DPoP/public token is unchanged. See
+    /// [`finalize_pop`](Self::finalize_pop).
+    mtls_bound_tokens: bool,
 }
 
 /// The token cache + the shared replay handle it marks `jti`s through (the SAME store the verifier
@@ -64,6 +76,7 @@ impl<J: JwksProvider, R: ReplayStore> AuthContext<J, R> {
             verifier,
             base_url: base_url.into(),
             cache: None,
+            mtls_bound_tokens: false,
         }
     }
 
@@ -80,7 +93,17 @@ impl<J: JwksProvider, R: ReplayStore> AuthContext<J, R> {
             verifier,
             base_url: base_url.into(),
             cache: Some(TokenCache { cache, replay }),
+            mtls_bound_tokens: false,
         }
+    }
+
+    /// Enable (or disable) the PoP Tier-1b RFC 8705 mTLS cert-bound-token confirmation dispatch
+    /// (`SOLID_SERVER_MTLS_BOUND_TOKENS`). Off by default; `main` turns it on only when the flag is set
+    /// AND in-process TLS is terminating (so a client certificate can actually be presented). A
+    /// builder-style setter so the two constructors above stay unchanged for every existing caller/test.
+    pub fn with_mtls_bound_tokens(mut self, enabled: bool) -> Self {
+        self.mtls_bound_tokens = enabled;
+        self
     }
 
     /// Verify the request and return the caller's [`VerifiedToken`] (possibly public), or the
@@ -93,7 +116,47 @@ impl<J: JwksProvider, R: ReplayStore> AuthContext<J, R> {
     /// (the cache cannot turn a failing proof into a success). On a MISS (or any non-DPoP request) the
     /// full verifier runs, and a successful DPoP-bound result is inserted for the token's `exp` window.
     /// Disabling the cache is byte-identical to the pre-round-3 path.
+    ///
+    /// ## PoP Tier-1b confirmation dispatch (when the mTLS flag is on)
+    /// After the verifier (or the cache) yields a token, [`finalize_pop`](Self::finalize_pop) runs the
+    /// RFC 8705 mTLS confirmation dispatch when [`with_mtls_bound_tokens`](Self::with_mtls_bound_tokens)
+    /// is enabled: `presented_cert` is the thumbprint of the client certificate on THIS TLS connection
+    /// (from the [`ConnPop`] request extension, `None` when no client cert / not on the TLS+mTLS path).
+    /// When the flag is off, `presented_cert` is ignored and the result is byte-identical to before.
     pub fn authenticate(
+        &self,
+        authorization: Option<String>,
+        dpop: Option<String>,
+        method: &str,
+        path: &str,
+    ) -> Result<VerifiedToken, ServerError> {
+        // No presented client certificate (the non-mTLS / no-TLS caller). With the mTLS flag off this is
+        // byte-identical to the pre-Tier-1b path; with it on, a cert-bound token is denied fail-closed
+        // (no cert to satisfy the binding). The mTLS serve path calls
+        // [`authenticate_with_cert`](Self::authenticate_with_cert) with the connection's cert.
+        self.authenticate_with_cert(authorization, dpop, method, path, None)
+    }
+
+    /// As [`authenticate`](Self::authenticate), but supplying the client-certificate thumbprint the peer
+    /// presented on THIS TLS connection (PoP Tier-1b). Called by the auth middleware on the mTLS serve
+    /// path from the [`ConnPop`] request extension; `presented_cert` is `None` when no client cert was
+    /// presented / the mTLS path is inactive.
+    pub fn authenticate_with_cert(
+        &self,
+        authorization: Option<String>,
+        dpop: Option<String>,
+        method: &str,
+        path: &str,
+        presented_cert: Option<&CertThumbprint>,
+    ) -> Result<VerifiedToken, ServerError> {
+        let token = self.authenticate_inner(authorization, dpop, method, path)?;
+        self.finalize_pop(token, presented_cert)
+    }
+
+    /// The pre-Tier-1b verify-or-cache core (unchanged): returns the verifier's/cache's decision with no
+    /// mTLS confirmation dispatch. [`authenticate`](Self::authenticate) applies [`finalize_pop`](Self::finalize_pop)
+    /// on top when the mTLS flag is on.
+    fn authenticate_inner(
         &self,
         authorization: Option<String>,
         dpop: Option<String>,
@@ -155,7 +218,18 @@ impl<J: JwksProvider, R: ReplayStore> AuthContext<J, R> {
                             })?;
                     // Only a SUCCESSFUL full verification reaches here => safe to cache. A non-DPoP-bound
                     // token (no cnf.jkt/exp) is silently not cached by `insert`.
-                    tc.cache.insert(access_token, &token, now_secs());
+                    //
+                    // (roborev Medium) When the mTLS flag is on, `finalize_pop` (applied by the caller
+                    // AFTER this returns) rejects a token that ALSO carries a cert binding — a
+                    // multi-binding token is refused (a cert-bound-only token has no cnf.jkt so `insert`
+                    // already skips it). Caching such a token would let a token that never completes
+                    // authentication occupy an LRU slot and be served on later attempts. So skip the
+                    // insert for ANY token carrying a cert binding when mTLS is on — only a PURELY
+                    // DPoP-bound token (the sole thing `finalize_pop` accepts down the cache path) is
+                    // cached. When mTLS is off this is unchanged (the condition is never true).
+                    if !(self.mtls_bound_tokens && token.cnf_x5t_s256.is_some()) {
+                        tc.cache.insert(access_token, &token, now_secs());
+                    }
                     return Ok(token);
                 }
             }
@@ -175,6 +249,73 @@ impl<J: JwksProvider, R: ReplayStore> AuthContext<J, R> {
                 message: e.message().to_string(),
                 www_authenticate: self.verifier.www_authenticate(&e),
             })
+    }
+
+    /// PoP Tier-1b — the RFC 8705 mTLS confirmation dispatch applied to an already-verified token.
+    ///
+    /// This is PURELY ADDITIVE hardening: it can only turn an otherwise-accepted token into a DENY (for
+    /// a cert-bound / malformed-binding / multi-binding token that does not satisfy its confirmation on
+    /// THIS connection); it NEVER turns a deny into an accept. The token reached here only via a full
+    /// verify (signature + RFC 9068 + any DPoP proof) or a cache hit (fresh proof re-verified), so its
+    /// `cnf` claims are trustworthy.
+    ///
+    /// - **Flag off** ⇒ returned unchanged (byte-identical to pre-Tier-1b; the presented cert is ignored).
+    /// - **DPoP-bound** (`cnf.jkt` only) ⇒ [`PopRoute::Dpop`]: accepted (the verifier already ran the
+    ///   full DPoP proof; a certificate can never satisfy — nor is it consulted for — a DPoP token).
+    /// - **Public / unbound** (no `cnf`) ⇒ [`PopRoute::Unbound`]: returned unchanged (the verifier's
+    ///   `require_dpop` policy already governed whether an unbound token was admitted at all).
+    /// - **Cert-bound** (`cnf.x5t#S256` only) ⇒ [`PopRoute::CertBound`]: the presented certificate MUST
+    ///   match; no cert / wrong cert ⇒ 401 (fail-closed — never a downgrade to bearer).
+    /// - **Malformed cert binding** (`cnf.x5t#S256` present but not a valid thumbprint) ⇒ 401 (a broken
+    ///   cert binding is never collapsed to "unbound" — the fail-closed choice, mirroring the verifier's
+    ///   three-state [`X5tS256`]).
+    /// - **Multiple bindings** (`cnf.jkt` AND `cnf.x5t#S256`) ⇒ [`PopRoute::MultipleBindings`]: refused
+    ///   (combined both-must-hold verification is unimplemented; satisfying only one would bypass the
+    ///   other — see [`Confirmation::MultipleBindings`]).
+    fn finalize_pop(
+        &self,
+        token: VerifiedToken,
+        presented_cert: Option<&CertThumbprint>,
+    ) -> Result<VerifiedToken, ServerError> {
+        if !self.mtls_bound_tokens {
+            // mTLS path disabled — no confirmation dispatch, presented cert ignored. Byte-identical.
+            return Ok(token);
+        }
+
+        // Parse the token's mTLS confirmation into a comparable thumbprint, failing CLOSED on a present
+        // but malformed binding (never treated as unbound).
+        let x5t: Option<CertThumbprint> = match &token.cnf_x5t_s256 {
+            None => None,
+            Some(X5tS256::Thumbprint(t)) => match CertThumbprint::from_base64url(t) {
+                Ok(tp) => Some(tp),
+                // The verifier already validates the base64url/length of a `Thumbprint`, so this is
+                // belt-and-braces; a parse failure here still fails closed rather than silently unbinds.
+                Err(_) => return Err(self.cert_bound_denied()),
+            },
+            Some(X5tS256::Malformed) => return Err(self.cert_bound_denied()),
+        };
+
+        let confirmation = Confirmation::select(token.cnf_jkt.clone(), x5t);
+        match pop_dispatch(&confirmation, presented_cert) {
+            // The verifier is authoritative for DPoP + unbound/public; return unchanged.
+            PopRoute::Dpop | PopRoute::Unbound => Ok(token),
+            PopRoute::CertBound(CertBindingOutcome::Confirmed) => Ok(token),
+            PopRoute::CertBound(CertBindingOutcome::Denied(_)) => Err(self.cert_bound_denied()),
+            PopRoute::MultipleBindings => Err(self.cert_bound_denied()),
+        }
+    }
+
+    /// The 401 for a failed RFC 8705 mTLS cert-binding (no cert / wrong cert / malformed / multi-binding).
+    /// Fail-closed: a cert-bound token that does not satisfy its binding on this connection is rejected,
+    /// never accepted bare. The `WWW-Authenticate` challenge reuses the server's single-sourced DPoP
+    /// challenge (the RFC 9728 `resource_metadata` param is a documented follow-up — see the design §6).
+    fn cert_bound_denied(&self) -> ServerError {
+        ServerError::Unauthorized {
+            status: 401,
+            message: "The access token's certificate binding was not satisfied on this connection."
+                .to_string(),
+            www_authenticate: self.unauthenticated_challenge(),
+        }
     }
 
     /// Build the 401 + `WWW-Authenticate` challenge for a request that REQUIRES authentication but
@@ -242,7 +383,17 @@ where
         Err(()) => return ServerError::BadRequest("malformed DPoP header".into()).into_response(),
     };
 
-    match ctx.authenticate(authorization, dpop, &method, &path) {
+    // PoP Tier-1b: the client-certificate thumbprint for THIS connection, injected once per connection
+    // by the mTLS acceptor ([`crate::pop::conn::ConnPopService`]). Absent when the mTLS flag is off, on
+    // the plain-HTTP path, or when the peer presented no client certificate — in all of which a
+    // cert-bound token is denied fail-closed by `authenticate`. Cloned out (a 32-byte thumbprint) so we
+    // can still move `req` into the handler chain below.
+    let presented_cert = req
+        .extensions()
+        .get::<ConnPop>()
+        .and_then(|p| p.thumbprint().cloned());
+
+    match ctx.authenticate_with_cert(authorization, dpop, &method, &path, presented_cert.as_ref()) {
         Ok(token) => {
             req.extensions_mut().insert(token);
             next.run(req).await
