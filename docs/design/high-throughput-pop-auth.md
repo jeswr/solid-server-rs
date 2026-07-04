@@ -145,9 +145,12 @@ hundreds of nanoseconds versus ~125 µs for the ECDSA verify (order-of-magnitude
 measured on this box by the follow-up bench, not asserted as a gate).
 
 Where a TLS channel binding is available to the client (native/service clients), the session key
-is additionally bound to the TLS connection via the **`tls-exporter` channel binding of
-[RFC 9266](https://www.rfc-editor.org/rfc/rfc9266.html)** (Exported Keying Material, label
-`EXPORTER-Channel-Binding`, empty context, 32 bytes, per [RFC 8446 §7.5](https://www.rfc-editor.org/rfc/rfc8446.html#section-7.5));
+is additionally bound to the TLS connection via TLS Exported Keying Material
+([RFC 8446 §7.5](https://www.rfc-editor.org/rfc/rfc8446.html#section-7.5), [[RFC5705]]), using a
+dedicated private-use exporter label `EXPERIMENTAL-dpop-sk-v1` (per RFC 5705 Section 4) — not the
+`EXPORTER-Channel-Binding` label from [RFC 9266](https://www.rfc-editor.org/rfc/rfc9266.html),
+which RFC 9266 itself forbids using as secret key material; the exact key-derivation scheme is
+specified in the DPoP-SK profile (see §4.1);
 rustls exposes exactly this
 (`ConnectionCommon::export_keying_material(output, label, context)` —
 [rustls docs](https://docs.rs/rustls/latest/rustls/struct.ConnectionCommon.html)). Browser JS has
@@ -254,9 +257,14 @@ Content-Type: application/json
 - The RS runs the **full existing DPoP verification** on this one request (verifier untouched).
   Establishment is therefore exactly as strong as today's per-request check.
 - **Key derivation.** With `cb=tls-exporter` (native clients): both ends compute
-  `EKM = export_keying_material(32, "EXPORTER-Channel-Binding", ∅)` per RFC 9266 and derive
-  `K = HKDF-SHA256(ikm=EKM, salt=session_id, info="dpop-sk v1" ‖ ath ‖ jkt)`; **no key bytes
-  cross the wire**, and K is useless on any other TLS connection. With `cb=none` (browsers):
+  `EKM = TLS-Exporter("EXPERIMENTAL-dpop-sk-v1", context = "" (zero-length), 32 bytes)` per
+  RFC 8446 §7.5 and RFC 5705, then derive using HKDF-SHA256 (RFC 5869):
+  ```
+  PRK = HKDF-Extract(salt = ASCII(session_id), IKM = EKM)
+  K   = HKDF-Expand(PRK, info = ASCII("dpop-sk/v1") || 0x00 || ASCII(ath) || 0x00 || ASCII(jkt), L = 32)
+  ```
+  No key bytes cross the wire, and K is useless on any other TLS connection (see the DPoP-SK
+  specification [[DPOP-SK]] for the complete, normative derivation). With `cb=none` (browsers):
   the RS generates K randomly and returns it in the (TLS-protected) response body; the client
   imports it as a **non-extractable WebCrypto HMAC key** and discards the raw bytes.
 - **Server state:** `session_id → { K, sha256(access_token), cnf.jkt, webid/VerifiedToken,
@@ -561,6 +569,7 @@ it as of 2026-07 — flagged as a search result, not an exhaustive registry audi
 - RFC 9728 (Protected Resource Metadata): https://www.rfc-editor.org/rfc/rfc9728.html — well-known URI, `dpop_*` + `tls_client_certificate_bound_access_tokens` members, `resource_metadata` challenge param
 - RFC 8446 (TLS 1.3): https://www.rfc-editor.org/rfc/rfc8446.html — §2.2 PSK resumption, §7.5 exporters, §8/E.5 0-RTT replay, renegotiation forbidden
 - RFC 9266 (tls-exporter channel binding): https://www.rfc-editor.org/rfc/rfc9266.html
+- [[DPOP-SK]] DPoP-SK: Negotiated Symmetric Session Keys for DPoP-Bound Requests (specification): https://jeswr.github.io/dpop-sk-spec/ — the normative key-derivation scheme (§4.1), anti-replay window design (§4.2), and adversarial security review (Appendix B)
 - RFC 4303 (ESP) §3.4.3 — the sliding-window anti-replay algorithm Tier 2 adopts: https://www.rfc-editor.org/rfc/rfc4303.html#section-3.4.3
 - Solid-OIDC 0.1.0: https://solidproject.org/TR/oidc — §8 client DPoP MUST, §9.3 RS validation
 - FAPI 2.0 Security Profile (Final, 2025-02-22): https://openid.net/specs/fapi-security-profile-2_0-final.html — §5.3.2.1/§5.3.3.1/§5.3.4 sender-constraining via MTLS or DPoP
