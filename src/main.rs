@@ -110,6 +110,15 @@ const ENV_SEED_CONFORMANCE: &str = "SOLID_SERVER_SEED_CONFORMANCE";
 /// `true` (or any non-integer) uses [`seed::BENCH_DEFAULT_CHILDREN`]. NEVER set against a real
 /// (SPARQ/S3) backend. Purely additive seeding — it changes no request-handling behaviour.
 const ENV_SEED_BENCH: &str = "SOLID_SERVER_SEED_BENCH";
+/// Dev/BENCHMARK ONLY (companion to [`ENV_SEED_BENCH`]): override the bench pod OWNER WebID named by
+/// the seeded owner-only ACL grants. The syscall harness (`bench/syscalls.sh`) serves plain HTTP but
+/// the verifier requires an `https:` `webid` claim — the derived `http:` owner IRI could never match
+/// a valid token, so the harness sets this to a synthetic `https:` WebID and mints its DPoP tokens
+/// for the same value (never dereferenced: the harness runs `SOLID_SERVER_BIDIRECTIONAL=off`). Unset
+/// ⇒ the derived `<base>/bench/profile/card#me`, byte-identical to before. Only read when
+/// [`ENV_SEED_BENCH`] is active; like the rest of the seed it only changes seeded FIXTURE content,
+/// never request handling.
+const ENV_SEED_BENCH_OWNER: &str = "SOLID_SERVER_SEED_BENCH_OWNER";
 /// Dev/conformance ESCAPE HATCH: explicitly permit the dev seed flags
 /// ([`ENV_SEED_CONFORMANCE`] / [`ENV_SEED_BENCH`]) against a NON-`memory` backend. UNSET (the default)
 /// makes the startup seed-guard FAIL CLOSED when a seed flag is set on a `http`/`embedded` backend —
@@ -809,12 +818,21 @@ where
     // Dev/benchmark seeding (gated): purely additive fixtures for the HTTPS load benchmark. Like the
     // conformance seed it only writes resources; it changes no request handling.
     if let Some(child_count) = bench_seed_count(ENV_SEED_BENCH) {
-        let fixtures = solid_server_rs::seed::seed_bench(&store, base_url, child_count)
-            .await
-            .map_err(|e| format!("bench seeding failed: {e:?}"))?;
+        let owner_override = std::env::var(ENV_SEED_BENCH_OWNER)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let fixtures = solid_server_rs::seed::seed_bench_with_owner(
+            &store,
+            base_url,
+            child_count,
+            owner_override.as_deref(),
+        )
+        .await
+        .map_err(|e| format!("bench seeding failed: {e:?}"))?;
         eprintln!(
-            "  SEEDED bench fixtures — DEV/BENCH ONLY: public_doc={} listing={} ({} children) private_doc={}",
-            fixtures.public_doc, fixtures.listing, fixtures.child_count, fixtures.private_doc
+            "  SEEDED bench fixtures — DEV/BENCH ONLY: public_doc={} listing={} ({} children) private_doc={} owner={}",
+            fixtures.public_doc, fixtures.listing, fixtures.child_count, fixtures.private_doc, fixtures.owner
         );
     }
 

@@ -14,6 +14,9 @@
 /bench/results-skip/
 /bench/results-after*/
 /bench/results-before*/
+# Syscall-harness raw DEV artifacts (regenerate with bench/syscalls.sh; the generated
+# <date>-linux.{json,md} reports directly under /bench/syscalls-results/ ARE committed)
+/bench/syscalls-results/raw/
 # Profiling-round DEV artifacts (regenerate with bench/profile-run.sh / bench/profile-auth.sh)
 /bench/prof-*.json.gz
 /bench/prof-*-oha.json

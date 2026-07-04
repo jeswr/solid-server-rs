@@ -144,13 +144,35 @@ else
   server_env "$SERVER_BIN" > "$REPORTS/server.log" 2>&1 &
 fi
 LAUNCH_PID=$!
+SERVER_PID=""
+
+# Locate OUR server process — NARROWLY. `pgrep -f "$SERVER_BIN"` (the old pattern) substring-matches
+# ANY process whose command line merely CONTAINS the binary path — e.g. `strace/perf/gdb <bin>`,
+# `tail -f` on a same-named log, an editor with the file open, or a SECOND conformance/bench run from
+# the same checkout — and cleanup would then TERM that innocent process's whole group (a real hazard
+# on a shared box). All three launch paths above exec the binary with NO arguments, so the server's
+# full command line is EXACTLY the binary path: match it exactly (-x with -f = whole-cmdline match),
+# restrict to our own user (-u), and take the newest (-n) — i.e. the one just launched.
+find_server_pid() {
+  pgrep -n -u "$(id -un)" -fx "$SERVER_BIN" 2>/dev/null || true
+}
 
 cleanup() {
-  # Kill the whole server SESSION (negative PID ⇒ the process group), since the server is its own
-  # session leader; fall back to the launcher PID. `|| true` so cleanup never fails the run.
-  local srv
-  srv="$(pgrep -f "$SERVER_BIN" 2>/dev/null | head -1 || true)"
-  [ -n "$srv" ] && kill -TERM "-$srv" 2>/dev/null || true
+  # Prefer the PID captured right after boot; fall back to the narrow lookup. `|| true` throughout so
+  # cleanup never fails the run.
+  local srv="${SERVER_PID:-}"
+  [ -n "$srv" ] || srv="$(find_server_pid)"
+  if [ -n "$srv" ]; then
+    if [ "$(ps -o sess= -p "$srv" 2>/dev/null | tr -d '[:space:]')" = "$srv" ]; then
+      # The server is its own session leader (the setsid/python launch paths): TERM the whole
+      # session's process group so nothing it spawned lingers.
+      kill -TERM "-$srv" 2>/dev/null || true
+    else
+      # Bare-background fallback path: the server shares OUR process group — a group-kill would TERM
+      # this script (and any sibling) too. PID-only is exact and sufficient (the server forks nothing).
+      kill -TERM "$srv" 2>/dev/null || true
+    fi
+  fi
   kill "$LAUNCH_PID" 2>/dev/null || true
   docker rm -f "$FWD_NAME" >/dev/null 2>&1 || true
 }
@@ -164,6 +186,9 @@ for i in $(seq 1 30); do
   sleep 0.5
   [ "$i" = 30 ] && { echo "ERROR: server did not become ready; log:" >&2; cat "$REPORTS/server.log" >&2; exit 1; }
 done
+# Pin the exact server PID for cleanup now that it is provably up (the newest exact-cmdline match by
+# our user, captured immediately after OUR launch — not a pattern re-derived at teardown time).
+SERVER_PID="$(find_server_pid)"
 
 # --- the VM-side socat forwarder: VM localhost:3000 -> macOS host :3000 --------------------------
 # So a `--network host` harness reaches the host-bound server at `localhost:3000`. On native Linux this
