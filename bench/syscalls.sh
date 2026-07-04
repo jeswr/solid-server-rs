@@ -60,6 +60,11 @@ INSTANCE_LABEL="${INSTANCE_LABEL:-$(uname -n)}"
 # because the verifier requires an https: webid claim while this harness serves plain HTTP, so the
 # seed's derived http: owner could never match a token (see seed_bench_with_owner / SYSCALLS.md).
 BENCH_OWNER_WEBID="${BENCH_OWNER_WEBID:-https://bench.invalid/profile/card#me}"
+# A FIXED seed for the driver's deterministic mock-issuer key. Both driver processes (the strace
+# pass + the perf pass) derive the SAME issuer keypair from it, so the server's cached JWKS (TTL
+# raised to 24h below) validates BOTH passes' tokens. A per-process random issuer key would make the
+# second pass fail `InvalidSignature` against the first pass's still-cached key.
+ISSUER_SEED="${ISSUER_SEED:-solid-server-rs-syscall-harness-issuer-v1}"
 
 RESULTS="$HERE/syscalls-results"
 STAMP="$(date -u +%Y-%m-%d)"
@@ -119,7 +124,12 @@ run_pass() {
   mkfifo "$fifo"
   # Keep a writer fd open for the fifo so the driver never sees EOF between GO lines.
   exec 4<>"$fifo"
+  # `set +e` around the pipeline so a driver failure surfaces the diagnostic below instead of
+  # aborting the script at the pipe (errexit + pipefail would otherwise exit here, skipping the
+  # fifo cleanup + the "see the driver log" message).
+  set +e
   "$DRIVER_BIN" --base "$BASE" --issuer-port "$ISSUER_PORT" --webid "$BENCH_OWNER_WEBID" \
+    --issuer-seed "$ISSUER_SEED" \
     --scenarios "$scen_list" --n "$n" --warmup "$SYS_WARMUP" --idle-secs "$IDLE_SECS" \
     < "$fifo" 2>> "$RAW/driver-${pass}.log" | {
     local idx=0 tracer_pids=()
@@ -153,10 +163,12 @@ run_pass() {
     done
   }
   local rc="${PIPESTATUS[0]}"
+  set -e
   exec 4>&-
   rm -f "$fifo"
   if [ "$rc" != 0 ]; then
-    echo "ERROR: driver exited rc=$rc in the ${pass} pass (see $RAW/driver-${pass}.log) — results INVALID" >&2
+    echo "ERROR: driver exited rc=$rc in the ${pass} pass — results INVALID. Driver log:" >&2
+    tail -5 "$RAW/driver-${pass}.log" >&2 || true
     exit 1
   fi
 }

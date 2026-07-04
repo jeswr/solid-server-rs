@@ -115,7 +115,30 @@ struct KeyKit {
 
 impl KeyKit {
     fn generate() -> Self {
-        let signing = SigningKey::random(&mut OsRng);
+        Self::from_signing(SigningKey::random(&mut OsRng))
+    }
+
+    /// A DETERMINISTIC key derived from a seed string (SHA-256 → the P-256 scalar). Used for the
+    /// mock ISSUER key so it is IDENTICAL across the harness's two driver processes (strace pass +
+    /// perf pass). The server caches an issuer's JWKS for `SOLID_SERVER_JWKS_CACHE_TTL_SECS` (raised
+    /// to 24h so no refetch lands mid-window); with a fresh random issuer key per process, the
+    /// second process's tokens are signed by a key the server won't refetch → `InvalidSignature`.
+    /// A shared seed makes both processes present the SAME JWKS, so the cached keys validate both.
+    /// (The DPoP PROOF key can stay per-process random: token+proof are minted by the SAME process
+    /// and the token's `cnf.jkt` binds them, so they are always internally consistent.)
+    fn from_seed(seed: &str) -> Self {
+        // SHA-256(seed) as the scalar; on the astronomically unlikely invalid-scalar case, re-hash
+        // with a fixed suffix. from_bytes rejects zero / >= curve order.
+        let mut material: [u8; 32] = Sha256::digest(seed.as_bytes()).into();
+        loop {
+            if let Ok(signing) = SigningKey::from_bytes((&material).into()) {
+                return Self::from_signing(signing);
+            }
+            material = Sha256::digest([&material[..], b"retry"].concat()).into();
+        }
+    }
+
+    fn from_signing(signing: SigningKey) -> Self {
         let verifying: VerifyingKey = *signing.verifying_key();
         let point = verifying.to_encoded_point(false);
         let x = b64url(point.x().expect("uncompressed point has x"));
@@ -398,6 +421,10 @@ struct Args {
     /// i.e. `SOLID_SERVER_SEED_BENCH_OWNER` when the server serves plain HTTP (the verifier
     /// requires an https: webid claim, so the derived http: owner can never authenticate).
     webid: Option<String>,
+    /// A seed for the DETERMINISTIC mock-issuer key. When two harness passes each spawn a driver
+    /// process against a JWKS-caching server, they MUST share the issuer key — pass the same seed.
+    /// Unset ⇒ a random per-process issuer key (fine for a single-pass run).
+    issuer_seed: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -415,6 +442,7 @@ fn parse_args() -> Result<Args, String> {
     let mut idle_secs: u64 = 5;
     let mut token_exp_secs: i64 = 3600;
     let mut webid: Option<String> = None;
+    let mut issuer_seed: Option<String> = None;
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -440,6 +468,7 @@ fn parse_args() -> Result<Args, String> {
                 token_exp_secs = val.parse().map_err(|e| format!("{flag}: {e}"))?
             }
             "--webid" => webid = Some(val.clone()),
+            "--issuer-seed" => issuer_seed = Some(val.clone()),
             other => return Err(format!("unknown flag '{other}'")),
         }
         i += 2;
@@ -456,6 +485,7 @@ fn parse_args() -> Result<Args, String> {
         idle_secs,
         token_exp_secs,
         webid,
+        issuer_seed,
     })
 }
 
@@ -559,7 +589,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Keys + the mock issuer. One issuer key + one DPoP proof key for the whole process; the access
     // token is re-minted PER SCENARIO (fresh exp) so a long traced window never straddles expiry.
-    let issuer_key = KeyKit::generate();
+    let issuer_key = match args.issuer_seed.as_deref() {
+        Some(seed) => KeyKit::from_seed(seed),
+        None => KeyKit::generate(),
+    };
     let proof_key = KeyKit::generate();
     let needs_auth = args.scenarios.iter().any(|c| c.authed());
     let issuer = if needs_auth {
