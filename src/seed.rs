@@ -289,6 +289,24 @@ pub async fn seed_bench<S: Store>(
     base_url: &str,
     child_count: usize,
 ) -> ServerResult<BenchFixtures> {
+    seed_bench_with_owner(store, base_url, child_count, None).await
+}
+
+/// [`seed_bench`] with an explicit owner-WebID override for the ACL grants (dev-only, like the rest
+/// of the seed).
+///
+/// WHY: the token verifier requires the `webid` claim to be an `https:` URL, but the DERIVED bench
+/// owner (`<base>/bench/profile/card#me`) is an `http:` IRI whenever the server serves plain HTTP —
+/// so under an http base no valid token could ever match the seeded owner-only ACL. The Linux
+/// syscall harness (`bench/syscalls.sh`) measures over plain HTTP and passes a synthetic `https:`
+/// owner WebID here (never dereferenced — it runs with `SOLID_SERVER_BIDIRECTIONAL=off`), minting
+/// its tokens for the same WebID. `None` ⇒ the derived owner, byte-identical to before.
+pub async fn seed_bench_with_owner<S: Store>(
+    store: &S,
+    base_url: &str,
+    child_count: usize,
+    owner_webid: Option<&str>,
+) -> ServerResult<BenchFixtures> {
     let base = base_url.trim_end_matches('/');
 
     // Root + the bench pod must exist before anything under them.
@@ -298,7 +316,10 @@ pub async fn seed_bench<S: Store>(
     ensure_container(store, &pod, Some(&root)).await?;
 
     // The bench WebID owner subject (used by the owner-only private-doc ACL).
-    let owner = format!("{base}/{BENCH_USER}/profile/card#me");
+    let owner = match owner_webid {
+        Some(w) => w.to_string(),
+        None => format!("{base}/{BENCH_USER}/profile/card#me"),
+    };
 
     // The pod-root ACL: PUBLIC Read by default (`acl:default`, so descendants inherit it) PLUS the
     // owner full control. This is what makes the public doc + listing container anonymously readable.
@@ -372,6 +393,7 @@ pub async fn seed_bench<S: Store>(
         listing,
         private_doc,
         child_count,
+        owner,
     })
 }
 
@@ -382,6 +404,8 @@ pub struct BenchFixtures {
     pub listing: String,
     pub private_doc: String,
     pub child_count: usize,
+    /// The WebID the owner-only grants name (derived, or the dev-only override).
+    pub owner: String,
 }
 
 /// A tiny RDF document body for a bench fixture: `<subject> rdfs:label "label"`. Built via oxrdf
@@ -631,6 +655,53 @@ mod tests {
         let owner = format!("{base}/{BENCH_USER}/profile/card#me");
         assert!(matches!(
             wac.authorize(&fx.private_doc, AccessMode::Read, Some(&owner), None)
+                .await
+                .unwrap(),
+            Decision::Allow(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn bench_owner_override_grants_exactly_that_webid() {
+        use crate::authz::wac::{Decision, WacAuthorizer};
+        use crate::authz::AccessMode;
+
+        let s = store();
+        // Plain-HTTP base (the syscall-harness posture): the DERIVED owner would be an http: IRI no
+        // valid https-WebID token could match — the override names the https WebID instead.
+        let base = "http://127.0.0.1:3400";
+        let owner = "https://bench.example/profile/card#me";
+        let fx = seed_bench_with_owner(&s, base, 3, Some(owner))
+            .await
+            .unwrap();
+        assert_eq!(fx.owner, owner);
+
+        let wac = WacAuthorizer::new(&s, base);
+        // The override owner reads the private doc; the derived http owner does NOT.
+        assert!(matches!(
+            wac.authorize(&fx.private_doc, AccessMode::Read, Some(owner), None)
+                .await
+                .unwrap(),
+            Decision::Allow(_)
+        ));
+        let derived = format!("{base}/{BENCH_USER}/profile/card#me");
+        assert!(!matches!(
+            wac.authorize(&fx.private_doc, AccessMode::Read, Some(&derived), None)
+                .await
+                .unwrap(),
+            Decision::Allow(_)
+        ));
+        // The override owner also gets Write under the pod default (the harness PUT scenario).
+        let put_target = format!("{base}/bench/private/put-target");
+        assert!(matches!(
+            wac.authorize(&put_target, AccessMode::Write, Some(owner), None)
+                .await
+                .unwrap(),
+            Decision::Allow(_)
+        ));
+        // And the public fixtures stay anonymously readable.
+        assert!(matches!(
+            wac.authorize(&fx.public_doc, AccessMode::Read, None, None)
                 .await
                 .unwrap(),
             Decision::Allow(_)
