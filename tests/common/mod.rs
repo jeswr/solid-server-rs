@@ -124,6 +124,26 @@ pub fn mint_cert_bound_access_token(issuer_key: &KeyKit, x5t_s256: &str) -> Stri
     issuer_key.sign(&header, &claims)
 }
 
+/// Mint a well-formed RFC-9068 access token with NO confirmation (`cnf`) claim at all — a plain,
+/// UNBOUND bearer token. Under the Solid `require_dpop(true)` posture the verifier rejects this as
+/// `Bearer` (DPoP is mandatory for any non-cert-bound token), which the PoP Tier-1 LIVE tests assert
+/// stays true.
+pub fn mint_unbound_access_token(issuer_key: &KeyKit) -> String {
+    let header = json!({ "alg": "ES256", "typ": "at+jwt" });
+    let iat = now();
+    let claims = json!({
+        "iss": ISSUER,
+        "sub": WEBID,
+        "jti": format!("at-{}", next_id()),
+        "client_id": CLIENT_ID,
+        "aud": BASE_URL,
+        "webid": WEBID,
+        "iat": iat,
+        "exp": iat + 300,
+    });
+    issuer_key.sign(&header, &claims)
+}
+
 /// Mint an RFC-9068 access token carrying BOTH a DPoP (`cnf.jkt`) and an mTLS (`cnf.x5t#S256`)
 /// confirmation — the multi-binding case the Tier-1b dispatch refuses fail-closed.
 pub fn mint_dual_bound_access_token(issuer_key: &KeyKit, cnf_jkt: &str, x5t_s256: &str) -> String {
