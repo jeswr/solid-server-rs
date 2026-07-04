@@ -149,24 +149,44 @@ impl<J: JwksProvider, R: ReplayStore> AuthContext<J, R> {
         path: &str,
         presented_cert: Option<&CertThumbprint>,
     ) -> Result<VerifiedToken, ServerError> {
-        let token = self.authenticate_inner(authorization, dpop, method, path)?;
+        let token = self.authenticate_inner(authorization, dpop, method, path, presented_cert)?;
         self.finalize_pop(token, presented_cert)
     }
 
-    /// The pre-Tier-1b verify-or-cache core (unchanged): returns the verifier's/cache's decision with no
-    /// mTLS confirmation dispatch. [`authenticate`](Self::authenticate) applies [`finalize_pop`](Self::finalize_pop)
-    /// on top when the mTLS flag is on.
+    /// The verify-or-cache core: returns the verifier's/cache's decision. Threads the RS-verified
+    /// client-certificate thumbprint into the verifier's [`AuthRequest`] (PoP Tier-1 LIVE) so the
+    /// verifier can itself ADMIT a cert-bound Bearer token under `require_dpop` and enforce the
+    /// RFC 8705 §3.1 thumbprint match; [`authenticate`](Self::authenticate) then applies
+    /// [`finalize_pop`](Self::finalize_pop) on top (dispatch-level match, defence-in-depth) when the
+    /// mTLS flag is on.
     fn authenticate_inner(
         &self,
         authorization: Option<String>,
         dpop: Option<String>,
         method: &str,
         path: &str,
+        presented_cert: Option<&CertThumbprint>,
     ) -> Result<VerifiedToken, ServerError> {
         // Reconstruct the htu the verifier checks the DPoP proof against. A bad target is a 400
         // before we even reach the verifier (it would otherwise reject on htu mismatch as a 401).
         let target = parse_target(&self.base_url, path)?;
         let method_uc = method.to_ascii_uppercase();
+
+        // PoP Tier-1 LIVE: the RS-verified client-certificate thumbprint threaded into the verifier's
+        // `AuthRequest.client_cert_x5t_s256` so the verifier can ADMIT a cert-bound Bearer token under
+        // `require_dpop` — its proof-of-possession is the client certificate at the TLS layer (RFC 8705
+        // §3), in place of a DPoP proof — and enforce the §3.1 thumbprint match itself (constant-time,
+        // fail-closed). Env-gated + fail-closed: `None` whenever the mTLS flag is off OR the connection
+        // presented no client certificate. With the flag OFF this is byte-identical to the pre-Tier-1
+        // path (the field stays `None`, so the verifier keeps DPoP mandatory and rejects a cert-bound
+        // Bearer exactly as before). Encoded base64url-no-pad to match how `cnf.x5t#S256` is encoded, or
+        // the verifier's byte-compare would (fail-closed) reject. `finalize_pop`'s dispatch-level match
+        // still runs afterwards as defence-in-depth.
+        let client_cert_x5t_s256: Option<String> = if self.mtls_bound_tokens {
+            presented_cert.map(CertThumbprint::to_base64url)
+        } else {
+            None
+        };
 
         // Cache fast-path: ONLY for a `DPoP <token>` request (the production posture). Everything else
         // -- absent auth (public), Bearer, or an unparseable header -- goes straight to the verifier,
@@ -207,6 +227,7 @@ impl<J: JwksProvider, R: ReplayStore> AuthContext<J, R> {
                         dpop,
                         method: method_uc,
                         url: target.htu,
+                        client_cert_x5t_s256,
                     };
                     let token =
                         self.verifier
@@ -241,6 +262,7 @@ impl<J: JwksProvider, R: ReplayStore> AuthContext<J, R> {
             dpop,
             method: method_uc,
             url: target.htu,
+            client_cert_x5t_s256,
         };
         self.verifier
             .verify(&req)
