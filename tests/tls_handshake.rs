@@ -64,7 +64,7 @@ async fn tls_handshake_serves_https() {
         cert_path: CERT_PATH.into(),
         key_path: KEY_PATH.into(),
     };
-    let rustls_config = build_rustls_config(&mode)
+    let rustls_config = build_rustls_config(&mode, false)
         .await
         .expect("build rustls config from fixture PEM")
         .expect("TLS mode yields a config");
@@ -180,7 +180,7 @@ async fn tls_graceful_shutdown_drains_via_handle() {
         cert_path: CERT_PATH.into(),
         key_path: KEY_PATH.into(),
     };
-    let rustls_config = build_rustls_config(&mode)
+    let rustls_config = build_rustls_config(&mode, false)
         .await
         .expect("build rustls config")
         .expect("TLS mode yields a config");
@@ -249,7 +249,7 @@ async fn alpn_negotiates_h2_when_offered_and_h1_fallback() {
         cert_path: CERT_PATH.into(),
         key_path: KEY_PATH.into(),
     };
-    let rustls_config = build_rustls_config(&mode)
+    let rustls_config = build_rustls_config(&mode, false)
         .await
         .expect("build rustls config")
         .expect("TLS mode yields a config");
@@ -361,4 +361,191 @@ async fn negotiated_alpn(addr: std::net::SocketAddr, offer: &[&[u8]]) -> Option<
         }
     }
     panic!("could not connect to the server to negotiate ALPN");
+}
+
+// ---------------------------------------------------------------------------------------------------
+// PoP Tier-1b — LIVE mTLS client-certificate handshake (end-to-end ConnPopAcceptor + real
+// rustls `peer_certificates()` read). `#[ignore]`d (needs openssl + real socket I/O); run with
+// `cargo test -- --ignored tls_mtls`.
+// ---------------------------------------------------------------------------------------------------
+
+/// Mint a throwaway self-signed P-256 CLIENT cert+key (CN=test-client) via the system `openssl`,
+/// returning `(cert_pem, key_pem)`. Unique per call. Never a real credential.
+fn mint_client_cert() -> (Vec<u8>, Vec<u8>) {
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "ssrs-mtls-client-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert = dir.join("client-cert.pem");
+    let key = dir.join("client-key.pem");
+    let out = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:P-256",
+            "-nodes",
+            "-keyout",
+        ])
+        .arg(&key)
+        .arg("-out")
+        .arg(&cert)
+        .args(["-days", "1", "-subj", "/CN=test-client"])
+        .output()
+        .expect("run openssl to mint a client cert");
+    assert!(out.status.success(), "openssl failed: {out:?}");
+    let cert_bytes = std::fs::read(&cert).unwrap();
+    let key_bytes = std::fs::read(&key).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    (cert_bytes, key_bytes)
+}
+
+/// GET `/whoami` over a live TLS stream (Connection: close) and return the response body — the test
+/// route echoes the connection's `ConnPop` thumbprint (base64url) or `none`.
+async fn whoami_body(connector: &TlsConnector, addr: std::net::SocketAddr) -> String {
+    let dns_name = ServerName::try_from("localhost").expect("server name");
+    let mut tls = None;
+    let mut last_err: Option<std::io::Error> = None;
+    for _ in 0..50 {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(tcp) => match connector.connect(dns_name.clone(), tcp).await {
+                Ok(stream) => {
+                    tls = Some(stream);
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    break;
+                }
+            },
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+        }
+    }
+    let mut tls = tls.unwrap_or_else(|| panic!("mTLS handshake failed: {last_err:?}"));
+    let req = "GET /whoami HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    tls.write_all(req.as_bytes()).await.expect("write request");
+    tls.flush().await.expect("flush");
+    let mut buf = Vec::new();
+    tls.read_to_end(&mut buf).await.expect("read response");
+    let resp = String::from_utf8_lossy(&buf);
+    // Body is everything after the header terminator.
+    resp.split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+#[tokio::test]
+#[ignore = "needs openssl + real socket I/O; run with --ignored"]
+async fn tls_mtls_connpop_reads_binds_and_rebinds_client_cert_across_resumption() {
+    use solid_server_rs::pop::cert_bound::CertThumbprint;
+    use solid_server_rs::pop::conn::{ConnPop, ConnPopAcceptor};
+    use tokio_rustls::rustls::pki_types::PrivateKeyDer;
+
+    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    // Server: build the mTLS config (optional client-cert request) via the SAME path the binary uses.
+    let mode = TlsMode::Tls {
+        cert_path: CERT_PATH.into(),
+        key_path: KEY_PATH.into(),
+    };
+    let rustls_config = build_rustls_config(&mode, true)
+        .await
+        .expect("build mTLS rustls config")
+        .expect("TLS mode yields a config");
+
+    // A test route that echoes the per-connection ConnPop thumbprint the acceptor injected.
+    async fn whoami(req: axum::extract::Request) -> String {
+        match req.extensions().get::<ConnPop>() {
+            Some(p) => match p.thumbprint() {
+                Some(t) => t.to_base64url(),
+                None => "none".to_string(),
+            },
+            None => "no-connpop".to_string(),
+        }
+    }
+    let app = Router::new().route("/whoami", get(whoami));
+
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve port");
+    let addr = probe.local_addr().expect("local addr");
+    drop(probe);
+    // Wrap the rustls acceptor with the ConnPopAcceptor — the SAME wrapper `main` adds when the mTLS
+    // flag is on (TlsStream impls PeerCertDer, so no connection-cap layer is needed for the test).
+    let server = axum_server::bind_rustls(addr, rustls_config).map(ConnPopAcceptor::new);
+    let server_task = tokio::spawn(async move {
+        let _ = server.serve(app.into_make_service()).await;
+    });
+
+    // Client A: presents a client certificate ⇒ the server must read + hash it and report its x5t#S256.
+    let (client_cert_pem, client_key_pem) = mint_client_cert();
+    let client_chain: Vec<CertificateDer<'static>> = certs(&mut client_cert_pem.as_slice())
+        .collect::<Result<_, _>>()
+        .expect("parse client cert");
+    let client_key: PrivateKeyDer<'static> =
+        rustls_pemfile::private_key(&mut client_key_pem.as_slice())
+            .expect("read client key")
+            .expect("a client private key");
+    let expected = CertThumbprint::from_cert_der(client_chain[0].as_ref()).to_base64url();
+
+    let pem = std::fs::read(CA_PATH).expect("read fixture CA");
+    let mut roots = RootCertStore::empty();
+    for cert in certs(&mut pem.as_slice()) {
+        roots.add(cert.expect("parse fixture CA")).expect("add CA");
+    }
+    // A resumption-ENABLED client config (rustls `ClientConfig` enables an in-memory session store by
+    // default, and the server sends TLS 1.3 session tickets by default), reused across TWO connections
+    // so the SECOND connection can resume the first via PSK.
+    let with_cert = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots.clone())
+            .with_client_auth_cert(client_chain, client_key)
+            .expect("client auth config"),
+    );
+    let connector = TlsConnector::from(with_cert);
+
+    // Connection 1 (full handshake, presents the client cert): the server reads + hashes it and binds
+    // the x5t#S256 thumbprint.
+    let body_a = whoami_body(&connector, addr).await;
+    assert_eq!(
+        body_a, expected,
+        "the server must read the presented client cert and bind its x5t#S256 thumbprint"
+    );
+
+    // Connection 2 REUSES the same resumption-enabled config, so it may resume connection 1's TLS
+    // session (PSK). On a resumed TLS 1.3 handshake the client does NOT re-send its Certificate, yet
+    // rustls's `peer_certificates()` returns the ORIGINAL handshake's client chain "for both full and
+    // resumed handshakes" — so the acceptor RE-COMPUTES the SAME binding from THIS connection's session
+    // state (never a lost or foreign binding). Whether TLS actually resumes or falls back to a full
+    // handshake, the invariant is identical: the same client identity ⇒ the same bound thumbprint.
+    let body_a_resumed = whoami_body(&connector, addr).await;
+    assert_eq!(
+        body_a_resumed, expected,
+        "a resumed (or reconnected) connection for the SAME client identity must re-bind to the SAME \
+         x5t#S256 — rustls returns peer_certificates() across resumption, so the binding is never lost"
+    );
+
+    // Client B: a SEPARATE connection presenting NO client cert ⇒ its ConnPop is `none`. Distinct
+    // connections yielding DIFFERENT bindings on the same server proves the binding is re-read
+    // PER CONNECTION from that connection's own session state — a no-cert connection can NEVER inherit
+    // another connection's certificate (the fail-closed property a cert-bound token relies on).
+    let no_cert = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let body_b = whoami_body(&TlsConnector::from(Arc::new(no_cert)), addr).await;
+    assert_eq!(
+        body_b, "none",
+        "a connection with no client cert must have a None ConnPop (never inherit another conn's cert)"
+    );
+
+    server_task.abort();
 }

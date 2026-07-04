@@ -65,16 +65,22 @@ pub struct OverloadConfig {
     /// rate-limit layer (the `off` sentinel). When present it is the OUTERMOST application layer — see
     /// [`build_router_with_overload`].
     pub rate_limiter: Option<RateLimiter>,
+    /// The maximum request-body size in bytes (a body over this ⇒ 413). An explicit, audited,
+    /// configurable ceiling on per-request body buffering — see [`crate::body_limit`]. Always finite
+    /// (there is no unlimited mode); defaults to [`crate::body_limit::DEFAULT_MAX_BODY_BYTES`].
+    pub body_limit_bytes: usize,
 }
 
 impl OverloadConfig {
-    /// A config with admission control sized to `max_concurrency` and the given timeout, and NO rate
-    /// limiter (back-compat for callers/tests that don't exercise the rate-limit layer).
+    /// A config with admission control sized to `max_concurrency` and the given timeout, NO rate
+    /// limiter, and the DEFAULT body-size limit (back-compat for callers/tests that don't exercise the
+    /// rate-limit or body-limit layers).
     pub fn new(max_concurrency: usize, request_timeout: Option<Duration>) -> Self {
         Self {
             admission: AdmissionControl::new(max_concurrency),
             request_timeout,
             rate_limiter: None,
+            body_limit_bytes: crate::body_limit::DEFAULT_MAX_BODY_BYTES,
         }
     }
 }
@@ -113,7 +119,7 @@ where
 ///
 /// ## Auth split on the notification surface
 /// - `POST /.notifications/WebSocketChannel2023/` is AUTH-GATED (same DPoP middleware as the LDP
-///   routes) so it sees a [`VerifiedToken`] and can fail-closed on an anonymous caller.
+///   routes) so it sees a `VerifiedToken` and can fail-closed on an anonymous caller.
 /// - `GET …/receive` (the WS upgrade) and `GET /.well-known/solid` (discovery) are PUBLIC: a browser
 ///   WebSocket cannot carry the DPoP header, and discovery is public like a storage description. The
 ///   receive-token + per-resource WAC seam (`sparq#992`) is documented in `notifications::ws`.
@@ -128,7 +134,16 @@ where
     R: ReplayStore + Send + Sync + 'static,
     S: Store + 'static,
 {
-    build_app_routes(state).merge(health_routes())
+    // Explicit, audited request-body ceiling on the app routes (a body over the DEFAULT limit ⇒ 413),
+    // even on this no-overload build — so the default 2 MiB bound is OWNED by this crate rather than
+    // relying on axum's implicit default (which a dependency bump could silently change). The binary's
+    // [`build_router_with_overload`] applies the CONFIGURABLE value instead. Health routes are merged
+    // OUTSIDE the layer (they carry no body).
+    build_app_routes(state)
+        .layer(crate::body_limit::layer(
+            crate::body_limit::DEFAULT_MAX_BODY_BYTES,
+        ))
+        .merge(health_routes())
 }
 
 /// Build the router WITH overload protection (the binary's path): admission control (load shedding)
@@ -146,6 +161,13 @@ where
     S: Store + 'static,
 {
     let mut app = build_app_routes(state);
+
+    // INNERMOST (app routes): the explicit, configurable request-body ceiling (a body over the limit ⇒
+    // 413). It only sets the `DefaultBodyLimit` request extension the body extractor reads, so its
+    // position among the app-route layers is immaterial to correctness — applied here so the body bound
+    // is unmissably part of the app-route stack. See [`crate::body_limit`]; the resident-memory ceiling
+    // for body buffering is `max_concurrency × body_limit_bytes`.
+    app = app.layer(crate::body_limit::layer(overload.body_limit_bytes));
 
     // INNER: the request timeout (504 on a stuck request) — applied first so it is INSIDE admission
     // control (a timed-out request still holds its admission permit until it times out; that is

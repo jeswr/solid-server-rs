@@ -40,7 +40,7 @@
 //!
 //! ## Dispatch — delegate to `serve_read` with a public token (ONE WAC pass)
 //! For a no-credential GET/HEAD, the middleware constructs `token = VerifiedToken::public()` and
-//! delegates STRAIGHT to the SAME [`serve_read`] the handler uses — it does NOT run its own separate
+//! delegates STRAIGHT to the SAME `serve_read` the handler uses — it does NOT run its own separate
 //! WAC predicate first. `serve_read` does exactly ONE effective-ACL resolution (web_id = None — the
 //! anonymous decision) and returns: a PUBLIC read → 200 + body; an anonymous denial → the same 401 +
 //! `WWW-Authenticate` the full path returns; a malformed target → the canonical 400 (it calls
@@ -52,7 +52,7 @@
 //! ## Security invariants (tested in `tests/public_read_skip.rs`)
 //! - **INV-1 ANONYMOUS-EQUIVALENCE.** When the skip fires, the FULL response tuple
 //!   {status, body, ALL headers incl. `WAC-Allow` + `ETag` + `Content-*`} is byte-identical to a
-//!   genuinely anonymous request for the same target+Origin — it IS the same [`serve_read`] call with
+//!   genuinely anonymous request for the same target+Origin — it IS the same `serve_read` call with
 //!   the same public token, on a request that carries no credentials.
 //! - **INV-2 IDENTITY-INDEPENDENCE.** The skip fires ONLY for a request with no `Authorization`/`DPoP`
 //!   header, and serves with `VerifiedToken::public()` (`web_id = None`). It NEVER reads a claimed
@@ -80,7 +80,7 @@ use crate::store::Store;
 /// The pre-crypto public-read skip middleware. See the module docs for the full contract.
 ///
 /// State is the `Arc<LdpState<S>>` (the store + base URL + ACL cache + notification hub) — the SAME
-/// state the LDP handlers carry, so a short-circuited read is served over an identical [`serve_read`].
+/// state the LDP handlers carry, so a short-circuited read is served over an identical `serve_read`.
 pub async fn public_read_skip_middleware<S>(
     State(state): State<Arc<LdpState<S>>>,
     req: Request,

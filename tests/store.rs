@@ -240,7 +240,10 @@ async fn create_in_container_records_membership() {
     .unwrap();
 
     let children = s.list_children(container).await.unwrap();
-    assert_eq!(children, vec![child.to_string()]);
+    assert_eq!(
+        children.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+        vec![child]
+    );
     assert!(s.exists(child).await.unwrap());
 }
 
@@ -287,8 +290,13 @@ async fn create_in_container_twice_keeps_a_single_membership() {
         .unwrap();
     }
     assert_eq!(
-        s.list_children(container).await.unwrap(),
-        vec![child.to_string()]
+        s.list_children(container)
+            .await
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str())
+            .collect::<Vec<_>>(),
+        vec![child]
     );
 }
 
@@ -435,8 +443,13 @@ async fn delete_container_if_empty_refuses_a_populated_container() {
         "a NotEmpty result must leave the child present (not orphaned)"
     );
     assert_eq!(
-        s.list_children(container).await.unwrap(),
-        vec![child.to_string()],
+        s.list_children(container)
+            .await
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str())
+            .collect::<Vec<_>>(),
+        vec![child],
         "a NotEmpty result must leave the membership edge intact"
     );
 }

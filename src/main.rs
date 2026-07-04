@@ -31,6 +31,18 @@
 //!   in-memory store doubles so it runs without SPARQ / S3; swapping in `HttpSparqClient` is wiring).
 //! - WAC authorization (gated on sparq#992 — the LDP layer is fail-closed: mutations need an
 //!   authenticated caller, reads are public since no ACLs exist yet).
+//!
+//! ## Global allocator (mimalloc)
+//! The process installs Microsoft's mimalloc as the `#[global_allocator]` (drop-in, musl-friendly).
+//! This is a behaviour-NEUTRAL perf lever — it only changes which allocator backs `alloc`/`dealloc`,
+//! not any server logic. See the `Cargo.toml` dependency comment for the trust-surface delta (a
+//! vendored-C `*-sys` crate compiled at build time) and why mimalloc over jemalloc (musl page-size).
+
+/// Process-wide allocator. mimalloc replaces the default libc allocator on the hot alloc/dealloc
+/// path. Declared at the TOP of the binary so it is the allocator from the first allocation onward.
+/// Behaviour-neutral: no server logic depends on it; conformance + tests are unchanged.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,6 +57,7 @@ use solid_server_rs::auth::AuthContext;
 use solid_server_rs::auth_cache::{
     ProofPolicy, SharedReplay, VerifiedTokenCache, DEFAULT_CACHE_CAPACITY,
 };
+use solid_server_rs::body_limit;
 use solid_server_rs::ldp::handler::LdpState;
 use solid_server_rs::overload::{self, AdmissionControl};
 use solid_server_rs::rate_limit::{self, RateConfig, RateLimiter};
@@ -217,6 +230,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Resolve EARLY so a misconfiguration (one TLS var without the other) fails fast at boot, before
     // we stand up auth/storage. Filesystem + PEM validation happens just before binding, below.
     let tls_mode = tls::mode_from_env().map_err(|e| format!("TLS configuration error: {e}"))?;
+    // PoP Tier-1b: whether to enable the RFC 8705 mTLS-bound-token path (optional client-cert request
+    // in the TLS handshake + the per-connection cert-binding dispatch in auth). Default OFF ⇒ the TLS +
+    // plain serve paths are byte-identical to pre-Tier-1b. Only meaningful on the in-process TLS path.
+    let mtls_bound_tokens = tls::mtls_bound_tokens_from_env();
 
     // --- Auth: REAL network-backed verification (delegated to solid-oidc-verifier). ----------------
     // The NetworkJwksProvider does OIDC discovery + JWKS fetch over the DNS-pinned SSRF-guarded path.
@@ -315,7 +332,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 0 => cache DISABLED: the pre-round-3 full-verify-every-request path.
         0 => {
             eprintln!("  AUTH: verified-access-token cache DISABLED (full verify per request).");
-            AuthContext::new(verifier, base_url.clone())
+            AuthContext::new(verifier, base_url.clone()).with_mtls_bound_tokens(mtls_bound_tokens)
         }
         cap => {
             eprintln!(
@@ -329,6 +346,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let max_entry_ttl = jwks_cache_ttl.as_secs() as i64;
             let cache = VerifiedTokenCache::with_max_entry_ttl(cap, proof_policy, max_entry_ttl);
             AuthContext::with_cache(verifier, base_url.clone(), cache, cache_replay)
+                .with_mtls_bound_tokens(mtls_bound_tokens)
         }
     };
 
@@ -392,10 +410,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // --- Explicit request-body size limit. -------------------------------------------------------
+    // An audited, configurable ceiling on per-request body buffering (a body over it ⇒ 413), replacing
+    // reliance on axum's implicit 2 MiB default. Always finite (no unlimited mode). The resident-memory
+    // ceiling for body buffering is `max_concurrency × body_limit`.
+    let body_limit_bytes = body_limit::max_body_bytes_from_env();
+    eprintln!(
+        "  BODY-LIMIT: max request body {body_limit_bytes} bytes (over ⇒ 413). Aggregate body-buffer \
+         ceiling ≈ max_concurrency ({max_concurrency}) × {body_limit_bytes} bytes."
+    );
+
     let overload_config = OverloadConfig {
         admission,
         request_timeout,
         rate_limiter,
+        body_limit_bytes,
     };
 
     // --- Transport-layer DoS hardening (HTTP/2 caps + slowloris timeout + connection cap). --------
@@ -405,7 +434,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the plain-HTTP path cannot configure them (axum::serve exposes neither). All defaults are
     // deliberately lenient so they never trip the conformance harness. See `solid_server_rs::transport`.
     let transport_config = TransportConfig::from_env();
-    let connection_limiter = ConnectionLimiter::new(transport_config.max_connections);
+    // Global connection cap + the per-SOURCE (per-IP) cap: the global cap alone lets one source hold
+    // all slots, so pair it with a per-IP cap (default-on, internal-IP-exempt) that bounds any single
+    // source well below the global ceiling.
+    let connection_limiter = ConnectionLimiter::new(transport_config.max_connections)
+        .with_per_ip_cap(
+            transport_config.max_connections_per_ip,
+            transport_config.conn_exempt_internal,
+        );
     // Log honestly per serve mode (roborev Low): the transport caps are ACTIVE only when terminating
     // TLS in-process. In plain-HTTP mode they are NOT enforced — say so, so an operator behind a
     // reverse proxy does not believe the in-process caps are on.
@@ -413,8 +449,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "  TRANSPORT (TLS path, ACTIVE): HTTP/2 max_concurrent_streams={}, rapid-reset cap \
              (CVE-2023-44487)={} (hyper default 20 unless overridden), slowloris header-read \
-             timeout={}, max concurrent connections={}, handshake timeout={}, h2 keep-alive \
-             ping={} (reclaims a DEAD-peer connection, not a live-idle one).",
+             timeout={}, max concurrent connections={} (per-source cap={}, exempt-internal={}), \
+             handshake timeout={}, h2 keep-alive ping={} (reclaims a DEAD-peer connection, not a \
+             live-idle one).",
             transport_config.h2_max_concurrent_streams,
             match transport_config.h2_max_pending_reset_streams {
                 Some(n) => format!("{n} (override)"),
@@ -422,6 +459,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             fmt_opt_secs(transport_config.header_read_timeout),
             connection_limiter.max_connections(),
+            match connection_limiter.max_per_ip() {
+                Some(n) => format!("{n}/IP"),
+                None => "DISABLED".to_string(),
+            },
+            transport_config.conn_exempt_internal,
             fmt_opt_secs(transport_config.handshake_timeout),
             fmt_opt_secs(transport_config.keep_alive_timeout),
         );
@@ -583,7 +625,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build the rustls config (reads + validates the PEM files) for TLS mode; `None` for plain mode.
     // Done after the router is assembled but before binding, so a bad cert/key fails at boot.
-    let rustls_config = tls::build_rustls_config(&tls_mode)
+    let rustls_config = tls::build_rustls_config(&tls_mode, mtls_bound_tokens)
         .await
         .map_err(|e| format!("TLS configuration error: {e}"))?;
 
@@ -604,7 +646,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cert_path.display(),
             key_path.display()
         );
+        if mtls_bound_tokens {
+            eprintln!(
+                "  mTLS (PoP Tier-1b): RFC 8705 cert-bound tokens ENABLED — the handshake REQUESTS an \
+                 optional client certificate (plain-DPoP clients unaffected); a cert-bound token is \
+                 matched against the presented cert fail-closed."
+            );
+        }
     } else {
+        if mtls_bound_tokens {
+            eprintln!(
+                "  WARNING: SOLID_SERVER_MTLS_BOUND_TOKENS is set but in-process TLS is OFF — the mTLS \
+                 cert-bound path needs in-process TLS to see a client certificate, so it is INACTIVE on \
+                 the plain-HTTP path (a cert-bound token would be denied fail-closed). Set \
+                 SOLID_SERVER_TLS_CERT + _KEY to enable it."
+            );
+        }
         eprintln!("  TLS: plain HTTP — terminate TLS at a reverse proxy (set SOLID_SERVER_TLS_CERT + _KEY to enable in-process HTTPS).");
     }
     if allow_loopback {
@@ -652,21 +709,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             //      `auto::Builder` axum-server serves with — preserving rustls TLS + h2/http1.1 ALPN
             //      exactly (the rustls config owns ALPN; we touch only the hyper protocol knobs).
             let handshake_timeout = transport_config.handshake_timeout;
-            let mut server = axum_server::from_tcp_rustls(std_listener, config)?
+            let base = axum_server::from_tcp_rustls(std_listener, config)?
                 .handle(handle)
-                .map(|acceptor| {
+                .map(move |acceptor| {
                     connection_limiter
                         .wrap_acceptor_with_handshake_timeout(acceptor, handshake_timeout)
                 });
-            transport_config.apply_to_builder(server.http_builder());
 
             // `into_make_service_with_connect_info::<SocketAddr>()` (NOT plain `into_make_service`) so
             // each request carries `ConnectInfo<SocketAddr>` in its extensions — the pre-crypto rate
             // limiter reads the direct peer IP from it. axum-server supports the connect-info make
             // service. Without this the limiter would see no peer IP and FAIL OPEN (proceed to auth).
-            server
-                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                .await?;
+            //
+            // PoP Tier-1b: when the mTLS flag is on, wrap the connection-cap acceptor with the
+            // `ConnPopAcceptor` OUTERMOST — it reads the peer client certificate ONCE per connection
+            // (after the handshake) and injects a `ConnPop` into every request so the auth layer can
+            // match a cert-bound token against it. When off, the serve path is byte-identical (no wrap),
+            // so the `.map` type differs between branches — hence the duplicated serve call.
+            if mtls_bound_tokens {
+                let mut server = base.map(solid_server_rs::pop::conn::ConnPopAcceptor::new);
+                transport_config.apply_to_builder(server.http_builder());
+                server
+                    .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                    .await?;
+            } else {
+                let mut server = base;
+                transport_config.apply_to_builder(server.http_builder());
+                server
+                    .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                    .await?;
+            }
         }
         // Plain TCP (dev/test behaviour). Graceful shutdown on Ctrl-C.
         //

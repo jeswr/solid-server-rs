@@ -13,6 +13,10 @@
 //!      connection (the read returns EOF / the handshake-level stream closes) within the window.
 //!   3. **Connection cap.** With `max_connections` small, more than that many concurrently-served
 //!      connections cannot be admitted at once — the cap holds, then recovers when a slot frees.
+//!   4. **Per-source connection cap.** With a huge global cap but a small `max_connections_per_ip`
+//!      (and internal-exemption off so the loopback source is capped), one source cannot hold more
+//!      than its per-source limit of concurrent connections — bounding a single-source flood well
+//!      below the global ceiling — and recovers when it releases one.
 //!
 //! `#[ignore]`d by default (real socket I/O + the fixture test cert), like `tls_handshake.rs`. Run with
 //! `cargo test --test transport_dos -- --ignored`.
@@ -65,7 +69,7 @@ async fn boot_hardened_server(
         cert_path: CERT_PATH.into(),
         key_path: KEY_PATH.into(),
     };
-    let rustls_config = build_rustls_config(&mode)
+    let rustls_config = build_rustls_config(&mode, false)
         .await
         .expect("build rustls config")
         .expect("tls mode yields a config");
@@ -80,7 +84,10 @@ async fn boot_hardened_server(
     let std_listener = tokio_listener.into_std().expect("into_std");
     std_listener.set_nonblocking(true).expect("set_nonblocking");
 
-    let limiter = ConnectionLimiter::new(transport.max_connections);
+    let limiter = ConnectionLimiter::new(transport.max_connections).with_per_ip_cap(
+        transport.max_connections_per_ip,
+        transport.conn_exempt_internal,
+    );
     let handle = axum_server::Handle::new();
     let server_handle = handle.clone();
     let handshake_timeout = transport.handshake_timeout;
@@ -139,6 +146,8 @@ async fn rapid_reset_burst_is_bounded_by_goaway() {
         max_connections: 10_000,
         keep_alive_timeout: Some(Duration::from_secs(60)),
         handshake_timeout: Some(Duration::from_secs(10)),
+        max_connections_per_ip: None,
+        conn_exempt_internal: true,
     };
     let (addr, handle) = boot_hardened_server(transport).await;
 
@@ -228,6 +237,8 @@ async fn slowloris_header_trickle_is_dropped_after_timeout() {
         max_connections: 10_000,
         keep_alive_timeout: Some(Duration::from_secs(60)),
         handshake_timeout: Some(Duration::from_secs(10)),
+        max_connections_per_ip: None,
+        conn_exempt_internal: true,
     };
     let (addr, handle) = boot_hardened_server(transport).await;
 
@@ -292,6 +303,10 @@ async fn connection_cap_bounds_concurrent_served_connections() {
         // No handshake timeout here: the held connections complete their handshake fast; the cap test
         // is about post-handshake permit holding, and a short handshake bound could race the test.
         handshake_timeout: None,
+        // Per-source cap DISABLED here so this test isolates the GLOBAL cap (the per-source cap has its
+        // own dedicated test below).
+        max_connections_per_ip: None,
+        conn_exempt_internal: true,
     };
     let (addr, handle) = boot_hardened_server(transport).await;
 
@@ -371,6 +386,95 @@ async fn connection_cap_bounds_concurrent_served_connections() {
     );
 
     // Keep held2 alive until here so the cap stayed at capacity for the blocked assertion.
+    drop(held2);
+    handle.graceful_shutdown(Some(Duration::from_secs(1)));
+}
+
+/// REGRESSION 4 — PER-SOURCE connection cap. With a HUGE global cap but `max_connections_per_ip = 2`
+/// and `conn_exempt_internal = false` (so loopback IS capped), hold two long-lived connections from
+/// this (single) source, then assert a THIRD from the SAME source is REFUSED while at the per-source
+/// cap — and that releasing one frees a per-source slot. This proves the per-source cap bounds ONE IP
+/// well below the global ceiling (a single-source slowloris/connection flood can't pin the whole pool).
+#[tokio::test]
+#[ignore = "needs the fixture test cert + real socket I/O; run with --ignored"]
+async fn per_source_connection_cap_bounds_a_single_source() {
+    let transport = TransportConfig {
+        h2_max_concurrent_streams: 256,
+        h2_max_pending_reset_streams: None,
+        header_read_timeout: None, // a parked-mid-request connection must not be header-timed-out
+        max_connections: 10_000,   // GLOBAL cap is huge — the PER-SOURCE cap is what must bind here
+        keep_alive_timeout: None,
+        handshake_timeout: None,
+        max_connections_per_ip: Some(2), // at most 2 concurrent connections from one source IP
+        conn_exempt_internal: false,     // so the loopback test source IS subject to the cap
+    };
+    let (addr, handle) = boot_hardened_server(transport).await;
+
+    async fn full_request(
+        addr: std::net::SocketAddr,
+    ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+        let mut tls = connect_tls(addr, &[b"http/1.1"]).await;
+        let req = "GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        tls.write_all(req.as_bytes()).await.expect("write");
+        tls.flush().await.expect("flush");
+        let mut buf = [0u8; 12];
+        tls.read_exact(&mut buf).await.expect("read status");
+        assert!(
+            buf.starts_with(b"HTTP/1.1 200"),
+            "held connection should be served: {:?}",
+            String::from_utf8_lossy(&buf)
+        );
+        tls
+    }
+
+    // Hold two connections from this source (loopback) — both served, both keep their per-source slot.
+    let held1 = full_request(addr).await;
+    let held2 = full_request(addr).await;
+
+    // A THIRD connection from the SAME source is over the per-source cap ⇒ REFUSED fail-fast (no served
+    // 200), even though the GLOBAL pool has ~10k free slots. Tolerate a handshake/connection failure —
+    // that IS the per-source cap doing its job.
+    let connector = TlsConnector::from(Arc::new(client_config(&[b"http/1.1"])));
+    let dns_name = ServerName::try_from("localhost").expect("server name");
+    let third_served = tokio::time::timeout(Duration::from_secs(2), async {
+        let tcp = tokio::net::TcpStream::connect(addr).await.ok()?;
+        let mut tls = connector.connect(dns_name.clone(), tcp).await.ok()?;
+        let req = "GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        tls.write_all(req.as_bytes()).await.ok()?;
+        tls.flush().await.ok()?;
+        let mut buf = Vec::new();
+        tls.read_to_end(&mut buf).await.ok()?;
+        Some(String::from_utf8_lossy(&buf).to_string())
+    })
+    .await;
+    let got_200_over_per_source_cap =
+        matches!(&third_served, Ok(Some(body)) if body.contains("200"));
+    assert!(
+        !got_200_over_per_source_cap,
+        "a 3rd connection from the SAME source must NOT be SERVED (200) while its per-source cap (2) is \
+         held — the per-source cap leaked: {third_served:?}"
+    );
+
+    // Release one held connection → a per-source slot frees → a fresh connection from the source is
+    // served promptly (proving the cap is per-source-live, not a permanent lockout).
+    drop(held1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let now_served = tokio::time::timeout(Duration::from_secs(4), async {
+        let mut tls = connect_tls(addr, &[b"http/1.1"]).await;
+        let req = "GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        tls.write_all(req.as_bytes()).await.expect("write");
+        tls.flush().await.expect("flush");
+        let mut buf = Vec::new();
+        tls.read_to_end(&mut buf).await.expect("read");
+        String::from_utf8_lossy(&buf).to_string()
+    })
+    .await
+    .expect("a freed per-source slot must admit a new connection from the source promptly");
+    assert!(
+        now_served.contains("200"),
+        "after a per-source slot freed, a new connection from the source should be served (200): {now_served}"
+    );
+
     drop(held2);
     handle.graceful_shutdown(Some(Duration::from_secs(1)));
 }

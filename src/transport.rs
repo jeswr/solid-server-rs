@@ -1,6 +1,6 @@
 // AUTHORED-BY Claude Opus 4.8
-//! Transport-layer DoS hardening — HTTP/2 stream/reset caps + slowloris header timeout + a
-//! concurrent-connection cap.
+//! Transport-layer DoS hardening — HTTP/2 stream/reset caps + slowloris header timeout + a global AND
+//! a per-source concurrent-connection cap.
 //!
 //! ## Why (the transport-DoS gap the application layers leave open)
 //! The overload layers ([`crate::overload`]) and the per-IP rate limiter ([`crate::rate_limit`]) gate
@@ -21,7 +21,21 @@
 //!   such half-open connections cannot exhaust file descriptors / memory, plus a bounded **TLS
 //!   handshake timeout** so a connection that stalls the handshake (never completing it) cannot pin a
 //!   connection permit, and an **h2 keep-alive PING** (interval + ack-timeout) so a DEAD-peer h2
-//!   connection (host gone without a FIN) that is holding a permit is reclaimed.
+//!   connection (host gone without a FIN) that is holding a permit is reclaimed. The global cap alone
+//!   lets ONE source hold ALL the slots, so it is paired with a **per-source (per-IP) connection cap**
+//!   (default-on, internal-IP-exempt — see [`ConnectionLimiter::with_per_ip_cap`]) so a single IP's
+//!   half-open flood is bounded well below the global ceiling.
+//! - **Slow-body (slow-POST trickle).** A client sends a complete header set (so `header_read_timeout`
+//!   is satisfied) then dribbles the request BODY one byte at a time. hyper exposes NO server-side
+//!   body-read timeout knob, so this is bounded by the composition of the OTHER layers rather than a
+//!   dedicated one: the [`crate::overload`] **request timeout** (default 30s) caps the TOTAL request
+//!   time including the body read, the explicit [`crate::body_limit`] **body-size cap** (default 2 MiB)
+//!   bounds how many bytes a single slow body can ever be, and the connection caps bound how many such
+//!   trickles a source may hold at once. Together these bound a slow-body attacker to
+//!   `≤ body_limit` bytes over `≤ request_timeout`, on `≤ max_per_ip` connections — a finite, small
+//!   resource footprint. (A dedicated min-throughput body reader is deliberately NOT hand-rolled: it
+//!   would duplicate what the request timeout already guarantees and add a bespoke body-stream wrapper
+//!   to the hot path.)
 //!
 //! ## What hyper provides vs what we add (the rapid-reset accounting)
 //! The in-tree `hyper` 1.x + `h2` 0.4.x already ship the CVE-2023-44487 reset-accounting:
@@ -53,10 +67,12 @@
 //! LDP/auth/WAC semantics of a request that IS served — so conformance is unaffected (the caps are
 //! deliberately lenient enough never to trip the harness's own concurrency; see the defaults).
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
+use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -65,6 +81,13 @@ use hyper_util::rt::TokioTimer;
 use hyper_util::server::conn::auto::Builder;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use crate::rate_limit::is_internal_ip;
+
+/// The per-source live-connection map: a count of currently-open connections keyed by source IP. Shared
+/// (behind `Arc<Mutex<_>>`) between the [`ConnectionLimiter`] and the [`IpConnGuard`]s that decrement it
+/// on connection close. Aliased so the (otherwise clippy-`type_complexity`) shared type is named once.
+type PerIpConnMap = HashMap<IpAddr, usize>;
 
 // --- Env var names --------------------------------------------------------------------------------
 
@@ -106,6 +129,23 @@ pub const ENV_KEEP_ALIVE_TIMEOUT_SECS: &str = "SOLID_SERVER_KEEP_ALIVE_TIMEOUT_S
 /// invalid ⇒ [`DEFAULT_HANDSHAKE_TIMEOUT_SECS`]; `0` ⇒ DISABLED (rely on the acceptor's own bound).
 pub const ENV_HANDSHAKE_TIMEOUT_SECS: &str = "SOLID_SERVER_HANDSHAKE_TIMEOUT_SECS";
 
+/// Env var: the maximum number of concurrently-open connections from a SINGLE source IP. The global
+/// [`ENV_MAX_CONNECTIONS`] cap alone lets ONE source hold ALL the slots (a single-IP slowloris flood);
+/// this bounds any one IP well below the global ceiling. Unset / empty / non-numeric ⇒
+/// [`DEFAULT_MAX_CONNECTIONS_PER_IP`] (ENABLED at the default); the sentinel `off` (case-insensitive)
+/// or `0` ⇒ DISABLED (no per-source cap — rely on the global cap only). See [`parse_max_connections_per_ip`].
+pub const ENV_MAX_CONNECTIONS_PER_IP: &str = "SOLID_SERVER_MAX_CONNECTIONS_PER_IP";
+
+/// Env var: whether to EXEMPT internal source IPs (loopback + RFC-1918 private + link-local + IPv6 ULA
+/// — see [`crate::rate_limit::is_internal_ip`]) from the PER-SOURCE connection cap. `0`/`false`/`no`/
+/// `off` (case-insensitive) disables the exemption; anything else / absent ⇒ exemption ON (**the
+/// default**). ON by default for the SAME footgun-guard reason as the rate limiter: behind a reverse
+/// proxy / docker-bridge / k8s service WITHOUT a real client-IP source, EVERY client shares one
+/// internal hop IP, so a per-IP CONNECTION cap keyed on that hop would throttle ALL clients together
+/// (and it covers the conformance harness's `host.docker.internal` private-IP hop). A directly-exposed
+/// public deployment gets the per-source cap; an internal hop is exempt (bounded by the global cap).
+pub const ENV_CONN_EXEMPT_INTERNAL: &str = "SOLID_SERVER_CONN_EXEMPT_INTERNAL";
+
 // --- Defaults -------------------------------------------------------------------------------------
 
 /// Default `max_concurrent_streams`. hyper's own default is 200; we set 256 explicitly (a small,
@@ -137,6 +177,15 @@ pub const DEFAULT_KEEP_ALIVE_TIMEOUT_SECS: u64 = 60;
 /// releases the CONNECTION PERMIT (not just the handshake) on expiry.
 pub const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 
+/// Default per-source (per-IP) concurrent-connection cap. Deliberately GENEROUS — a safety bound
+/// against a SINGLE source pinning the whole global pool, NOT a throughput throttle. `512` concurrent
+/// connections from one IP is far above any normal client (a browser opens ~6 per origin) yet bounds a
+/// single-IP half-open/slowloris flood to a small fraction of the global [`DEFAULT_MAX_CONNECTIONS`]
+/// ceiling. Internal IPs are exempt by default ([`ENV_CONN_EXEMPT_INTERNAL`]), so a reverse-proxy /
+/// docker / k8s / conformance hop is unaffected; a directly-exposed public deployment behind a large
+/// NAT can raise it. An operator tunes it to their box's fd/memory budget vs. its client population.
+pub const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 512;
+
 // --- Resolved config ------------------------------------------------------------------------------
 
 /// The resolved transport-hardening configuration. Built from the env via [`TransportConfig::from_env`]
@@ -159,6 +208,14 @@ pub struct TransportConfig {
     /// connection permit, after which the permit is released. `None` ⇒ disabled (rely on the underlying
     /// acceptor's own handshake bound).
     pub handshake_timeout: Option<Duration>,
+    /// Per-source (per-IP) concurrent-connection cap. `Some(n)` ⇒ at most `n` simultaneous connections
+    /// per source IP (over ⇒ the connection is refused at the acceptor); `None` ⇒ the per-source cap is
+    /// disabled (rely on the global [`max_connections`](Self::max_connections) cap only).
+    pub max_connections_per_ip: Option<usize>,
+    /// Whether internal source IPs (loopback / private / link-local / ULA) are EXEMPT from the
+    /// per-source connection cap (the default-on footgun guard for a proxy/docker/k8s/conformance hop —
+    /// see [`ENV_CONN_EXEMPT_INTERNAL`]).
+    pub conn_exempt_internal: bool,
 }
 
 impl TransportConfig {
@@ -183,6 +240,12 @@ impl TransportConfig {
             handshake_timeout: parse_optional_secs(
                 std::env::var(ENV_HANDSHAKE_TIMEOUT_SECS).ok(),
                 DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+            ),
+            max_connections_per_ip: parse_max_connections_per_ip(
+                std::env::var(ENV_MAX_CONNECTIONS_PER_IP).ok(),
+            ),
+            conn_exempt_internal: parse_conn_exempt_internal(
+                std::env::var(ENV_CONN_EXEMPT_INTERNAL).ok(),
             ),
         }
     }
@@ -252,6 +315,16 @@ impl TransportConfig {
 pub struct ConnectionLimiter {
     semaphore: Arc<Semaphore>,
     max_connections: usize,
+    /// The per-source (per-IP) cap. `None` ⇒ the per-source cap is disabled (global cap only). Set via
+    /// [`with_per_ip_cap`](Self::with_per_ip_cap).
+    max_per_ip: Option<usize>,
+    /// Whether internal source IPs are exempt from the per-source cap (default-on footgun guard — set
+    /// with the per-IP cap).
+    exempt_internal: bool,
+    /// Live-connection counts per source IP (only populated when the per-source cap is enabled AND the
+    /// peer IP is known + non-exempt). A single `Mutex` is fine: connection ACCEPTS are rare relative to
+    /// requests, and each critical section is a tiny map lookup + integer step (no I/O, no `.await`).
+    per_ip: Arc<Mutex<PerIpConnMap>>,
 }
 
 impl ConnectionLimiter {
@@ -263,17 +336,75 @@ impl ConnectionLimiter {
     ///   `Semaphore::new` panics if its initial permit count exceeds that bound, and an operator could
     ///   set an absurdly large `SOLID_SERVER_MAX_CONNECTIONS`. Clamping fails SAFE (a still-enormous,
     ///   never-reached cap) rather than crashing the boot (roborev Low).
+    ///
+    /// The per-source (per-IP) cap is DISABLED by default (global cap only); enable it with
+    /// [`with_per_ip_cap`](Self::with_per_ip_cap) — so every existing caller/test keeps global-only
+    /// behaviour unless it opts in.
     pub fn new(max_connections: usize) -> Self {
         let permits = max_connections.clamp(1, Semaphore::MAX_PERMITS);
         Self {
             semaphore: Arc::new(Semaphore::new(permits)),
             max_connections: permits,
+            max_per_ip: None,
+            exempt_internal: true,
+            per_ip: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Enable (or disable) the per-source (per-IP) connection cap. `max_per_ip = Some(n)` caps each
+    /// source IP at `n` simultaneous connections; `None` disables the per-source cap (global cap only).
+    /// `exempt_internal` exempts internal source IPs (loopback / private / link-local / ULA) — the
+    /// default-on footgun guard for a proxy/docker/k8s/conformance hop. A `Some(0)` is clamped to
+    /// `Some(1)` so a direct construction can never accidentally refuse ALL connections (the env parser
+    /// already maps `0` to "disabled").
+    pub fn with_per_ip_cap(mut self, max_per_ip: Option<usize>, exempt_internal: bool) -> Self {
+        self.max_per_ip = max_per_ip.map(|n| n.max(1));
+        self.exempt_internal = exempt_internal;
+        self
     }
 
     /// The configured connection ceiling (after the `[1, MAX_PERMITS]` clamp).
     pub fn max_connections(&self) -> usize {
         self.max_connections
+    }
+
+    /// The configured per-source (per-IP) cap, if enabled.
+    pub fn max_per_ip(&self) -> Option<usize> {
+        self.max_per_ip
+    }
+
+    /// Try to reserve one per-source connection slot for `ip`. Returns:
+    /// - `Some(guard)` — admitted (the guard DECREMENTS the source's live count on drop). This covers
+    ///   BOTH the per-source-cap-disabled case and the exempt-internal-IP case (a no-op guard), so the
+    ///   caller always gets a guard to move into the served connection when admitted;
+    /// - `None` — the source is AT its per-source cap ⇒ the connection must be REFUSED.
+    ///
+    /// 🔒 This can only REFUSE a connection earlier; it never admits one the global cap would reject
+    /// (the caller takes the global permit FIRST). Internal IPs are exempt when configured (a
+    /// proxy/docker/k8s hop must not be capped as one source). A poisoned lock is recovered so one
+    /// panicking accept can never wedge the per-IP map.
+    fn try_acquire_ip(&self, ip: IpAddr) -> Option<IpConnGuard> {
+        let Some(max) = self.max_per_ip else {
+            return Some(IpConnGuard::disabled()); // per-source cap off ⇒ always admit (no tracking)
+        };
+        if self.exempt_internal && is_internal_ip(&ip) {
+            return Some(IpConnGuard::disabled()); // internal hop ⇒ exempt (never capped as one source)
+        }
+        let mut map = match self.per_ip.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let count = map.get(&ip).copied().unwrap_or(0);
+        if count >= max {
+            // At the per-source cap — REFUSE. We looked up without inserting, so a capped-out (or
+            // brand-new-but-somehow-capped) IP never leaves a stray entry in the map.
+            return None;
+        }
+        // Admit: raise the source's live count (creating the entry on its first connection). `max ≥ 1`
+        // is guaranteed (`with_per_ip_cap` clamps, the parser maps 0 → disabled), so a fresh IP (count
+        // 0) always has room for its first connection.
+        map.insert(ip, count + 1);
+        Some(IpConnGuard::tracked(self.per_ip.clone(), ip))
     }
 
     /// Currently-available connection permits (cap minus in-flight). Exposed for tests/metrics.
@@ -291,9 +422,26 @@ impl ConnectionLimiter {
         self.semaphore.clone().try_acquire_owned().ok()
     }
 
+    /// Drive the per-source cap for tests (exposes the [`try_acquire_ip`](Self::try_acquire_ip) core):
+    /// `Some(guard)` ⇒ admitted (hold to keep the source's live count raised; drop to release);
+    /// `None` ⇒ the source is at its per-source cap (refused).
+    #[doc(hidden)]
+    pub fn try_acquire_ip_for_test(&self, ip: IpAddr) -> Option<IpConnGuard> {
+        self.try_acquire_ip(ip)
+    }
+
+    /// The current live-connection count tracked for `ip` (0 if untracked). Test-only.
+    #[doc(hidden)]
+    pub fn per_ip_count_for_test(&self, ip: IpAddr) -> usize {
+        match self.per_ip.lock() {
+            Ok(g) => g.get(&ip).copied().unwrap_or(0),
+            Err(p) => p.into_inner().get(&ip).copied().unwrap_or(0),
+        }
+    }
+
     /// Wrap an `axum-server` acceptor so each accepted connection holds a connection permit for its
     /// lifetime — the connection-cap for the TLS serve path, with NO handshake timeout (rely on the
-    /// underlying acceptor's own bound). Prefer [`wrap_acceptor_with_handshake_timeout`].
+    /// underlying acceptor's own bound). Prefer [`wrap_acceptor_with_handshake_timeout`](Self::wrap_acceptor_with_handshake_timeout).
     pub fn wrap_acceptor<A>(&self, inner: A) -> ConnectionLimitAcceptor<A> {
         self.wrap_acceptor_with_handshake_timeout(inner, None)
     }
@@ -313,6 +461,71 @@ impl ConnectionLimiter {
             limiter: self.clone(),
             handshake_timeout,
         }
+    }
+}
+
+/// A RAII guard for ONE per-source connection slot. Held for a connection's lifetime alongside the
+/// global [`OwnedSemaphorePermit`]; on drop it DECREMENTS the source IP's live-connection count in the
+/// [`ConnectionLimiter`]'s per-IP map (removing the entry at zero so the map stays bounded). A
+/// `disabled()` guard (per-source cap off, or an exempt/unknown IP) tracks nothing and its drop is a
+/// no-op. Never leaks: whether the connection is admitted, refused after the handshake, or times out,
+/// the guard drops with the accept future / served stream, releasing the source's slot.
+pub struct IpConnGuard {
+    /// `Some((map, ip))` ⇒ this guard holds a tracked slot for `ip`; `None` ⇒ a no-op (disabled/exempt).
+    tracked: Option<(Arc<Mutex<PerIpConnMap>>, IpAddr)>,
+}
+
+impl IpConnGuard {
+    /// A no-op guard (per-source cap disabled, or the IP is exempt/unknown) — its drop does nothing.
+    fn disabled() -> Self {
+        Self { tracked: None }
+    }
+
+    /// A guard tracking one live connection for `ip`; drop decrements the count in `map`.
+    fn tracked(map: Arc<Mutex<PerIpConnMap>>, ip: IpAddr) -> Self {
+        Self {
+            tracked: Some((map, ip)),
+        }
+    }
+}
+
+impl Drop for IpConnGuard {
+    fn drop(&mut self) {
+        if let Some((map, ip)) = &self.tracked {
+            let mut map = match map.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(count) = map.get_mut(ip) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    map.remove(ip); // keep the map bounded — drop the entry when a source has no live conns
+                }
+            }
+        }
+    }
+}
+
+/// Extract the source (peer) IP from a connection's INPUT stream (the raw TCP stream the acceptor
+/// receives BEFORE the TLS handshake), for the per-source connection cap. Implemented for the concrete
+/// stream types the serve path + tests instantiate ([`tokio::net::TcpStream`] on the live TLS path,
+/// `()` in the acceptor unit tests). A `None` result means "peer IP unknown" ⇒ the per-source cap
+/// FAILS OPEN for that connection (it is admitted, still bounded by the global cap) — never deny-all on
+/// a missing address, mirroring the rate limiter's fail-open-to-the-next-gate stance.
+pub trait PeerAddr {
+    /// The peer (source) IP of this connection, or `None` if it cannot be determined.
+    fn peer_ip(&self) -> Option<IpAddr>;
+}
+
+impl PeerAddr for tokio::net::TcpStream {
+    fn peer_ip(&self) -> Option<IpAddr> {
+        self.peer_addr().ok().map(|a| a.ip())
+    }
+}
+
+impl PeerAddr for () {
+    fn peer_ip(&self) -> Option<IpAddr> {
+        None
     }
 }
 
@@ -337,7 +550,7 @@ where
     A::Stream: AsyncRead + AsyncWrite + Unpin + Send,
     A::Service: Send,
     A::Future: Send,
-    I: Send + 'static,
+    I: PeerAddr + Send + 'static,
     S: Send + 'static,
 {
     type Stream = PermittedStream<A::Stream>;
@@ -345,30 +558,47 @@ where
     type Future = Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
 
     fn accept(&self, stream: I, service: S) -> Self::Future {
-        // Acquire the connection permit FAIL-FAST, OUTSIDE the async block, so an over-cap connection
-        // is refused HERE (the socket `stream` is dropped at once, reclaiming it) instead of being
-        // queued as a parked task awaiting a permit. `axum-server` drops a connection whose
+        // Acquire the GLOBAL connection permit FAIL-FAST, OUTSIDE the async block, so an over-cap
+        // connection is refused HERE (the socket `stream` is dropped at once, reclaiming it) instead of
+        // being queued as a parked task awaiting a permit. `axum-server` drops a connection whose
         // `accept` future resolves to `Err`, so an over-cap `Err` sheds the connection immediately.
         let permit = match self.limiter.try_acquire() {
             Some(p) => p,
             None => {
-                // At capacity — refuse. `stream`/`service` are dropped with this future, releasing the
-                // socket. This is the connection cap doing its job (a 503-equivalent at the transport
-                // layer): strictly less than the connection would otherwise get, never a bypass.
+                // At the GLOBAL capacity — refuse. `stream`/`service` are dropped with this future,
+                // releasing the socket. The connection cap doing its job (a 503-equivalent at the
+                // transport layer): strictly less than the connection would otherwise get, never a bypass.
                 return Box::pin(std::future::ready(Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "connection cap reached — refusing connection",
                 ))));
             }
         };
+        // PER-SOURCE cap: read the peer IP from the raw input stream (BEFORE it is moved into the inner
+        // accept) and reserve a per-source slot. Over the per-source cap ⇒ refuse (dropping `permit`
+        // here RELEASES the global slot too, so a refused per-source connection frees BOTH counters).
+        // An UNKNOWN peer IP (`None`) FAILS OPEN — admitted, still bounded by the global cap.
+        let ip_guard = match stream.peer_ip() {
+            Some(ip) => match self.limiter.try_acquire_ip(ip) {
+                Some(g) => g,
+                None => {
+                    return Box::pin(std::future::ready(Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "per-source connection cap reached — refusing connection",
+                    ))));
+                }
+            },
+            None => IpConnGuard::disabled(), // peer IP unknown ⇒ per-source cap fails open (global cap holds)
+        };
         let inner = self.inner.clone();
         let handshake_timeout = self.handshake_timeout;
         Box::pin(async move {
             // Run the inner accept (e.g. the TLS handshake), BOUNDED by `handshake_timeout` when set —
             // a stalled handshake must not pin the permit. On timeout the inner accept future is
-            // dropped (cancelling the handshake) and we return an error; `permit` is dropped with this
-            // future, RELEASING the connection slot at once. The permit is held across a SUCCESSFUL
-            // accept and moved into the returned stream, so it stays held for the connection lifetime.
+            // dropped (cancelling the handshake) and we return an error; `permit` AND `ip_guard` are
+            // dropped with this future, RELEASING both the global slot and the per-source slot at once.
+            // On a SUCCESSFUL accept both are moved into the returned stream, so they stay held for the
+            // connection lifetime and are released together when it closes.
             let accept_fut = inner.accept(stream, service);
             let (io_stream, svc) = match handshake_timeout {
                 Some(to) => match tokio::time::timeout(to, accept_fut).await {
@@ -382,7 +612,7 @@ where
                 },
                 None => accept_fut.await?,
             };
-            Ok((PermittedStream::new(io_stream, permit), svc))
+            Ok((PermittedStream::new(io_stream, permit, ip_guard), svc))
         })
     }
 }
@@ -395,14 +625,29 @@ pub struct PermittedStream<Io> {
     inner: Io,
     // Held for the connection lifetime; released on drop. Never read — its Drop is the whole point.
     _permit: OwnedSemaphorePermit,
+    // The per-source slot for this connection; its Drop decrements the source IP's live-connection
+    // count (a no-op guard when the per-source cap is off / the IP is exempt / unknown). Held for the
+    // connection lifetime alongside the global permit.
+    _ip_guard: IpConnGuard,
 }
 
 impl<Io> PermittedStream<Io> {
-    fn new(inner: Io, permit: OwnedSemaphorePermit) -> Self {
+    fn new(inner: Io, permit: OwnedSemaphorePermit, ip_guard: IpConnGuard) -> Self {
         Self {
             inner,
             _permit: permit,
+            _ip_guard: ip_guard,
         }
+    }
+}
+
+/// Forward the peer-certificate read through the connection-cap wrapper so the PoP Tier-1b acceptor
+/// ([`crate::pop::conn::ConnPopAcceptor`]) can read the client cert from a `PermittedStream<TlsStream>`
+/// exactly as it would from the bare TLS stream. Purely a delegation — the permit/per-IP guards do not
+/// affect the certificate.
+impl<Io: crate::pop::conn::PeerCertDer> crate::pop::conn::PeerCertDer for PermittedStream<Io> {
+    fn peer_cert_der(&self) -> Option<Vec<u8>> {
+        self.inner.peer_cert_der()
     }
 }
 
@@ -483,6 +728,37 @@ pub fn parse_max_connections(raw: Option<String>) -> usize {
             Ok(0) | Err(_) => DEFAULT_MAX_CONNECTIONS,
             Ok(n) => n,
         },
+    }
+}
+
+/// Resolve the per-source (per-IP) connection cap. absent / empty / non-numeric ⇒
+/// `Some(DEFAULT_MAX_CONNECTIONS_PER_IP)` (ENABLED at the default); the sentinel `off`/`disabled`
+/// (case-insensitive) or `0` ⇒ `None` (DISABLED — a `0` per-IP cap would refuse EVERY connection, so
+/// it means "disable the per-source cap", never "allow none"); `>0` ⇒ `Some(n)`.
+pub fn parse_max_connections_per_ip(raw: Option<String>) -> Option<usize> {
+    match raw.as_deref().map(str::trim) {
+        None | Some("") => Some(DEFAULT_MAX_CONNECTIONS_PER_IP),
+        Some(s) if s.eq_ignore_ascii_case("off") || s.eq_ignore_ascii_case("disabled") => None,
+        Some(s) => match s.parse::<usize>() {
+            Ok(0) => None,                                  // 0 ⇒ disable (never "allow none")
+            Ok(n) => Some(n),                               // explicit positive cap
+            Err(_) => Some(DEFAULT_MAX_CONNECTIONS_PER_IP), // typo ⇒ safe default (never silently disable)
+        },
+    }
+}
+
+/// Resolve whether internal source IPs are EXEMPT from the per-source connection cap. `0`/`false`/
+/// `no`/`off` (case-insensitive) ⇒ NOT exempt; anything else / absent ⇒ exempt (the default). Matches
+/// the rate limiter's internal-exemption grammar so the two agree.
+pub fn parse_conn_exempt_internal(raw: Option<String>) -> bool {
+    match raw.as_deref().map(str::trim) {
+        Some(s) => {
+            !(s.eq_ignore_ascii_case("0")
+                || s.eq_ignore_ascii_case("false")
+                || s.eq_ignore_ascii_case("no")
+                || s.eq_ignore_ascii_case("off"))
+        }
+        None => true,
     }
 }
 
@@ -613,6 +889,8 @@ mod tests {
             ENV_MAX_CONNECTIONS,
             ENV_KEEP_ALIVE_TIMEOUT_SECS,
             ENV_HANDSHAKE_TIMEOUT_SECS,
+            ENV_MAX_CONNECTIONS_PER_IP,
+            ENV_CONN_EXEMPT_INTERNAL,
         ];
         let saved: Vec<(&str, Option<String>)> =
             keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
@@ -635,6 +913,8 @@ mod tests {
                 max_connections: DEFAULT_MAX_CONNECTIONS,
                 keep_alive_timeout: Some(Duration::from_secs(DEFAULT_KEEP_ALIVE_TIMEOUT_SECS)),
                 handshake_timeout: Some(Duration::from_secs(DEFAULT_HANDSHAKE_TIMEOUT_SECS)),
+                max_connections_per_ip: Some(DEFAULT_MAX_CONNECTIONS_PER_IP),
+                conn_exempt_internal: true,
             }
         );
     }
@@ -654,6 +934,8 @@ mod tests {
                 max_connections: 10_000,
                 keep_alive_timeout: Some(Duration::from_secs(60)),
                 handshake_timeout: Some(Duration::from_secs(10)),
+                max_connections_per_ip: Some(512),
+                conn_exempt_internal: true,
             };
             let mut builder = Builder::new(hyper_util::rt::TokioExecutor::new());
             cfg.apply_to_builder(&mut builder);
@@ -789,9 +1071,207 @@ mod tests {
                 max_connections: 10_000,
                 keep_alive_timeout: None,
                 handshake_timeout: None,
+                max_connections_per_ip: None,
+                conn_exempt_internal: true,
             };
             let mut builder = Builder::new(hyper_util::rt::TokioExecutor::new());
             cfg.apply_to_builder(&mut builder);
         });
+    }
+
+    // --- per-source (per-IP) connection cap ---
+
+    use std::net::Ipv4Addr;
+
+    fn pub_ip(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    #[test]
+    fn max_connections_per_ip_parse_rules() {
+        // absent / empty / non-numeric ⇒ default (ENABLED); off/disabled/0 ⇒ None (DISABLED); >0 ⇒ that.
+        assert_eq!(
+            parse_max_connections_per_ip(None),
+            Some(DEFAULT_MAX_CONNECTIONS_PER_IP)
+        );
+        assert_eq!(
+            parse_max_connections_per_ip(Some("".into())),
+            Some(DEFAULT_MAX_CONNECTIONS_PER_IP)
+        );
+        assert_eq!(
+            parse_max_connections_per_ip(Some("abc".into())),
+            Some(DEFAULT_MAX_CONNECTIONS_PER_IP),
+            "a typo must NOT silently disable the per-source cap"
+        );
+        assert_eq!(parse_max_connections_per_ip(Some("off".into())), None);
+        assert_eq!(parse_max_connections_per_ip(Some("OFF".into())), None);
+        assert_eq!(parse_max_connections_per_ip(Some("disabled".into())), None);
+        assert_eq!(
+            parse_max_connections_per_ip(Some("0".into())),
+            None,
+            "0 means DISABLE the per-source cap (never 'allow none')"
+        );
+        assert_eq!(parse_max_connections_per_ip(Some("1".into())), Some(1));
+        assert_eq!(
+            parse_max_connections_per_ip(Some("  256 ".into())),
+            Some(256)
+        );
+    }
+
+    #[test]
+    fn conn_exempt_internal_parse_rules() {
+        // Default ON; falsey values (any casing) turn it off.
+        assert!(parse_conn_exempt_internal(None));
+        assert!(parse_conn_exempt_internal(Some("1".into())));
+        assert!(parse_conn_exempt_internal(Some("true".into())));
+        assert!(!parse_conn_exempt_internal(Some("0".into())));
+        assert!(!parse_conn_exempt_internal(Some("false".into())));
+        assert!(!parse_conn_exempt_internal(Some("no".into())));
+        assert!(!parse_conn_exempt_internal(Some("OFF".into())));
+        assert!(!parse_conn_exempt_internal(Some(" No ".into())));
+    }
+
+    #[test]
+    fn per_ip_cap_bounds_a_single_source_and_recovers_on_drop() {
+        // The core per-source invariant: at most `max_per_ip` live connections per source IP; a held
+        // guard raises the count; dropping it restores capacity; an over-cap acquire is REFUSED (None).
+        // exempt_internal=false so we can drive a public IP. Global pool is huge (isolate the per-IP cap).
+        let limiter = ConnectionLimiter::new(10_000).with_per_ip_cap(Some(2), false);
+        let ip = pub_ip(203, 0, 113, 7);
+        assert_eq!(limiter.per_ip_count_for_test(ip), 0);
+
+        let g1 = limiter.try_acquire_ip_for_test(ip).expect("slot 1");
+        let g2 = limiter.try_acquire_ip_for_test(ip).expect("slot 2");
+        assert_eq!(
+            limiter.per_ip_count_for_test(ip),
+            2,
+            "two live conns for the IP"
+        );
+        assert!(
+            limiter.try_acquire_ip_for_test(ip).is_none(),
+            "a 3rd connection from the same IP is REFUSED (per-source cap = 2)"
+        );
+
+        // Dropping one guard frees a slot for that IP; the map entry is removed only at zero.
+        drop(g1);
+        assert_eq!(limiter.per_ip_count_for_test(ip), 1);
+        let g3 = limiter
+            .try_acquire_ip_for_test(ip)
+            .expect("a freed per-source slot re-admits the IP");
+        assert_eq!(limiter.per_ip_count_for_test(ip), 2);
+
+        drop(g2);
+        drop(g3);
+        assert_eq!(
+            limiter.per_ip_count_for_test(ip),
+            0,
+            "all guards dropped ⇒ the IP's count is 0 (entry removed — map stays bounded)"
+        );
+        // And the source can connect afresh (its throttle is not permanently stuck).
+        assert!(limiter.try_acquire_ip_for_test(ip).is_some());
+    }
+
+    #[test]
+    fn per_ip_cap_isolates_sources() {
+        // MUTATION KILL: one IP exhausting its per-source cap must NOT affect a DIFFERENT IP.
+        let limiter = ConnectionLimiter::new(10_000).with_per_ip_cap(Some(1), false);
+        let a = pub_ip(198, 51, 100, 1);
+        let b = pub_ip(198, 51, 100, 2);
+        let _ga = limiter.try_acquire_ip_for_test(a).expect("A slot 1");
+        assert!(
+            limiter.try_acquire_ip_for_test(a).is_none(),
+            "A is at its cap"
+        );
+        // B is unaffected — its own independent per-source slot.
+        assert!(
+            limiter.try_acquire_ip_for_test(b).is_some(),
+            "B has its own per-source slot (a shared counter would refuse it)"
+        );
+    }
+
+    #[test]
+    fn per_ip_cap_exempts_internal_ips_by_default() {
+        // exempt_internal=true (the default): internal source IPs are NEVER per-source-capped (the
+        // proxy/docker/k8s/conformance hop footgun guard) — a public IP still is.
+        let limiter = ConnectionLimiter::new(10_000).with_per_ip_cap(Some(1), true);
+        for internal in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            pub_ip(10, 1, 2, 3),
+            pub_ip(192, 168, 0, 1),
+            "::1".parse().unwrap(),
+            "fe80::1".parse().unwrap(),
+        ] {
+            // Many acquires from an internal IP all succeed (exempt); none are tracked.
+            for _ in 0..5 {
+                assert!(
+                    limiter.try_acquire_ip_for_test(internal).is_some(),
+                    "internal IP {internal} must be exempt from the per-source cap"
+                );
+            }
+            assert_eq!(
+                limiter.per_ip_count_for_test(internal),
+                0,
+                "an exempt internal IP is not tracked in the map"
+            );
+        }
+        // A PUBLIC IP is still capped at 1.
+        let public = pub_ip(203, 0, 113, 9);
+        let _g = limiter
+            .try_acquire_ip_for_test(public)
+            .expect("public slot 1");
+        assert!(
+            limiter.try_acquire_ip_for_test(public).is_none(),
+            "a public IP is still per-source-capped"
+        );
+    }
+
+    #[test]
+    fn per_ip_cap_disabled_admits_everything() {
+        // `with_per_ip_cap(None, ..)` (the default from `new`) ⇒ the per-source cap is off: every
+        // acquire is admitted and nothing is tracked (global cap only).
+        let limiter = ConnectionLimiter::new(10_000); // per-IP disabled by default
+        assert_eq!(limiter.max_per_ip(), None);
+        let ip = pub_ip(203, 0, 113, 1);
+        for _ in 0..1000 {
+            assert!(limiter.try_acquire_ip_for_test(ip).is_some());
+        }
+        assert_eq!(
+            limiter.per_ip_count_for_test(ip),
+            0,
+            "per-source cap off ⇒ no per-IP tracking"
+        );
+    }
+
+    #[test]
+    fn per_ip_cap_zero_is_clamped_to_one_never_refuses_all() {
+        // A direct `Some(0)` construction must NOT refuse every connection — it is clamped to 1 (the env
+        // parser already maps `0` to disabled; this guards a direct mis-construction).
+        let limiter = ConnectionLimiter::new(10_000).with_per_ip_cap(Some(0), false);
+        assert_eq!(limiter.max_per_ip(), Some(1));
+        let ip = pub_ip(203, 0, 113, 2);
+        assert!(
+            limiter.try_acquire_ip_for_test(ip).is_some(),
+            "a fresh IP always gets its first connection (cap clamped to >=1)"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcpstream_peer_ip_is_extracted_for_the_per_source_cap() {
+        // The PeerAddr wiring the acceptor relies on: a real TcpStream reports its peer IP (loopback
+        // here), which is what the per-source cap keys on. Proves the extraction end (the `()` test
+        // stream returns None → fail-open; this proves the live path returns Some).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server_stream, _peer) = listener.accept().await.unwrap();
+        // Server side sees the client's loopback IP as the peer.
+        assert_eq!(
+            PeerAddr::peer_ip(&server_stream),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            "a live TcpStream must expose its peer IP for the per-source cap"
+        );
+        // The `()` test stream fails open (no peer IP).
+        assert_eq!(PeerAddr::peer_ip(&()), None);
+        drop(client);
     }
 }

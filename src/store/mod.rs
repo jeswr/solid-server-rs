@@ -7,6 +7,10 @@
 //! whole stack is testable without a running SPARQ or S3.
 
 pub mod blob;
+// Deterministic backend round-trip counters at the SparqClient/BlobStore seams (read-1 of the
+// read-path perf plan — docs/design/backend-read-path.md §7). Decorators used by the pinned
+// counter tests + the bench harness; zero-cost when not wired in.
+pub mod counting;
 // The in-process embedded SPARQ backend (opt-in `embedded-sparq` feature) — a THIRD `SparqClient`
 // impl alongside the HTTP client + the in-memory double. Off by default so the standard build
 // carries no sparq dependency. See [`embedded`] + decisions/0001-embed-sparq-in-process.md.
@@ -19,8 +23,12 @@ pub mod sparql;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use oxrdf::NamedNode;
 
 pub use blob::{BlobEntry, BlobError, BlobStore, InMemoryBlobStore};
+pub use counting::{
+    BackendCounters, CounterSnapshot, CountingBlobStore, CountingSparqClient, MeasureScope,
+};
 #[cfg(feature = "embedded-sparq")]
 pub use embedded::EmbeddedSparqClient;
 pub use http::{HttpSparqClient, SparqHttpError};
@@ -28,7 +36,9 @@ pub use reconcile::{
     reconcile_orphans, spawn_periodic, ReconcileError, ReconcileOptions, ReconcileReport,
     DEFAULT_GRACE,
 };
-pub use sparq::{DeleteOutcome, InMemorySparqClient, ResourceMeta, SparqClient, SparqError};
+pub use sparq::{
+    DeleteOutcome, InMemorySparqClient, ReadPlan, ResourceMeta, SparqClient, SparqError,
+};
 pub use sparql::{BodyObject, BuildError};
 
 use crate::error::{ServerError, ServerResult};
@@ -38,6 +48,50 @@ use crate::error::{ServerError, ServerResult};
 pub struct Resource {
     pub body: Bytes,
     pub meta: ResourceMeta,
+}
+
+/// A container child IRI **validated as RFC-3987 at the [`Store::list_children`] boundary** — the
+/// architecturally-correct home for child-IRI validation (bead wg3).
+///
+/// # Why this newtype exists (the invariant it carries)
+/// The container-listing render (`ldp::handler`) serialises each child IRI into a Turtle/N-Triples
+/// `<...>` term. Previously it did so on the hot path behind a *cheap structural* guard plus a
+/// `debug_assert!` — which left a residual: an invalid-but-serialisable IRI (e.g. a bad percent-escape)
+/// could slip into a release build's output. Validating **once, here, at the store boundary** — where a
+/// malformed/injected row from storage first crosses into the server's own logic — makes "every child
+/// IRI that reaches the render is a full RFC-3987-valid IRI" a **type-level invariant**: the render
+/// receives `ValidatedChildIri` values and can construct the RDF term with NO per-child re-parse and NO
+/// structural guard. A malformed row is FAIL-CLOSED **omitted** at the boundary (see
+/// [`ValidatedChildIri::parse`] / the [`CompositeStore`] impl), so it never flows unchecked into a
+/// response.
+///
+/// It wraps a validated [`NamedNode`], so a consumer that needs the RDF term (the render) gets it for
+/// free (`as_named_node`/`into_named_node`) without re-parsing, and one that needs the string form uses
+/// `as_str`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedChildIri(NamedNode);
+
+impl ValidatedChildIri {
+    /// Validate a raw child IRI (full RFC-3987 via oxrdf/oxiri's `NamedNode::new`). Returns `None` for a
+    /// malformed IRI, so the caller can FAIL CLOSED (omit it) rather than let it flow unchecked.
+    pub fn parse(raw: &str) -> Option<Self> {
+        NamedNode::new(raw).ok().map(Self)
+    }
+
+    /// The validated IRI as a string slice.
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// Borrow the validated [`NamedNode`] (for building an RDF term without a re-parse).
+    pub fn as_named_node(&self) -> &NamedNode {
+        &self.0
+    }
+
+    /// Consume into the validated [`NamedNode`] (moved into an RDF term on the render path).
+    pub fn into_named_node(self) -> NamedNode {
+        self.0
+    }
 }
 
 /// The composite storage seam used by the LDP handlers.
@@ -98,7 +152,7 @@ pub trait Store: Send + Sync {
     /// ORPHANED (no index row references them) and GC'd by the reconciler's orphaned-bytes sweep. We
     /// leave the bytes to the reconciler rather than delete them inline because the blob store is a
     /// separate system (its `delete` is unconditional). Since the composite store now mints UNIQUE
-    /// blob keys per write ([`CompositeStore::mint_blob_key`]), a concurrent same-IRI recreate gets a
+    /// blob keys per write (`CompositeStore::mint_blob_key`), a concurrent same-IRI recreate gets a
     /// DIFFERENT key, so an inline delete of THIS container's key could no longer clobber a recreate's
     /// bytes — but leaving them to the reconciler keeps the path uniform and side-effect-free (the sweep
     /// only GCs bytes with NO index row). Transient orphan until a sweep runs — space only, never an
@@ -112,9 +166,57 @@ pub trait Store: Send + Sync {
         parent: Option<&str>,
     ) -> ServerResult<DeleteOutcome>;
 
-    /// List the direct children (their IRIs) of a container — the authoritative `ldp:contains`
-    /// membership. Used for the empty-container DELETE refusal.
-    async fn list_children(&self, container: &str) -> ServerResult<Vec<String>>;
+    /// List the direct children of a container — the authoritative `ldp:contains` membership — each as a
+    /// [`ValidatedChildIri`] (RFC-3987-validated at THIS boundary, so a malformed/injected row never
+    /// flows unchecked into the container-listing render; see [`ValidatedChildIri`]).
+    ///
+    /// SCOPE (load-bearing): this method is for the container-listing **render ONLY**. Because a
+    /// malformed stored membership row is FAIL-CLOSED OMITTED here, this list is NOT authoritative for
+    /// **emptiness** — a container with a (malformed) membership edge would appear shorter/empty in
+    /// THIS filtered view. The empty-container DELETE decision therefore does NOT use this method: it
+    /// goes through [`delete_container_if_empty`](Store::delete_container_if_empty) →
+    /// `SparqClient::delete_meta_if_empty`, which counts ALL raw membership edges at the SPARQ level
+    /// (atomically, with no filtering), so a malformed edge still keeps the container non-empty and it
+    /// is NOT deleted. Do NOT introduce an emptiness check over this filtered list — use the atomic
+    /// path.
+    async fn list_children(&self, container: &str) -> ServerResult<Vec<ValidatedChildIri>>;
+
+    /// ONE combined read-plan lookup for the read path (read-2 —
+    /// `docs/design/backend-read-path.md` §3.1): the target's authoritative metadata + the
+    /// presence/etag of every ACL candidate, in a single index round-trip. See
+    /// [`SparqClient::read_plan`] for the contract (candidate ordering, the two IRI roles,
+    /// fail-closed on any backend error).
+    ///
+    /// The DEFAULT implementation loops [`meta`](Store::meta) (one round-trip per IRI) so every
+    /// [`Store`] impl — including the handler-level test doubles — keeps its exact per-IRI
+    /// error/presence semantics unchanged; [`CompositeStore`] overrides it to delegate to the
+    /// [`SparqClient`] seam, where the live client answers it in ONE combined query.
+    async fn read_plan(&self, target: &str, acl_candidates: &[String]) -> ServerResult<ReadPlan> {
+        let target_meta = self.meta(target).await?;
+        let mut acls = Vec::with_capacity(acl_candidates.len());
+        for candidate in acl_candidates {
+            let etag = self.meta(candidate).await?.map(|m| m.etag);
+            acls.push((candidate.clone(), etag));
+        }
+        Ok(ReadPlan {
+            target: target_meta,
+            acls,
+        })
+    }
+
+    /// Fetch a resource's bytes through ALREADY-HELD authoritative metadata (from THIS request's
+    /// [`read_plan`](Store::read_plan) round) — the §3.3 `read_at`: no second `get_meta`. Safe
+    /// because blob keys are minted UNIQUE PER WRITE (`CompositeStore::mint_blob_key`): the key
+    /// names an immutable object, so bytes fetched through a held pointer are exactly the bytes
+    /// that pointer committed with — never a torn read of a newer write.
+    ///
+    /// The DEFAULT implementation re-reads via [`read`](Store::read) (metadata + bytes — the
+    /// pre-read-2 cost and semantics), so non-composite [`Store`] impls (test doubles) behave
+    /// exactly as before; [`CompositeStore`] overrides it with the direct blob fetch.
+    async fn read_at(&self, iri: &str, meta: &ResourceMeta) -> ServerResult<Bytes> {
+        let _ = meta;
+        Ok(self.read(iri).await?.body)
+    }
 }
 
 /// The default [`Store`]: SPARQ (authoritative metadata) + a blob store (backup bytes).
@@ -372,11 +474,58 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
         Ok(outcome)
     }
 
-    async fn list_children(&self, container: &str) -> ServerResult<Vec<String>> {
+    async fn read_plan(&self, target: &str, acl_candidates: &[String]) -> ServerResult<ReadPlan> {
+        // Delegate to the SparqClient seam: the live HTTP client answers this with ONE combined
+        // SELECT (§3.1); the in-memory double with one atomic index pass. Fail-closed: any backend
+        // error fails the whole plan.
         self.sparq
+            .read_plan(target, acl_candidates)
+            .await
+            .map_err(|e| match e {
+                SparqError::NotFound => ServerError::NotFound,
+                SparqError::Backend(msg) => ServerError::Storage(msg),
+            })
+    }
+
+    async fn read_at(&self, iri: &str, meta: &ResourceMeta) -> ServerResult<Bytes> {
+        // The §3.3 direct byte fetch through the held pointer — NO second `get_meta`. The unique-
+        // per-write blob key names an immutable object, so these are exactly the bytes the held
+        // metadata committed with. `iri` is not needed here (the pointer is authoritative); it is
+        // part of the trait signature so the default (re-read) impl can exist for test doubles.
+        let _ = iri;
+        self.blob.get(&meta.blob_key).await.map_err(|e| match e {
+            // The index says it exists but bytes are missing: a reconciler-class inconsistency —
+            // the SAME mapping `read` uses, so error behaviour is unchanged.
+            BlobError::NotFound => ServerError::Storage("byte/index inconsistency".into()),
+            BlobError::Backend(msg) => ServerError::Storage(msg),
+        })
+    }
+
+    async fn list_children(&self, container: &str) -> ServerResult<Vec<ValidatedChildIri>> {
+        let raw = self
+            .sparq
             .list_children(container)
             .await
-            .map_err(|e| ServerError::Storage(format!("{e}")))
+            .map_err(|e| ServerError::Storage(format!("{e}")))?;
+        // Validate each raw child IRI (full RFC-3987) at THIS boundary — the point where a
+        // malformed/injected row from storage first crosses into the server's own logic. A malformed
+        // IRI is FAIL-CLOSED OMITTED (never flows unchecked into the render), preserving the render's
+        // prior skip-on-invalid behaviour but moving the guarantee to the architecturally-correct place.
+        // Unreachable via the validated LDP write path (every stored child IRI is RFC-3987-valid by
+        // construction); a store-layer bug that produced one is caught in debug/test by the assert.
+        let mut out = Vec::with_capacity(raw.len());
+        for iri in raw {
+            match ValidatedChildIri::parse(&iri) {
+                Some(v) => out.push(v),
+                None => {
+                    debug_assert!(false, "store yielded a non-RFC-3987 child IRI: {iri}");
+                    eprintln!(
+                        "  STORE: omitting non-RFC-3987 child IRI from list_children: {iri:?}"
+                    );
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -397,6 +546,65 @@ mod tests {
     use crate::store::sparq::InMemorySparqClient;
 
     type S = CompositeStore<InMemorySparqClient, InMemoryBlobStore>;
+
+    #[test]
+    fn validated_child_iri_accepts_valid_rejects_malformed() {
+        // The fail-closed gate (bead wg3): full RFC-3987 validation. A valid IRI parses (and exposes
+        // both the string + the NamedNode without a re-parse); a malformed one returns None so the
+        // caller omits it rather than letting it flow unchecked.
+        let v = ValidatedChildIri::parse("https://pod.example/c/item-0042")
+            .expect("a valid http IRI must parse");
+        assert_eq!(v.as_str(), "https://pod.example/c/item-0042");
+        assert_eq!(
+            v.as_named_node().as_str(),
+            "https://pod.example/c/item-0042"
+        );
+        assert_eq!(
+            v.clone().into_named_node(),
+            NamedNode::new_unchecked("https://pod.example/c/item-0042")
+        );
+
+        // Malformed / injected forms RFC-3987 forbids in an IRI ⇒ None (fail-closed).
+        for bad in [
+            "",                              // empty
+            "not an iri",                    // spaces
+            "https://pod.example/c/a b",     // embedded space
+            "https://pod.example/c/a\nb",    // control (newline)
+            "https://pod.example/c/<a>",     // angle brackets (would corrupt a term)
+            "https://pod.example/c/a\u{7f}", // DEL control
+            "https://pod.example/c/a`b",     // backtick delimiter
+        ] {
+            assert!(
+                ValidatedChildIri::parse(bad).is_none(),
+                "malformed child IRI {bad:?} must be rejected (parse ⇒ None)"
+            );
+        }
+    }
+
+    #[test]
+    fn composite_list_children_returns_validated_iris() {
+        // The Store boundary yields RFC-3987-validated children. Written through the authoritative path,
+        // then listed back — each child is a ValidatedChildIri whose string matches what was stored.
+        let store = S::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+        let container = "https://pod.example/c/";
+        let child = "https://pod.example/c/note1";
+        tokio_test_block_on(async {
+            store
+                .write(container, Bytes::from_static(b""), "text/turtle")
+                .await
+                .expect("mint container");
+            store
+                .create_in_container(container, child, Bytes::from_static(b"x"), "text/turtle")
+                .await
+                .expect("add child");
+            let kids = store.list_children(container).await.expect("list");
+            assert_eq!(
+                kids.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+                vec![child],
+                "list_children returns the child as a validated IRI"
+            );
+        });
+    }
 
     #[test]
     fn mint_blob_key_is_unique_per_call_for_the_same_iri() {

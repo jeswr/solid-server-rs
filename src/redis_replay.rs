@@ -14,7 +14,7 @@
 //! `SET dpop:jti:<jti> 1 NX PX <ttl_ms>`:
 //! - `NX` makes the write happen ONLY if the key is absent. Redis replies with the value on a write
 //!   (the key was new) and `nil` when the key already existed (a replay). That single reply IS the
-//!   atomic check-and-set: `Some(..)` ⇒ [`MarkResult::New`], `nil`/`None` ⇒ [`MarkResult::Replay`].
+//!   atomic check-and-set: `Some(..)` ⇒ [`MarkResult::New`](solid_oidc_verifier::replay::MarkResult::New), `nil`/`None` ⇒ [`MarkResult::Replay`](solid_oidc_verifier::replay::MarkResult::Replay).
 //!   There is NO `GET`-then-`SET` race — the decision is made server-side in one command.
 //! - `PX <ttl_ms>` sets the key's expiry to EXACTLY the `ttl` the verifier passes to `mark()` (the
 //!   proof-freshness window). Once the key expires the `jti` is re-markable, mirroring the in-memory
@@ -26,12 +26,12 @@
 //!
 //! ## Fail-closed (non-negotiable)
 //! ANY Redis error — pool exhaustion, connect timeout, command timeout, a malformed reply — returns a
-//! [`ReplayBackendError`], which the verifier maps to its existing 503 (`replay_fail_closed` defaults
+//! [`ReplayBackendError`](solid_oidc_verifier::replay::ReplayBackendError), which the verifier maps to its existing 503 (`replay_fail_closed` defaults
 //! true). We NEVER fail open: a fail-open Redis outage would be a GLOBAL replay-protection bypass
 //! across the whole fleet. A slow Redis becomes a fast 503, never a worker pile-up (see the timeout).
 //!
 //! ## Off the async runtime (no worker-blocking)
-//! [`ReplayStore::mark`] is a SYNC trait method called directly from inside the async axum handler's
+//! [`ReplayStore::mark`](solid_oidc_verifier::replay::ReplayStore::mark) is a SYNC trait method called directly from inside the async axum handler's
 //! Tokio runtime. We must NOT block a Tokio worker on the Redis RTT, and we must NOT call a blocking
 //! Redis client from inside the runtime (it would either block a worker or, for an async client,
 //! trip "runtime within a runtime"). We mirror the verifier's `net.rs` discipline EXACTLY: a dedicated
@@ -146,7 +146,7 @@ impl RedisReplayStore {
     /// Connect to Redis at `url` (e.g. `redis://127.0.0.1:6379`) with the [`DEFAULT_OP_TIMEOUT`].
     ///
     /// Builds an r2d2 pool of BLOCKING connections (so the worker threads do ordinary blocking Redis I/O
-    /// — never a Tokio runtime), spawns [`DEFAULT_WORKERS`] worker threads that share the pool + a single
+    /// — never a Tokio runtime), spawns `DEFAULT_WORKERS` worker threads that share the pool + a single
     /// job channel (so up to N marks run their `SET NX PX` concurrently), and **eagerly validates one
     /// connection** so a misconfigured/unreachable Redis fails at boot (fail-closed) rather than only on
     /// the first authenticated request.
@@ -279,7 +279,7 @@ impl ReplayStore for RedisReplayStore {
     }
 
     /// READ-ONLY existence probe → a single Redis `EXISTS dpop:jti:<jti>` on a worker thread. NEVER a
-    /// `SET`/`SET NX` (it must not mark) — the authoritative, mutating check-and-set is [`mark`]. Same
+    /// `SET`/`SET NX` (it must not mark) — the authoritative, mutating check-and-set is `mark`. Same
     /// fail-closed-on-error posture as `mark`: a queue-full / disconnect / timeout / Redis error all map
     /// to a `ReplayBackendError`, NEVER a false `Ok(false)` ("not seen") that could mask a replay. This
     /// is an OPTIMIZATION-hint seam (the held opt-4 jti-precheck) and is NOT wired into the auth path in

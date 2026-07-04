@@ -4,7 +4,7 @@
 //! [`EmbeddedSparqClient`] implements the authoritative-RDF seam by calling the `sparq-engine`
 //! query/update entry points DIRECTLY against an in-process [`Graph`] (`sparq-core`), rather than
 //! over SPARQ's HTTP service (the [`HttpSparqClient`](super::http::HttpSparqClient) path). It is a
-//! THIRD `SparqClient` impl alongside the HTTP client and the [`InMemorySparqClient`] test double,
+//! THIRD `SparqClient` impl alongside the HTTP client and the [`InMemorySparqClient`](crate::store::InMemorySparqClient) test double,
 //! selected at boot by `PSS_SPARQ_BACKEND=embedded` (see `main.rs`). Behind the OPT-IN
 //! `embedded-sparq` build feature, so the DEFAULT build/tests/conformance carry NO sparq dependency
 //! and are byte-identical. See `decisions/0001-embed-sparq-in-process.md`.

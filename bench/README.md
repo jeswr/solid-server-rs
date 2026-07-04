@@ -4,6 +4,21 @@ A self-contained harness that measures the server's **highly-concurrent throughp
 RPS + the saturation concurrency) and **latency** (p50/p99/p999) over **HTTPS**, against the
 in-memory store (no S3, no live SPARQ), so later optimization rounds have a baseline to beat.
 
+## Harnesses in this directory
+
+| harness | transport | needs | docs |
+|---|---|---|---|
+| `run.sh` (+ `run-auth.sh`) | real HTTPS via `oha` | `oha`, a running server, self-signed cert | this file |
+| **`run-bench.sh`** (`examples/bench_harness`) | in-process `tower::Service` oneshot | nothing but `cargo` | [`HARNESS.md`](./HARNESS.md) |
+| **`run-adversarial.sh`** (`examples/adversarial_bench` + `tests/adversarial_invariants`) | in-process | nothing but `cargo` | [`ADVERSARIAL-BENCH.md`](./ADVERSARIAL-BENCH.md) |
+
+The **`run-bench.sh` / `run-adversarial.sh`** harnesses are the dependency-light, always-runnable
+complement to the `oha` HTTPS sweep: they drive the full application stack (auth → WAC → store) over
+the in-memory doubles with **no external services**, emit a machine-readable JSON report per scenario
+at multiple concurrencies, and follow the PSS perf-gate rule — **deterministic** metrics
+(status/response-bytes/allocation counts) are strict/comparable, **timing** metrics are ADVISORY
+(never a merge gate). No performance numbers are committed to markdown; read the generated JSON.
+
 This directory is **measurement only** — it does not change server request behaviour. The one server
 `src/` touch is dev-only bench *seeding* (`SOLID_SERVER_SEED_BENCH`, default-off — see "Fixtures").
 

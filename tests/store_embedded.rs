@@ -125,8 +125,13 @@ async fn create_in_container_records_membership() {
     .unwrap();
 
     assert_eq!(
-        s.list_children(container).await.unwrap(),
-        vec![child.to_string()]
+        s.list_children(container)
+            .await
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str())
+            .collect::<Vec<_>>(),
+        vec![child]
     );
     assert!(s.exists(child).await.unwrap());
 }
@@ -170,8 +175,13 @@ async fn create_in_container_twice_keeps_a_single_membership() {
         .unwrap();
     }
     assert_eq!(
-        s.list_children(container).await.unwrap(),
-        vec![child.to_string()],
+        s.list_children(container)
+            .await
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str())
+            .collect::<Vec<_>>(),
+        vec![child],
         "a re-create of the same child IRI must not duplicate the membership edge"
     );
 }
@@ -227,8 +237,13 @@ async fn delete_detaches_from_parent_container() {
     .await
     .unwrap();
     assert_eq!(
-        s.list_children(container).await.unwrap(),
-        vec![child.to_string()]
+        s.list_children(container)
+            .await
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str())
+            .collect::<Vec<_>>(),
+        vec![child]
     );
 
     // Deleting the child WITH its parent detaches the membership edge atomically.
@@ -273,8 +288,13 @@ async fn delete_container_if_empty_refuses_a_populated_container() {
         "NotEmpty must leave the child present (not orphaned)"
     );
     assert_eq!(
-        s.list_children(container).await.unwrap(),
-        vec![child.to_string()],
+        s.list_children(container)
+            .await
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str())
+            .collect::<Vec<_>>(),
+        vec![child],
         "NotEmpty must leave the membership edge intact"
     );
 }
@@ -372,8 +392,13 @@ async fn delete_container_if_empty_detaches_from_parent_and_routes_recreate_clea
         "a container re-created at the same IRI must inherit no stale containment"
     );
     assert_eq!(
-        s.list_children(parent).await.unwrap(),
-        vec![container.to_string()],
+        s.list_children(parent)
+            .await
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str())
+            .collect::<Vec<_>>(),
+        vec![container],
         "the parent re-contains the recreated sub-container exactly once"
     );
 }

@@ -28,7 +28,7 @@
 //! ## Replay-store sharing (the load-bearing correctness point)
 //! The cache's hit-path proof verification marks the `jti` in the **SAME** replay store the verifier
 //! uses -- otherwise a `jti` used on a cache-MISS request could be replayed on a cache-HIT request
-//! (a replay bypass). The server therefore constructs ONE [`InMemoryReplayStore`] behind an `Arc` and
+//! (a replay bypass). The server therefore constructs ONE [`InMemoryReplayStore`](solid_oidc_verifier::replay::InMemoryReplayStore) behind an `Arc` and
 //! hands a clone to both the verifier (via the [`SharedReplay`] newtype) and this cache.
 //!
 //! ## Bounds + lifetime
@@ -604,6 +604,7 @@ mod tests {
             client_id: Some("conformance-alice".into()),
             scopes: vec![],
             cnf_jkt: Some(jkt.to_string()),
+            cnf_x5t_s256: None,
             expiry: Some(exp),
         }
     }

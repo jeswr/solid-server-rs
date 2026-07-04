@@ -27,8 +27,10 @@ no-rights-on-target" shape, and states the invariant that governs all of them.
 > requester — anonymous, or authenticated-but-lacking-the-mode — receives their DENIAL code (401 if
 > anonymous, 403 if authenticated) for BOTH "forbidden-existing" AND "not-found", **byte-identically**:
 > same status, same body, same headers (`Location`, `ETag`, `WWW-Authenticate`). The rule applies
-> uniformly across GET / HEAD / PUT / POST / PATCH / DELETE **and** the conditional / header channels,
-> so no single verb or header is an existence oracle.
+> across GET / HEAD / PUT / POST / PATCH / DELETE **and** the conditional / header channels, so no
+> single verb or header is an existence oracle — with ONE narrow, WAC-inherent residual on the
+> PUT/PATCH **create-vs-overwrite** membership axis (see "Residual — the create/overwrite membership
+> asymmetry" below).
 
 Equivalently: **`404` means "you were allowed to know, and it isn't there."**
 
@@ -72,6 +74,33 @@ resource — it must use **POST** (which mints a server-opaque, collision-free n
 real, intentional WAC-semantics choice: PUT names the exact target IRI, so PUT-create is a
 write-the-target operation and is gated on target-Write; the containment-mutating "add a member"
 primitive an Append holder is entitled to is POST. (CTH-safe — see "Conformance latitude".)
+
+### Residual — the create/overwrite membership asymmetry (LOW–MEDIUM, accepted; inherent to WAC)
+
+The container-modification half of the create rule — a PUT/PATCH **create** *additionally* requires
+`acl:Append` on the **containing container** (via that container's own `acl:accessTo`), because
+minting a member mutates the container's `ldp:contains` membership; this is what stops an
+`acl:default`-only Write grant (or a Control-holder-pre-provisioned target `.acl`) from letting an
+agent with no right over the container create members in it — is **not symmetric** with **overwrite**,
+which mutates no membership and so requires no container right. Consequently one narrow principal can
+STILL distinguish existence on PUT/PATCH: an agent that holds `acl:Write` on a member **via the
+container's `acl:default`** but does **NOT** hold `acl:Append` on the container **via `acl:accessTo`**
+gets a **204** overwriting an EXISTING member (only target-Write is checked) versus a **403** creating
+a MISSING one (the container-modification `acl:Append` check fails). That 204-vs-403 split reveals
+whether the member existed. So the create-vs-overwrite denial is **not** byte-uniform for this one
+grant shape — hence the narrowing of the invariant above.
+
+This asymmetry is **inherent to Web Access Control**, not a gap in the closure. Creating a member is a
+container-membership mutation and overwriting one is not, so the two operations legitimately require
+different rights; and `acl:default` (which flows to members) and `acl:accessTo` on the container are
+INDEPENDENTLY grantable, so the "member-Write-without-container-Append" grant that exposes the split is
+expressible and cannot be authorized away without either (a) dropping the container-modification check
+— reopening the privilege-escalation it exists to close (`acl:default`-only Write minting container
+members) — or (b) forbidding overwrite for any principal that could create, which WAC does not support.
+The exposure is bounded: it needs that specific split grant (an owner who grants member-Write via
+`acl:default` yet withholds container-Append is unusual), it reveals only **existence** — never content
+(the V4/V5 ETag closures still hold) — and only to a principal already trusted to write the member's
+representation. It is therefore **accepted** rather than closed.
 
 ### V2 — POST colliding-Slug `Location` fingerprint
 

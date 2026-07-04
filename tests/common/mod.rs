@@ -96,6 +96,92 @@ pub fn mint_access_token(issuer_key: &KeyKit, cnf_jkt: &str) -> String {
     issuer_key.sign(&header, &claims)
 }
 
+/// The RFC 8705 §3.1 `cnf.x5t#S256` for a certificate: base64url-no-pad(SHA-256(cert DER)). Matches
+/// `solid_server_rs::pop::cert_bound::CertThumbprint::from_cert_der(der).to_base64url()`, so a token
+/// minted with this value binds to exactly that DER.
+pub fn cert_x5t_s256(cert_der: &[u8]) -> String {
+    b64url(&Sha256::digest(cert_der))
+}
+
+/// Mint a well-formed RFC-9068 access token whose confirmation is an RFC 8705 mTLS certificate binding
+/// (`cnf.x5t#S256` ONLY — no `cnf.jkt`), signed by `issuer_key`. Used by the PoP Tier-1b fail-closed
+/// tests (needs a verifier configured with `require_dpop(false)` so a Bearer-presented cert-bound token
+/// is verified rather than rejected at the DPoP-scheme gate).
+pub fn mint_cert_bound_access_token(issuer_key: &KeyKit, x5t_s256: &str) -> String {
+    let header = json!({ "alg": "ES256", "typ": "at+jwt" });
+    let iat = now();
+    let claims = json!({
+        "iss": ISSUER,
+        "sub": WEBID,
+        "jti": format!("at-{}", next_id()),
+        "client_id": CLIENT_ID,
+        "aud": BASE_URL,
+        "webid": WEBID,
+        "cnf": { "x5t#S256": x5t_s256 },
+        "iat": iat,
+        "exp": iat + 300,
+    });
+    issuer_key.sign(&header, &claims)
+}
+
+/// Mint a well-formed RFC-9068 access token with NO confirmation (`cnf`) claim at all — a plain,
+/// UNBOUND bearer token. Under the Solid `require_dpop(true)` posture the verifier rejects this as
+/// `Bearer` (DPoP is mandatory for any non-cert-bound token), which the PoP Tier-1 LIVE tests assert
+/// stays true.
+pub fn mint_unbound_access_token(issuer_key: &KeyKit) -> String {
+    let header = json!({ "alg": "ES256", "typ": "at+jwt" });
+    let iat = now();
+    let claims = json!({
+        "iss": ISSUER,
+        "sub": WEBID,
+        "jti": format!("at-{}", next_id()),
+        "client_id": CLIENT_ID,
+        "aud": BASE_URL,
+        "webid": WEBID,
+        "iat": iat,
+        "exp": iat + 300,
+    });
+    issuer_key.sign(&header, &claims)
+}
+
+/// Mint an RFC-9068 access token carrying BOTH a DPoP (`cnf.jkt`) and an mTLS (`cnf.x5t#S256`)
+/// confirmation — the multi-binding case the Tier-1b dispatch refuses fail-closed.
+pub fn mint_dual_bound_access_token(issuer_key: &KeyKit, cnf_jkt: &str, x5t_s256: &str) -> String {
+    let header = json!({ "alg": "ES256", "typ": "at+jwt" });
+    let iat = now();
+    let claims = json!({
+        "iss": ISSUER,
+        "sub": WEBID,
+        "jti": format!("at-{}", next_id()),
+        "client_id": CLIENT_ID,
+        "aud": BASE_URL,
+        "webid": WEBID,
+        "cnf": { "jkt": cnf_jkt, "x5t#S256": x5t_s256 },
+        "iat": iat,
+        "exp": iat + 300,
+    });
+    issuer_key.sign(&header, &claims)
+}
+
+/// Mint an RFC-9068 access token whose `cnf.x5t#S256` is PRESENT but MALFORMED (not a valid 32-byte
+/// base64url thumbprint) — the fail-closed "malformed binding" case. `cnf.jkt` is absent.
+pub fn mint_malformed_cert_bound_access_token(issuer_key: &KeyKit) -> String {
+    let header = json!({ "alg": "ES256", "typ": "at+jwt" });
+    let iat = now();
+    let claims = json!({
+        "iss": ISSUER,
+        "sub": WEBID,
+        "jti": format!("at-{}", next_id()),
+        "client_id": CLIENT_ID,
+        "aud": BASE_URL,
+        "webid": WEBID,
+        "cnf": { "x5t#S256": "not-a-valid-thumbprint" },
+        "iat": iat,
+        "exp": iat + 300,
+    });
+    issuer_key.sign(&header, &claims)
+}
+
 /// base64url(SHA-256(token)) — the DPoP `ath`.
 pub fn ath(token: &str) -> String {
     b64url(&Sha256::digest(token.as_bytes()))

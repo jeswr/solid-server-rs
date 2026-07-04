@@ -7,12 +7,12 @@
 //! Every authenticated AND anonymous GET/HEAD resolves the effective ACL of the target — the
 //! child→root walk, a `store.read(<acl>)` (an index `get_meta` PLUS a blob byte-fetch) per candidate
 //! ACL, and an `oxttl` parse of the found ACL's bytes into triples (see
-//! [`crate::authz::wac::WacAuthorizer::resolve_effective_acl`]). For a HOT resource whose ACL does not
+//! `WacAuthorizer::resolve_effective_acl`). For a HOT resource whose ACL does not
 //! change between reads, the byte-fetch + parse of that ACL is pure waste — the SAME triples come out
 //! every time.
 //!
 //! This cache stores the **parsed triples** of an ACL resource keyed by **`(acl-iri, etag)`**. On each
-//! probe of a candidate ACL the resolver obtains the ACL's CURRENT [`ResourceMeta::etag`] CHEAPLY (a
+//! probe of a candidate ACL the resolver obtains the ACL's CURRENT [`ResourceMeta::etag`](crate::store::ResourceMeta::etag) CHEAPLY (a
 //! `store.meta` — an index lookup, NO blob byte-fetch, NO parse) and:
 //! - if a cached entry exists for that `acl-iri` AND its stored etag **equals** the current etag, the
 //!   cached triples are reused (the byte-fetch + `oxttl` parse are SKIPPED);
