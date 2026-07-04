@@ -393,6 +393,33 @@ fn live_plain_bearer_still_rejected_under_require_dpop() {
 }
 
 #[test]
+fn live_dpop_bound_token_presented_as_bearer_with_cert_is_401_under_require_dpop() {
+    // No token-replay downgrade: a DPoP-BOUND token (cnf.jkt, no cnf.x5t#S256) mis-presented as
+    // `Bearer` is rejected under require_dpop EVEN WITH a matching-looking client certificate on the
+    // wire. The certificate must NEVER admit a token that is not itself cert-bound — a captured
+    // DPoP-bound token replayed as Bearer would otherwise skip its proof-of-possession. (`token_is_cert_bound`
+    // is false for a cnf.jkt-only token, so the verifier's Bearer/require_dpop gate rejects it before the
+    // cert path is ever consulted.)
+    let issuer_key = KeyKit::generate();
+    let client_key = KeyKit::generate();
+    let ctx = ctx_require_dpop(&issuer_key, true);
+    let access = mint_access_token(&issuer_key, &client_key.thumbprint);
+
+    let err = ctx
+        .authenticate_with_cert(
+            Some(format!("Bearer {access}")), // DPoP-bound token, but presented as Bearer
+            None,
+            "GET",
+            "/alice/data",
+            Some(&presented(CERT_A)), // a cert on the wire must not admit a DPoP-bound Bearer
+        )
+        .expect_err(
+            "a cnf.jkt token presented as Bearer must be 401 under require_dpop, cert or not",
+        );
+    assert_eq!(err.status().as_u16(), 401);
+}
+
+#[test]
 fn live_flag_off_is_byte_identical_cert_bound_bearer_rejected_under_require_dpop() {
     // FLAG-OFF byte-identical proof (item 4): with the mTLS flag OFF, `authenticate_with_cert` NEVER
     // threads the presented certificate into the verifier — so under require_dpop a cert-bound Bearer
