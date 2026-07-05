@@ -56,6 +56,14 @@ An **additive, runtime-flag-gated** surface in `src/lws/` (`SOLID_SERVER_LWS`), 
    on. A per-request profile negotiation that could subsume this deployment-level toggle is an
    M2 design question.
 
+   *Existence-disclosure check (decisions/0003 lens):* the strict 409 `missing-parent` vs 201
+   split reveals the PARENT container's existence — but only to an agent already authorized to
+   create at the target (target-`Write` via the effective ACL + `Append` on the nearest existing
+   ancestor, both checked first). That same agent can already learn the same fact through the
+   sanctioned V4 bare-`*` channel (`PUT <parent> If-None-Match: *` → 201-created vs 412-exists,
+   explicitly exempted for required-mode holders), so the strict branch adds no oracle beyond
+   what decisions/0003 already grants that principal class.
+
 4. **LWS errors carry RFC 9457 problem details** (D17) via a dedicated
    `ServerError::LwsProblem { status, type_uri, title }` variant (fixed registry under
    `…/lws/problems/`, never request-derived), constructed ONLY on LWS code paths — the existing
