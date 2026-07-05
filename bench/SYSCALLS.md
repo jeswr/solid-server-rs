@@ -44,10 +44,18 @@ Per request class, on ONE warm keep-alive HTTP/1.1 connection, exactly `SYS_N` r
 
 ## Running (Linux only — the EC2 lane)
 
+**Turnkey fresh-box recipe: [`RUN-ON-EC2.md`](./RUN-ON-EC2.md)** — clone → build → boot → load →
+strace → emit + commit the report, including the one-time `kernel.yama.ptrace_scope=0` sysctl the
+strace attach requires. Short form:
+
 ```bash
-# deps: dnf install -y strace perf gcc gcc-c++ cmake perl-core git  (+ rustup toolchain)
-./bench/syscalls.sh
+# deps: dnf install -y strace perf gcc gcc-c++ cmake perl-core git python3 curl  (+ rustup toolchain)
+sudo sysctl kernel.yama.ptrace_scope=0   # REQUIRED — strace attaches to a sibling process
+./bench/syscalls.sh                       # add SKIP_PERF=1 to skip the advisory perf pass
 ```
+
+Runs against the **in-memory store** (`PSS_SPARQ_BACKEND=memory`) + the driver's embedded mock OIDC
+issuer — **no Docker/Keycloak/S3/SPARQ**, default `cargo build` (no `embedded-sparq` feature).
 
 Knobs: `SYS_N` (5000), `SYS_WARMUP` (200), `SYS_REPS` (2), `PERF_N` (50000), `IDLE_SECS` (5),
 `CHILDREN` (100), `SYS_PORT`/`SYS_ISSUER_PORT` (3400/3401), `SKIP_PERF=1`, `INSTANCE_LABEL`.

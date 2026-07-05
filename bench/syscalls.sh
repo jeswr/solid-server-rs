@@ -180,6 +180,30 @@ for _ in $(seq 1 "$SYS_REPS"); do
 done
 run_pass strace "$STRACE_SCENARIOS" "$SYS_N"
 
+# --- GUARD: a DENIED strace attach leaves an EMPTY -o summary table, which the report would render
+# as "0 syscalls/request" — a silently-bogus committed baseline. The usual cause on a fresh box is
+# YAMA: strace attaches to the SERVER, which is a SIBLING (not a descendant) of the tracer, so
+# `kernel.yama.ptrace_scope` must be 0 (see bench/RUN-ON-EC2.md). Fail loudly with that hint rather
+# than emit a zero-count report.
+strace_tables=0
+for f in "$RAW"/strace-*.txt; do
+  [ -e "$f" ] || continue
+  strace_tables=$((strace_tables + 1))
+  if [ ! -s "$f" ]; then
+    echo "ERROR: strace produced an EMPTY summary table ($f) — the attach was almost certainly DENIED." >&2
+    echo "       Run: sudo sysctl kernel.yama.ptrace_scope=0   (strace must attach to a sibling process)" >&2
+    echo "       then re-run ./bench/syscalls.sh. See bench/RUN-ON-EC2.md. strace attach log:" >&2
+    cat "$RAW/strace-attach.log" >&2 2>/dev/null || true
+    exit 1
+  fi
+done
+if [ "$strace_tables" = 0 ]; then
+  echo "ERROR: the strace pass produced NO summary tables in $RAW — results INVALID (attach denied?)." >&2
+  cat "$RAW/strace-attach.log" >&2 2>/dev/null || true
+  exit 1
+fi
+echo ">> strace pass OK: $strace_tables non-empty syscall tables."
+
 # --- PERF PASS (advisory): one window per class ---------------------------------------------------
 if [ -z "$SKIP_PERF" ]; then
   run_pass perf "anon-doc,listing,authed-doc,put" "$PERF_N"
