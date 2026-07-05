@@ -50,6 +50,7 @@ pub mod authz;
 pub mod body_limit;
 pub mod error;
 pub mod ldp;
+pub mod nodelay;
 pub mod notifications;
 pub mod overload;
 /// Tiered proof-of-possession (RFC 8705 cert-bound tokens, later DPoP-SK) — the negotiated,

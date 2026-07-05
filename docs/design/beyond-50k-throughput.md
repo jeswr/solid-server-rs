@@ -44,9 +44,9 @@ O(N) listing render + single-pass ACL (`bench/ROUND1.md`), the verified-access-t
 micro-dedups (`bench/P1-QUICKWINS.md`), the per-child IRI-guard ASCII fast path
 (`bench/ROUND4-PROFILE.md`), HTTP/2 ALPN + overload/backpressure (`bench/HTTP2-BACKPRESSURE.md`),
 pre-crypto rate limiting, and the scoped anonymous public-read skip (`bench/SKIP-CRYPTO.md`,
-`decisions/0002`). Unmerged prototypes exist on branches: `perf-b-mimalloc` /
-`perf-b-mimalloc-fix` (mimalloc global allocator — Linux/musl + peak-RSS validation still
-open), `perf-c-alloc-reduction` (read-response header allocations), `perf-a-http2-guards`
+`decisions/0002`). The **mimalloc global allocator (`perf-b-mimalloc`) has LANDED** — `src/main.rs`
+installs `mimalloc::MiMalloc` as the `#[global_allocator]` (see §4 P1.1). Other unmerged prototypes
+exist on branches: `perf-c-alloc-reduction` (read-response header allocations), `perf-a-http2-guards`
 (transport-guard hardening), and `perf-crypto-offload` (**measured NO win, default-OFF** —
 evidence, not a lever).
 
@@ -159,18 +159,19 @@ The whole syscall story is currently macOS-profiled; the deploy target is Linux
 Ordered by (expected impact × confidence) ÷ risk. Each is independently landable and
 independently reversible.
 
-1. **P1.1 — land the parked allocator swap (mimalloc)** — branch `perf-b-mimalloc`(+`-fix`),
-   already written and supply-chain-reviewed (mimalloc 0.1.52 / libmimalloc-sys 0.1.49, MIT,
-   vendored-C build documented). Targets the **27.2% MALLOC band** (regime A) — the largest
-   single addressable slice after syscalls. Blocked-on (its own commit message says so):
-   musl-target build check, Dockerized CTH 41/41, and **peak-RSS under a
-   concurrency-saturating flood** (allocator page retention changes the OOM/DoS envelope —
-   the adversarial-bench flood arm is the acceptance test). jemalloc was already considered
-   and rejected for musl page-size pain — don't relitigate.
+1. **P1.1 — allocator swap (mimalloc) — LANDED.** `src/main.rs` installs `mimalloc::MiMalloc` as the
+   `#[global_allocator]` (mimalloc `0.1`, MIT, vendored-C `libmimalloc-sys` — trust-surface delta
+   documented in the `Cargo.toml` dependency comment + the `main.rs` module docs). Targets the
+   **27.2% MALLOC band** (regime A) — the largest single addressable slice after syscalls. It is a
+   behaviour-NEUTRAL lever (only the alloc/dealloc backend changes; conformance + tests unchanged).
+   jemalloc was already considered and rejected for musl page-size pain — don't relitigate. Remaining
+   acceptance to bank on the deploy target (not a code change): **peak-RSS under a
+   concurrency-saturating flood** (allocator page retention changes the OOM/DoS envelope — the
+   adversarial-bench flood arm), run on the Linux/EC2 lane.
 2. **P1.2 — land `perf-c-alloc-reduction`** (per-request read-response header allocations) —
    deterministic alloc-count delta via the bench-harness floor; the `bench/BASELINE.md` rank-4
    target.
-3. **P1.3 — TLS session resumption: size it for production.** rustls `ServerConfig` defaults
+3. **P1.3 — TLS session resumption: size it for production — LANDED (cache-size half).** rustls `ServerConfig` defaults
    (verified against docs.rs/rustls): an in-memory **session cache of only 256 sessions**,
    **2 TLS 1.3 resumption tickets** per handshake, and **`max_early_data_size = 0`** (0-RTT
    off). Resumption therefore already *works*, but a 256-entry cache is a handful of
@@ -194,17 +195,27 @@ independently reversible.
    pass-through or pre-concatenate small responses into one `Bytes`. Deterministic: write-class
    syscalls per request drops from 2→1. (Unverified today which of the two we get — that is
    the point of measuring first.)
-5. **P1.5 — TCP tuning audit**: confirm `TCP_NODELAY` on accepted sockets on BOTH serve paths
-   (axum-server and plain `axum::serve`), keep-alive timeouts already owned by
-   `src/transport.rs`. Deterministic-ish (socket option state is inspectable); latency effect
-   advisory.
-6. **P1.6 — backend round-trip amortization (regime C).** (a) confirm the `HttpSparqClient`'s
-   hyper-util legacy pool reuses connections under load (pool metrics / P0.1 `connect` counts);
-   (b) same for `object_store`'s S3 client; (c) promote the **`embedded-sparq`** backend
-   (`decisions/0001`) from opt-in experiment to the benchmarked configuration for the
-   single-node deployment — it deletes ~every SPARQ metadata syscall+RTT (an HTTP request per
-   metadata op → a function call). Deterministic: backend round-trips per LDP op, already
-   countable at the seam.
+5. **P1.5 — TCP tuning audit — LANDED (TCP_NODELAY).** `TCP_NODELAY` is now set on accepted sockets
+   on BOTH serve paths (it was OFF — Nagle on — by default on both): the TLS path composes
+   axum-server's `NoDelayAcceptor` as the inner acceptor of the `RustlsAcceptor` (sets the option on
+   the raw `TcpStream` before the handshake), and the plain `axum::serve` path taps the listener with
+   the `ListenerExt` nodelay tap. Both live in `src/nodelay.rs`. **Deterministic metric:** the
+   socket-option STATE — `tests/tcp_nodelay.rs` asserts `TcpStream::nodelay() == true` on each path's
+   mechanism (and pins the Nagle-on baseline it changed). Keep-alive timeouts already owned by
+   `src/transport.rs`; the latency effect is advisory.
+6. **P1.6 — backend round-trip amortization (regime C).** The deterministic **backend round-trip
+   counters at the SparqClient/BlobStore seams have LANDED** for both write (`tests/write_path_counters.rs`)
+   and read (`tests/read_path_counters.rs`) paths, and now for the **embedded-sparq** backend
+   (`tests/embedded_read_counters.rs`, feature-gated) — the per-LDP-op backend round-trip counts are
+   pinned so a regression that adds a round-trip fails. The embedded bench surfaces the next lever:
+   `EmbeddedSparqClient` has NO combined-`read_plan` override, so it inherits the trait default and
+   pays **`1 + N` sequential `get_meta` round-trips** per read (target + N ACL candidates), where the
+   in-memory double / the live HTTP one-combined-`SELECT` do it in 1 — implementing a combined
+   `read_plan` on the embedded client is the measured reduction to bank next. Still open: (a) confirm
+   the `HttpSparqClient`'s hyper-util legacy pool reuses connections under load (pool metrics / P0.1
+   `connect` counts); (b) same for `object_store`'s S3 client; (c) promote **`embedded-sparq`**
+   (`decisions/0001`) from opt-in experiment to the benchmarked single-node configuration — it deletes
+   ~every SPARQ metadata syscall+RTT (an HTTP request per metadata op → a function call).
 7. **P1.7 — SO_REUSEPORT sharded accept** (only if P0.1 shows accept-path contention at high
    connection churn): N listeners with `SO_REUSEPORT`, one per worker, kernel-level load
    spread. Cheap to prototype on tokio via `socket2`; measurable as accept-latency tail.
@@ -357,11 +368,12 @@ transport crate-boundary and keeps the CTH + adversarial suites as the invariant
 |---|---|---|---|
 | perf-p0-syscount | `bench/syscalls.sh` — strace-based deterministic syscalls/request harness (Linux/EC2 lane) + JSON report | 0 | deterministic |
 | perf-p0-linuxprof | re-run the round-4 profile with `perf` on the Linux target; write the Linux NET-SYSCALL/MALLOC split into a `bench/LINUX-PROFILE.md` | 0 | measurement |
-| perf-p1-mimalloc | validate + land `perf-b-mimalloc-fix`: musl build, Dockerized CTH 41/41, peak-RSS flood acceptance | 1 | deterministic (alloc source) + advisory RSS |
+| perf-p1-mimalloc | **LANDED** — `mimalloc::MiMalloc` installed as the `#[global_allocator]` in `src/main.rs`; remaining musl-build + Dockerized CTH 41/41 + peak-RSS flood acceptance run on the Linux/EC2 lane | 1 | deterministic (alloc source) + advisory RSS |
 | perf-p1-allocred | rebase + land `perf-c-alloc-reduction` on the bench-harness alloc floor | 1 | deterministic |
 | perf-p1-resumption | env-tunable rustls session-cache size / ticketer in `src/tls.rs`; scripted resumed-vs-full handshake count — **cache-size half LANDED** (`SOLID_SERVER_TLS_SESSION_CACHE_SIZE`, default 10 240; ticketer half deferred) | 1 | deterministic |
 | perf-p1-writev | P0.1-driven write-coalescing audit (2 writes → 1 per response if confirmed) | 1 | deterministic |
-| perf-p1-backend | backend-RTT counters at the SparqClient/BlobStore seams + pooled-connection verification; embedded-sparq benchmark config | 1 | deterministic |
+| perf-p1-nodelay | **LANDED (P1.5)** — `TCP_NODELAY` on accepted sockets on BOTH serve paths (`src/nodelay.rs`: TLS `NoDelayAcceptor` + plain `ListenerExt` tap); socket-option state pinned in `tests/tcp_nodelay.rs` | 1 | deterministic (socket-option state) |
+| perf-p1-backend | **counters LANDED** — backend-RTT counters at the SparqClient/BlobStore seams (`tests/{read,write}_path_counters.rs`) + the **embedded-sparq bench config** (`tests/embedded_read_counters.rs`, pins the embedded default `read_plan` `1+N` fan-out as the next reduction target); still open: pooled-connection verification for the HTTP client + `object_store` | 1 | deterministic |
 | perf-p2-ktls-spike | kTLS spike: `ktls` crate + kernel matrix verification; decision memo only | 2 | spike |
 | perf-p3-monoio-spike | the D4 monoio TLS-echo spike, same-box tokio comparison; decision memo against D1–D4 | 3 | spike |
 

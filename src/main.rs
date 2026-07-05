@@ -526,6 +526,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              per-IP rate limit, request timeout) DO apply on this path."
         );
     }
+    // P1.5 (beyond-50k): TCP_NODELAY is set on accepted sockets on BOTH serve paths — the TLS path
+    // via axum-server's NoDelayAcceptor composed into the RustlsAcceptor, the plain path via the
+    // ListenerExt nodelay tap. Nagle off ⇒ small responses leave promptly. See `src/nodelay.rs`.
+    eprintln!(
+        "  TRANSPORT: TCP_NODELAY = ON (Nagle disabled) on accepted sockets (both serve paths)."
+    );
 
     // --- SPARQ data-path backend selection. -------------------------------------------------------
     // `CompositeStore<S>` / `AppState<J,R,S>` / the router are generic over the SparqClient `S`, so
@@ -765,6 +771,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let base = axum_server::from_tcp_rustls(std_listener, config)?
                 .handle(handle)
                 .map(move |acceptor| {
+                    // P1.5 (beyond-50k): set TCP_NODELAY on the raw accepted TcpStream by composing
+                    // axum-server's `NoDelayAcceptor` as the INNER acceptor of the RustlsAcceptor — it
+                    // runs on the raw stream BEFORE the TLS handshake, so small responses are not held
+                    // by Nagle. Type-preserving: `RustlsAcceptor<NoDelayAcceptor>::Stream` is still
+                    // `TlsStream<TcpStream>` (NoDelayAcceptor::Stream = TcpStream), so every guard/PoP
+                    // wrapper downstream is unchanged.
+                    let acceptor =
+                        acceptor.acceptor(solid_server_rs::nodelay::NoDelayAcceptor::new());
                     // The FULL guard set: connection-cap permit (global + per-source) + handshake
                     // timeout (accept-time) + idle-keepalive read timeout (IO-layer) +
                     // max-requests-per-conn (service-layer).
@@ -823,6 +837,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // `connection_limiter` is unused on this path (see above); a fronting proxy / the TLS path
             // owns the connection cap in production. Drop it explicitly so the intent is clear.
             drop(connection_limiter);
+            // P1.5 (beyond-50k): set TCP_NODELAY on every accepted plain-TCP stream. `axum::serve`
+            // does NOT do this by default; `tap_nodelay` wraps the listener with the `ListenerExt`
+            // tap so each accepted stream gets the option (Nagle off), matching the TLS path. `TapIo`
+            // preserves `Io = TcpStream` / `Addr = SocketAddr`, so connect-info still carries the peer
+            // IP to the rate limiter.
+            let listener = solid_server_rs::nodelay::tap_nodelay(listener);
             // Same as the TLS path: serve WITH connect-info so the rate limiter sees the peer IP.
             axum::serve(
                 listener,
