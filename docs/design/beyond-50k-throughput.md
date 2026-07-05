@@ -101,8 +101,9 @@ tokio's multi-threaded work-stealing runtime with a mio epoll (Linux) / kqueue (
 On a warm keep-alive connection the *expected* per-request syscall shape is:
 
 - ≥1 `recvmsg`/`read` (request bytes; possibly 2 if the TLS record boundary splits),
-- ≥1 `sendmsg`/`write`/`writev` (response; header+body may or may not coalesce into one
-  vectored write),
+- exactly 1 `writev` (response; head+body coalesce into one vectored write over a
+  vectored-capable transport — **MEASURED, P1.4**, `tests/response_write_coalescing.rs`; over TLS
+  it is 1 flattened `write` instead — either way one write-family syscall),
 - an amortized share of `epoll_wait`/`kevent` wakeups (one wakeup can service many
   connections),
 - occasional `accept4` + per-connection socket setup (amortized by keep-alive; HTTP/2
@@ -189,12 +190,30 @@ independently reversible.
    `--ignored --nocapture`). The `Ticketer` (stateless-tickets) half is deferred — it changes the TLS 1.3
    resumption mechanism (stateless vs the stateful cache) and interacts with the horizontal-scale /
    shared-replay design, so it is a separate increment.
-4. **P1.4 — vectored-write / response-coalescing audit.** Verify (via the P0.1 counts) whether
-   header+body leave as one `writev`-equivalent or two writes per response through
-   axum-server → tokio-rustls → hyper. If two: enable/exploit `poll_write_vectored`
-   pass-through or pre-concatenate small responses into one `Bytes`. Deterministic: write-class
-   syscalls per request drops from 2→1. (Unverified today which of the two we get — that is
-   the point of measuring first.)
+4. **P1.4 — vectored-write / response-coalescing audit — DONE (no change; premise did not hold).**
+   The audit question was whether the response head+body leave as one `writev`-equivalent or two
+   writes per response through axum-server → hyper. **Measured answer: already ONE.** The P0.1
+   `write` 1.04/req is NOT the response. Evidence: `tests/response_write_coalescing.rs` wraps a real
+   accepted loopback `TcpStream` in a counting adapter that tallies every `poll_write` vs
+   `poll_write_vectored` hyper issues (== the connection-socket write-family syscalls) and drives K
+   keep-alive GETs through the SAME `hyper_util` auto `Builder` that `axum::serve` uses. Result:
+   **exactly 1 `writev` and 0 plain `write` per response** for the small-RDF hot path, a
+   ~5 KiB container-listing body, AND a `206` Range response — byte-identical bodies asserted.
+   hyper's h1 encoder already buffers the head + a length-delimited `Bytes` body into one `WriteBuf`
+   and flushes it as a single vectored write (Queue strategy, because a loopback `TcpStream`
+   advertises `is_write_vectored() == true`; over TLS the same bytes leave as a single flattened
+   `write`, since rustls advertises `false`). So there is NO app change that reduces the response
+   below one write — pre-concatenating into one `Bytes` or forcing `http1_writev(false)` would ADD a
+   memcpy for the same single syscall; a custom serializer is explicitly rejected (§5 discipline).
+   The remaining P0.1 `write` 1.04/req is a **process-level, non-connection-socket** syscall: the
+   tokio multi-threaded runtime's mio reactor waker (`write()` to an `eventfd`), firing ~once per
+   request under the single-connection work-stealing ping-pong — corroborated by `write` ≈ N with
+   near-zero `futex` and no per-request fd write anywhere in the request path (`src/auth`, `src/authz`,
+   `src/ldp`, `src/store`). It is NOT a response-serialization lever; reducing it is a runtime change
+   (`SO_REUSEPORT` sharded single-thread accept — P1.7 — or the Phase-3 thread-per-core direction).
+   **EC2 follow-up (confirmation only, not a code change):** re-run `bench/syscalls.sh` with
+   `strace -yy -e trace=write,writev` — the `-yy` prints the fd kind, which should show the response
+   `writev` on the connection socket and the extra `write` on an `<eventfd:...>` (the reactor waker).
 5. **P1.5 — TCP tuning audit — LANDED (TCP_NODELAY).** `TCP_NODELAY` is now set on accepted sockets
    on BOTH serve paths (it was OFF — Nagle on — by default on both): the TLS path composes
    axum-server's `NoDelayAcceptor` as the inner acceptor of the `RustlsAcceptor` (sets the option on
@@ -371,7 +390,7 @@ transport crate-boundary and keeps the CTH + adversarial suites as the invariant
 | perf-p1-mimalloc | **LANDED** — `mimalloc::MiMalloc` installed as the `#[global_allocator]` in `src/main.rs`; remaining musl-build + Dockerized CTH 41/41 + peak-RSS flood acceptance run on the Linux/EC2 lane | 1 | deterministic (alloc source) + advisory RSS |
 | perf-p1-allocred | rebase + land `perf-c-alloc-reduction` on the bench-harness alloc floor | 1 | deterministic |
 | perf-p1-resumption | env-tunable rustls session-cache size / ticketer in `src/tls.rs`; scripted resumed-vs-full handshake count — **cache-size half LANDED** (`SOLID_SERVER_TLS_SESSION_CACHE_SIZE`, default 10 240; ticketer half deferred) | 1 | deterministic |
-| perf-p1-writev | P0.1-driven write-coalescing audit (2 writes → 1 per response if confirmed) | 1 | deterministic |
+| perf-p1-writev | **DONE (no code change)** — P0.1-driven write-coalescing audit: the response head+body already leave as ONE `writev` (`tests/response_write_coalescing.rs`); the P0.1 `write` 1.04/req is the tokio reactor waker (`eventfd`), a runtime lever not a serialization one. EC2 `strace -yy` confirmation-only follow-up. | 1 | deterministic |
 | perf-p1-nodelay | **LANDED (P1.5)** — `TCP_NODELAY` on accepted sockets on BOTH serve paths (`src/nodelay.rs`: TLS `NoDelayAcceptor` + plain `ListenerExt` tap); socket-option state pinned in `tests/tcp_nodelay.rs` | 1 | deterministic (socket-option state) |
 | perf-p1-backend | **counters LANDED** — backend-RTT counters at the SparqClient/BlobStore seams (`tests/{read,write}_path_counters.rs`) + the **embedded-sparq bench config** (`tests/embedded_read_counters.rs`, pins the embedded default `read_plan` `1+N` fan-out as the next reduction target); still open: pooled-connection verification for the HTTP client + `object_store` | 1 | deterministic |
 | perf-p2-ktls-spike | kTLS spike: `ktls` crate + kernel matrix verification; decision memo only | 2 | spike |
@@ -410,7 +429,8 @@ External (verified 2026-07-03 against the live source):
 - io_uring mechanics (batched SQ/CQ, SQPOLL) — J. Axboe, "Efficient IO with io_uring",
   <https://kernel.dk/io_uring.pdf>.
 
-**Unverified / to-verify flags carried in-text:** the per-request syscall shape (§2.1 — P0.1
-measures it); whether header+body coalesce into one write (§4 P1.4); the kTLS kernel
+**Unverified / to-verify flags carried in-text:** ~~whether header+body coalesce into one write
+(§4 P1.4)~~ **RESOLVED — they do; measured, `tests/response_write_coalescing.rs`**; the kTLS kernel
 cipher/version matrix (§4 phase 2); monoio-compat's exact hyper interop surface (phase-3 spike
-scope).
+scope). Still needing the EC2 lane (confirmation, not code): attributing the P0.1 `write` 1.04/req
+to the reactor-waker `eventfd` via `strace -yy` (§4 P1.4).
