@@ -1,7 +1,9 @@
 // AUTHORED-BY Claude Fable 5
 //! P1.4 (`docs/design/beyond-50k-throughput.md` §4, item P1.4 — the vectored-write /
 //! response-coalescing audit): a DETERMINISTIC guard that pins the number of write-family
-//! syscalls the HTTP/1.1 response path emits per response, measured at the hyper→transport seam.
+//! syscalls the HTTP/1.1 response path emits per response, measured at the hyper→transport seam,
+//! **driving the REAL assembled router** (`build_router` → CORS → public-read skip → auth → WAC →
+//! LDP handler → `serve_read`/`negotiate_body`) over the SAME `axum::serve` path production uses.
 //!
 //! ## Why this test exists — the P1.4 finding
 //!
@@ -11,56 +13,63 @@
 //! "header+body coalesce into one vectored write" — the P1.4 lever was to collapse a presumed
 //! two-writes-per-response into one.
 //!
-//! This test resolves that flag with a deterministic, cross-platform measurement. It wraps a REAL
-//! accepted loopback `TcpStream` in a counting adapter that tallies every `poll_write` vs
-//! `poll_write_vectored` hyper issues (== the real `write`/`writev` syscalls on the connection
-//! socket, modulo partial writes — which do not occur for these tiny loopback responses), then
-//! drives K sequential keep-alive GETs through the SAME `hyper_util` auto `Builder` that
-//! `axum::serve` uses.
+//! This test resolves that flag with a deterministic, cross-platform measurement. A `CountListener`
+//! (an `axum::serve::Listener`) wraps every accepted loopback `TcpStream` in a counting adapter
+//! that tallies each `poll_write` (a `write(2)`) vs `poll_write_vectored` (a `writev(2)`) hyper
+//! issues — == the response's real connection-socket write-family syscalls, modulo partial writes,
+//! which do not occur for these small loopback responses. `axum::serve` then serves the real router
+//! over that listener while the test drives K sequential keep-alive requests.
 //!
 //! The measured result (asserted below): **exactly 1 `writev` and 0 plain `write` per response**
-//! for the small-RDF hot path, a container-listing-sized body, AND a `206 Partial Content` Range
-//! response. hyper's h1 encoder ALREADY buffers the response head + a length-delimited `Bytes`
-//! body into ONE `WriteBuf` and flushes it as a single vectored write (Queue strategy, since a
-//! loopback `TcpStream` advertises `is_write_vectored() == true`). Over TLS the same bytes leave
-//! as a single flattened `write` (rustls advertises `is_write_vectored() == false`); either way
-//! the response is ONE write-family syscall.
+//! for a real anonymous public-document GET, a real `206 Partial Content` Range GET, and a real
+//! container-listing GET. hyper's h1 encoder ALREADY buffers the response head + the length-delimited
+//! `Bytes` body the handler produces into ONE `WriteBuf` and flushes it as a single vectored write
+//! (Queue strategy, since a loopback `TcpStream` advertises `is_write_vectored() == true`).
 //!
-//! **Therefore the P0.1 `write` 1.04/req is NOT the HTTP response** — the response is already at
-//! the P1.4 target of one write per response. The second per-request `write` is a process-level
-//! (non-connection-socket) syscall: the tokio multi-threaded runtime's mio reactor waker
-//! (`write()` to an `eventfd`), which fires ~once per request under a single-connection
-//! work-stealing ping-pong. It is NOT reducible by any response-serialization change; reducing it
-//! is a runtime-level lever (`SO_REUSEPORT` sharded single-thread accept — P1.7 — or the Phase-3
-//! thread-per-core direction), out of P1.4's scope. Confirming the strace `write` is specifically
-//! the reactor waker fd needs an EC2 re-run of `bench/syscalls.sh` with `strace -yy -e
-//! trace=write,writev` (the `-yy` shows the fd kind: `<eventfd:...>` vs the connection socket).
+//! **Therefore the P0.1 `write` 1.04/req is NOT the HTTP response** — the response is already at the
+//! P1.4 target of one write per response. The second per-request `write` is a process-level
+//! (non-connection-socket) syscall: the tokio multi-threaded runtime's mio reactor waker (`write()`
+//! to an `eventfd`), which fires ~once per request under a single-connection work-stealing ping-pong.
+//! It is NOT reducible by any response-serialization change; reducing it is a runtime-level lever
+//! (`SO_REUSEPORT` sharded single-thread accept — P1.7 — or the Phase-3 thread-per-core direction),
+//! out of P1.4's scope. Confirming the strace `write` is specifically the reactor waker fd (and the
+//! TLS-transport write shape) needs an EC2 re-run of `bench/syscalls.sh` with
+//! `strace -yy -e trace=write,writev` (the `-yy` shows the fd kind: `<eventfd:...>` vs the socket).
 //!
 //! ## What this guards
 //!
-//! This is a REGRESSION guard, not an optimization: it locks in the coalescing so a future change
-//! that splits the response into a header write + a separate body write (e.g. returning the body
-//! as a multi-frame / unknown-length streaming body instead of a single length-delimited `Bytes`
-//! frame, or a body wrapper that breaks `is_end_stream`/`size_hint`) is caught here — that would
-//! double the response write syscalls on the hot path. It also asserts the response BYTES are
-//! byte-identical to what was constructed (the coalesced write must not truncate/reorder).
+//! A REGRESSION guard, not an optimization. Because it drives the REAL handler, it catches a change
+//! that splits a response into a header write + a separate body write — e.g. a handler returning the
+//! body as a multi-frame / unknown-length streaming body instead of a single length-delimited `Bytes`
+//! frame, or a body wrapper that breaks `is_end_stream`/`size_hint`. It also asserts the response
+//! BYTES are exactly what the handler produced (a coalesced write must not truncate/reorder).
+//!
+//! Scope note: this exercises the PLAIN-HTTP serve path (the P0.1 baseline transport). Over TLS the
+//! same bytes leave as a single flattened `write` (rustls advertises `is_write_vectored() == false`
+//! → hyper's Flatten strategy) — an INFERENCE from the strategy selection, not measured here; the
+//! EC2 follow-up covers it.
+
+mod common;
 
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use bytes::Bytes;
-use http::{header, Response, StatusCode};
-use http_body_util::combinators::UnsyncBoxBody;
-use http_body_util::{BodyExt, Full};
-use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use common::{jwks_provider, KeyKit, BASE_URL, ISSUER};
+use solid_oidc_verifier::config::VerifierConfig;
+use solid_oidc_verifier::replay::InMemoryReplayStore;
+use solid_oidc_verifier::verifier::Verifier;
+use solid_server_rs::app::{build_router, AppState};
+use solid_server_rs::auth::AuthContext;
+use solid_server_rs::ldp::handler::LdpState;
+use solid_server_rs::store::{CompositeStore, InMemoryBlobStore, InMemorySparqClient, Store};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 
-type BoxBody = UnsyncBoxBody<Bytes, std::convert::Infallible>;
+const WEBID: &str = common::WEBID;
 
 /// Counts hyper's write-family calls at the transport seam.
 struct Counters {
@@ -68,11 +77,11 @@ struct Counters {
     writevs: AtomicUsize,
 }
 
-/// Wraps a real accepted `TcpStream`, forwarding all I/O to it while counting how many times
-/// hyper calls `poll_write` (a plain `write(2)`) vs `poll_write_vectored` (a `writev(2)`). Because
-/// hyper writes exclusively through the IO handed to it, these counts equal the response's real
-/// write-family syscalls on the connection socket (partial writes, which would inflate the count,
-/// do not occur for these tiny loopback responses).
+/// Wraps a real accepted `TcpStream`, forwarding all I/O to it while counting how many times hyper
+/// calls `poll_write` (a plain `write(2)`) vs `poll_write_vectored` (a `writev(2)`). Because hyper
+/// writes exclusively through the IO handed to it, these counts equal the response's real
+/// write-family syscalls on the connection socket (partial writes, which would inflate the count, do
+/// not occur for these small loopback responses).
 struct CountIo {
     inner: TcpStream,
     c: Arc<Counters>,
@@ -120,141 +129,198 @@ impl AsyncWrite for CountIo {
     }
 }
 
-/// A representative small-RDF GET response: length-delimited `Bytes` body + Content-Length, exactly
-/// the shape the LDP handler emits (`src/ldp/handler.rs`, `RangeOutcome::Full`).
-fn full_response(body: Bytes) -> Response<BoxBody> {
-    let len = body.len();
-    let mut resp = Response::new(Full::new(body).boxed_unsync());
-    *resp.status_mut() = StatusCode::OK;
-    let h = resp.headers_mut();
-    h.insert(header::CONTENT_TYPE, "text/turtle".parse().unwrap());
-    h.insert(header::CONTENT_LENGTH, len.to_string().parse().unwrap());
-    h.insert(
-        header::ACCEPT_RANGES,
-        header::HeaderValue::from_static("bytes"),
-    );
-    h.insert("etag", "\"abc123\"".parse().unwrap());
-    h.insert(header::VARY, "Accept".parse().unwrap());
-    resp
+/// An `axum::serve::Listener` that wraps every accepted `TcpStream` in a `CountIo`, so the entire
+/// real serve path (`axum::serve` → `hyper_util` auto builder → hyper h1) writes through the
+/// counter. Sets `TCP_NODELAY` to match the production accept path (`src/nodelay.rs`).
+struct CountListener {
+    inner: TcpListener,
+    c: Arc<Counters>,
 }
 
-/// A `206 Partial Content` Range response (`src/ldp/handler.rs`, `RangeOutcome::Satisfied`).
-fn range_response(full: Bytes, start: usize, end_inclusive: usize) -> Response<BoxBody> {
-    let slice = full.slice(start..=end_inclusive);
-    let len = slice.len();
-    let total = full.len();
-    let mut resp = Response::new(Full::new(slice).boxed_unsync());
-    *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
-    let h = resp.headers_mut();
-    h.insert(header::CONTENT_TYPE, "text/turtle".parse().unwrap());
-    h.insert(header::CONTENT_LENGTH, len.to_string().parse().unwrap());
-    h.insert(
-        header::CONTENT_RANGE,
-        format!("bytes {start}-{end_inclusive}/{total}")
-            .parse()
-            .unwrap(),
-    );
-    h.insert(
-        header::ACCEPT_RANGES,
-        header::HeaderValue::from_static("bytes"),
-    );
-    resp
+impl axum::serve::Listener for CountListener {
+    type Io = CountIo;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.inner.accept().await {
+                Ok((sock, addr)) => {
+                    sock.set_nodelay(true).ok();
+                    return (
+                        CountIo {
+                            inner: sock,
+                            c: self.c.clone(),
+                        },
+                        addr,
+                    );
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
 }
 
-/// Serve K sequential keep-alive requests through the `auto::Builder` (what `axum::serve` uses),
-/// returning `(writes, writevs, is_write_vectored)`. Asserts the response body bytes each request
-/// are byte-identical to `expected_body`.
-async fn measure(
-    request: &'static [u8],
-    response_factory: impl Fn() -> Response<BoxBody> + Send + Sync + 'static,
-    expected_body: &'static [u8],
-    k: usize,
-) -> (usize, usize, bool) {
+type MemStore = CompositeStore<InMemorySparqClient, InMemoryBlobStore>;
+
+async fn seed_acl(store: &MemStore, iri: &str, body: &str) {
+    store
+        .write(
+            iri,
+            axum::body::Bytes::from(body.to_string()),
+            "text/turtle",
+        )
+        .await
+        .expect("seed acl");
+}
+
+/// Build the real router around a caller-seeded in-memory store, exactly as `main`/the integration
+/// tests do (`build_router(AppState::new(ctx, ldp))`).
+fn build_real_router(store: MemStore) -> axum::Router {
+    let issuer_key = KeyKit::generate();
+    let config = VerifierConfig::new(vec![ISSUER.to_string()], BASE_URL);
+    let replay = InMemoryReplayStore::with_window(config.replay_ttl());
+    let verifier = Verifier::new(config, jwks_provider(&issuer_key), replay).unwrap();
+    let ctx = AuthContext::new(verifier, BASE_URL);
+    let ldp = LdpState::new(store, BASE_URL);
+    build_router(AppState::new(ctx, ldp))
+}
+
+/// Serve `router` over a fresh loopback `CountListener`; returns `(addr, counters, join_handle)`.
+async fn serve(router: axum::Router) -> (SocketAddr, Arc<Counters>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let c = Arc::new(Counters {
         writes: AtomicUsize::new(0),
         writevs: AtomicUsize::new(0),
     });
-    let c2 = c.clone();
-
-    let server = tokio::spawn(async move {
-        let (sock, _) = listener.accept().await.unwrap();
-        sock.set_nodelay(true).ok();
-        let vectored = sock.is_write_vectored();
-        let cio = CountIo { inner: sock, c: c2 };
-        let factory = Arc::new(response_factory);
-        let svc = service_fn(move |_req: http::Request<hyper::body::Incoming>| {
-            let factory = factory.clone();
-            async move { Ok::<_, std::convert::Infallible>(factory()) }
-        });
-        let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-            .serve_connection(TokioIo::new(cio), svc)
-            .await;
-        vectored
+    let count_listener = CountListener {
+        inner: listener,
+        c: c.clone(),
+    };
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(count_listener, router.into_make_service()).await;
     });
-
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-    stream.set_nodelay(true).ok();
-    let mut rbuf = vec![0u8; 8192];
-    for i in 0..k {
-        stream.write_all(request).await.unwrap();
-        stream.flush().await.unwrap();
-        // Read exactly one full response: parse headers, then read Content-Length body bytes.
-        let mut acc: Vec<u8> = Vec::new();
-        let (hdr_end, body_len) = loop {
-            if let Some(pos) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
-                let head = &acc[..pos];
-                let head_str = String::from_utf8_lossy(head).to_ascii_lowercase();
-                let cl = head_str
-                    .split("\r\n")
-                    .find_map(|line| line.strip_prefix("content-length:"))
-                    .map(|v| v.trim().parse::<usize>().unwrap())
-                    .expect("content-length header present");
-                break (pos + 4, cl);
-            }
-            let n = stream.read(&mut rbuf).await.unwrap();
-            assert!(n > 0, "unexpected EOF reading headers (req {i})");
-            acc.extend_from_slice(&rbuf[..n]);
-        };
-        while acc.len() < hdr_end + body_len {
-            let n = stream.read(&mut rbuf).await.unwrap();
-            assert!(n > 0, "unexpected EOF reading body (req {i})");
-            acc.extend_from_slice(&rbuf[..n]);
-        }
-        let body = &acc[hdr_end..hdr_end + body_len];
-        assert_eq!(
-            body, expected_body,
-            "response body must be byte-identical (req {i})"
-        );
-    }
-    drop(stream);
-    let vectored = server.await.unwrap();
-    (
-        c.writes.load(Ordering::SeqCst),
-        c.writevs.load(Ordering::SeqCst),
-        vectored,
-    )
+    (addr, c, handle)
 }
 
-const HOT_DOC: &[u8] = b"<https://pod.example/a/x#me> <http://p> <http://o> .\n";
+/// One HTTP/1.1 response read off `stream`: `(status_code, body_bytes)`.
+async fn read_one_response(
+    stream: &mut TcpStream,
+    rbuf: &mut [u8],
+    acc: &mut Vec<u8>,
+) -> (u16, Vec<u8>) {
+    let (hdr_end, status, body_len) = loop {
+        if let Some(pos) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&acc[..pos]);
+            let status: u16 = head
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|s| s.parse().ok())
+                .expect("status line");
+            let cl: usize = head
+                .to_ascii_lowercase()
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("content-length:")
+                        .map(|v| v.trim().to_string())
+                })
+                .and_then(|v| v.parse().ok())
+                .expect("content-length header");
+            break (pos + 4, status, cl);
+        }
+        let n = stream.read(rbuf).await.unwrap();
+        assert!(n > 0, "unexpected EOF reading headers");
+        acc.extend_from_slice(&rbuf[..n]);
+    };
+    while acc.len() < hdr_end + body_len {
+        let n = stream.read(rbuf).await.unwrap();
+        assert!(n > 0, "unexpected EOF reading body");
+        acc.extend_from_slice(&rbuf[..n]);
+    }
+    let body = acc[hdr_end..hdr_end + body_len].to_vec();
+    acc.drain(..hdr_end + body_len);
+    (status, body)
+}
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn small_rdf_get_is_single_vectored_write() {
-    let k = 16;
-    let (writes, writevs, vectored) = measure(
-        b"GET /a/x HTTP/1.1\r\nHost: pod.example\r\n\r\n",
-        || full_response(Bytes::from_static(HOT_DOC)),
-        HOT_DOC,
-        k,
+/// Drive K sequential keep-alive requests (raw request line + Host) on ONE connection; returns each
+/// response's `(status, body)`.
+async fn drive(addr: SocketAddr, request: &[u8], k: usize) -> Vec<(u16, Vec<u8>)> {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream.set_nodelay(true).ok();
+    let mut rbuf = vec![0u8; 16384];
+    let mut acc: Vec<u8> = Vec::new();
+    let mut out = Vec::with_capacity(k);
+    for _ in 0..k {
+        stream.write_all(request).await.unwrap();
+        stream.flush().await.unwrap();
+        out.push(read_one_response(&mut stream, &mut rbuf, &mut acc).await);
+    }
+    drop(stream);
+    out
+}
+
+const PUB_DOC: &str =
+    "<https://pod.example/pub#it> <http://xmlns.com/foaf/0.1/name> \"Public\" .\n";
+
+/// Seed a private-by-default root plus a foaf:Agent-readable public document at `/pub`.
+async fn seed_public_doc(store: &MemStore) {
+    seed_acl(
+        store,
+        "https://pod.example/.acl",
+        &format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#owner> a acl:Authorization; acl:agent <{WEBID}>;
+  acl:accessTo <https://pod.example/>; acl:default <https://pod.example/>;
+  acl:mode acl:Read, acl:Write, acl:Control."#
+        ),
     )
     .await;
-    assert!(
-        vectored,
-        "loopback TcpStream must advertise vectored writes"
-    );
-    // The P1.4 target: exactly one write-family syscall per response, and it is vectored (head+body
-    // coalesced), never a header-writev + body-write split.
+    store
+        .write(
+            "https://pod.example/pub",
+            axum::body::Bytes::from(PUB_DOC),
+            "text/turtle",
+        )
+        .await
+        .unwrap();
+    seed_acl(
+        store,
+        "https://pod.example/pub.acl",
+        &format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+@prefix foaf: <http://xmlns.com/foaf/0.1/>.
+<#owner> a acl:Authorization; acl:agent <{WEBID}>; acl:accessTo <https://pod.example/pub>; acl:mode acl:Read, acl:Write, acl:Control.
+<#pub> a acl:Authorization; acl:agentClass foaf:Agent; acl:accessTo <https://pod.example/pub>; acl:mode acl:Read."#
+        ),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_public_get_is_single_vectored_write() {
+    let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+    seed_public_doc(&store).await;
+    let (addr, c, handle) = serve(build_real_router(store)).await;
+
+    let k = 16;
+    let responses = drive(addr, b"GET /pub HTTP/1.1\r\nHost: pod.example\r\n\r\n", k).await;
+    handle.abort();
+
+    for (status, body) in &responses {
+        assert_eq!(*status, 200, "public GET must be 200");
+        assert_eq!(
+            body.as_slice(),
+            PUB_DOC.as_bytes(),
+            "body must be byte-identical"
+        );
+    }
+    let writes = c.writes.load(Ordering::SeqCst);
+    let writevs = c.writevs.load(Ordering::SeqCst);
     assert_eq!(
         writes, 0,
         "no plain write() — head+body must not split (got {writes})"
@@ -266,40 +332,31 @@ async fn small_rdf_get_is_single_vectored_write() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn container_listing_sized_get_is_single_vectored_write() {
-    // A container-listing-sized body (~5 KiB, matching the P0.1 `listing` class at 5199 B).
-    let listing: &'static [u8] = Box::leak(vec![b'x'; 5199].into_boxed_slice());
-    let k = 16;
-    let (writes, writevs, _vectored) = measure(
-        b"GET /c/ HTTP/1.1\r\nHost: pod.example\r\n\r\n",
-        move || full_response(Bytes::from_static(listing)),
-        listing,
-        k,
-    )
-    .await;
-    // Robust invariant: the body is never split off into a separate plain write. A ~5 KiB body is
-    // atomic on loopback, so it stays exactly one writev per response.
-    assert_eq!(
-        writes, 0,
-        "no plain write() for the listing body (got {writes})"
-    );
-    assert_eq!(
-        writevs, k,
-        "one writev per listing response (got {writevs} over {k})"
-    );
-}
+async fn real_range_206_is_single_vectored_write() {
+    let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+    seed_public_doc(&store).await;
+    let (addr, c, handle) = serve(build_real_router(store)).await;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn range_206_is_single_vectored_write() {
     let k = 16;
-    let expected: &[u8] = &HOT_DOC[0..=9];
-    let (writes, writevs, _vectored) = measure(
-        b"GET /a/x HTTP/1.1\r\nHost: pod.example\r\nRange: bytes=0-9\r\n\r\n",
-        || range_response(Bytes::from_static(HOT_DOC), 0, 9),
-        expected,
+    let responses = drive(
+        addr,
+        b"GET /pub HTTP/1.1\r\nHost: pod.example\r\nRange: bytes=0-9\r\n\r\n",
         k,
     )
     .await;
+    handle.abort();
+
+    let expected = &PUB_DOC.as_bytes()[0..=9];
+    for (status, body) in &responses {
+        assert_eq!(*status, 206, "range GET must be 206");
+        assert_eq!(
+            body.as_slice(),
+            expected,
+            "partial body must be byte-identical"
+        );
+    }
+    let writes = c.writes.load(Ordering::SeqCst);
+    let writevs = c.writevs.load(Ordering::SeqCst);
     assert_eq!(
         writes, 0,
         "no plain write() for a 206 Range body (got {writes})"
@@ -307,5 +364,101 @@ async fn range_206_is_single_vectored_write() {
     assert_eq!(
         writevs, k,
         "one writev per 206 response (got {writevs} over {k})"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_container_listing_is_single_vectored_write() {
+    let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+    // Root owner ACL.
+    seed_acl(
+        &store,
+        "https://pod.example/.acl",
+        &format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#owner> a acl:Authorization; acl:agent <{WEBID}>;
+  acl:accessTo <https://pod.example/>; acl:default <https://pod.example/>;
+  acl:mode acl:Read, acl:Write, acl:Control."#
+        ),
+    )
+    .await;
+    // A public container with a benchmark-sized child set (matching the P0.1 `listing` class of 100
+    // children ≈ 5 KiB — `bench/syscalls-results/2026-07-04-linux.md`), so the rendered `ldp:contains`
+    // listing exercises the same larger-body write path the baseline measured. The container record
+    // must exist first (an empty-body write, as `seed::ensure_container` does); children are wired via
+    // `create_in_container` so the `ldp:contains` edges are real.
+    const CHILDREN: usize = 100;
+    store
+        .write(
+            "https://pod.example/list/",
+            axum::body::Bytes::new(),
+            "text/turtle",
+        )
+        .await
+        .unwrap();
+    for i in 0..CHILDREN {
+        store
+            .create_in_container(
+                "https://pod.example/list/",
+                &format!("https://pod.example/list/child{i}"),
+                axum::body::Bytes::from(PUB_DOC),
+                "text/turtle",
+            )
+            .await
+            .unwrap();
+    }
+    seed_acl(
+        &store,
+        "https://pod.example/list/.acl",
+        &format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+@prefix foaf: <http://xmlns.com/foaf/0.1/>.
+<#owner> a acl:Authorization; acl:agent <{WEBID}>; acl:accessTo <https://pod.example/list/>; acl:default <https://pod.example/list/>; acl:mode acl:Read, acl:Write, acl:Control.
+<#pub> a acl:Authorization; acl:agentClass foaf:Agent; acl:accessTo <https://pod.example/list/>; acl:default <https://pod.example/list/>; acl:mode acl:Read."#
+        ),
+    )
+    .await;
+
+    let (addr, c, handle) = serve(build_real_router(store)).await;
+    let k = 16;
+    let responses = drive(addr, b"GET /list/ HTTP/1.1\r\nHost: pod.example\r\n\r\n", k).await;
+    handle.abort();
+
+    for (status, body) in &responses {
+        assert_eq!(*status, 200, "public container GET must be 200");
+        // Benchmark-sized listing (~5 KiB for 100 children) — the P0.1 `listing` class body size, so
+        // this exercises the larger-body write path, not a trivial one.
+        assert!(
+            body.len() >= 3000,
+            "listing body must be benchmark-sized (got {} bytes)",
+            body.len()
+        );
+        // Deterministic content: EVERY seeded child must appear individually in the rendered
+        // `ldp:contains` membership (order-independent — the listing may not be sorted). Each child is
+        // a Turtle IRI term `<…/list/child{i}>`; the trailing `>` distinguishes `child1` from
+        // `child10`, so a body that duplicated one child and omitted others cannot pass.
+        let body_str = String::from_utf8_lossy(body);
+        for i in 0..CHILDREN {
+            let term = format!("/list/child{i}>");
+            assert!(
+                body_str.contains(&term),
+                "listing must render child {i} (`{term}` absent)"
+            );
+        }
+        // The listing render is deterministic per store, so every keep-alive response is identical.
+        assert_eq!(
+            body, &responses[0].1,
+            "each listing response must be identical"
+        );
+    }
+    let writes = c.writes.load(Ordering::SeqCst);
+    let writevs = c.writevs.load(Ordering::SeqCst);
+    assert_eq!(
+        writes, 0,
+        "no plain write() for the listing body (got {writes})"
+    );
+    assert_eq!(
+        writevs, k,
+        "one writev per listing response (got {writevs} over {k})"
     );
 }

@@ -102,8 +102,10 @@ On a warm keep-alive connection the *expected* per-request syscall shape is:
 
 - ≥1 `recvmsg`/`read` (request bytes; possibly 2 if the TLS record boundary splits),
 - exactly 1 `writev` (response; head+body coalesce into one vectored write over a
-  vectored-capable transport — **MEASURED, P1.4**, `tests/response_write_coalescing.rs`; over TLS
-  it is 1 flattened `write` instead — either way one write-family syscall),
+  vectored-capable plain-TCP transport — **MEASURED, P1.4**, `tests/response_write_coalescing.rs`,
+  driving the real router over `axum::serve`; over TLS it is **inferred** to be 1 flattened `write`
+  instead — rustls advertises `is_write_vectored() == false`, selecting hyper's Flatten strategy —
+  either way one write-family syscall; the TLS shape awaits the EC2 `strace -yy` confirmation),
 - an amortized share of `epoll_wait`/`kevent` wakeups (one wakeup can service many
   connections),
 - occasional `accept4` + per-connection socket setup (amortized by keep-alive; HTTP/2
@@ -193,16 +195,19 @@ independently reversible.
 4. **P1.4 — vectored-write / response-coalescing audit — DONE (no change; premise did not hold).**
    The audit question was whether the response head+body leave as one `writev`-equivalent or two
    writes per response through axum-server → hyper. **Measured answer: already ONE.** The P0.1
-   `write` 1.04/req is NOT the response. Evidence: `tests/response_write_coalescing.rs` wraps a real
-   accepted loopback `TcpStream` in a counting adapter that tallies every `poll_write` vs
-   `poll_write_vectored` hyper issues (== the connection-socket write-family syscalls) and drives K
-   keep-alive GETs through the SAME `hyper_util` auto `Builder` that `axum::serve` uses. Result:
-   **exactly 1 `writev` and 0 plain `write` per response** for the small-RDF hot path, a
-   ~5 KiB container-listing body, AND a `206` Range response — byte-identical bodies asserted.
-   hyper's h1 encoder already buffers the head + a length-delimited `Bytes` body into one `WriteBuf`
-   and flushes it as a single vectored write (Queue strategy, because a loopback `TcpStream`
-   advertises `is_write_vectored() == true`; over TLS the same bytes leave as a single flattened
-   `write`, since rustls advertises `false`). So there is NO app change that reduces the response
+   `write` 1.04/req is NOT the response. Evidence: `tests/response_write_coalescing.rs` serves the
+   REAL assembled router (`build_router` → CORS → public-read skip → auth → WAC → LDP handler →
+   `serve_read`/`negotiate_body`) via `axum::serve` over a `CountListener` that wraps each accepted
+   loopback `TcpStream` in a counting adapter tallying every `poll_write` vs `poll_write_vectored`
+   hyper issues (== the connection-socket write-family syscalls), and drives K keep-alive requests.
+   Result: **exactly 1 `writev` and 0 plain `write` per response** for a real anonymous public-doc
+   GET, a real `206` Range GET, AND a real container-listing GET — byte-identical bodies asserted.
+   hyper's h1 encoder already buffers the head + the length-delimited `Bytes` body the handler
+   produces into one `WriteBuf` and flushes it as a single vectored write (Queue strategy, because a
+   loopback `TcpStream` advertises `is_write_vectored() == true`; over TLS the same bytes are
+   **inferred** to leave as a single flattened `write` — rustls advertises `false`, selecting hyper's
+   Flatten strategy — pending the EC2 `strace -yy` TLS confirmation). So there is NO app change that
+   reduces the response
    below one write — pre-concatenating into one `Bytes` or forcing `http1_writev(false)` would ADD a
    memcpy for the same single syscall; a custom serializer is explicitly rejected (§5 discipline).
    The remaining P0.1 `write` 1.04/req is a **process-level, non-connection-socket** syscall: the
@@ -433,4 +438,5 @@ External (verified 2026-07-03 against the live source):
 (§4 P1.4)~~ **RESOLVED — they do; measured, `tests/response_write_coalescing.rs`**; the kTLS kernel
 cipher/version matrix (§4 phase 2); monoio-compat's exact hyper interop surface (phase-3 spike
 scope). Still needing the EC2 lane (confirmation, not code): attributing the P0.1 `write` 1.04/req
-to the reactor-waker `eventfd` via `strace -yy` (§4 P1.4).
+to the reactor-waker `eventfd` via `strace -yy`, and confirming the TLS response-write shape (the
+Flatten single-`write` inference) on the same run (§4 P1.4).
