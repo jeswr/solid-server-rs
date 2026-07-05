@@ -46,12 +46,23 @@ DURATION="${BENCH_DURATION:-10s}"             # oha -z per concurrency level (be
 WARMUP_DURATION="${BENCH_WARMUP:-3s}"         # discarded warm-up before the measured sweep
 # The concurrency sweep. Override with a space-separated list, e.g. BENCH_CONCURRENCY="1 16 64".
 CONCURRENCY="${BENCH_CONCURRENCY:-1 8 16 32 64 128 256 512}"
-# Drive HTTP/2 (oha --http2, multiplexing streams over one connection) when BENCH_HTTP2=1; default is
-# HTTP/1.1. The server advertises both via ALPN, so the SAME server/binary serves either — set this to
-# measure the h2 multiplexing effect against the h1 baseline on the same box/run.
+# Protocol selection. The server advertises BOTH `h2` and `http/1.1` via ALPN (see src/tls.rs), so the
+# SAME server/binary serves either — the load tool picks via its own ALPN offer:
+#   - BENCH_HTTP2=1            → drive ONLY HTTP/2 (oha --http2, multiplexing streams over one conn);
+#   - BENCH_COMPARE_H2=1       → drive BOTH h1 AND h2 over the SAME boot and emit a side-by-side
+#                                h2-vs-h1 RPS/latency DELTA (the decisive multiplexing number — this is
+#                                the h2 bench arm). Overrides BENCH_HTTP2.
+#   - neither (default)        → HTTP/1.1 only (the existing baseline).
 HTTP2="${BENCH_HTTP2:-0}"
-OHA_PROTO_FLAG=""
-case "$HTTP2" in 1|true|TRUE|True) OHA_PROTO_FLAG="--http2" ;; esac
+COMPARE_H2="${BENCH_COMPARE_H2:-0}"
+# Resolve the protocol list to sweep. In compare mode we run h1 THEN h2 against the same server boot, so
+# the delta is apples-to-apples (same binary, same fixtures, same box, same run). The `oha` flag for
+# each: "" = HTTP/1.1 (oha's default), "--http2" = HTTP/2 over the negotiated h2 ALPN.
+PROTOCOLS=("h1:")  # default: h1 only ("label:oha-flag")
+case "$COMPARE_H2" in 1|true|TRUE|True) PROTOCOLS=("h1:" "h2:--http2") ;; esac
+if [ "${#PROTOCOLS[@]}" -eq 1 ]; then
+  case "$HTTP2" in 1|true|TRUE|True) PROTOCOLS=("h2:--http2") ;; esac
+fi
 SERVER_BIN="${SERVER_BIN:-$REPO/target/release/solid-server-rs}"
 CERT="$HERE/tls/server-cert.pem"
 KEY="$HERE/tls/server-key.pem"
@@ -74,7 +85,7 @@ bash "$HERE/gen-cert.sh"
 rm -rf "$RESULTS"
 mkdir -p "$RESULTS"
 RESULTS_TSV="$RESULTS/results.tsv"
-printf 'scenario\tconcurrency\trps\tsuccess_rate\tp50_ms\tp99_ms\tp999_ms\tslowest_ms\n' > "$RESULTS_TSV"
+printf 'scenario\tproto\tconcurrency\trps\tsuccess_rate\tp50_ms\tp99_ms\tp999_ms\tslowest_ms\n' > "$RESULTS_TSV"
 
 # --- boot the server (in-memory, TLS, bench-seeded) ---------------------------------------------
 echo ">> Booting solid-server-rs (in-memory, TLS, bench-seeded ${CHILDREN} children) at ${BASE_URL} ..."
@@ -116,10 +127,10 @@ echo ">> Fixtures verified: public=200 listing=200 private=401(anon)."
 
 # --- the sweep ----------------------------------------------------------------------------------
 # Parse oha JSON → a results row. Latencies are in SECONDS in oha; convert to ms.
-parse_and_record() {  # $1=scenario $2=concurrency $3=json-file
-  python3 - "$1" "$2" "$3" "$RESULTS_TSV" <<'PY'
+parse_and_record() {  # $1=scenario $2=proto-label $3=concurrency $4=json-file
+  python3 - "$1" "$2" "$3" "$4" "$RESULTS_TSV" <<'PY'
 import json, sys
-scenario, conc, jf, tsv = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+scenario, proto, conc, jf, tsv = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 with open(jf) as f:
     d = json.load(f)
 s = d["summary"]
@@ -128,7 +139,7 @@ def ms(x):
     # oha emits null for a percentile when it has no sample for it; report -1 (absent) rather than crash.
     return round(x * 1000.0, 3) if isinstance(x, (int, float)) else -1.0
 row = [
-    scenario, conc,
+    scenario, proto, conc,
     f'{s["requestsPerSec"]:.1f}',
     f'{s["successRate"]:.4f}',
     str(ms(lp.get("p50"))), str(ms(lp.get("p99"))), str(ms(lp.get("p99.9"))),
@@ -136,7 +147,7 @@ row = [
 ]
 with open(tsv, "a") as f:
     f.write("\t".join(row) + "\n")
-print(f'  [{scenario} c={conc}] rps={s["requestsPerSec"]:.0f} success={s["successRate"]:.3f} '
+print(f'  [{scenario}/{proto} c={conc}] rps={s["requestsPerSec"]:.0f} success={s["successRate"]:.3f} '
       f'p50={ms(lp.get("p50"))}ms p99={ms(lp.get("p99"))}ms p999={ms(lp.get("p99.9"))}ms')
 PY
 }
@@ -145,20 +156,30 @@ run_scenario() {  # $1=scenario-name $2=url
   local name="$1" url="$2"
   echo ""
   echo ">> Scenario ($name): $url"
-  # One warm-up at mid concurrency (discarded) to prime keep-alive connections + caches.
-  oha --no-tui --insecure $OHA_PROTO_FLAG --output-format quiet -c 16 -z "$WARMUP_DURATION" "$url" >/dev/null 2>&1 || true
-  for c in $CONCURRENCY; do
-    local jf="$RESULTS/${name}-c${c}.json"
-    # Cap requests-in-flight at the concurrency; -z drives by duration (best sustained over the window).
-    # $OHA_PROTO_FLAG is empty (HTTP/1.1) by default, or `--http2` when BENCH_HTTP2=1.
-    oha --no-tui --insecure $OHA_PROTO_FLAG --output-format json -c "$c" -z "$DURATION" "$url" > "$jf" 2>/dev/null
-    parse_and_record "$name" "$c" "$jf"
+  # Sweep each requested protocol over the SAME server boot (h1 only by default; h1+h2 in compare mode).
+  # `entry` is "label:oha-flag" — e.g. "h2:--http2" (label `h2`, flag `--http2`) or "h1:" (label `h1`,
+  # no flag = oha's HTTP/1.1 default).
+  local entry label proto_flag
+  for entry in "${PROTOCOLS[@]}"; do
+    label="${entry%%:*}"
+    proto_flag="${entry#*:}"
+    echo ">>   protocol: ${label} ($([ -n "$proto_flag" ] && echo "$proto_flag" || echo 'HTTP/1.1'))"
+    # One warm-up at mid concurrency (discarded) to prime keep-alive connections + caches.
+    oha --no-tui --insecure $proto_flag --output-format quiet -c 16 -z "$WARMUP_DURATION" "$url" >/dev/null 2>&1 || true
+    for c in $CONCURRENCY; do
+      local jf="$RESULTS/${name}-${label}-c${c}.json"
+      # Cap requests-in-flight at the concurrency; -z drives by duration (best sustained over the window).
+      oha --no-tui --insecure $proto_flag --output-format json -c "$c" -z "$DURATION" "$url" > "$jf" 2>/dev/null
+      parse_and_record "$name" "$label" "$c" "$jf"
+    done
   done
 }
 
 # Note the box: core count + model (for the BASELINE doc — these go in the doc by hand, not Date.now).
 echo ">> Machine: $(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m), cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo '?')"
-echo ">> Transport: $([ -n "$OHA_PROTO_FLAG" ] && echo 'HTTP/2 (oha --http2)' || echo 'HTTP/1.1')"
+proto_labels=""
+for entry in "${PROTOCOLS[@]}"; do proto_labels="${proto_labels}${proto_labels:+, }${entry%%:*}"; done
+echo ">> Transport(s): ${proto_labels}  (server ALPN advertises [h2, http/1.1]; oha selects per its ALPN offer)"
 
 run_scenario "public-doc" "$PUBLIC_DOC"
 run_scenario "listing"    "$LISTING"
@@ -167,6 +188,56 @@ echo ""
 echo ">> DONE. Per-level JSON in $RESULTS/, summary table in $RESULTS_TSV:"
 echo ""
 column -t -s $'\t' "$RESULTS_TSV"
+
+# --- h2-vs-h1 delta (compare mode only) ---------------------------------------------------------
+# When BOTH h1 and h2 were swept against the same boot, emit the decisive side-by-side number: per
+# (scenario, concurrency), the h2 RPS as a % of the h1 RPS and the p99 latency delta. This is the h2
+# bench arm's payoff — the multiplexing effect measured apples-to-apples (same binary/fixtures/box/run).
+swept_h2=0; swept_h1=0
+for entry in "${PROTOCOLS[@]}"; do
+  case "${entry%%:*}" in h2) swept_h2=1 ;; h1) swept_h1=1 ;; esac
+done
+if [ "$swept_h2" = 1 ] && [ "$swept_h1" = 1 ]; then
+  DELTA_TSV="$RESULTS/h2-vs-h1.tsv"
+  echo ""
+  echo ">> h2-vs-h1 DELTA (same boot; h2 RPS as % of h1, p99 latency delta) → $DELTA_TSV"
+  echo ""
+  python3 - "$RESULTS_TSV" "$DELTA_TSV" <<'PY'
+import csv, sys
+src, out = sys.argv[1], sys.argv[2]
+rows = {}
+with open(src) as f:
+    r = csv.DictReader(f, delimiter="\t")
+    for row in r:
+        rows[(row["scenario"], row["proto"], row["concurrency"])] = row
+scenarios, concs = [], []
+for (sc, _p, c) in rows:
+    if sc not in scenarios: scenarios.append(sc)
+    if c not in concs: concs.append(c)
+concs.sort(key=lambda x: int(x))
+def f(x):
+    try: return float(x)
+    except Exception: return None
+hdr = ["scenario", "concurrency", "h1_rps", "h2_rps", "h2_rps_pct_of_h1", "h1_p99_ms", "h2_p99_ms", "p99_delta_ms"]
+lines = ["\t".join(hdr)]
+for sc in scenarios:
+    for c in concs:
+        h1 = rows.get((sc, "h1", c)); h2 = rows.get((sc, "h2", c))
+        if not h1 or not h2: continue
+        h1r, h2r = f(h1["rps"]), f(h2["rps"])
+        pct = f"{(h2r / h1r * 100):.1f}%" if (h1r and h2r is not None and h1r != 0) else "n/a"
+        h1p, h2p = f(h1["p99_ms"]), f(h2["p99_ms"])
+        dly = f"{(h2p - h1p):+.3f}" if (h1p is not None and h2p is not None) else "n/a"
+        lines.append("\t".join([sc, c, h1["rps"], h2["rps"], pct, h1["p99_ms"], h2["p99_ms"], dly]))
+with open(out, "w") as fo:
+    fo.write("\n".join(lines) + "\n")
+print("\n".join(lines))
+PY
+  echo ""
+  echo ">> A value >100% means h2 sustained MORE RPS than h1 at that concurrency (multiplexing win);"
+  echo ">> a NEGATIVE p99 delta means h2 was faster at the tail. Record the verdict in bench/BASELINE.md."
+fi
+
 echo ""
 echo ">> Server log: $RESULTS/server.log"
 echo ">> NOTE: scenario (c) authenticated GET is a documented follow-up (needs a Keycloak DPoP token) — see bench/README.md."
