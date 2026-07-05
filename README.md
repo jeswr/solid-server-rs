@@ -123,6 +123,7 @@ cargo run                   # boot the experimental server (defaults to 127.0.0.
 #   SOLID_SERVER_ALLOW_LOOPBACK       dev/IT ONLY: permit http:/loopback IdP+WebID (default 0)
 #   SOLID_SERVER_TLS_CERT             PEM cert-chain file path; set WITH _TLS_KEY to terminate HTTPS
 #   SOLID_SERVER_TLS_KEY              PEM private-key file path; set WITH _TLS_CERT (both-or-neither)
+#   SOLID_SERVER_TLS_SESSION_CACHE_SIZE  TLS session-resumption cache size (default 10240; 0 disables)
 #   SOLID_SERVER_MAX_CONCURRENCY      max in-flight requests before load is shed (503); default 10000
 #   SOLID_SERVER_REQUEST_TIMEOUT_SECS per-request timeout ⇒ 504; default 30; 0 disables
 SOLID_SERVER_BIND=127.0.0.1:3000 \
@@ -162,6 +163,14 @@ LDP/auth/WAC semantics — so an old client is never broken. The ALPN set is own
 [`src/tls.rs`](src/tls.rs) (`ALPN_PROTOCOLS`), not inherited from a dependency default. (When TLS is
 terminated at a reverse proxy instead, the proxy owns h2 to the client; the plain-HTTP listener
 behind it stays HTTP/1.1.)
+
+**TLS session resumption** is env-tunable via `SOLID_SERVER_TLS_SESSION_CACHE_SIZE` (default 10 240
+sessions; `0` disables resumption). rustls's own default is only 256 sessions — a handful of
+concurrent clients before eviction forces expensive full handshakes; the larger default lets a
+realistic returning-client population resume (skipping the asymmetric key exchange) — the
+connection-amortization throughput lever (`docs/design/beyond-50k-throughput.md` §4 P1.3). This is a
+pure performance knob: it changes no LDP/auth/WAC semantics, and TLS **0-RTT early data stays OFF**
+(`max_early_data_size = 0`) because 0-RTT is replayable and this server's auth is anti-replay (DPoP).
 
 ### Horizontal scaling — the distributed Redis DPoP-`jti` replay store (opt-in)
 

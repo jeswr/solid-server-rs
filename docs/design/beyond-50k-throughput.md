@@ -180,7 +180,14 @@ independently reversible.
    resumed-vs-full handshake counts over a scripted reconnect run.** This is the doc's half of
    the connection-amortization pact with the auth proposal: a resumed handshake skips the
    asymmetric key exchange, exactly as the connection-bound PoP skips per-request asymmetric
-   verifies. **Keep 0-RTT OFF** (§6).
+   verifies. **Keep 0-RTT OFF** (§6). **LANDED (cache-size half):** `SOLID_SERVER_TLS_SESSION_CACHE_SIZE`
+   (default 10 240; `0` disables) in `src/tls.rs`, applied uniformly on both the default and mTLS build
+   paths via `apply_transport_tuning`; 0-RTT stays off (asserted). The deterministic resumed-vs-full
+   handshake count is the ignored integration test
+   `tests/tls_handshake.rs::tls_session_cache_size_governs_resumed_handshake_count` (run with
+   `--ignored --nocapture`). The `Ticketer` (stateless-tickets) half is deferred — it changes the TLS 1.3
+   resumption mechanism (stateless vs the stateful cache) and interacts with the horizontal-scale /
+   shared-replay design, so it is a separate increment.
 4. **P1.4 — vectored-write / response-coalescing audit.** Verify (via the P0.1 counts) whether
    header+body leave as one `writev`-equivalent or two writes per response through
    axum-server → tokio-rustls → hyper. If two: enable/exploit `poll_write_vectored`
@@ -352,7 +359,7 @@ transport crate-boundary and keeps the CTH + adversarial suites as the invariant
 | perf-p0-linuxprof | re-run the round-4 profile with `perf` on the Linux target; write the Linux NET-SYSCALL/MALLOC split into a `bench/LINUX-PROFILE.md` | 0 | measurement |
 | perf-p1-mimalloc | validate + land `perf-b-mimalloc-fix`: musl build, Dockerized CTH 41/41, peak-RSS flood acceptance | 1 | deterministic (alloc source) + advisory RSS |
 | perf-p1-allocred | rebase + land `perf-c-alloc-reduction` on the bench-harness alloc floor | 1 | deterministic |
-| perf-p1-resumption | env-tunable rustls session-cache size / ticketer in `src/tls.rs`; scripted resumed-vs-full handshake count | 1 | deterministic |
+| perf-p1-resumption | env-tunable rustls session-cache size / ticketer in `src/tls.rs`; scripted resumed-vs-full handshake count — **cache-size half LANDED** (`SOLID_SERVER_TLS_SESSION_CACHE_SIZE`, default 10 240; ticketer half deferred) | 1 | deterministic |
 | perf-p1-writev | P0.1-driven write-coalescing audit (2 writes → 1 per response if confirmed) | 1 | deterministic |
 | perf-p1-backend | backend-RTT counters at the SparqClient/BlobStore seams + pooled-connection verification; embedded-sparq benchmark config | 1 | deterministic |
 | perf-p2-ktls-spike | kTLS spike: `ktls` crate + kernel matrix verification; decision memo only | 2 | spike |

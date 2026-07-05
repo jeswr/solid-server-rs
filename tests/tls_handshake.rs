@@ -18,10 +18,13 @@ use std::sync::Arc;
 use axum::routing::get;
 use axum::Router;
 use rustls_pemfile::certs;
-use solid_server_rs::tls::{build_rustls_config, TlsMode};
+use solid_server_rs::tls::{
+    build_rustls_config, build_rustls_config_with_session_cache_size, TlsMode,
+    DEFAULT_TLS_SESSION_CACHE_SIZE,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use tokio_rustls::rustls::{ClientConfig, HandshakeKind, ProtocolVersion, RootCertStore};
 use tokio_rustls::TlsConnector;
 
 /// The server's leaf cert (signed by the fixture CA) + its private key — what the binary serves.
@@ -548,4 +551,219 @@ async fn tls_mtls_connpop_reads_binds_and_rebinds_client_cert_across_resumption(
     );
 
     server_task.abort();
+}
+
+// ---------------------------------------------------------------------------------------------------
+// TLS session-resumption cache size (beyond-50k §4 P1.3) — the DETERMINISTIC resumed-vs-full
+// handshake COUNT metric the design names. `#[ignore]`d (fixture cert + real socket I/O), run with
+// `cargo test --test tls_handshake -- --ignored --nocapture session_cache`.
+//
+// Mechanism under test: rustls stores resumable TLS sessions in a bounded `ServerSessionMemoryCache`
+// (default 256 sessions — a handful of clients before eviction). `SOLID_SERVER_TLS_SESSION_CACHE_SIZE`
+// makes that bound tunable (default 10 240; 0 disables resumption). A larger cache lets more distinct
+// returning clients complete an ABBREVIATED (resumed) handshake instead of a full one — the
+// connection-amortization throughput lever. The count is deterministic: with a small cache, reconnecting
+// N ≫ capacity distinct clients forces evicted clients into FULL handshakes; with a large cache they all
+// RESUME. This is a byte-for-byte semantics-neutral change — it only affects handshake KIND, never any
+// LDP/auth/WAC behaviour — so it cannot regress conformance or security.
+// ---------------------------------------------------------------------------------------------------
+
+/// Connect one client (its own resumption-enabled `TlsConnector`, so it remembers ITS OWN prior
+/// session), drive a `GET /healthz` and read to EOF so the client receives + stores the server's TLS
+/// 1.3 `NewSessionTicket`, and return the negotiated handshake KIND (`Full` on a fresh/evicted session,
+/// `Resumed` when the server still had this client's session cached). Retries the TCP connect briefly to
+/// avoid racing the server bind; a handshake failure on a CONNECTED socket is surfaced (a real error).
+async fn exchange_and_handshake_kind(
+    connector: &TlsConnector,
+    addr: std::net::SocketAddr,
+) -> (HandshakeKind, Option<ProtocolVersion>) {
+    let dns_name = ServerName::try_from("localhost").expect("server name");
+    let mut tls = None;
+    for _ in 0..100 {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(tcp) => {
+                let stream = connector
+                    .connect(dns_name.clone(), tcp)
+                    .await
+                    .expect("TLS handshake on a connected socket");
+                tls = Some(stream);
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+        }
+    }
+    let mut tls = tls.expect("could not connect to the resumption test server");
+    // Handshake is complete once `connect().await` resolved — the kind + negotiated version are known.
+    let (kind, version) = {
+        let (_io, conn) = tls.get_ref();
+        (
+            conn.handshake_kind()
+                .expect("handshake kind is known after a completed handshake"),
+            conn.protocol_version(),
+        )
+    };
+    // Drive one request + read to EOF so the client consumes the NewSessionTicket record(s) and can
+    // resume on a later connection (Connection: close ends the exchange cleanly).
+    let req = "GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    tls.write_all(req.as_bytes()).await.expect("write request");
+    tls.flush().await.expect("flush");
+    let mut buf = Vec::new();
+    let _ = tls.read_to_end(&mut buf).await;
+    (kind, version)
+}
+
+/// Boot a TLS server with a session cache of `cache_size`, then run a scripted reconnect over
+/// `n_clients` DISTINCT clients: phase 1 every client does a fresh (full) handshake — populating (and,
+/// past the bound, evicting from) the shared server session cache; phase 2 every client reconnects and
+/// we tally how many RESUMED vs did a full handshake. Returns `(resumed, full, all_resumed_tls13)` —
+/// a deterministic count plus whether EVERY resumed handshake negotiated TLS 1.3 (so the test can prove
+/// the cache governs TLS 1.3 resumption specifically — see the roborev-finding note on the test below).
+async fn resumed_vs_full(cache_size: usize, n_clients: usize) -> (usize, usize, bool) {
+    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let mode = TlsMode::Tls {
+        cert_path: CERT_PATH.into(),
+        key_path: KEY_PATH.into(),
+    };
+    let rustls_config = build_rustls_config_with_session_cache_size(&mode, false, cache_size)
+        .await
+        .expect("build rustls config")
+        .expect("TLS mode yields a config");
+
+    let app = Router::new().route("/healthz", get(|| async { "ok" }));
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve port");
+    let addr = probe.local_addr().expect("local addr");
+    drop(probe);
+    let handle = axum_server::Handle::new();
+    let server_handle = handle.clone();
+    let server_task = tokio::spawn(async move {
+        let _ = axum_server::bind_rustls(addr, rustls_config)
+            .handle(server_handle)
+            .serve(app.into_make_service())
+            .await;
+    });
+
+    // One resumption-enabled connector PER client (each remembers only ITS OWN session), so any
+    // resumption observed is genuine server-side reuse of that client's cached session — never a
+    // cross-client leak.
+    let connectors: Vec<TlsConnector> = (0..n_clients)
+        .map(|_| TlsConnector::from(Arc::new(client_config())))
+        .collect();
+
+    // Phase 1: every client does a full handshake, populating the shared server cache in order (so the
+    // lowest-index clients are the OLDEST and evicted first when the bound is exceeded).
+    for c in &connectors {
+        let _ = exchange_and_handshake_kind(c, addr).await;
+    }
+    // Phase 2: every client reconnects; count resumed vs full. We reconnect in REVERSE order
+    // (most-recently-cached client first) on purpose: this makes the count CAPACITY-faithful rather
+    // than exaggerating the win. In arrival order an evicted client's full-handshake reconnect stores
+    // fresh sessions that cascade-evict the still-cached survivors before we reach them (collapsing an
+    // undersized cache's resumed count to ~0 — a real churn pathology, but it OVERSTATES the delta).
+    // Reverse order processes the survivors first, so the number reflects how many sessions the cache
+    // actually held — the conservative, honest before/after (it does NOT flatter the enlarged cache).
+    let mut resumed = 0usize;
+    let mut full = 0usize;
+    // Vacuously true if nothing resumes; ANDed with "this resumed handshake was TLS 1.3" per resume.
+    let mut all_resumed_tls13 = true;
+    for c in connectors.iter().rev() {
+        let (kind, version) = exchange_and_handshake_kind(c, addr).await;
+        match kind {
+            HandshakeKind::Resumed => {
+                resumed += 1;
+                all_resumed_tls13 &= version == Some(ProtocolVersion::TLSv1_3);
+            }
+            HandshakeKind::Full | HandshakeKind::FullWithHelloRetryRequest => full += 1,
+        }
+    }
+
+    handle.graceful_shutdown(Some(std::time::Duration::from_millis(200)));
+    server_task.abort();
+    assert_eq!(
+        resumed + full,
+        n_clients,
+        "every client must be counted once"
+    );
+    (resumed, full, all_resumed_tls13)
+}
+
+#[tokio::test]
+#[ignore = "needs the fixture test cert + real socket I/O; run with --ignored"]
+async fn tls_session_cache_size_governs_resumed_handshake_count() {
+    // NOTE (addresses a roborev finding that `session_storage` might not govern TLS 1.3 resumption):
+    // with the default `NeverProducesTickets` ticketer we KEEP, rustls does STATEFUL TLS 1.3 resumption
+    // backed by `session_storage` (server/tls13.rs: `stateless = ticketer.enabled()` is false ⇒
+    // `session_storage.put/take`). This test PROVES that empirically — Scenario A asserts every resumed
+    // handshake it counts is TLS 1.3, and Scenario B proves size 0 disables TLS 1.3 resumption entirely.
+    //
+    // Scenario A — the lever WORKS: with the tuned default (10 240) cache, all N distinct clients resume
+    // on reconnect (N ≪ capacity, no eviction). Deterministic upper bound: resumed == N, all TLS 1.3.
+    let n_small = 64usize;
+    let (resumed_default, full_default, default_all_tls13) =
+        resumed_vs_full(DEFAULT_TLS_SESSION_CACHE_SIZE, n_small).await;
+    assert_eq!(
+        resumed_default, n_small,
+        "with the tuned default cache, all {n_small} clients must resume (got {resumed_default} resumed, {full_default} full)"
+    );
+    assert!(
+        default_all_tls13,
+        "the resumed handshakes must be TLS 1.3 — proving `session_storage` governs TLS 1.3 resumption"
+    );
+
+    // Scenario B — DISABLED (size 0): resumption is off, so EVERY reconnect is a full handshake. Because
+    // the negotiated version is TLS 1.3 (Scenario A), this proves size 0 disables TLS 1.3 resumption.
+    let n_disabled = 8usize;
+    let (resumed_off, full_off, _) = resumed_vs_full(0, n_disabled).await;
+    assert_eq!(
+        resumed_off, 0,
+        "size 0 must disable resumption entirely (got {resumed_off} resumed)"
+    );
+    assert_eq!(full_off, n_disabled);
+
+    // Scenario C — a TINY cache (4) demonstrates the eviction cliff the default 256 suffers in
+    // miniature: reconnecting N ≫ capacity clients forces most into FULL handshakes. resumed < N.
+    let (resumed_tiny, full_tiny, _) = resumed_vs_full(4, n_small).await;
+    assert!(
+        resumed_tiny < n_small,
+        "a tiny cache must evict → fewer than {n_small} resume (got {resumed_tiny} resumed, {full_tiny} full)"
+    );
+    assert!(
+        resumed_tiny < resumed_default,
+        "the tuned default must resume strictly more than a tiny cache ({resumed_default} vs {resumed_tiny})"
+    );
+
+    // Scenario D — the ACTUAL default change: rustls's prior 256-session default vs the new 10 240.
+    // With N = 320 distinct clients (> 256), the 256 cache evicts and forces full handshakes; the
+    // 10 240 cache resumes all 320. This is the before/after the increment delivers.
+    let n_boundary = 320usize;
+    let (resumed_256, full_256, _) = resumed_vs_full(256, n_boundary).await;
+    let (resumed_10240, full_10240, boundary_all_tls13) = resumed_vs_full(10_240, n_boundary).await;
+    assert!(
+        boundary_all_tls13,
+        "the 10 240-cache resumptions at N={n_boundary} must all be TLS 1.3 (session_storage-governed)"
+    );
+    assert!(
+        resumed_256 < n_boundary,
+        "the OLD 256-session default must force full handshakes past its bound at N={n_boundary} (got {resumed_256} resumed, {full_256} full)"
+    );
+    assert_eq!(
+        resumed_10240, n_boundary,
+        "the NEW 10 240 default must resume all {n_boundary} clients (got {resumed_10240} resumed, {full_10240} full)"
+    );
+    assert!(
+        resumed_10240 > resumed_256,
+        "enlarging the cache 256 → 10 240 must strictly increase resumed handshakes ({resumed_10240} vs {resumed_256})"
+    );
+
+    // Deterministic report line (printed under --nocapture) — the resumed-vs-full COUNT metric.
+    eprintln!(
+        "P1.3 session-resumption (resumed/total on reconnect):\n  \
+         default(10240) N={n_small}: {resumed_default}/{n_small} resumed\n  \
+         disabled(0)    N={n_disabled}: {resumed_off}/{n_disabled} resumed\n  \
+         tiny(4)        N={n_small}: {resumed_tiny}/{n_small} resumed ({full_tiny} full)\n  \
+         BEFORE cache=256   N={n_boundary}: {resumed_256}/{n_boundary} resumed ({full_256} full)\n  \
+         AFTER  cache=10240 N={n_boundary}: {resumed_10240}/{n_boundary} resumed ({full_10240} full)"
+    );
 }

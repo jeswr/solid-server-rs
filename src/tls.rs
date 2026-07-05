@@ -43,6 +43,19 @@
 //! implementation detail of a dependency that a version bump (or a future swap to an ACME /
 //! `from_config` cert path) could silently drop. [`build_rustls_config`] re-asserts it after building
 //! the config, so the advertised protocols are always exactly what this module declares.
+//!
+//! ## TLS session resumption — env-tunable cache size (throughput lever), 0-RTT stays OFF
+//! rustls's `ServerConfig` defaults to a **256-session** in-memory resumption cache — only a handful
+//! of concurrent clients before eviction forces expensive full handshakes on the anonymous-read hot
+//! path. [`ENV_TLS_SESSION_CACHE_SIZE`] makes that cache size env-tunable (default
+//! [`DEFAULT_TLS_SESSION_CACHE_SIZE`] = 10 240; `0` disables resumption entirely). A larger cache lets
+//! more returning clients complete an ABBREVIATED (resumed) handshake — skipping the asymmetric key
+//! exchange — which is the connection-amortization half of the beyond-50k throughput plan
+//! (`docs/design/beyond-50k-throughput.md` §4 P1.3). This is a pure PERFORMANCE knob: it changes no
+//! LDP/auth/WAC semantics, and it does **NOT** enable TLS 0-RTT early data — `max_early_data_size`
+//! stays `0`. 0-RTT is replayable by design, which is incoherent under this server's anti-replay DPoP
+//! (`jti`) model, so it is never turned on here (§5 of the design doc). The tuning is installed
+//! uniformly on both build paths (default + mTLS) by [`apply_transport_tuning`].
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -66,6 +79,36 @@ pub const ENV_TLS_KEY: &str = "SOLID_SERVER_TLS_KEY";
 /// [`build_rustls_config`]. Design: `docs/design/high-throughput-pop-auth.md` §7 (bead 2).
 pub const ENV_MTLS_BOUND_TOKENS: &str = "SOLID_SERVER_MTLS_BOUND_TOKENS";
 
+/// Env var tuning the size of the in-memory TLS **session-resumption cache** (rustls's
+/// `ServerSessionMemoryCache`): the maximum number of resumable TLS sessions the server remembers so
+/// a returning client can complete an ABBREVIATED (resumed) handshake — skipping the asymmetric key
+/// exchange — instead of a full one. Parsed as a non-negative integer:
+/// - unset / empty / unparseable ⇒ [`DEFAULT_TLS_SESSION_CACHE_SIZE`] (the tuned default),
+/// - `0` ⇒ resumption DISABLED (a [`rustls::server::NoServerSessionStorage`] is installed, so every
+///   handshake is full),
+/// - `N` ⇒ remember up to ≈`N` sessions, clamped to [`MAX_TLS_SESSION_CACHE_SIZE`].
+///
+/// This is a pure THROUGHPUT knob — the connection-amortization half of the beyond-50k plan
+/// (`docs/design/beyond-50k-throughput.md` §4 P1.3): a larger cache lets more distinct concurrent
+/// clients resume before eviction forces a full handshake, exactly as a connection-bound PoP check
+/// amortizes per-request asymmetric verifies. It changes NO LDP/auth/WAC semantics and, crucially,
+/// does NOT enable TLS 0-RTT early data — `max_early_data_size` stays `0`, because 0-RTT is replayable
+/// by design and this server's auth model is anti-replay (DPoP `jti`). See the module docs.
+pub const ENV_TLS_SESSION_CACHE_SIZE: &str = "SOLID_SERVER_TLS_SESSION_CACHE_SIZE";
+
+/// Default TLS session-resumption cache size when [`ENV_TLS_SESSION_CACHE_SIZE`] is unset. Chosen well
+/// above rustls's own 256-session default (only a handful of concurrent clients before eviction forces
+/// full handshakes) so a realistic concurrent-client population resumes. Each stored session is a few
+/// hundred bytes, so ~10k sessions is a low-single-digit-MB memory ceiling — cheap insurance against
+/// the eviction cliff on the anonymous-read hot path.
+pub const DEFAULT_TLS_SESSION_CACHE_SIZE: usize = 10_240;
+
+/// Upper clamp on [`ENV_TLS_SESSION_CACHE_SIZE`]. `ServerSessionMemoryCache::new(n)` PRE-ALLOCATES a
+/// map + deque sized to `n` at boot, so an absurd operator value (a typo'd `1000000000`) would try to
+/// reserve gigabytes before serving a single request. The cap bounds boot-time allocation while still
+/// permitting a very large (≈1M-session) cache for a big single-node deployment.
+pub const MAX_TLS_SESSION_CACHE_SIZE: usize = 1 << 20; // 1,048,576
+
 /// Whether the RFC 8705 mTLS-bound-token path is enabled ([`ENV_MTLS_BOUND_TOKENS`]). Truthy =
 /// `1`/`true`/`yes`/`on` (case-insensitive, trimmed); everything else (absent, empty, `0`, `false`,
 /// any other string) ⇒ **OFF** (the fail-safe default — a typo never silently enables a security path
@@ -81,6 +124,32 @@ pub fn mtls_bound_tokens_from_env() -> bool {
             || s.eq_ignore_ascii_case("yes")
             || s.eq_ignore_ascii_case("on")
     )
+}
+
+/// Read + parse [`ENV_TLS_SESSION_CACHE_SIZE`] into the session-cache size to install.
+pub fn session_cache_size_from_env() -> usize {
+    parse_session_cache_size(std::env::var(ENV_TLS_SESSION_CACHE_SIZE).ok().as_deref())
+}
+
+/// The testable core of [`session_cache_size_from_env`]. `None` / empty / unparseable ⇒ the tuned
+/// [`DEFAULT_TLS_SESSION_CACHE_SIZE`]; a parsed value is clamped to [`MAX_TLS_SESSION_CACHE_SIZE`];
+/// `0` is honoured verbatim as "resumption disabled".
+///
+/// FAIL-SAFE (not fail-closed): a garbage value falls back to the good DEFAULT rather than breaking
+/// boot. This is deliberate and the OPPOSITE of [`mtls_bound_tokens_from_env`]'s affirmative-opt-in
+/// grammar — the mTLS flag gates a SECURITY posture (requesting client certs), so a typo must fail
+/// safe to OFF; this is a non-security THROUGHPUT knob, so a typo must never take the server down, it
+/// just reverts to the sensible default cache size. Resumption is a performance optimisation whose
+/// worst case (a smaller/absent cache) is only "more full handshakes", never a correctness or
+/// security change.
+pub fn parse_session_cache_size(raw: Option<&str>) -> usize {
+    match raw.map(str::trim) {
+        None | Some("") => DEFAULT_TLS_SESSION_CACHE_SIZE,
+        Some(s) => match s.parse::<usize>() {
+            Ok(n) => n.min(MAX_TLS_SESSION_CACHE_SIZE),
+            Err(_) => DEFAULT_TLS_SESSION_CACHE_SIZE,
+        },
+    }
 }
 
 /// The ALPN protocols advertised in the TLS handshake, in server preference order: HTTP/2 (`h2`)
@@ -255,9 +324,32 @@ fn trim_os(value: &OsStr) -> OsString {
 ///   flavour: trust is the `cnf.x5t#S256` thumbprint match enforced downstream, NOT the chain). Key
 ///   POSSESSION is still proven by the handshake `CertificateVerify` signature (verified against the
 ///   presented cert's own key). Plain-DPoP clients that present NO cert are unaffected (optional auth).
+///
+/// The session-resumption cache size is read from [`ENV_TLS_SESSION_CACHE_SIZE`]
+/// ([`session_cache_size_from_env`]); [`build_rustls_config_with_session_cache_size`] is the
+/// explicit-size core (used by the resumption-count tests to build configs deterministically without
+/// touching process-global env).
 pub async fn build_rustls_config(
     mode: &TlsMode,
     mtls_bound_tokens: bool,
+) -> Result<Option<RustlsConfig>, TlsConfigError> {
+    build_rustls_config_with_session_cache_size(
+        mode,
+        mtls_bound_tokens,
+        session_cache_size_from_env(),
+    )
+    .await
+}
+
+/// The explicit-`session_cache_size` core of [`build_rustls_config`] (which reads the size from env).
+/// `session_cache_size` is the maximum number of resumable TLS sessions to remember (`0` disables
+/// resumption); see [`ENV_TLS_SESSION_CACHE_SIZE`] / [`apply_transport_tuning`]. Exposed so tests can
+/// build configs with a chosen cache size deterministically, without mutating process-global env
+/// (which would race other parallel tests in the same binary).
+pub async fn build_rustls_config_with_session_cache_size(
+    mode: &TlsMode,
+    mtls_bound_tokens: bool,
+    session_cache_size: usize,
 ) -> Result<Option<RustlsConfig>, TlsConfigError> {
     let (cert_path, key_path) = match mode {
         TlsMode::Plain => return Ok(None),
@@ -291,12 +383,14 @@ pub async fn build_rustls_config(
             .map_err(|source| TlsConfigError::Malformed { source })?
     };
 
-    // Own the ALPN advertisement explicitly (do not inherit axum-server's `from_pem` default): set
-    // `[h2, http/1.1]` so an h2-capable client gets HTTP/2 and an h1-only client negotiates down. This
-    // is a documented, tested transport invariant of THIS crate (see the module + `ALPN_PROTOCOLS`
-    // docs) — re-asserting it here means a dependency bump or a future ACME/`from_config` cert path
-    // (incl. the mTLS branch above) can never silently change the advertised protocol set.
-    set_alpn_protocols(&config);
+    // Finalize the transport tuning on the built config, uniformly across both build paths above:
+    // (1) own the ALPN advertisement explicitly (do not inherit axum-server's `from_pem` default) —
+    // `[h2, http/1.1]` so an h2-capable client gets HTTP/2 and an h1-only client negotiates down; and
+    // (2) install the session-resumption cache of `session_cache_size` (0 ⇒ resumption disabled).
+    // Re-asserting both here means a dependency bump or a future ACME/`from_config` cert path (incl.
+    // the mTLS branch above) can never silently change the advertised protocol set OR the resumption
+    // posture. 0-RTT early data stays OFF (`max_early_data_size` is never set — see the module docs).
+    apply_transport_tuning(&config, session_cache_size);
     Ok(Some(config))
 }
 
@@ -444,17 +538,64 @@ impl rustls::server::danger::ClientCertVerifier for SelfSignedOptionalClientCert
     }
 }
 
-/// Re-assert the advertised ALPN protocols ([`ALPN_PROTOCOLS`]) on a built [`RustlsConfig`].
+/// Finalize the transport tuning on a built [`RustlsConfig`]: re-assert the advertised ALPN protocols
+/// ([`ALPN_PROTOCOLS`]) AND install the session-resumption cache (`cache_size`). Both build paths in
+/// [`build_rustls_config_with_session_cache_size`] (`from_pem` default and the mTLS builder) converge
+/// here, so the tuning is applied UNIFORMLY regardless of which path produced the config.
 ///
 /// `RustlsConfig` wraps an `ArcSwap<ServerConfig>`; the inner `ServerConfig` is immutable behind the
-/// `Arc`, so we clone it, set `alpn_protocols`, and swap the new config back in via
-/// `reload_from_config`. This is the same swap path axum-server itself uses for cert reload, so it is
-/// the supported way to mutate the live config; at boot there are no in-flight handshakes, so the swap
-/// is contention-free.
-fn set_alpn_protocols(config: &RustlsConfig) {
+/// `Arc`, so we clone it ONCE, set both fields, and swap the new config back in via
+/// `reload_from_config` (the same swap path axum-server itself uses for cert reload). At boot there
+/// are no in-flight handshakes, so the swap is contention-free.
+///
+/// **This knob governs TLS 1.3 resumption too** (not just TLS 1.2 session IDs). We deliberately KEEP
+/// rustls's default `ticketer` (`NeverProducesTickets`), so rustls performs *stateful* TLS 1.3
+/// resumption backed by `session_storage`: on issue it stores the session and hands the client a
+/// random 32-byte id as the ticket (`server/tls13.rs`: `let stateless = ticketer.enabled(); … else {
+/// session_storage.put(id, plain) }` — and if `put` returns `false` it logs "resumption not available;
+/// not issuing ticket"), and on resume it looks the id up via `session_storage.take(ticket)`. Therefore
+/// `cache_size == 0` (a [`rustls::server::NoServerSessionStorage`] whose `put` returns `false`)
+/// genuinely DISABLES TLS 1.3 resumption — no ticket is even issued — and a bounded cache bounds the
+/// number of resumable TLS 1.3 sessions (proven by the ignored `tls_session_cache_size_*` test, which
+/// asserts the resumed handshakes it counts are TLS 1.3). Only a configured `Ticketer` would move TLS
+/// 1.3 resumption to the stateless-ticket path — that is the deferred half of P1.3.
+///
+/// **0-RTT stays OFF (security invariant).** [`max_early_data_size`](rustls::ServerConfig) is
+/// deliberately NEVER set here — it is `0` by construction (the rustls builder default) and `.clone()`
+/// preserves it. 0-RTT early data is replayable by design, which is incoherent under this server's
+/// anti-replay DPoP `jti` model (`docs/design/beyond-50k-throughput.md` §5). The `debug_assert`
+/// pins the invariant so a future rustls default change surfaces in tests.
+fn apply_transport_tuning(config: &RustlsConfig, cache_size: usize) {
     let mut server_config = (*config.get_inner()).clone();
     server_config.alpn_protocols = ALPN_PROTOCOLS.iter().map(|p| p.to_vec()).collect();
+    server_config.session_storage = make_session_storage(cache_size);
+    // HARD-ENFORCE 0-RTT OFF, in release too — do not merely assert. It is already `0` by construction
+    // (the rustls builder default, preserved by `.clone()`), but setting it explicitly makes the
+    // anti-replay invariant hold even if a future rustls default or a `from_config` cert path arrived
+    // with a nonzero value; the `debug_assert` then just documents that this line changed nothing today.
+    let prior_early_data = server_config.max_early_data_size;
+    server_config.max_early_data_size = 0;
+    debug_assert_eq!(
+        prior_early_data, 0,
+        "0-RTT early data must stay disabled (anti-replay invariant) — a nonzero default appeared"
+    );
     config.reload_from_config(std::sync::Arc::new(server_config));
+}
+
+/// Build the rustls server session store for a given resumption-cache `size`:
+/// - `size == 0` ⇒ [`rustls::server::NoServerSessionStorage`] — resumption disabled (every handshake
+///   is full; `can_cache()` is `false`, so the server never even issues resumption tickets);
+/// - `size > 0` ⇒ a [`rustls::server::ServerSessionMemoryCache`] bounded to ≈`size` sessions (oldest
+///   evicted on overflow).
+///
+/// Factored out (a) so both the config-build path and the always-run unit tests exercise the SAME
+/// selection logic, and (b) to keep the `if`/`else` arms coercing to one `dyn` trait object cleanly.
+fn make_session_storage(size: usize) -> Arc<dyn rustls::server::StoresServerSessions> {
+    if size == 0 {
+        Arc::new(rustls::server::NoServerSessionStorage {})
+    } else {
+        rustls::server::ServerSessionMemoryCache::new(size)
+    }
 }
 
 /// Read a PEM file, mapping a missing/unreadable file and an empty file to clear errors.
@@ -867,6 +1008,152 @@ mod tests {
         };
         assert!(build_rustls_config(&mode, false).await.unwrap().is_some());
         assert!(build_rustls_config(&mode, true).await.unwrap().is_some());
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    // --- TLS session-resumption cache size (beyond-50k P1.3) -----------------------------------------
+
+    #[test]
+    fn parse_session_cache_size_table() {
+        // Unset / empty / whitespace ⇒ the tuned default.
+        assert_eq!(
+            parse_session_cache_size(None),
+            DEFAULT_TLS_SESSION_CACHE_SIZE
+        );
+        assert_eq!(
+            parse_session_cache_size(Some("")),
+            DEFAULT_TLS_SESSION_CACHE_SIZE
+        );
+        assert_eq!(
+            parse_session_cache_size(Some("   ")),
+            DEFAULT_TLS_SESSION_CACHE_SIZE
+        );
+        // A valid non-negative integer is honoured (with surrounding whitespace trimmed).
+        assert_eq!(parse_session_cache_size(Some("256")), 256);
+        assert_eq!(parse_session_cache_size(Some("  512 ")), 512);
+        assert_eq!(parse_session_cache_size(Some("1")), 1);
+        // `0` is honoured VERBATIM as "disable resumption" (mapped to NoServerSessionStorage).
+        assert_eq!(parse_session_cache_size(Some("0")), 0);
+        // Over-large values are CLAMPED so boot never tries to pre-allocate an unbounded map.
+        assert_eq!(
+            parse_session_cache_size(Some("1000000000")),
+            MAX_TLS_SESSION_CACHE_SIZE
+        );
+        // Garbage / negative / non-integer ⇒ FAIL-SAFE to the default (never a boot break — perf knob).
+        for bad in ["garbage", "-1", "12.5", "1e6", "0x10", "  ", "abc123"] {
+            assert_eq!(
+                parse_session_cache_size(Some(bad)),
+                DEFAULT_TLS_SESSION_CACHE_SIZE,
+                "{bad:?} must fall back to the default cache size"
+            );
+        }
+    }
+
+    #[test]
+    fn make_session_storage_disables_at_zero_and_bounds_above() {
+        // (`StoresServerSessions`'s methods are callable directly on the `dyn` trait object.)
+        // size 0 ⇒ resumption DISABLED: the store advertises it cannot cache, and a put is dropped.
+        let disabled = make_session_storage(0);
+        assert!(
+            !disabled.can_cache(),
+            "size 0 must install a store that cannot cache (resumption disabled)"
+        );
+        assert!(
+            !disabled.put(b"k".to_vec(), b"v".to_vec()),
+            "a disabled store must not accept a session"
+        );
+        assert_eq!(disabled.get(b"k"), None);
+
+        // A bounded store caches, round-trips, AND evicts the oldest past its capacity. `new(4)` keeps
+        // ~3 sessions (rustls evicts the oldest on reaching capacity), so after 10 distinct inserts the
+        // earliest is gone and the most-recent survives — the exact bound this lever raises from 256.
+        let bounded = make_session_storage(4);
+        assert!(bounded.can_cache(), "a positive size must cache");
+        for i in 0..10u8 {
+            assert!(bounded.put(vec![i], vec![i]));
+        }
+        assert_eq!(
+            bounded.get(&[0]),
+            None,
+            "the oldest session must be evicted past the bound"
+        );
+        assert_eq!(
+            bounded.get(&[9]),
+            Some(vec![9]),
+            "the most-recent session must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn built_config_installs_session_cache_and_keeps_0rtt_off() {
+        // End-to-end through the real build path: a config built with an explicit cache size must carry
+        // a matching session store AND keep 0-RTT early data OFF (the anti-replay invariant). This runs
+        // in the standard gate (no socket I/O) and is the deterministic proof that the lever reaches the
+        // live ServerConfig, complementing the ignored resumed-vs-full handshake-count integration test.
+        // (`StoresServerSessions::can_cache` is callable directly on the `dyn` trait object.)
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (cert, key) = self_signed_localhost_pem();
+        let dir = std::env::temp_dir().join(format!("ssrs-tls-scache-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let cert_path = dir.join("c.pem");
+        let key_path = dir.join("k.pem");
+        tokio::fs::write(&cert_path, &cert).await.unwrap();
+        tokio::fs::write(&key_path, &key).await.unwrap();
+        let mode = TlsMode::Tls {
+            cert_path,
+            key_path,
+        };
+
+        // size 0 ⇒ the built config's store cannot cache (resumption disabled).
+        let disabled = build_rustls_config_with_session_cache_size(&mode, false, 0)
+            .await
+            .expect("build config")
+            .expect("tls mode yields a config");
+        {
+            let inner = disabled.get_inner();
+            assert!(
+                !inner.session_storage.can_cache(),
+                "cache size 0 must disable resumption on the built config"
+            );
+            assert_eq!(
+                inner.max_early_data_size, 0,
+                "0-RTT early data must be OFF (anti-replay invariant)"
+            );
+        }
+
+        // Positive sizes install a caching store; 0-RTT stays off. Use the EXPLICIT-size builder (not
+        // the env-reading `build_rustls_config`) so this assertion is independent of any ambient
+        // `SOLID_SERVER_TLS_SESSION_CACHE_SIZE` (e.g. an operator/CI env setting it to `0` would
+        // otherwise disable resumption and fail the `can_cache()` assertion).
+        for cfg in [
+            build_rustls_config_with_session_cache_size(&mode, false, 4096)
+                .await
+                .unwrap()
+                .unwrap(),
+            build_rustls_config_with_session_cache_size(
+                &mode,
+                false,
+                DEFAULT_TLS_SESSION_CACHE_SIZE,
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        ] {
+            let inner = cfg.get_inner();
+            assert!(
+                inner.session_storage.can_cache(),
+                "a positive cache size must enable resumption"
+            );
+            assert_eq!(
+                inner.max_early_data_size, 0,
+                "0-RTT early data must stay OFF on every build path"
+            );
+            // ALPN is still owned + advertised (tuning did not clobber the transport contract).
+            assert_eq!(
+                inner.alpn_protocols,
+                vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+            );
+        }
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }
