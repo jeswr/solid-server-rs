@@ -347,15 +347,30 @@ where
         router = router.merge(sk_routes);
     }
 
-    // RFC 9728 protected-resource metadata — the PoP negotiation/advertisement surface. Mounted
-    // only when a PoP tier beyond baseline DPoP is enabled (mTLS-bound tokens and/or DPoP-SK), so
-    // the default build's public surface is unchanged. The document is static per boot; built once.
-    if auth.mtls_bound_tokens() || auth.sk().is_some() {
-        let body = Arc::new(protected_resource_metadata_json(
+    // RFC 9728 protected-resource metadata — the PoP negotiation/advertisement surface, and (LWS
+    // M2) the authorization-server discovery document the 401 `resource_metadata` challenge points
+    // at. Mounted when a PoP tier beyond baseline DPoP is enabled (mTLS-bound tokens and/or
+    // DPoP-SK) OR the LWS auth chain is on, so the default build's public surface is unchanged.
+    // The document is static per boot; built once. When the LWS chain is on, the SAME document is
+    // extended with the spec-required members (`authorization_servers`,
+    // `jlws_storage_description`) and `dpop_bound_access_tokens_required` is made honest for the
+    // realm's actual posture (Bearer baseline ⇒ false; PoP-required ⇒ true) — see
+    // [`crate::lws::auth::LwsBearerAuth::extend_protected_resource_metadata`]. LWS-off keeps the
+    // pre-LWS bytes verbatim.
+    let lws_auth = auth.lws().cloned();
+    if auth.mtls_bound_tokens() || auth.sk().is_some() || lws_auth.is_some() {
+        let mut body_json = protected_resource_metadata_json(
             &auth.base_url,
             auth.mtls_bound_tokens(),
             auth.sk().map(Arc::as_ref),
-        ));
+        );
+        if let Some(lws) = &lws_auth {
+            if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&body_json) {
+                lws.extend_protected_resource_metadata(&mut doc);
+                body_json = doc.to_string();
+            }
+        }
+        let body = Arc::new(body_json);
         let metadata = Router::new().route(
             OAUTH_PROTECTED_RESOURCE_PATH,
             get(move || {
@@ -371,7 +386,19 @@ where
         router = router.merge(metadata);
     }
 
-    router.merge(protected)
+    let router = router.merge(protected);
+
+    // LWS M2 (flag-gated): the RFC 9728 401 challenge-append layer — every 401 leaving the
+    // application routes advertises `realm` + `resource_metadata` (spec §authz-discovery) beside
+    // whatever challenge it already carries. Mounted ONLY when the LWS auth chain is configured,
+    // so a flag-off build has no layer and byte-identical responses.
+    match lws_auth {
+        Some(lws) => router.layer(axum::middleware::from_fn_with_state(
+            lws,
+            crate::lws::auth::lws_challenge_middleware,
+        )),
+        None => router,
+    }
 }
 
 /// The health/readiness routes: `GET /livez` (process up) + `GET /readyz` (ready to serve). Both are

@@ -978,7 +978,39 @@ where
         ),
         None => eprintln!("  LWS: surface disabled (default — set SOLID_SERVER_LWS=1 to enable)."),
     }
+    let lws_enabled = lws.is_some();
     ldp.set_lws(lws.map(std::sync::Arc::new));
+
+    // The LWS AUTH CHAIN (M2, same SOLID_SERVER_LWS flag): RFC 9728 challenge/metadata + RFC 9068
+    // `at+jwt` Bearer validation (`solid_server_rs::lws::auth`). Trusts the SAME issuer allowlist
+    // as the Solid-OIDC verifier (the storage server's one canonical AS list), over its OWN
+    // network JWKS provider instance — the existing verifier's construction/wiring is untouched,
+    // so the flag-off auth path is byte-identical to pre-LWS.
+    let auth = if lws_enabled {
+        let require_pop = solid_server_rs::lws::auth::require_pop_from_env();
+        let max_ttl = solid_server_rs::lws::auth::max_token_ttl_from_env();
+        // Same dev/IT loopback posture as the Solid-OIDC verifier's JWKS provider (read from the
+        // same env flag `main` resolved it from — this helper only receives the issuer + TTL).
+        let lws_jwks = NetworkJwksProvider::new(jwks_cache_ttl, env_flag(ENV_ALLOW_LOOPBACK))
+            .map_err(|e| format!("failed to init the LWS JWKS provider: {e}"))?;
+        let lws_auth = solid_server_rs::lws::auth::LwsBearerAuth::new(
+            Arc::new(lws_jwks),
+            vec![issuer.to_string()],
+            base_url,
+            require_pop,
+        )
+        .map_err(|e| format!("invalid LWS auth configuration: {e}"))?
+        .with_max_token_ttl(max_ttl);
+        eprintln!(
+            "  LWS AUTH: RFC 9068 at+jwt Bearer chain ENABLED (realm {}; authorization server \
+             {issuer}; max remaining token lifetime {max_ttl}s; PoP-required: {require_pop}) — \
+             401s carry the RFC 9728 resource_metadata challenge.",
+            lws_auth.realm(),
+        );
+        auth.with_lws_bearer(Some(Arc::new(lws_auth)))
+    } else {
+        auth
+    };
 
     Ok(build_router_with_overload(
         AppState::new(auth, ldp),

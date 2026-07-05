@@ -1046,3 +1046,86 @@ async fn solid_surface_intact_with_lws_on() {
     assert_eq!(anon.status(), StatusCode::UNAUTHORIZED);
     assert!(anon.headers().contains_key(header::WWW_AUTHENTICATE));
 }
+
+/// The M1-verify Low, locked as a regression test: a stored `application/ld+json` resource whose
+/// `@context` is a hostile REMOTE URL must never trigger a server-side fetch when a derived
+/// representation is negotiated — oxjsonld performs no remote-context resolution by construction,
+/// so the parse fails and the transform degrades to the per-resource 406 problem
+/// (`unparseable-source`), while the stored type stays byte-exact readable. A LIVE local listener
+/// stands in for the "remote" context (the loopback stand-in for a metadata endpoint like
+/// 169.254.169.254): the test fails if ANY connection arrives — pinning the no-SSRF invariant
+/// against a future oxjsonld upgrade that might add remote context loading.
+#[tokio::test]
+async fn transform_never_fetches_a_remote_jsonld_context() {
+    let h = Harness::lws().await;
+
+    // A live listener the hostile @context points at. Bound on an ephemeral loopback port;
+    // NOTHING should ever connect to it.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind canary listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking canary listener");
+    let canary = format!("http://{}/hostile-context", listener.local_addr().unwrap());
+
+    let hostile = format!(
+        r#"{{"@context": "{canary}", "@id": "https://pod.example/alice/ssrf", "name": "x"}}"#
+    );
+
+    // The HTTP write path already refuses the body (parse-on-write cannot resolve the remote
+    // context — WITHOUT fetching it): the hostile document is unstorable over LDP. Pin that too.
+    let put = h
+        .request(
+            "PUT",
+            "/alice/ssrf",
+            Some("application/ld+json"),
+            Body::from(hostile.clone()),
+        )
+        .await;
+    assert_eq!(put.status(), StatusCode::BAD_REQUEST);
+
+    // Seed the hostile document DIRECTLY through the store (imported / pre-existing data — the
+    // scenario the read-path regression is about), then negotiate the derived representation.
+    h.store
+        .write(
+            "https://pod.example/alice/ssrf",
+            Bytes::from(hostile.clone()),
+            "application/ld+json",
+        )
+        .await
+        .expect("seed hostile ld+json directly");
+
+    // Negotiate the DERIVED N-Triples representation — the transform must attempt the parse
+    // WITHOUT dereferencing the @context, fail, and answer the 406 unparseable-source problem.
+    let nt = h
+        .request_with("GET", "/alice/ssrf", None, &[("accept", NT)], Body::empty())
+        .await;
+    assert_eq!(nt.status(), StatusCode::NOT_ACCEPTABLE);
+    let problem = String::from_utf8(body_bytes(nt).await.to_vec()).unwrap();
+    assert!(
+        problem.contains("unparseable-source"),
+        "expected the unparseable-source problem, got: {problem}"
+    );
+
+    // The stored type stays byte-exact readable (authoritative bytes) — still no fetch.
+    let stored = h
+        .request_with(
+            "GET",
+            "/alice/ssrf",
+            None,
+            &[("accept", "application/ld+json")],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(stored.status(), StatusCode::OK);
+    assert_eq!(
+        String::from_utf8(body_bytes(stored).await.to_vec()).unwrap(),
+        hostile
+    );
+
+    // THE invariant: no connection ever arrived at the hostile context host.
+    match listener.accept() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {} // nothing connected — correct
+        Ok((_, peer)) => panic!("the server fetched the remote @context (connection from {peer})"),
+        Err(e) => panic!("canary listener failed: {e}"),
+    }
+}

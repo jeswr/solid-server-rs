@@ -64,15 +64,29 @@
 //! counts), RDF-transform round-trip + per-representation ETags + `normalizes`-absent byte-exact
 //! read-back, conditional create (`If-None-Match: *` / 412 / strict-428).
 //!
-//! ## M2 (deferred, seams noted)
-//! The LWS-specific auth chain (RFC 9728 `resource_metadata` challenge — the RFC 9728 document
-//! builder already exists at [`crate::pop::sk::handlers::protected_resource_metadata_json`] — +
-//! RFC 8693 exchange-verify with audience-restricted ≤300 s `at+jwt` Bearer; the current DPoP path
-//! is reused meanwhile), RFC 9264 linkset metadata, notifications bindings (SSE + WebSocket under
-//! the WD subscription API), pagination, `size` in listings (needs a `ResourceMeta` field), the
-//! `SparqlQueryService`/AC-SPARQL companion, and container `application/json`-vs-`text/turtle`
-//! preference refinement.
+//! ## What M2 ships (the LWS auth chain — [`auth`])
+//! The server half of the spec's authorization chain (§authz-discovery / §access-token /
+//! §presentation / §rs-validation): the RFC 9728 `resource_metadata` + `realm` 401 challenge
+//! (appended by [`auth::lws_challenge_middleware`], reusing the RFC 9728 document built by
+//! [`crate::pop::sk::handlers::protected_resource_metadata_json`] and extended with
+//! `authorization_servers` + `jlws_storage_description`), and RFC 9068 `at+jwt` **Bearer**
+//! validation ([`auth::LwsBearerAuth`]) — trusted-issuer allowlist, vetted signature path,
+//! single-valued audience with same-origin + `/`-segment-boundary containment, bounded ≤300 s
+//! lifetime, required `client_id`/`sub`/`jti`, bare-`cnf` refusal — mapping the verified `sub`
+//! onto the existing WAC decision path. The RFC 8693 exchange itself is the authorization
+//! server's job (lws-keycloak); this server only verifies the resulting token. Bearer is the
+//! MUST-accept baseline; a deployment MAY designate the realm PoP-required
+//! ([`auth::ENV_LWS_REQUIRE_POP`]).
+//!
+//! ## M3 (deferred, seams noted)
+//! RFC 9264 linkset metadata, notifications bindings (SSE + WebSocket under the WD subscription
+//! API), pagination, `size` in listings (needs a `ResourceMeta` field), the
+//! `SparqlQueryService`/AC-SPARQL companion, container `application/json`-vs-`text/turtle`
+//! preference refinement, DPoP-bound LWS-audience token validation for a PoP-required realm, and
+//! RFC 9396 `authorization_details` narrowing (ignoring it today grants exactly the WAC
+//! baseline — the claim may only narrow, never widen).
 
+pub mod auth;
 pub mod container;
 pub mod transform;
 

@@ -163,6 +163,54 @@ fn cert_bound_token_with_matching_cert_authenticates() {
 }
 
 #[test]
+fn cert_bound_bearer_still_authenticates_with_the_lws_chain_on() {
+    // Composition (roborev Medium, e827448): enabling the LWS Bearer chain MUST NOT swallow an
+    // RFC 8705 cert-bound Bearer token. Its `aud` is a single URI (this storage), so a naive LWS
+    // candidate check would capture it — but `LwsBearerAuth::is_lws_candidate` excludes any
+    // `cnf`-bearing token, so it falls through to the verifier + Tier-1b dispatch UNCHANGED and
+    // authenticates exactly as without LWS. (The security direction — a cert-bound token is never
+    // downgraded — is covered by the bare-cnf rejection elsewhere.)
+    let issuer_key = KeyKit::generate();
+    let jwks: Arc<dyn solid_oidc_verifier::config::JwksProvider> =
+        Arc::new(jwks_provider(&issuer_key));
+    let lws = solid_server_rs::lws::auth::LwsBearerAuth::new(
+        jwks,
+        vec![common::ISSUER.to_string()],
+        BASE_URL,
+        false,
+    )
+    .unwrap();
+    let ctx = ctx(&issuer_key, true).with_lws_bearer(Some(Arc::new(lws)));
+    let access = mint_cert_bound_access_token(&issuer_key, &cert_x5t_s256(CERT_A));
+
+    let token = ctx
+        .authenticate_with_cert(
+            Some(format!("Bearer {access}")),
+            None,
+            "GET",
+            "/alice/data",
+            Some(&presented(CERT_A)),
+        )
+        .expect("LWS-on must not break the cert-bound Bearer path");
+    assert_eq!(token.web_id.as_deref(), Some(WEBID));
+
+    // And the wrong cert is still fail-closed with LWS on (the dispatch still runs).
+    let err = ctx
+        .authenticate_with_cert(
+            Some(format!("Bearer {access}")),
+            None,
+            "GET",
+            "/alice/data",
+            Some(&presented(CERT_B)),
+        )
+        .expect_err("a wrong cert must still be refused with LWS on");
+    assert!(matches!(
+        err,
+        solid_server_rs::error::ServerError::Unauthorized { status: 401, .. }
+    ));
+}
+
+#[test]
 fn malformed_cert_binding_is_denied_not_treated_as_unbound() {
     // A present-but-malformed cnf.x5t#S256 must fail CLOSED — even with a matching-looking cert
     // presented, a broken binding is never collapsed to "unbound"/accepted.

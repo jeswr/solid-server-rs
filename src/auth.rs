@@ -67,6 +67,19 @@ pub struct AuthContext<J: JwksProvider, R: ReplayStore> {
     /// `dpop-sk`-tagged RFC 9421 signature is processed under the DPoP-SK profile EXCLUSIVELY
     /// (see [`crate::pop::sk::verify`]); everything else is unchanged.
     sk: Option<Arc<SkState>>,
+    /// The LWS auth chain (M2, `SOLID_SERVER_LWS` — see [`crate::lws::auth`]). **Default `None`**
+    /// — when unset, the middleware runs the pre-LWS path byte-for-byte (a Bearer header is
+    /// decided by the verifier exactly as before). When set, a `Bearer` token whose unverified
+    /// shape is an LWS access token (exactly one audience, an absolute http(s) URI, NO `cnf`)
+    /// COMMITS to the fail-closed LWS `at+jwt` verification; everything else — DPoP, any
+    /// `cnf`-bearing Bearer (incl. the RFC 8705 cert-bound mTLS path, which keeps working),
+    /// non-URI-audience Bearer, anonymous — is unchanged. NB with this server's audience
+    /// convention (`SOLID_SERVER_AUDIENCE` defaults to the base URL) an unbound origin-audience
+    /// at+jwt from the trusted AS IS an LWS token by the spec's definition — the accepted,
+    /// documented consequence (decisions/0005 "Security analysis"); a PoP-BOUND token is never
+    /// downgraded (excluded from LWS candidacy, and the LWS path independently refuses any bare
+    /// `cnf`-bearing token on its verified claims).
+    lws: Option<Arc<crate::lws::auth::LwsBearerAuth>>,
 }
 
 /// The token cache + the shared replay handle it marks `jti`s through (the SAME store the verifier
@@ -86,6 +99,7 @@ impl<J: JwksProvider, R: ReplayStore> AuthContext<J, R> {
             cache: None,
             mtls_bound_tokens: false,
             sk: None,
+            lws: None,
         }
     }
 
@@ -104,6 +118,7 @@ impl<J: JwksProvider, R: ReplayStore> AuthContext<J, R> {
             cache: Some(TokenCache { cache, replay }),
             mtls_bound_tokens: false,
             sk: None,
+            lws: None,
         }
     }
 
@@ -128,6 +143,20 @@ impl<J: JwksProvider, R: ReplayStore> AuthContext<J, R> {
     /// establishment routes + advertise the profile in the RFC 9728 metadata).
     pub fn sk(&self) -> Option<&Arc<SkState>> {
         self.sk.as_ref()
+    }
+
+    /// Enable the LWS auth chain (M2, `SOLID_SERVER_LWS`) by supplying the LWS Bearer verifier.
+    /// `None` (the default) is byte-identical to the pre-LWS middleware. A builder-style setter,
+    /// mirroring [`with_dpop_sk`](Self::with_dpop_sk).
+    pub fn with_lws_bearer(mut self, lws: Option<Arc<crate::lws::auth::LwsBearerAuth>>) -> Self {
+        self.lws = lws;
+        self
+    }
+
+    /// The LWS auth chain, when enabled (used by `crate::app` to mount the RFC 9728 metadata with
+    /// the LWS members and the 401 challenge-append layer).
+    pub fn lws(&self) -> Option<&Arc<crate::lws::auth::LwsBearerAuth>> {
+        self.lws.as_ref()
     }
 
     /// Whether the PoP Tier-1b mTLS cert-bound-token dispatch is enabled (used by `crate::app`
@@ -217,6 +246,27 @@ impl<J: JwksProvider, R: ReplayStore> AuthContext<J, R> {
         } else {
             None
         };
+
+        // The LWS auth chain (M2, flag-gated — `None` on every pre-LWS/flag-off build, leaving
+        // this path byte-identical): a `Bearer` token whose unverified shape is an LWS access
+        // token (exactly one audience, an absolute http(s) URI, NO `cnf`) COMMITS to the
+        // fail-closed LWS `at+jwt` verification against the SAME server-reconstructed target the
+        // DPoP `htu` check uses; its verdict is final. A `cnf`-bearing token stays on the
+        // verifier path below, which validates its binding at full strength (the RFC 8705
+        // cert-bound mTLS Bearer keeps working with LWS on) — so a PoP-bound token is never
+        // downgraded to bearer, and the LWS branch independently refuses bare `cnf` on its
+        // VERIFIED claims. Routing on a peeked claim is not a security decision — both branches
+        // fully verify (see the field doc + decisions/0005).
+        if let Some(lws) = &self.lws {
+            if let Some(bearer) = authorization
+                .as_deref()
+                .and_then(bearer_scheme_access_token)
+            {
+                if lws.is_lws_candidate(bearer) {
+                    return lws.verify_bearer(bearer, &target.htu, now_secs());
+                }
+            }
+        }
 
         // Cache fast-path: ONLY for a `DPoP <token>` request (the production posture). Everything else
         // -- absent auth (public), Bearer, or an unparseable header -- goes straight to the verifier,
@@ -537,6 +587,27 @@ pub(crate) fn dpop_scheme_access_token(header: &str) -> Option<&str> {
     }
 }
 
+/// Extract the access-token string from a `Bearer <token>` Authorization header, returning `None`
+/// for any other scheme or a malformed/empty header. Parses EXACTLY like
+/// [`dpop_scheme_access_token`] (trim, split on the FIRST space, case-insensitive scheme, trim the
+/// token) so the LWS candidate dispatch sees the byte-identical token string the verifier would
+/// otherwise parse. Used ONLY to route an LWS-shaped Bearer token to the LWS verifier — never a
+/// security decision on its own (both branches fully verify).
+pub(crate) fn bearer_scheme_access_token(header: &str) -> Option<&str> {
+    let trimmed = header.trim();
+    let sp = trimmed.find(' ')?;
+    let scheme = &trimmed[..sp];
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = trimmed[sp + 1..].trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
 /// Current UNIX time in seconds (the cache's `now` for token-`exp` + proof-`iat` checks). Matches the
 /// verifier's internal clock.
 fn now_secs() -> i64 {
@@ -548,7 +619,21 @@ fn now_secs() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::dpop_scheme_access_token;
+    use super::{bearer_scheme_access_token, dpop_scheme_access_token};
+
+    #[test]
+    fn extracts_bearer_token_only() {
+        assert_eq!(
+            bearer_scheme_access_token("Bearer abc.def.ghi"),
+            Some("abc.def.ghi")
+        );
+        // Case-insensitive scheme, whitespace-trimmed — mirrors the DPoP extractor exactly.
+        assert_eq!(bearer_scheme_access_token("  bEaReR   tok  "), Some("tok"));
+        assert_eq!(bearer_scheme_access_token("DPoP tok"), None);
+        assert_eq!(bearer_scheme_access_token("Bearer"), None);
+        assert_eq!(bearer_scheme_access_token("Bearer "), None);
+        assert_eq!(bearer_scheme_access_token(""), None);
+    }
 
     #[test]
     fn extracts_dpop_token_only() {

@@ -86,11 +86,10 @@ An **additive, runtime-flag-gated** surface in `src/lws/` (`SOLID_SERVER_LWS`), 
   member-visibility plan into one round-trip is an M2 optimisation seam.
 - `size` is omitted from member descriptions (SHOULD-level) — `ResourceMeta` records no byte
   length; adding it is an M2 store change. Pagination (SHOULD) likewise deferred.
-- M2 (deferred, seams marked in `src/lws`): the LWS-specific auth chain — RFC 9728
-  `resource_metadata` challenge (the RFC 9728 document builder already exists in `pop::sk`) +
-  RFC 8693 exchange-verify with audience-restricted ≤300 s `at+jwt` Bearer presentation (the
-  existing DPoP path is reused meanwhile) — RFC 9264 linksets, SSE/WebSocket notification
-  bindings under the WD subscription API, and the `SparqlQueryService`/AC-SPARQL companion
+- M2 — the LWS auth chain (RFC 9728 `resource_metadata` challenge + audience-restricted ≤300 s
+  `at+jwt` Bearer validation) — **SHIPPED**; see `decisions/0005-lws-auth-m2.md`. Still deferred
+  (M3, seams marked in `src/lws`): RFC 9264 linksets, SSE/WebSocket notification bindings under
+  the WD subscription API, pagination/`size`, and the `SparqlQueryService`/AC-SPARQL companion
   (gated on the same SPARQ access-control design as WAC-in-SPARQ, `sparq#992`).
 - The `jeswr/lws-spec` `test-vectors/` suite (parallel work) plugs in over plain HTTP against the
   assembled router; `tests/lws_http.rs` is the hand-written pin of the same contract and the
