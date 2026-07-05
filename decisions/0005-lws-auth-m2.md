@@ -78,6 +78,19 @@ dead, the pre-LWS auth path byte-identical — the M1 invariance rule extended t
    is unaffected. Executed end-to-end as a regression test (a `/bob/`-scoped token against
    `/alice/%2e%2e/bob/doc` → 401, not a served `/alice/`-subtree resource).
 
+   *Guard-breadth finding closed as false-positive (roborev Medium, job 4727 on the amended M2
+   commit).* The review claimed the guard "fails closed for normal URL spellings that `url`
+   normalizes, such as percent-encoded unreserved characters (`/%61lice/doc`)", causing avoidable
+   401s for valid aliases. Empirically false for the cited example: the `url` crate (WHATWG URL)
+   does **not** decode percent-encoded unreserved characters —
+   `Url::parse("https://h/%61lice/doc").path()` returns `/%61lice/doc` byte-identical, so the
+   guard passes it (unit-pinned in the `aud_containment` tests: `%61lice` is a *different*
+   resource from `alice`, denied by ordinary path comparison, not by the guard; `/alice/%61-note`
+   under an `/alice/`-scoped audience is allowed). WHATWG renormalizes only full dot-segments
+   (`%2e%2e`, `.%2e`, …), `\`→`/` in special URLs, and non-ASCII re-encoding — each an *ambiguous
+   identity* between the raw string the store/WAC key by and the parsed URL, exactly the class
+   the guard must refuse, and refusal is always a deny (never an over-grant). No code change.
+
 5. **Dispatch: commit on shape, both branches fail-closed.** In the auth middleware, a
    `Bearer`-scheme token whose *unverified* `aud` is a single absolute http(s) URI **and that
    carries no `cnf`** COMMITS to the LWS verifier (final verdict); everything else — DPoP, ANY
