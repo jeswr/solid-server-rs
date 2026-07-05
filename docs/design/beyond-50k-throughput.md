@@ -201,7 +201,9 @@ independently reversible.
    loopback `TcpStream` in a counting adapter tallying every `poll_write` vs `poll_write_vectored`
    hyper issues (== the connection-socket write-family syscalls), and drives K keep-alive requests.
    Result: **exactly 1 `writev` and 0 plain `write` per response** for a real anonymous public-doc
-   GET, a real `206` Range GET, AND a real container-listing GET — byte-identical bodies asserted.
+   GET, a real `206` Range GET, a real container-listing GET, AND a real authenticated (DPoP-bound)
+   private-doc GET that traverses the full auth middleware → WAC → handler (the P0.1 `authed-doc`
+   class; the anonymous cases short-circuit at the public-read skip) — byte-identical bodies asserted.
    hyper's h1 encoder already buffers the head + the length-delimited `Bytes` body the handler
    produces into one `WriteBuf` and flushes it as a single vectored write (Queue strategy, because a
    loopback `TcpStream` advertises `is_write_vectored() == true`; over TLS the same bytes are

@@ -2,8 +2,12 @@
 //! P1.4 (`docs/design/beyond-50k-throughput.md` §4, item P1.4 — the vectored-write /
 //! response-coalescing audit): a DETERMINISTIC guard that pins the number of write-family
 //! syscalls the HTTP/1.1 response path emits per response, measured at the hyper→transport seam,
-//! **driving the REAL assembled router** (`build_router` → CORS → public-read skip → auth → WAC →
+//! **driving the REAL assembled router** (`build_router` — CORS → public-read skip → auth → WAC →
 //! LDP handler → `serve_read`/`negotiate_body`) over the SAME `axum::serve` path production uses.
+//! Both read paths are covered: the anonymous cases traverse CORS → public-read skip → `serve_read`
+//! (the skip short-circuits before the auth middleware), and the authenticated case
+//! (`real_authenticated_get_…`) carries a DPoP-bound token so it traverses the FULL auth middleware
+//! → WAC → LDP handler → `serve_read` (the P0.1 `authed-doc` class).
 //!
 //! ## Why this test exists — the P1.4 finding
 //!
@@ -21,8 +25,9 @@
 //! over that listener while the test drives K sequential keep-alive requests.
 //!
 //! The measured result (asserted below): **exactly 1 `writev` and 0 plain `write` per response**
-//! for a real anonymous public-document GET, a real `206 Partial Content` Range GET, and a real
-//! container-listing GET. hyper's h1 encoder ALREADY buffers the response head + the length-delimited
+//! for a real anonymous public-document GET, a real `206 Partial Content` Range GET, a real
+//! container-listing GET, and a real authenticated (DPoP-bound) private-document GET. hyper's h1
+//! encoder ALREADY buffers the response head + the length-delimited
 //! `Bytes` body the handler produces into ONE `WriteBuf` and flushes it as a single vectored write
 //! (Queue strategy, since a loopback `TcpStream` advertises `is_write_vectored() == true`).
 //!
@@ -58,7 +63,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use common::{jwks_provider, KeyKit, BASE_URL, ISSUER};
+use common::{jwks_provider, mint_access_token, mint_dpop_proof, KeyKit, BASE_URL, ISSUER};
 use solid_oidc_verifier::config::VerifierConfig;
 use solid_oidc_verifier::replay::InMemoryReplayStore;
 use solid_oidc_verifier::verifier::Verifier;
@@ -178,12 +183,13 @@ async fn seed_acl(store: &MemStore, iri: &str, body: &str) {
 }
 
 /// Build the real router around a caller-seeded in-memory store, exactly as `main`/the integration
-/// tests do (`build_router(AppState::new(ctx, ldp))`).
-fn build_real_router(store: MemStore) -> axum::Router {
-    let issuer_key = KeyKit::generate();
+/// tests do (`build_router(AppState::new(ctx, ldp))`). `issuer_key` is the key whose JWK the verifier
+/// trusts — the caller supplies it so an authenticated request can mint a token the server accepts
+/// (for the anonymous cases it is irrelevant; a throwaway key is fine).
+fn build_real_router(store: MemStore, issuer_key: &KeyKit) -> axum::Router {
     let config = VerifierConfig::new(vec![ISSUER.to_string()], BASE_URL);
     let replay = InMemoryReplayStore::with_window(config.replay_ttl());
-    let verifier = Verifier::new(config, jwks_provider(&issuer_key), replay).unwrap();
+    let verifier = Verifier::new(config, jwks_provider(issuer_key), replay).unwrap();
     let ctx = AuthContext::new(verifier, BASE_URL);
     let ldp = LdpState::new(store, BASE_URL);
     build_router(AppState::new(ctx, ldp))
@@ -264,6 +270,42 @@ async fn drive(addr: SocketAddr, request: &[u8], k: usize) -> Vec<(u16, Vec<u8>)
     out
 }
 
+/// Drive K sequential keep-alive requests carrying a valid DPoP-bound `(Authorization, DPoP)` pair
+/// (the P0.1 `authed-doc` class). A FRESH access token + a FRESH DPoP proof (unique `jti`) is minted
+/// per request, so the anti-replay store admits every one and the FULL auth middleware → WAC → LDP
+/// handler runs each time — the public-read skip does NOT fire when an `Authorization` header is
+/// present. Returns each response's `(status, body)`.
+async fn drive_authenticated(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    extra_header: Option<&str>,
+    issuer_key: &KeyKit,
+    client_key: &KeyKit,
+    k: usize,
+) -> Vec<(u16, Vec<u8>)> {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream.set_nodelay(true).ok();
+    let mut rbuf = vec![0u8; 16384];
+    let mut acc: Vec<u8> = Vec::new();
+    let mut out = Vec::with_capacity(k);
+    let htu = format!("{BASE_URL}{path}");
+    for _ in 0..k {
+        // Fresh token + proof per request — the proof `jti` is unique, so replay never rejects.
+        let access = mint_access_token(issuer_key, &client_key.thumbprint);
+        let proof = mint_dpop_proof(client_key, method, &htu, &access);
+        let extra = extra_header.map(|h| format!("{h}\r\n")).unwrap_or_default();
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: pod.example\r\nAuthorization: DPoP {access}\r\nDPoP: {proof}\r\n{extra}\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        out.push(read_one_response(&mut stream, &mut rbuf, &mut acc).await);
+    }
+    drop(stream);
+    out
+}
+
 const PUB_DOC: &str =
     "<https://pod.example/pub#it> <http://xmlns.com/foaf/0.1/name> \"Public\" .\n";
 
@@ -305,7 +347,7 @@ async fn seed_public_doc(store: &MemStore) {
 async fn real_public_get_is_single_vectored_write() {
     let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
     seed_public_doc(&store).await;
-    let (addr, c, handle) = serve(build_real_router(store)).await;
+    let (addr, c, handle) = serve(build_real_router(store, &KeyKit::generate())).await;
 
     let k = 16;
     let responses = drive(addr, b"GET /pub HTTP/1.1\r\nHost: pod.example\r\n\r\n", k).await;
@@ -335,7 +377,7 @@ async fn real_public_get_is_single_vectored_write() {
 async fn real_range_206_is_single_vectored_write() {
     let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
     seed_public_doc(&store).await;
-    let (addr, c, handle) = serve(build_real_router(store)).await;
+    let (addr, c, handle) = serve(build_real_router(store, &KeyKit::generate())).await;
 
     let k = 16;
     let responses = drive(
@@ -419,7 +461,7 @@ async fn real_container_listing_is_single_vectored_write() {
     )
     .await;
 
-    let (addr, c, handle) = serve(build_real_router(store)).await;
+    let (addr, c, handle) = serve(build_real_router(store, &KeyKit::generate())).await;
     let k = 16;
     let responses = drive(addr, b"GET /list/ HTTP/1.1\r\nHost: pod.example\r\n\r\n", k).await;
     handle.abort();
@@ -460,5 +502,78 @@ async fn real_container_listing_is_single_vectored_write() {
     assert_eq!(
         writevs, k,
         "one writev per listing response (got {writevs} over {k})"
+    );
+}
+
+const PRIV_DOC: &str =
+    "<https://pod.example/priv#it> <http://xmlns.com/foaf/0.1/name> \"Private\" .\n";
+
+/// The P0.1 `authed-doc` class: a CREDENTIALED owner GET of a PRIVATE resource. Because an
+/// `Authorization` header is present, the public-read skip does NOT fire — the request traverses the
+/// FULL auth middleware (DPoP-bound token verify) → WAC (owner Read) → LDP handler → `serve_read`.
+/// This is the coverage the anonymous cases (which short-circuit at the public-read skip) cannot give.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_authenticated_get_is_single_vectored_write() {
+    let issuer_key = KeyKit::generate();
+    let client_key = KeyKit::generate();
+    let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+    // Private-by-default root owned by WEBID (no public default).
+    seed_acl(
+        &store,
+        "https://pod.example/.acl",
+        &format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#owner> a acl:Authorization; acl:agent <{WEBID}>;
+  acl:accessTo <https://pod.example/>; acl:default <https://pod.example/>;
+  acl:mode acl:Read, acl:Write, acl:Control."#
+        ),
+    )
+    .await;
+    // A PRIVATE document — owner-only, NO public grant. Anonymous would 401; only the authed owner
+    // reads it, so the full crypto verify runs.
+    store
+        .write(
+            "https://pod.example/priv",
+            axum::body::Bytes::from(PRIV_DOC),
+            "text/turtle",
+        )
+        .await
+        .unwrap();
+    seed_acl(
+        &store,
+        "https://pod.example/priv.acl",
+        &format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#owner> a acl:Authorization; acl:agent <{WEBID}>; acl:accessTo <https://pod.example/priv>; acl:mode acl:Read, acl:Write, acl:Control."#
+        ),
+    )
+    .await;
+
+    let (addr, c, handle) = serve(build_real_router(store, &issuer_key)).await;
+    let k = 16;
+    let responses =
+        drive_authenticated(addr, "GET", "/priv", None, &issuer_key, &client_key, k).await;
+    handle.abort();
+
+    for (status, body) in &responses {
+        assert_eq!(
+            *status, 200,
+            "authenticated owner GET of a private doc must be 200 (full auth→WAC→handler)"
+        );
+        assert_eq!(
+            body.as_slice(),
+            PRIV_DOC.as_bytes(),
+            "authed body must be byte-identical"
+        );
+    }
+    let writes = c.writes.load(Ordering::SeqCst);
+    let writevs = c.writevs.load(Ordering::SeqCst);
+    assert_eq!(
+        writes, 0,
+        "no plain write() on the authed read path (got {writes})"
+    );
+    assert_eq!(
+        writevs, k,
+        "one writev per authed response (got {writevs} over {k})"
     );
 }
