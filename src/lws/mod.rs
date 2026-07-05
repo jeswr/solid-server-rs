@@ -78,16 +78,40 @@
 //! MUST-accept baseline; a deployment MAY designate the realm PoP-required
 //! ([`auth::ENV_LWS_REQUIRE_POP`]).
 //!
-//! ## M3 (deferred, seams noted)
-//! RFC 9264 linkset metadata, notifications bindings (SSE + WebSocket under the WD subscription
-//! API), pagination, `size` in listings (needs a `ResourceMeta` field), the
-//! `SparqlQueryService`/AC-SPARQL companion, container `application/json`-vs-`text/turtle`
-//! preference refinement, DPoP-bound LWS-audience token validation for a PoP-required realm, and
-//! RFC 9396 `authorization_details` narrowing (ignoring it today grants exactly the WAC
-//! baseline — the claim may only narrow, never widen).
+//! ## What M3 ships (the read-substrate completion — `decisions/0006`)
+//! - **RFC 9264 linkset metadata** ([`linkset`]; spec §metadata/§metadata-updates): every
+//!   resource's typed-link metadata as a standalone `application/linkset+json` resource at
+//!   `<resource>?linkset` — system-managed `up`/`type`/`acl`/storage-description links +
+//!   user-managed relations, updated ONLY via `application/merge-patch+json` under the strict
+//!   `If-Match`/428 discipline (412 on stale, 409 on any system-managed modification, CAS-backed
+//!   lost-update protection, ETag rotation), discovered via `Link rel="linkset"` on every GET/HEAD
+//!   and on 201 creates (+`rel="up"`). The user half persists as reserved triples in the
+//!   resource's OWN graph, so DELETE drops resource+linkset atomically.
+//! - **Paginated container listings + member `size`** ([`container`]; spec §pagination): a
+//!   listing whose VISIBLE membership exceeds [`LwsConfig::page_size`] is paged with the RFC 8288
+//!   `first`/`next`/`prev`/`last` links (`?lws-page=N`), deterministic lexicographic order, page
+//!   arithmetic strictly over the D12-filtered visible view; `items[]` members now carry the
+//!   SHOULD-level `size` (the `ResourceMeta::size` byte length stamped at write time). Each
+//!   response is a single-query snapshot; cross-request snapshot consistency is gated on
+//!   `sparq#1572` (documented in [`container`]).
+//! - **RFC 9396 `authorization_details` — narrowing-only** ([`rar`]; spec §rar): the LWS `at+jwt`
+//!   claim is enforced at the same single verify-chokepoint as the audience containment, as a
+//!   pure DENY-gate — effective access = WAC ∩ aud ∩ narrowing, so it can only ever reduce (a
+//!   widening attempt changes nothing: WAC remains the ceiling). Intelligible-but-uncovered ⇒
+//!   403 `insufficient_scope`; unintelligible ⇒ 401 fail-closed.
+//!
+//! ## M4 (deferred, seams noted)
+//! Notification bindings (SSE + WebSocket under the WD subscription API), DPoP-bound
+//! LWS-audience token validation for a PoP-required realm (§presentation-pop end-to-end), the
+//! `SparqlQueryService`/AC-SPARQL companion (a gated increment on `sparq#992`), multi-request
+//! pagination snapshot-consistency (`sparq#1572`), operation-precise narrowing for
+//! PUT-create/append-only-PATCH (today conservatively under-granted — [`rar`]), and the
+//! container `application/json`-vs-`text/turtle` preference refinement.
 
 pub mod auth;
 pub mod container;
+pub mod linkset;
+pub mod rar;
 pub mod transform;
 
 use axum::extract::State;
@@ -135,6 +159,34 @@ pub const PROBLEM_CONTAINER_BODY: &str = "https://w3id.org/jeswr/lws/problems/co
 /// rdf-transform §authoritative-bytes: a write in an advertised-target-but-not-source media type
 /// over an RDF-readable resource would strand it — 415 with the accepted types named.
 pub const PROBLEM_NOT_A_SOURCE: &str = "https://w3id.org/jeswr/lws/problems/not-a-source-type";
+/// Linkset (M3, §metadata-updates): a linkset PUT/PATCH without `If-Match` is a 428.
+pub const PROBLEM_METADATA_PRECONDITION: &str =
+    "https://w3id.org/jeswr/lws/problems/metadata-precondition-required";
+/// Linkset (M3, §metadata-updates — the spec-named registry entry): an attempt to modify a
+/// system-managed link is rejected.
+pub const PROBLEM_SYSTEM_MANAGED: &str =
+    "https://w3id.org/jeswr/lws/problems/system-managed-metadata";
+/// Linkset (M3): a merge-patch producing an invalid linkset document / user relation — 400/422.
+pub const PROBLEM_INVALID_LINKSET_PATCH: &str =
+    "https://w3id.org/jeswr/lws/problems/invalid-linkset-patch";
+/// Linkset (M3): a PATCH in any format other than `application/merge-patch+json` — 415.
+pub const PROBLEM_UNSUPPORTED_PATCH_TYPE: &str =
+    "https://w3id.org/jeswr/lws/problems/unsupported-patch-type";
+/// Linkset (M3): an `Accept` that cannot take `application/linkset+json` — 406.
+pub const PROBLEM_LINKSET_NOT_ACCEPTABLE: &str =
+    "https://w3id.org/jeswr/lws/problems/not-acceptable";
+/// Linkset (M3): a stale `If-Match` (or a lost update CAS) — 412.
+pub const PROBLEM_LINKSET_PRECONDITION_FAILED: &str =
+    "https://w3id.org/jeswr/lws/problems/precondition-failed";
+/// Linkset (M3): the user-managed relations exceed the server's size bound — 413.
+pub const PROBLEM_LINKSET_TOO_LARGE: &str = "https://w3id.org/jeswr/lws/problems/linkset-too-large";
+/// LWS-surface 404 with problem details (the linkset of a missing resource).
+pub const PROBLEM_NOT_FOUND: &str = "https://w3id.org/jeswr/lws/problems/not-found";
+/// Linkset (M3): a write verb on a linkset URI (its lifecycle is its resource's) — 405.
+pub const PROBLEM_LINKSET_METHOD: &str = "https://w3id.org/jeswr/lws/problems/method-not-allowed";
+/// Pagination (M3, §pagination): an unusable `lws-page` value — 400 (page URIs are opaque; only
+/// the server's own emitted links are meaningful).
+pub const PROBLEM_INVALID_PAGE: &str = "https://w3id.org/jeswr/lws/problems/invalid-page";
 
 /// Env flag that enables the LWS surface (`1`/`true`).
 pub const ENV_LWS: &str = "SOLID_SERVER_LWS";
@@ -145,6 +197,12 @@ pub const ENV_LWS_RDF_TRANSFORM: &str = "SOLID_SERVER_LWS_RDF_TRANSFORM";
 /// Env flag for the STRICT D2/D3 PUT semantics (pure-LWS deployments only — changes Solid PUT
 /// behaviour, see the module doc). Default **off**.
 pub const ENV_LWS_STRICT_PUT: &str = "SOLID_SERVER_LWS_STRICT_PUT";
+/// Env knob for the LWS container-listing PAGE SIZE (M3, spec §pagination — the "server-determined
+/// threshold"): a membership larger than this is paged. Default [`DEFAULT_LWS_PAGE_SIZE`]; `0`
+/// disables pagination (every listing single-page); unparseable values keep the default.
+pub const ENV_LWS_PAGE_SIZE: &str = "SOLID_SERVER_LWS_PAGE_SIZE";
+/// The default pagination threshold/page size (members per page).
+pub const DEFAULT_LWS_PAGE_SIZE: usize = 1000;
 
 /// The LWS surface configuration. Present on the [`LdpState`] ⇒ the surface is ON; absent (the
 /// default) ⇒ every LWS hook is dead code and the Solid surface is byte-identical to pre-LWS.
@@ -157,6 +215,11 @@ pub struct LwsConfig {
     /// The strict D2/D3 PUT semantics (every PUT conditional / no auto-intermediate containers /
     /// no container bodies). Off by default — see the module doc's composition note.
     pub strict_put: bool,
+    /// The container-listing page size (M3, spec §pagination): a listing whose VISIBLE membership
+    /// exceeds this is paged (`Link` rel first/next/prev/last; `items` = the current page;
+    /// `totalItems` = the whole visible membership). `None` ⇒ pagination off (every listing
+    /// single-page). Default `Some(`[`DEFAULT_LWS_PAGE_SIZE`]`)`.
+    pub page_size: Option<std::num::NonZeroUsize>,
     /// The precomputed storage-description document bytes (request-invariant per boot).
     description_body: Bytes,
     /// The precomputed `Link: <…/.well-known/lws>; rel="…#storageDescription"` header value
@@ -177,13 +240,22 @@ impl LwsConfig {
         Self {
             rdf_transform,
             strict_put,
+            page_size: std::num::NonZeroUsize::new(DEFAULT_LWS_PAGE_SIZE),
             description_body,
             storage_description_link,
         }
     }
 
+    /// Override the container-listing page size (M3): `None` disables pagination. Builder-style so
+    /// every existing `new` caller keeps the default.
+    pub fn with_page_size(mut self, page_size: Option<std::num::NonZeroUsize>) -> Self {
+        self.page_size = page_size;
+        self
+    }
+
     /// Read the LWS configuration from the environment: `None` (surface off — the default) unless
-    /// [`ENV_LWS`] is truthy; the transform defaults ON and strictness OFF per the constants' docs.
+    /// [`ENV_LWS`] is truthy; the transform defaults ON and strictness OFF per the constants' docs;
+    /// the page size per [`ENV_LWS_PAGE_SIZE`] (`0` = off, unset/unparseable = the default).
     pub fn from_env(base_url: &str) -> Option<Self> {
         if !env_truthy(ENV_LWS) {
             return None;
@@ -194,7 +266,14 @@ impl LwsConfig {
             Some(v) => is_truthy(&v),
         };
         let strict_put = env_truthy(ENV_LWS_STRICT_PUT);
-        Some(Self::new(base_url, rdf_transform, strict_put))
+        let page_size = match std::env::var(ENV_LWS_PAGE_SIZE)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            Some(n) => std::num::NonZeroUsize::new(n), // 0 ⇒ None ⇒ pagination off
+            None => std::num::NonZeroUsize::new(DEFAULT_LWS_PAGE_SIZE),
+        };
+        Some(Self::new(base_url, rdf_transform, strict_put).with_page_size(page_size))
     }
 
     /// The precomputed storage-description bytes (identical for every conneg variant — the WD

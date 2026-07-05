@@ -362,11 +362,15 @@ impl SparqClient for HttpSparqClient {
         // `?mod` is OPTIONAL: absent ⇒ no recorded modification time; present-but-unparseable ⇒
         // `None` too (fail OPEN — never a spurious 304, per `timestamp::from_xsd_datetime`).
         let last_modified = row.get("mod").and_then(|m| timestamp::from_xsd_datetime(m));
+        // `?size` is likewise OPTIONAL (a pre-M3 record carries none): absent/unparseable ⇒ `None`
+        // (fail open — size is SHOULD-level descriptive metadata, never load-bearing).
+        let size = row.get("size").and_then(|s| s.parse::<u64>().ok());
         Ok(ResourceMeta {
             content_type,
             blob_key,
             etag,
             last_modified,
+            size,
         })
     }
 
@@ -378,6 +382,7 @@ impl SparqClient for HttpSparqClient {
             &meta.blob_key,
             &meta.etag,
             modified.as_deref(),
+            meta.size,
         )?;
         self.update_raw(&u)
             .await
@@ -473,6 +478,7 @@ impl SparqClient for HttpSparqClient {
             &meta.blob_key,
             &meta.etag,
             modified.as_deref(),
+            meta.size,
             &nonce,
         )?;
         self.update_raw(&u)
@@ -592,11 +598,14 @@ impl SparqClient for HttpSparqClient {
             // `?mod` is OPTIONAL: absent/unparseable ⇒ `None` (fail open — the ACL candidates only
             // need the etag anyway; the target's `last_modified` feeds `If-Modified-Since`).
             let last_modified = row.get("mod").and_then(|m| timestamp::from_xsd_datetime(m));
+            // `?size` is OPTIONAL too: absent/unparseable ⇒ `None` (descriptive only).
+            let size = row.get("size").and_then(|s| s.parse::<u64>().ok());
             let meta = ResourceMeta {
                 content_type: bind("ct")?,
                 blob_key: bind("bk")?,
                 etag: bind("etag")?,
                 last_modified,
+                size,
             };
             // First row per graph wins (a well-formed index holds exactly one record per graph —
             // `update_put_meta`/`update_create_child` keep the record single-valued; this mirrors
@@ -611,6 +620,54 @@ impl SparqClient for HttpSparqClient {
                 .map(|c| (c.clone(), by_graph.get(c).map(|m| m.etag.clone())))
                 .collect(),
         })
+    }
+
+    async fn get_linkset(&self, iri: &str) -> Result<Option<(String, String)>, SparqError> {
+        let q = sparql::select_linkset(iri)?;
+        let (body, _ct) = self
+            .query_raw(&q, ACCEPT_RESULTS_JSON)
+            .await
+            .map_err(SparqHttpError::into_sparq)?;
+        let result = parse_select_json(&body).map_err(SparqHttpError::into_sparq)?;
+        // No row ⇒ no user linkset stored (the linkset resource serves system links only).
+        let Some(row) = result.rows.into_iter().next() else {
+            return Ok(None);
+        };
+        // A row missing either binding is a malformed backend response (the pair is written
+        // atomically) — fail closed, never a half-linkset.
+        let json = row
+            .get("json")
+            .cloned()
+            .ok_or_else(|| SparqError::Backend("fatal: linkset row missing json".into()))?;
+        let rev = row
+            .get("rev")
+            .cloned()
+            .ok_or_else(|| SparqError::Backend("fatal: linkset row missing rev".into()))?;
+        Ok(Some((json, rev)))
+    }
+
+    async fn set_linkset(
+        &self,
+        iri: &str,
+        json: &str,
+        new_rev: &str,
+        expected: sparql::LinksetCas<'_>,
+    ) -> Result<bool, SparqError> {
+        // ONE guarded atomic modify (record-EXISTS + the CAS guard in the WHERE — see
+        // `sparql::update_set_linkset`), then a race-resistant confirm: `new_rev` is
+        // operation-unique, so ASKing for it proves whether THIS operation's write landed — the
+        // same confirm discipline as the create/delete markers (an UPDATE over the SPARQL protocol
+        // cannot report whether its guard matched).
+        let u = sparql::update_set_linkset(iri, json, new_rev, expected)?;
+        self.update_raw(&u)
+            .await
+            .map_err(SparqHttpError::into_sparq)?;
+        let q = sparql::ask_linkset_rev(iri, new_rev)?;
+        let (body, _ct) = self
+            .query_raw(&q, ACCEPT_RESULTS_JSON)
+            .await
+            .map_err(SparqHttpError::into_sparq)?;
+        parse_ask_json(&body).map_err(SparqHttpError::into_sparq)
     }
 }
 

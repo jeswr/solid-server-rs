@@ -50,7 +50,7 @@ pub use reconcile::{
 pub use sparq::{
     DeleteOutcome, InMemorySparqClient, ReadPlan, ResourceMeta, SparqClient, SparqError,
 };
-pub use sparql::{BodyObject, BuildError};
+pub use sparql::{BodyObject, BuildError, LinksetCas};
 
 use crate::error::{ServerError, ServerResult};
 
@@ -228,6 +228,31 @@ pub trait Store: Send + Sync {
         let _ = meta;
         Ok(self.read(iri).await?.body)
     }
+
+    /// The USER-MANAGED half of a resource's RFC 9264 linkset (M3, LWS — `crate::lws::linkset`):
+    /// `Some((json, rev))` when stored, `None` otherwise. The DEFAULT reports none, so a store
+    /// double that never exercises the linkset path serves system links only (correct + inert).
+    async fn get_linkset(&self, iri: &str) -> ServerResult<Option<(String, String)>> {
+        let _ = iri;
+        Ok(None)
+    }
+
+    /// Compare-and-swap the USER-MANAGED linkset (M3, LWS): apply `(json, new_rev)` iff the
+    /// resource exists AND `expected` still holds; `Ok(false)` = the CAS lost (⇒ the handler's
+    /// 412). The DEFAULT FAILS CLOSED with a storage error — a store without linkset persistence
+    /// must never pretend an update succeeded.
+    async fn set_linkset(
+        &self,
+        iri: &str,
+        json: &str,
+        new_rev: &str,
+        expected: sparql::LinksetCas<'_>,
+    ) -> ServerResult<bool> {
+        let _ = (iri, json, new_rev, expected);
+        Err(ServerError::Storage(
+            "linkset persistence is not supported by this store".into(),
+        ))
+    }
 }
 
 /// The default [`Store`]: SPARQ (authoritative metadata) + a blob store (backup bytes), with a
@@ -399,6 +424,9 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
         // key) — the write errors instead, so the no-two-writes-share-a-key invariant holds even then.
         let blob_key = Self::mint_blob_key(iri)?;
         let etag = Self::etag_for(&body);
+        // Measure the ACTUAL bytes being stored (before `put` takes the body) — the `pss:size`
+        // record the LWS listing's SHOULD-level `size` member reads (M3).
+        let size = body.len() as u64;
         self.blob
             .put(&blob_key, body)
             .await
@@ -410,6 +438,7 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
             // Stamp the write instant so `If-Modified-Since` sees a real Last-Modified: a re-write
             // bumps it, so a later conditional GET correctly re-serves the changed representation.
             last_modified: Some(SystemTime::now()),
+            size: Some(size),
         };
         self.sparq
             .put_meta(iri, meta.clone())
@@ -439,6 +468,8 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
         // key), so the no-shared-key invariant holds even then.
         let blob_key = Self::mint_blob_key(child)?;
         let etag = Self::etag_for(&body);
+        // Measure the actual stored bytes (before `put` takes the body) — see `write`.
+        let size = body.len() as u64;
         self.blob
             .put(&blob_key, body)
             .await
@@ -450,6 +481,7 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
             // Stamp the create instant (see `write`) — the new child's Last-Modified for
             // `If-Modified-Since`.
             last_modified: Some(SystemTime::now()),
+            size: Some(size),
         };
         match self
             .sparq
@@ -547,6 +579,28 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
         // it is part of the trait signature so the default (re-read) impl can exist for doubles.
         let _ = iri;
         self.fetch_body(meta).await
+    }
+
+    async fn get_linkset(&self, iri: &str) -> ServerResult<Option<(String, String)>> {
+        // Delegate to the SparqClient seam (M3 — the user-managed linkset lives as reserved
+        // triples in the resource's own graph, so DELETE drops it atomically with the resource).
+        self.sparq
+            .get_linkset(iri)
+            .await
+            .map_err(|e| ServerError::Storage(format!("{e}")))
+    }
+
+    async fn set_linkset(
+        &self,
+        iri: &str,
+        json: &str,
+        new_rev: &str,
+        expected: sparql::LinksetCas<'_>,
+    ) -> ServerResult<bool> {
+        self.sparq
+            .set_linkset(iri, json, new_rev, expected)
+            .await
+            .map_err(|e| ServerError::Storage(format!("{e}")))
     }
 
     async fn list_children(&self, container: &str) -> ServerResult<Vec<ValidatedChildIri>> {

@@ -127,12 +127,27 @@ pinned by tests). With `SOLID_SERVER_LWS=1` the server additionally serves:
   only, `SOLID_SERVER_LWS_STRICT_PUT=1` enforces the strict D2/D3 rules (every PUT conditional ⇒
   428; no auto-created intermediate containers ⇒ 409 `missing-parent`; no container bodies),
   which deliberately replace the Solid PUT semantics and are therefore NOT part of the composed
-  default.
+  default;
+- the **LWS auth chain** (M2): RFC 9728 `resource_metadata` + `realm` challenges on every 401,
+  and RFC 9068 `at+jwt` **Bearer** validation for tokens minted by the RFC 8693 exchange at a
+  trusted authorization server — trusted-issuer allowlist, single-valued audience with
+  segment-boundary containment, ≤300 s lifetimes, bare-`cnf` refusal; the verified `sub` becomes
+  the WAC agent (WAC unchanged). `SOLID_SERVER_LWS_REQUIRE_POP=1` designates the realm
+  PoP-required (closes Bearer);
+- **RFC 9264 linkset metadata** (M3): every resource's typed-link metadata at
+  `<resource>?linkset` (`application/linkset+json`; `Link rel="linkset"` discovery), with
+  user-managed relations updated via `application/merge-patch+json` under the strict
+  `If-Match`/428 discipline (409 on system-managed modification; CAS-backed, ETag-rotating);
+- **paginated container listings + member `size`** (M3): listings over
+  `SOLID_SERVER_LWS_PAGE_SIZE` (default 1000; `0` off) page with RFC 8288
+  `first`/`next`/`prev`/`last` links, deterministic order, visible-membership-only arithmetic;
+- **RFC 9396 `authorization_details` narrowing** (M3): enforced narrowing-ONLY at the token
+  verify chokepoint (effective access = WAC ∩ audience ∩ narrowing — it can only reduce; a
+  widening attempt changes nothing), 403 `insufficient_scope` / fail-closed 401.
 
-M2 seams (marked in `src/lws`): the LWS auth chain (RFC 9728 `resource_metadata` challenge +
-RFC 8693 token-exchange verify — the current DPoP path is reused meanwhile), RFC 9264 linkset
-metadata, the SSE/WebSocket notification bindings, pagination, and the
-`SparqlQueryService`/AC-SPARQL companion. See `decisions/0004-lws-surface-m1.md`.
+M4 seams (marked in `src/lws`): the SSE/WebSocket notification bindings, DPoP-bound
+LWS-audience tokens for PoP-required realms, and the `SparqlQueryService`/AC-SPARQL companion
+(gated on `sparq#992`). See `decisions/0004` / `0005` / `0006`.
 
 ## Build & run
 

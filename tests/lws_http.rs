@@ -139,6 +139,21 @@ impl Store for SharedStore {
     ) -> solid_server_rs::ServerResult<Bytes> {
         self.0.read_at(iri, meta).await
     }
+    async fn get_linkset(
+        &self,
+        iri: &str,
+    ) -> solid_server_rs::ServerResult<Option<(String, String)>> {
+        self.0.get_linkset(iri).await
+    }
+    async fn set_linkset(
+        &self,
+        iri: &str,
+        json: &str,
+        new_rev: &str,
+        expected: solid_server_rs::store::LinksetCas<'_>,
+    ) -> solid_server_rs::ServerResult<bool> {
+        self.0.set_linkset(iri, json, new_rev, expected).await
+    }
 }
 
 impl Harness {
@@ -187,7 +202,9 @@ impl Harness {
 
     fn auth_headers(&self, method: &str, path: &str) -> (String, String) {
         let access = mint_access_token(&self.issuer_key, &self.client_key.thumbprint);
-        let htu = format!("{BASE_URL}{path}");
+        // The DPoP htu excludes the query (RFC 9449 §4.3), matching the server's parse_target —
+        // so a `?linkset` / `?lws-page=N` request mints a valid proof.
+        let htu = format!("{BASE_URL}{}", path.split('?').next().unwrap_or(path));
         let proof = mint_dpop_proof(&self.client_key, method, &htu, &access);
         (format!("DPoP {access}"), proof)
     }
@@ -1128,4 +1145,816 @@ async fn transform_never_fetches_a_remote_jsonld_context() {
         Ok((_, peer)) => panic!("the server fetched the remote @context (connection from {peer})"),
         Err(e) => panic!("canary listener failed: {e}"),
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// M3 §1 — RFC 9264 linkset metadata (`?linkset` + merge-patch + strict If-Match/428)
+// ---------------------------------------------------------------------------------------------
+
+/// A paged harness: LWS on, transform on, non-strict, PAGE SIZE 2 (so small fixtures paginate).
+impl Harness {
+    async fn lws_paged(page_size: usize) -> Self {
+        Self::with_lws(Some(
+            LwsConfig::new(BASE_URL, true, false)
+                .with_page_size(std::num::NonZeroUsize::new(page_size)),
+        ))
+        .await
+    }
+}
+
+#[tokio::test]
+async fn linkset_serves_the_system_links_and_discovery() {
+    let h = Harness::lws().await;
+    let put = h
+        .request(
+            "PUT",
+            "/alice/notes/a.ttl",
+            Some("text/turtle"),
+            Body::from(TURTLE),
+        )
+        .await;
+    assert_eq!(put.status(), StatusCode::CREATED);
+    // The 201 carries the spec-required create links (§http-create).
+    let links = link_values(&put);
+    assert!(
+        links
+            .iter()
+            .any(|l| l.contains("?linkset>; rel=\"linkset\"")),
+        "201 linkset link: {links:?}"
+    );
+    assert!(
+        links
+            .iter()
+            .any(|l| l == "<https://pod.example/alice/notes/>; rel=\"up\""),
+        "201 up link: {links:?}"
+    );
+
+    // The resource GET advertises its linkset (§metadata).
+    let get = h
+        .request("GET", "/alice/notes/a.ttl", None, Body::empty())
+        .await;
+    assert_eq!(get.status(), StatusCode::OK);
+    assert!(link_values(&get)
+        .iter()
+        .any(|l| l == "<https://pod.example/alice/notes/a.ttl?linkset>; rel=\"linkset\""));
+
+    // GET the linkset itself: RFC 9264 JSON, one context anchored at the resource, the
+    // system-managed typed relations, an ETag + Accept-Patch/Allow advertisement.
+    let ls = h
+        .request("GET", "/alice/notes/a.ttl?linkset", None, Body::empty())
+        .await;
+    assert_eq!(ls.status(), StatusCode::OK);
+    assert_eq!(
+        header_value(&ls, "content-type").unwrap(),
+        "application/linkset+json"
+    );
+    assert_eq!(
+        header_value(&ls, "accept-patch").unwrap(),
+        "application/merge-patch+json"
+    );
+    assert_eq!(
+        header_value(&ls, "allow").unwrap(),
+        "GET, HEAD, PATCH, OPTIONS"
+    );
+    let etag = header_value(&ls, "etag").unwrap().to_string();
+    assert!(
+        etag.starts_with("\"ls0-"),
+        "unpatched etag derives from the record: {etag}"
+    );
+    let doc = body_json(ls).await;
+    let ctx = &doc["linkset"][0];
+    assert_eq!(ctx["anchor"], "https://pod.example/alice/notes/a.ttl");
+    assert_eq!(ctx["up"][0]["href"], "https://pod.example/alice/notes/");
+    assert_eq!(
+        ctx["type"][0]["href"],
+        "https://w3id.org/jeswr/lws#DataResource"
+    );
+    assert_eq!(
+        ctx["acl"][0]["href"],
+        "https://pod.example/alice/notes/a.ttl.acl"
+    );
+    assert_eq!(
+        ctx["https://w3id.org/jeswr/lws#storageDescription"][0]["href"],
+        "https://pod.example/.well-known/lws"
+    );
+
+    // Conditional GET: If-None-Match on the linkset's own validator ⇒ 304.
+    let not_modified = h
+        .request_with(
+            "GET",
+            "/alice/notes/a.ttl?linkset",
+            None,
+            &[("if-none-match", &etag)],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+
+    // HEAD mirrors GET's headers without a body.
+    let head = h
+        .request("HEAD", "/alice/notes/a.ttl?linkset", None, Body::empty())
+        .await;
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(header_value(&head, "etag").unwrap(), etag);
+    assert!(body_bytes(head).await.is_empty());
+
+    // A linkset of a MISSING resource is a 404 problem (post-authorization).
+    let missing = h
+        .request("GET", "/alice/notes/nope.ttl?linkset", None, Body::empty())
+        .await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        header_value(&missing, "content-type").unwrap(),
+        "application/problem+json"
+    );
+
+    // An Accept that cannot take linkset+json is a 406 problem.
+    let na = h
+        .request_with(
+            "GET",
+            "/alice/notes/a.ttl?linkset",
+            None,
+            &[("accept", "text/turtle")],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(na.status(), StatusCode::NOT_ACCEPTABLE);
+}
+
+#[tokio::test]
+async fn linkset_merge_patch_full_flow() {
+    let h = Harness::lws().await;
+    h.request(
+        "PUT",
+        "/alice/doc.ttl",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
+    let ls = h
+        .request("GET", "/alice/doc.ttl?linkset", None, Body::empty())
+        .await;
+    let etag0 = header_value(&ls, "etag").unwrap().to_string();
+
+    // (1) No If-Match ⇒ 428 with the metadata-precondition problem (spec MUST).
+    let no_precond = h
+        .request(
+            "PATCH",
+            "/alice/doc.ttl?linkset",
+            Some("application/merge-patch+json"),
+            Body::from(
+                r#"{"linkset":[{"describedby":[{"href":"https://pod.example/alice/meta"}]}]}"#,
+            ),
+        )
+        .await;
+    assert_eq!(no_precond.status(), StatusCode::PRECONDITION_REQUIRED);
+    let problem = String::from_utf8(body_bytes(no_precond).await.to_vec()).unwrap();
+    assert!(
+        problem.contains("metadata-precondition-required"),
+        "{problem}"
+    );
+
+    // (2) A non-merge-patch content type ⇒ 415 + Accept-Patch.
+    let wrong_ct = h
+        .request_with(
+            "PATCH",
+            "/alice/doc.ttl?linkset",
+            Some("text/n3"),
+            &[("if-match", &etag0)],
+            Body::from("{}"),
+        )
+        .await;
+    assert_eq!(wrong_ct.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(
+        header_value(&wrong_ct, "accept-patch").unwrap(),
+        "application/merge-patch+json"
+    );
+
+    // (3) A stale If-Match ⇒ 412.
+    let stale = h
+        .request_with(
+            "PATCH",
+            "/alice/doc.ttl?linkset",
+            Some("application/merge-patch+json"),
+            &[("if-match", "\"ls0-not-the-current-one\"")],
+            Body::from("{}"),
+        )
+        .await;
+    assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+
+    // (4) The real update: add a describedby + a custom absolute-URI relation. RFC 7386 array
+    // semantics replace the whole context object, so the client echoes the system links
+    // UNCHANGED (a no-op on them — allowed).
+    let current = body_json(
+        h.request("GET", "/alice/doc.ttl?linkset", None, Body::empty())
+            .await,
+    )
+    .await;
+    let mut ctx = current["linkset"][0].clone();
+    ctx["describedby"] =
+        serde_json::json!([{ "href": "https://pod.example/alice/meta", "type": "text/turtle" }]);
+    ctx["https://example.org/rel/source"] =
+        serde_json::json!([{ "href": "https://upstream.example/orig" }]);
+    let patch_doc = serde_json::json!({ "linkset": [ctx] });
+    let ok = h
+        .request_with(
+            "PATCH",
+            "/alice/doc.ttl?linkset",
+            Some("application/merge-patch+json"),
+            &[("if-match", &etag0)],
+            Body::from(patch_doc.to_string()),
+        )
+        .await;
+    assert_eq!(ok.status(), StatusCode::NO_CONTENT);
+    let etag1 = header_value(&ok, "etag").unwrap().to_string();
+    assert_ne!(etag1, etag0, "a successful update MUST rotate the ETag");
+    assert!(etag1.starts_with("\"ls-"));
+
+    // The update is visible on GET, beside the untouched system links.
+    let after = h
+        .request("GET", "/alice/doc.ttl?linkset", None, Body::empty())
+        .await;
+    assert_eq!(header_value(&after, "etag").unwrap(), etag1);
+    let doc = body_json(after).await;
+    let ctx = &doc["linkset"][0];
+    assert_eq!(
+        ctx["describedby"][0]["href"],
+        "https://pod.example/alice/meta"
+    );
+    assert_eq!(
+        ctx["https://example.org/rel/source"][0]["href"],
+        "https://upstream.example/orig"
+    );
+    assert_eq!(ctx["up"][0]["href"], "https://pod.example/alice/");
+
+    // (5) The OLD etag no longer matches (lost-update protection) — a concurrent-writer replay
+    // is a 412.
+    let replay = h
+        .request_with(
+            "PATCH",
+            "/alice/doc.ttl?linkset",
+            Some("application/merge-patch+json"),
+            &[("if-match", &etag0)],
+            Body::from("{}"),
+        )
+        .await;
+    assert_eq!(replay.status(), StatusCode::PRECONDITION_FAILED);
+
+    // (6) Removal semantics. RFC 7386 nulls remove members only during OBJECT merging — but the
+    // `linkset` member is an ARRAY, replaced wholesale, so a null inside the echoed context object
+    // survives as a LITERAL null value ⇒ the strict validation rejects it (422). This pins the
+    // array-replacement footgun the module docs call out…
+    let nulls = h
+        .request_with(
+            "PATCH",
+            "/alice/doc.ttl?linkset",
+            Some("application/merge-patch+json"),
+            &[("if-match", &etag1)],
+            Body::from(
+                r#"{"linkset":[{"describedby":null,"https://example.org/rel/source":null}]}"#,
+            ),
+        )
+        .await;
+    assert_eq!(nulls.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // …the correct removal echoes the full context object WITHOUT the user members.
+    let current = body_json(
+        h.request("GET", "/alice/doc.ttl?linkset", None, Body::empty())
+            .await,
+    )
+    .await;
+    let mut ctx = current["linkset"][0].clone();
+    ctx.as_object_mut().unwrap().remove("describedby");
+    ctx.as_object_mut()
+        .unwrap()
+        .remove("https://example.org/rel/source");
+    let ok = h
+        .request_with(
+            "PATCH",
+            "/alice/doc.ttl?linkset",
+            Some("application/merge-patch+json"),
+            &[("if-match", &etag1)],
+            Body::from(serde_json::json!({ "linkset": [ctx] }).to_string()),
+        )
+        .await;
+    assert_eq!(ok.status(), StatusCode::NO_CONTENT);
+    let doc = body_json(
+        h.request("GET", "/alice/doc.ttl?linkset", None, Body::empty())
+            .await,
+    )
+    .await;
+    assert!(doc["linkset"][0].get("describedby").is_none());
+}
+
+#[tokio::test]
+async fn linkset_rejects_system_managed_modifications_and_write_verbs() {
+    let h = Harness::lws().await;
+    h.request(
+        "PUT",
+        "/alice/doc.ttl",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
+    let ls = h
+        .request("GET", "/alice/doc.ttl?linkset", None, Body::empty())
+        .await;
+    let etag = header_value(&ls, "etag").unwrap().to_string();
+    let current = body_json(ls).await;
+
+    // Retargeting `up` (a move attempt — the MoveResource capability is not offered) ⇒ 409 with
+    // the spec-named system-managed-metadata problem.
+    let mut ctx = current["linkset"][0].clone();
+    ctx["up"] = serde_json::json!([{ "href": "https://pod.example/elsewhere/" }]);
+    let resp = h
+        .request_with(
+            "PATCH",
+            "/alice/doc.ttl?linkset",
+            Some("application/merge-patch+json"),
+            &[("if-match", &etag)],
+            Body::from(serde_json::json!({ "linkset": [ctx] }).to_string()),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let problem = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+    assert!(problem.contains("system-managed-metadata"), "{problem}");
+    // …and nothing changed.
+    let after = h
+        .request("GET", "/alice/doc.ttl?linkset", None, Body::empty())
+        .await;
+    assert_eq!(header_value(&after, "etag").unwrap(), etag);
+
+    // A relative/invalid href in a user relation ⇒ 422 (fail-closed validation).
+    let mut ctx = current["linkset"][0].clone();
+    ctx["describedby"] = serde_json::json!([{ "href": "/relative" }]);
+    let resp = h
+        .request_with(
+            "PATCH",
+            "/alice/doc.ttl?linkset",
+            Some("application/merge-patch+json"),
+            &[("if-match", &etag)],
+            Body::from(serde_json::json!({ "linkset": [ctx] }).to_string()),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Unparseable JSON ⇒ 400.
+    let resp = h
+        .request_with(
+            "PATCH",
+            "/alice/doc.ttl?linkset",
+            Some("application/merge-patch+json"),
+            &[("if-match", &etag)],
+            Body::from("{not json"),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // PUT/POST/DELETE on a linkset URI: 405 + Allow (the linkset's lifecycle is its resource's).
+    for method in ["PUT", "POST", "DELETE"] {
+        let resp = h
+            .request(
+                method,
+                "/alice/doc.ttl?linkset",
+                Some("text/plain"),
+                Body::from("x"),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED, "{method}");
+        assert_eq!(
+            header_value(&resp, "allow").unwrap(),
+            "GET, HEAD, PATCH, OPTIONS",
+            "{method}"
+        );
+    }
+
+    // The resource itself is untouched by all of the above.
+    let get = h
+        .request("GET", "/alice/doc.ttl", None, Body::empty())
+        .await;
+    assert_eq!(get.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn linkset_survives_content_rewrite_and_dies_with_the_resource() {
+    let h = Harness::lws().await;
+    h.request(
+        "PUT",
+        "/alice/doc.ttl",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
+    // Attach a user link.
+    let ls = h
+        .request("GET", "/alice/doc.ttl?linkset", None, Body::empty())
+        .await;
+    let etag = header_value(&ls, "etag").unwrap().to_string();
+    let current = body_json(ls).await;
+    let mut ctx = current["linkset"][0].clone();
+    ctx["describedby"] = serde_json::json!([{ "href": "https://pod.example/alice/meta" }]);
+    let ok = h
+        .request_with(
+            "PATCH",
+            "/alice/doc.ttl?linkset",
+            Some("application/merge-patch+json"),
+            &[("if-match", &etag)],
+            Body::from(serde_json::json!({ "linkset": [ctx] }).to_string()),
+        )
+        .await;
+    assert_eq!(ok.status(), StatusCode::NO_CONTENT);
+
+    // A content RE-WRITE preserves the user-managed metadata (independent lifecycles until DELETE).
+    let rewrite = h
+        .request(
+            "PUT",
+            "/alice/doc.ttl",
+            Some("text/turtle"),
+            Body::from(TURTLE),
+        )
+        .await;
+    assert_eq!(rewrite.status(), StatusCode::NO_CONTENT);
+    let doc = body_json(
+        h.request("GET", "/alice/doc.ttl?linkset", None, Body::empty())
+            .await,
+    )
+    .await;
+    assert_eq!(
+        doc["linkset"][0]["describedby"][0]["href"],
+        "https://pod.example/alice/meta"
+    );
+
+    // DELETE removes resource + linkset together (§metadata: MUST).
+    let del = h
+        .request("DELETE", "/alice/doc.ttl", None, Body::empty())
+        .await;
+    assert_eq!(del.status(), StatusCode::NO_CONTENT);
+    let gone = h
+        .request("GET", "/alice/doc.ttl?linkset", None, Body::empty())
+        .await;
+    assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+    // A re-created resource starts with a FRESH (system-links-only) linkset.
+    h.request(
+        "PUT",
+        "/alice/doc.ttl",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
+    let doc = body_json(
+        h.request("GET", "/alice/doc.ttl?linkset", None, Body::empty())
+            .await,
+    )
+    .await;
+    assert!(
+        doc["linkset"][0].get("describedby").is_none(),
+        "no stale user links"
+    );
+}
+
+#[tokio::test]
+async fn linkset_is_read_gated_like_its_resource() {
+    let h = Harness::lws().await;
+    h.request(
+        "PUT",
+        "/alice/private.ttl",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
+    // Anonymous: the linkset of a private resource is a 401 (the same challenge as the resource),
+    // NOT a metadata leak.
+    let resp = h
+        .unauth_request("GET", "/alice/private.ttl?linkset", None)
+        .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // And of a MISSING resource: the same 401 (no existence oracle through metadata).
+    let resp = h
+        .unauth_request("GET", "/alice/nope.ttl?linkset", None)
+        .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------------------------
+// M3 §2 — paginated container listings + the member `size`
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn lws_listing_carries_size_and_stays_single_page_under_the_threshold() {
+    let h = Harness::lws().await; // default page size (1000) — these listings are single-page
+    h.request(
+        "PUT",
+        "/alice/notes/a.txt",
+        Some("text/plain"),
+        Body::from("four"),
+    )
+    .await;
+    let resp = h
+        .request_with(
+            "GET",
+            "/alice/notes/",
+            None,
+            &[("accept", LWS_JSON)],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    // No pagination links on a single-page listing.
+    assert!(
+        !link_values(&resp).iter().any(|l| l.contains("lws-page")),
+        "single-page listings carry no page links"
+    );
+    let doc = body_json(resp).await;
+    assert_eq!(doc["totalItems"], 1);
+    let item = &doc["items"][0];
+    assert_eq!(item["id"], "https://pod.example/alice/notes/a.txt");
+    assert_eq!(item["mediaType"], "text/plain");
+    assert_eq!(
+        item["size"], 4,
+        "the SHOULD-level byte length stamped at write time"
+    );
+}
+
+#[tokio::test]
+async fn lws_listing_paginates_deterministically_with_rfc8288_links() {
+    let h = Harness::lws_paged(2).await;
+    // Five members: pages of 2/2/1 in LEXICOGRAAPHIC order.
+    for name in ["e.txt", "c.txt", "a.txt", "d.txt", "b.txt"] {
+        let put = h
+            .request(
+                "PUT",
+                &format!("/alice/notes/{name}"),
+                Some("text/plain"),
+                Body::from("x"),
+            )
+            .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+    }
+    let ids_of = |doc: &serde_json::Value| -> Vec<String> {
+        doc["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // Page 1 (the bare container URI): first two members, first/next/last links, NO prev.
+    let p1 = h
+        .request_with(
+            "GET",
+            "/alice/notes/",
+            None,
+            &[("accept", LWS_JSON)],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(p1.status(), StatusCode::OK);
+    let links = link_values(&p1);
+    assert!(
+        links
+            .iter()
+            .any(|l| l == "<https://pod.example/alice/notes/?lws-page=1>; rel=\"first\""),
+        "{links:?}"
+    );
+    assert!(
+        links
+            .iter()
+            .any(|l| l == "<https://pod.example/alice/notes/?lws-page=2>; rel=\"next\""),
+        "{links:?}"
+    );
+    assert!(
+        links
+            .iter()
+            .any(|l| l == "<https://pod.example/alice/notes/?lws-page=3>; rel=\"last\""),
+        "{links:?}"
+    );
+    assert!(
+        !links.iter().any(|l| l.contains("rel=\"prev\"")),
+        "{links:?}"
+    );
+    let etag1 = header_value(&p1, "etag").unwrap().to_string();
+    let doc1 = body_json(p1).await;
+    // totalItems counts the WHOLE visible membership on every page; items is the page.
+    assert_eq!(doc1["totalItems"], 5);
+    assert_eq!(
+        ids_of(&doc1),
+        vec![
+            "https://pod.example/alice/notes/a.txt",
+            "https://pod.example/alice/notes/b.txt"
+        ]
+    );
+
+    // Page 2: prev+next+first+last; the middle slice.
+    let p2 = h
+        .request_with(
+            "GET",
+            "/alice/notes/?lws-page=2",
+            None,
+            &[("accept", LWS_JSON)],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(p2.status(), StatusCode::OK);
+    let links = link_values(&p2);
+    assert!(
+        links
+            .iter()
+            .any(|l| l.contains("lws-page=1>; rel=\"prev\"")),
+        "{links:?}"
+    );
+    assert!(
+        links
+            .iter()
+            .any(|l| l.contains("lws-page=3>; rel=\"next\"")),
+        "{links:?}"
+    );
+    let etag2 = header_value(&p2, "etag").unwrap().to_string();
+    assert_ne!(
+        etag1, etag2,
+        "each page is its own representation with its own validator"
+    );
+    let doc2 = body_json(p2).await;
+    assert_eq!(doc2["totalItems"], 5);
+    assert_eq!(
+        ids_of(&doc2),
+        vec![
+            "https://pod.example/alice/notes/c.txt",
+            "https://pod.example/alice/notes/d.txt"
+        ]
+    );
+
+    // Page 3 (last): next MUST be omitted; the final member.
+    let p3 = h
+        .request_with(
+            "GET",
+            "/alice/notes/?lws-page=3",
+            None,
+            &[("accept", LWS_JSON)],
+            Body::empty(),
+        )
+        .await;
+    let links = link_values(&p3);
+    assert!(
+        !links.iter().any(|l| l.contains("rel=\"next\"")),
+        "last page omits next: {links:?}"
+    );
+    assert!(links.iter().any(|l| l.contains("rel=\"first\"")));
+    let doc3 = body_json(p3).await;
+    assert_eq!(ids_of(&doc3), vec!["https://pod.example/alice/notes/e.txt"]);
+
+    // NO member skipped or duplicated across the walk (the determinism pin).
+    let mut walked = ids_of(&doc1);
+    walked.extend(ids_of(&doc2));
+    walked.extend(ids_of(&doc3));
+    let mut expect: Vec<String> = ["a", "b", "c", "d", "e"]
+        .iter()
+        .map(|n| format!("https://pod.example/alice/notes/{n}.txt"))
+        .collect();
+    expect.sort();
+    assert_eq!(
+        walked, expect,
+        "pages tile the membership exactly — no skip, no dup"
+    );
+
+    // A page past the end: an EMPTY page (opaque URIs may outlive shrinkage), never an error.
+    let past = h
+        .request_with(
+            "GET",
+            "/alice/notes/?lws-page=9",
+            None,
+            &[("accept", LWS_JSON)],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(past.status(), StatusCode::OK);
+    let doc = body_json(past).await;
+    assert_eq!(doc["items"].as_array().unwrap().len(), 0);
+    assert_eq!(doc["totalItems"], 5);
+
+    // An unusable page value: a 400 problem.
+    let bad = h
+        .request_with(
+            "GET",
+            "/alice/notes/?lws-page=zero",
+            None,
+            &[("accept", LWS_JSON)],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+    // The SOLID rendering of the same container is completely untouched by pagination: the
+    // Turtle listing still names every member, no page links.
+    let solid = h
+        .request_with(
+            "GET",
+            "/alice/notes/",
+            None,
+            &[("accept", "text/turtle")],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(solid.status(), StatusCode::OK);
+    assert!(!link_values(&solid).iter().any(|l| l.contains("lws-page")));
+    let ttl = String::from_utf8(body_bytes(solid).await.to_vec()).unwrap();
+    for n in ["a", "b", "c", "d", "e"] {
+        assert!(
+            ttl.contains(&format!("{n}.txt")),
+            "solid listing lists {n}.txt"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// M3 §flag-off — byte-invariance pins for every new query surface
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn flag_off_ignores_linkset_and_page_queries_byte_identically() {
+    let h = Harness::flag_off().await;
+    h.request(
+        "PUT",
+        "/alice/doc.ttl",
+        Some("text/turtle"),
+        Body::from(TURTLE),
+    )
+    .await;
+
+    // `?linkset` serves THE RESOURCE exactly as the bare URI does (queries were never inspected).
+    let bare = h
+        .request("GET", "/alice/doc.ttl", None, Body::empty())
+        .await;
+    let with_query = h
+        .request("GET", "/alice/doc.ttl?linkset", None, Body::empty())
+        .await;
+    assert_eq!(bare.status(), StatusCode::OK);
+    assert_eq!(with_query.status(), StatusCode::OK);
+    assert_eq!(
+        header_value(&with_query, "content-type"),
+        header_value(&bare, "content-type")
+    );
+    assert!(
+        !link_values(&with_query)
+            .iter()
+            .any(|l| l.contains("linkset")),
+        "no linkset link rides when the flag is off"
+    );
+    let (b1, b2) = (body_bytes(bare).await, body_bytes(with_query).await);
+    assert_eq!(
+        b1, b2,
+        "flag-off: ?linkset is byte-identical to the bare GET"
+    );
+
+    // Writes to `?linkset` URIs hit the RESOURCE path unchanged (a PUT replaces the doc).
+    let put = h
+        .request(
+            "PUT",
+            "/alice/doc.ttl?linkset",
+            Some("text/turtle"),
+            Body::from(TURTLE),
+        )
+        .await;
+    assert_eq!(
+        put.status(),
+        StatusCode::NO_CONTENT,
+        "flag-off PUT is the plain resource PUT"
+    );
+
+    // `?lws-page` on a container GET changes nothing.
+    let c1 = h
+        .request_with(
+            "GET",
+            "/alice/",
+            None,
+            &[("accept", "text/turtle")],
+            Body::empty(),
+        )
+        .await;
+    let c2 = h
+        .request_with(
+            "GET",
+            "/alice/?lws-page=2",
+            None,
+            &[("accept", "text/turtle")],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(c1.status(), StatusCode::OK);
+    assert_eq!(c2.status(), StatusCode::OK);
+    assert_eq!(body_bytes(c1).await, body_bytes(c2).await);
+
+    // And the 201 create response carries NO LWS links.
+    let put = h
+        .request(
+            "PUT",
+            "/alice/fresh.ttl",
+            Some("text/turtle"),
+            Body::from(TURTLE),
+        )
+        .await;
+    assert_eq!(put.status(), StatusCode::CREATED);
+    assert!(
+        link_values(&put).is_empty(),
+        "flag-off 201 carries no Link headers"
+    );
 }

@@ -135,9 +135,9 @@ dead, the pre-LWS auth path byte-identical — the M1 invariance rule extended t
   within-lifetime replay against the token's own storage as the residual risk PoP profiles close;
   `jti` is required present (RFC 9068) but not tracked. (DPoP proof `jti` replay on the Solid
   path is unchanged.)
-- **RFC 9396 `authorization_details` is ignored in M2** — safe by the spec's own rule: the claim
-  may only NARROW below the server's policy, never widen, so ignoring it grants exactly the WAC
-  baseline. Honouring the narrowing is an M3 seam.
+- **RFC 9396 `authorization_details` was ignored in M2** — safe by the spec's own rule: the claim
+  may only NARROW below the server's policy, never widen, so ignoring it granted exactly the WAC
+  baseline. M3 now honours the narrowing (fail-closed; `decisions/0006` Decision 3).
 - The valid-token/no-access split stays the existing engine's 403 (some access ⇒ 403; the
   0003 existence-non-disclosure closures are unchanged).
 
@@ -156,8 +156,10 @@ the M1-Low SSRF regression (`tests/lws_http.rs`): a stored hostile remote `@cont
 406 `unparseable-source` problem with a live canary listener proving no server-side fetch, and
 the LDP write path refuses the document outright.
 
-## M3 (deferred, seams noted)
+## M3 — SHIPPED (`decisions/0006-lws-read-substrate-m3.md`)
 
-RFC 9264 linksets, SSE/WebSocket notification bindings under the WD subscription API,
-pagination + `size`, the `SparqlQueryService`/AC-SPARQL companion (gated on `sparq#992`),
-DPoP-bound LWS-audience tokens for PoP-required realms, and RFC 9396 narrowing.
+RFC 9264 linksets, pagination + `size`, and RFC 9396 narrowing landed in M3 (the narrowing is
+enforced inside `verify_bearer`, beside the audience containment this ADR specifies — a pure
+deny-gate, so the M2 trust analysis above is unchanged). Still deferred (M4): SSE/WebSocket
+notification bindings under the WD subscription API, the `SparqlQueryService`/AC-SPARQL
+companion (gated on `sparq#992`), and DPoP-bound LWS-audience tokens for PoP-required realms.

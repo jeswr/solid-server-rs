@@ -35,6 +35,12 @@ pub struct ResourceMeta {
     /// [`super::Store::create_in_container`]) stamps it to the write instant, so a re-write bumps it
     /// and a subsequent `If-Modified-Since` correctly re-serves the changed representation.
     pub last_modified: Option<SystemTime>,
+    /// The stored byte length (the `pss:size` integer in the index), stamped at write time from the
+    /// body's actual length — like `last_modified`, purely descriptive metadata. `None` for a record
+    /// written before size was tracked; the consumer (the LWS container listing's SHOULD-level
+    /// `size` member, M3) simply omits it then. NEVER used for `Content-Length` (the read path
+    /// measures the actual bytes it serves) nor any security decision.
+    pub size: Option<u64>,
 }
 
 /// The result of ONE combined read-plan lookup ([`SparqClient::read_plan`]) — the whole per-read
@@ -214,6 +220,33 @@ pub trait SparqClient: Send + Sync {
             acls,
         })
     }
+
+    /// The USER-MANAGED half of a resource's RFC 9264 linkset (M3 — `crate::lws::linkset`):
+    /// `Some((json, rev))` when a user linkset is stored, `None` otherwise. The DEFAULT reports
+    /// none (test doubles that never exercise the linkset path stay correct: the linkset resource
+    /// then serves system links only).
+    async fn get_linkset(&self, iri: &str) -> Result<Option<(String, String)>, SparqError> {
+        let _ = iri;
+        Ok(None)
+    }
+
+    /// Compare-and-swap the USER-MANAGED linkset for `iri` (M3): apply `(json, new_rev)` iff the
+    /// resource's record exists AND the [`LinksetCas`] guard still holds. Returns `true` iff
+    /// applied (`false` = the CAS lost — the caller answers 412). The DEFAULT FAILS CLOSED with a
+    /// backend error: a store that has not implemented linkset persistence must never pretend an
+    /// update succeeded (a silent-drop would break the spec's ETag-rotation contract).
+    async fn set_linkset(
+        &self,
+        iri: &str,
+        json: &str,
+        new_rev: &str,
+        expected: crate::store::sparql::LinksetCas<'_>,
+    ) -> Result<bool, SparqError> {
+        let _ = (iri, json, new_rev, expected);
+        Err(SparqError::Backend(
+            "linkset persistence is not supported by this index".into(),
+        ))
+    }
 }
 
 /// An in-memory [`SparqClient`] for tests and the M1/M2 boot-without-SPARQ path.
@@ -232,6 +265,10 @@ struct Index {
     meta: HashMap<String, ResourceMeta>,
     /// container IRI → its direct children, kept in insertion order (a `Vec`, de-duplicated).
     children: HashMap<String, Vec<String>>,
+    /// resource IRI → its USER-MANAGED linkset `(json, rev)` (M3). Lives-and-dies with the
+    /// resource's record — mirroring the live path, where the linkset triples share the resource's
+    /// graph and `DROP GRAPH` removes both atomically.
+    linkset: HashMap<String, (String, String)>,
 }
 
 impl InMemorySparqClient {
@@ -280,6 +317,9 @@ impl SparqClient for InMemorySparqClient {
         // (empty-or-not) membership list. (The empty-container DELETE check has already run in the
         // handler, so any surviving entry would be a leak, not a live member.)
         guard.children.remove(iri);
+        // ...and its user linkset (same graph-drop parity — the spec's "deleting a resource MUST
+        // delete its linkset resource", atomic with the record here under the one lock).
+        guard.linkset.remove(iri);
         Ok(())
     }
 
@@ -311,6 +351,8 @@ impl SparqClient for InMemorySparqClient {
         // the live `DROP SILENT GRAPH`, so a re-created container at the same IRI inherits no stale set.
         guard.meta.remove(iri);
         guard.children.remove(iri);
+        // The container's user linkset dies with it (graph-drop parity, atomic under the one lock).
+        guard.linkset.remove(iri);
         // ...and detach the parent edge in the SAME atomic step (folded in, per Finding 2), so there is
         // no window in which the container graph is gone but the parent still `ldp:contains` it.
         if let Some(p) = parent {
@@ -393,5 +435,199 @@ impl SparqClient for InMemorySparqClient {
                 .map(|c| (c.clone(), guard.meta.get(c).map(|m| m.etag.clone())))
                 .collect(),
         })
+    }
+
+    async fn get_linkset(&self, iri: &str) -> Result<Option<(String, String)>, SparqError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| SparqError::Backend("poisoned".into()))?;
+        Ok(guard.linkset.get(iri).cloned())
+    }
+
+    async fn set_linkset(
+        &self,
+        iri: &str,
+        json: &str,
+        new_rev: &str,
+        expected: crate::store::sparql::LinksetCas<'_>,
+    ) -> Result<bool, SparqError> {
+        use crate::store::sparql::LinksetCas;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| SparqError::Backend("poisoned".into()))?;
+        // ONE atomic step under the single lock — the in-memory analogue of the live path's guarded
+        // `DELETE/INSERT … WHERE` (+ rev confirm). The resource's record must exist, and the CAS
+        // guard must hold; a lost race applies NOTHING and reports `false` (⇒ the handler's 412).
+        let Some(meta) = guard.meta.get(iri) else {
+            return Ok(false);
+        };
+        let holds = match expected {
+            LinksetCas::ExpectRev(old) => {
+                guard.linkset.get(iri).map(|(_, rev)| rev.as_str()) == Some(old)
+            }
+            LinksetCas::ExpectNone { record_etag } => {
+                !guard.linkset.contains_key(iri) && meta.etag == record_etag
+            }
+        };
+        if !holds {
+            return Ok(false);
+        }
+        guard
+            .linkset
+            .insert(iri.to_string(), (json.to_string(), new_rev.to_string()));
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::sparql::LinksetCas;
+
+    fn meta(etag: &str) -> ResourceMeta {
+        ResourceMeta {
+            content_type: "text/turtle".into(),
+            blob_key: "k".into(),
+            etag: etag.into(),
+            last_modified: None,
+            size: Some(4),
+        }
+    }
+
+    #[tokio::test]
+    async fn linkset_cas_first_write_guards_on_the_record_etag() {
+        let c = InMemorySparqClient::new();
+        let iri = "https://pod/alice/doc";
+        // No record ⇒ the CAS never applies (a linkset cannot outlive/pre-date its resource).
+        assert!(!c
+            .set_linkset(
+                iri,
+                "{}",
+                "r1",
+                LinksetCas::ExpectNone {
+                    record_etag: "\"e\""
+                }
+            )
+            .await
+            .unwrap());
+        c.put_meta(iri, meta("\"e\"")).await.unwrap();
+        // Wrong observed record etag ⇒ lost (a content re-write raced the caller).
+        assert!(!c
+            .set_linkset(
+                iri,
+                "{}",
+                "r1",
+                LinksetCas::ExpectNone {
+                    record_etag: "\"stale\""
+                }
+            )
+            .await
+            .unwrap());
+        assert_eq!(c.get_linkset(iri).await.unwrap(), None);
+        // Correct guard ⇒ applied.
+        assert!(c
+            .set_linkset(
+                iri,
+                "{\"a\":1}",
+                "r1",
+                LinksetCas::ExpectNone {
+                    record_etag: "\"e\""
+                }
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            c.get_linkset(iri).await.unwrap(),
+            Some(("{\"a\":1}".into(), "r1".into()))
+        );
+        // A second ExpectNone now loses (a linkset exists) — first-write races are serialised.
+        assert!(!c
+            .set_linkset(
+                iri,
+                "{}",
+                "r2",
+                LinksetCas::ExpectNone {
+                    record_etag: "\"e\""
+                }
+            )
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn linkset_cas_update_guards_on_the_revision() {
+        let c = InMemorySparqClient::new();
+        let iri = "https://pod/alice/doc";
+        c.put_meta(iri, meta("\"e\"")).await.unwrap();
+        assert!(c
+            .set_linkset(
+                iri,
+                "{}",
+                "r1",
+                LinksetCas::ExpectNone {
+                    record_etag: "\"e\""
+                }
+            )
+            .await
+            .unwrap());
+        // Stale revision ⇒ lost, state unchanged (never a lost update).
+        assert!(!c
+            .set_linkset(iri, "{\"x\":1}", "r2", LinksetCas::ExpectRev("r0"))
+            .await
+            .unwrap());
+        assert_eq!(
+            c.get_linkset(iri).await.unwrap(),
+            Some(("{}".into(), "r1".into()))
+        );
+        // Matching revision ⇒ applied, revision rotated.
+        assert!(c
+            .set_linkset(iri, "{\"x\":1}", "r2", LinksetCas::ExpectRev("r1"))
+            .await
+            .unwrap());
+        assert_eq!(
+            c.get_linkset(iri).await.unwrap(),
+            Some(("{\"x\":1}".into(), "r2".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_the_resource_deletes_its_linkset_atomically() {
+        let c = InMemorySparqClient::new();
+        let doc = "https://pod/alice/doc";
+        c.put_meta(doc, meta("\"e\"")).await.unwrap();
+        assert!(c
+            .set_linkset(
+                doc,
+                "{}",
+                "r1",
+                LinksetCas::ExpectNone {
+                    record_etag: "\"e\""
+                }
+            )
+            .await
+            .unwrap());
+        c.delete_meta(doc).await.unwrap();
+        assert_eq!(c.get_linkset(doc).await.unwrap(), None, "graph-drop parity");
+        // Same through the atomic empty-container delete.
+        let cont = "https://pod/alice/c/";
+        c.put_meta(cont, meta("\"ce\"")).await.unwrap();
+        assert!(c
+            .set_linkset(
+                cont,
+                "{}",
+                "r1",
+                LinksetCas::ExpectNone {
+                    record_etag: "\"ce\""
+                }
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            c.delete_meta_if_empty(cont, None).await.unwrap(),
+            DeleteOutcome::Deleted
+        );
+        assert_eq!(c.get_linkset(cont).await.unwrap(), None);
     }
 }

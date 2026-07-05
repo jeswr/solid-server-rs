@@ -107,6 +107,9 @@ pub struct LwsBearerAuth {
     /// Precomputed challenge header values for the append middleware (request-invariant).
     challenge_anonymous: HeaderValue,
     challenge_invalid_token: HeaderValue,
+    /// The RFC 6750 §3.1 `insufficient_scope` challenge (a 403 — the token IS valid but its
+    /// RFC 9396 `authorization_details` narrowing does not cover the request; M3).
+    challenge_insufficient_scope: String,
 }
 
 impl LwsBearerAuth {
@@ -127,6 +130,7 @@ impl LwsBearerAuth {
         let metadata_url = format!("{base}{}", crate::pop::sk::OAUTH_PROTECTED_RESOURCE_PATH);
         let anonymous = format!("{scheme} realm=\"{realm}\", resource_metadata=\"{metadata_url}\"");
         let invalid = format!("{anonymous}, error=\"invalid_token\"");
+        let challenge_insufficient_scope = format!("{anonymous}, error=\"insufficient_scope\"");
         let challenge_anonymous = HeaderValue::from_str(&anonymous)
             .map_err(|_| "LWS challenge is not a valid header value".to_string())?;
         let challenge_invalid_token = HeaderValue::from_str(&invalid)
@@ -140,6 +144,7 @@ impl LwsBearerAuth {
             require_pop,
             challenge_anonymous,
             challenge_invalid_token,
+            challenge_insufficient_scope,
         })
     }
 
@@ -224,16 +229,21 @@ impl LwsBearerAuth {
     }
 
     /// Verify a Bearer-presented LWS access token per spec §rs-validation, mapping the verified
-    /// claims onto the server's [`VerifiedToken`] (the `sub` becomes the WAC agent). `target_htu`
-    /// is the SERVER-reconstructed request URL (scheme/host/port/path, query stripped — the same
+    /// claims onto the server's [`VerifiedToken`] (the `sub` becomes the WAC agent). `method` is
+    /// the request's HTTP method (M3 — it selects the concrete action the RFC 9396
+    /// `authorization_details` narrowing must cover, [`crate::lws::rar`]); `target_htu` is the
+    /// SERVER-reconstructed request URL (scheme/host/port/path, query stripped — the same
     /// proxy-independent value the DPoP `htu` check uses); `now` is UNIX seconds.
     ///
     /// FAIL-CLOSED: every deviation is a 401 [`ServerError::Unauthorized`] carrying the RFC 6750
-    /// `invalid_token` challenge (+ `realm`/`resource_metadata`). Messages are static and
-    /// non-leaky (they name the failed check, never token contents).
+    /// `invalid_token` challenge (+ `realm`/`resource_metadata`) — except an intelligible
+    /// narrowing that does not COVER this request, which is the RFC 6750 §3.1
+    /// `insufficient_scope` **403** (the token is valid; its scope is not). Messages are static
+    /// and non-leaky (they name the failed check, never token contents).
     pub fn verify_bearer(
         &self,
         token: &str,
+        method: &str,
         target_htu: &str,
         now: i64,
     ) -> Result<VerifiedToken, ServerError> {
@@ -332,10 +342,33 @@ impl LwsBearerAuth {
             ));
         }
 
-        // The trusted AS asserts the agent (`sub`) — it becomes the WAC identity. No cnf, no
-        // scopes semantics defined by the LWS spec (RFC 9396 authorization_details is an M3 seam;
-        // per the spec it could only NARROW below WAC, never widen — ignoring it grants exactly
-        // the WAC baseline).
+        // (M3) RFC 9396 `authorization_details` — NARROWING-ONLY (spec §rar; `crate::lws::rar`).
+        // Enforced HERE, the single non-bypassable chokepoint every LWS-authenticated request
+        // routes through (the same place the audience containment ran above), so the effective
+        // access is the intersection WAC ∩ aud ∩ narrowing by construction — this block can only
+        // DENY; it admits nothing (WAC still decides downstream, unchanged):
+        //  - claim absent ⇒ the WAC baseline alone (the spec's rar-absent vector);
+        //  - claim present but not fully intelligible as a narrowing ⇒ 401 invalid_token
+        //    (fail-closed — enforcing PART of an AS's decision could widen past it);
+        //  - claim intelligible but not covering (method-action, target) ⇒ 403 insufficient_scope
+        //    (RFC 6750 §3.1 — the token is valid, its scope is not). OPTIONS is exempt (no
+        //    resource content; the CORS layer answers most OPTIONS before auth anyway); any other
+        //    unmapped method is denied.
+        match crate::lws::rar::parse_authorization_details(&claims) {
+            Err(_) => {
+                return Err(self.reject("Access token authorization_details is malformed."));
+            }
+            Ok(Some(narrowing)) if !method.eq_ignore_ascii_case("OPTIONS") => {
+                let allowed = crate::lws::rar::action_for_method(method)
+                    .is_some_and(|action| narrowing.allows(action, target_htu));
+                if !allowed {
+                    return Err(self.insufficient_scope());
+                }
+            }
+            Ok(_) => {}
+        }
+
+        // The trusted AS asserts the agent (`sub`) — it becomes the WAC identity. No cnf.
         Ok(VerifiedToken {
             web_id: Some(sub),
             issuer: Some(iss),
@@ -354,6 +387,19 @@ impl LwsBearerAuth {
             status: 401,
             message: message.to_string(),
             www_authenticate: self.www_authenticate_invalid(),
+        }
+    }
+
+    /// The RFC 6750 §3.1 `insufficient_scope` **403** (M3): the token verified, but its RFC 9396
+    /// `authorization_details` narrowing does not cover this (method, target). Deliberately
+    /// UNIFORM across targets/methods — derived from the request line only, never from resource
+    /// state — so it opens no existence oracle.
+    fn insufficient_scope(&self) -> ServerError {
+        ServerError::Unauthorized {
+            status: 403,
+            message: "The access token's authorization_details do not cover this request."
+                .to_string(),
+            www_authenticate: self.challenge_insufficient_scope.clone(),
         }
     }
 
@@ -811,7 +857,7 @@ mod tests {
     }
 
     fn expect_reject(auth: &LwsBearerAuth, token: &str, target: &str, now: i64, why: &str) {
-        match auth.verify_bearer(token, target, now) {
+        match auth.verify_bearer(token, "GET", target, now) {
             Err(ServerError::Unauthorized {
                 status,
                 www_authenticate,
@@ -838,7 +884,7 @@ mod tests {
         let n = now();
         let token = kit.sign(&at_header(), &base_claims(n));
         let verified = auth
-            .verify_bearer(&token, &format!("{BASE}/alice/notes/x"), n)
+            .verify_bearer(&token, "GET", &format!("{BASE}/alice/notes/x"), n)
             .expect("valid token accepted");
         assert_eq!(verified.web_id.as_deref(), Some(AGENT));
         assert_eq!(verified.issuer.as_deref(), Some(ISSUER));
@@ -849,7 +895,9 @@ mod tests {
         let mut c = base_claims(n);
         c["aud"] = json!([format!("{BASE}/")]);
         let token = kit.sign(&at_header(), &c);
-        assert!(auth.verify_bearer(&token, &format!("{BASE}/x"), n).is_ok());
+        assert!(auth
+            .verify_bearer(&token, "GET", &format!("{BASE}/x"), n)
+            .is_ok());
     }
 
     #[test]
@@ -937,7 +985,7 @@ mod tests {
         c["aud"] = json!(format!("{BASE}/alice"));
         let token = kit.sign(&at_header(), &c);
         assert!(auth
-            .verify_bearer(&token, &format!("{BASE}/alice/notes"), n)
+            .verify_bearer(&token, "GET", &format!("{BASE}/alice/notes"), n)
             .is_ok());
         expect_reject(
             &auth,
@@ -1018,7 +1066,7 @@ mod tests {
         let mut c = base_claims(n);
         c["exp"] = json!(n + DEFAULT_MAX_TOKEN_TTL_SECS);
         assert!(auth
-            .verify_bearer(&kit.sign(&at_header(), &c), &target, n)
+            .verify_bearer(&kit.sign(&at_header(), &c), "GET", &target, n)
             .is_ok());
         // Missing exp / iat.
         let mut c = base_claims(n);
@@ -1119,7 +1167,7 @@ mod tests {
         let n = now();
         // Even a fully valid token is refused on a PoP-required realm.
         let token = kit.sign(&at_header(), &base_claims(n));
-        match auth.verify_bearer(&token, &format!("{BASE}/x"), n) {
+        match auth.verify_bearer(&token, "GET", &format!("{BASE}/x"), n) {
             Err(ServerError::Unauthorized {
                 www_authenticate, ..
             }) => {

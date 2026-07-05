@@ -263,7 +263,10 @@ impl<J: JwksProvider, R: ReplayStore> AuthContext<J, R> {
                 .and_then(bearer_scheme_access_token)
             {
                 if lws.is_lws_candidate(bearer) {
-                    return lws.verify_bearer(bearer, &target.htu, now_secs());
+                    // M3: the method rides along so the RFC 9396 authorization_details narrowing
+                    // (spec §rar — deny-only, WAC remains the ceiling) is enforced at this same
+                    // single chokepoint as the audience containment.
+                    return lws.verify_bearer(bearer, &method_uc, &target.htu, now_secs());
                 }
             }
         }

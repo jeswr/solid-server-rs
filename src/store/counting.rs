@@ -381,6 +381,28 @@ impl<S: SparqClient> SparqClient for CountingSparqClient<S> {
         self.counters.count_queries(1);
         self.inner.read_plan(target, acl_candidates).await
     }
+
+    async fn get_linkset(&self, iri: &str) -> Result<Option<(String, String)>, SparqError> {
+        let _g = self.counters.op_guard();
+        self.counters.count_queries(1);
+        // Forwarded to `inner` (never the trait default), so the wrapped client's real linkset
+        // persistence is what answers — the decorator only counts.
+        self.inner.get_linkset(iri).await
+    }
+
+    async fn set_linkset(
+        &self,
+        iri: &str,
+        json: &str,
+        new_rev: &str,
+        expected: crate::store::sparql::LinksetCas<'_>,
+    ) -> Result<bool, SparqError> {
+        let _g = self.counters.op_guard();
+        // One guarded update (+ the HTTP client's confirm ASK is internal to it) — counted as one
+        // update at this seam, mirroring the other single-call write ops.
+        self.counters.count_update();
+        self.inner.set_linkset(iri, json, new_rev, expected).await
+    }
 }
 
 /// A [`BlobStore`] decorator counting byte fetches/writes (and every other backend call) against
@@ -463,6 +485,7 @@ mod tests {
             blob_key: "k1".into(),
             etag: "\"e1\"".into(),
             last_modified: None,
+            size: None,
         };
         sparq.put_meta("https://p/c/", meta.clone()).await.unwrap();
         let s0 = counters.snapshot();

@@ -87,10 +87,12 @@ An **additive, runtime-flag-gated** surface in `src/lws/` (`SOLID_SERVER_LWS`), 
 - `size` is omitted from member descriptions (SHOULD-level) — `ResourceMeta` records no byte
   length; adding it is an M2 store change. Pagination (SHOULD) likewise deferred.
 - M2 — the LWS auth chain (RFC 9728 `resource_metadata` challenge + audience-restricted ≤300 s
-  `at+jwt` Bearer validation) — **SHIPPED**; see `decisions/0005-lws-auth-m2.md`. Still deferred
-  (M3, seams marked in `src/lws`): RFC 9264 linksets, SSE/WebSocket notification bindings under
-  the WD subscription API, pagination/`size`, and the `SparqlQueryService`/AC-SPARQL companion
-  (gated on the same SPARQ access-control design as WAC-in-SPARQ, `sparq#992`).
+  `at+jwt` Bearer validation) — **SHIPPED**; see `decisions/0005-lws-auth-m2.md`. M3 — RFC 9264
+  linksets, pagination + `size`, RFC 9396 narrowing — **SHIPPED**; see
+  `decisions/0006-lws-read-substrate-m3.md`. Still deferred (M4): SSE/WebSocket notification
+  bindings under the WD subscription API, the DPoP-bound LWS-audience PoP profile, and the
+  `SparqlQueryService`/AC-SPARQL companion (gated on the same SPARQ access-control design as
+  WAC-in-SPARQ, `sparq#992`).
 - The `jeswr/lws-spec` `test-vectors/` suite (parallel work) plugs in over plain HTTP against the
   assembled router; `tests/lws_http.rs` is the hand-written pin of the same contract and the
   runner template.

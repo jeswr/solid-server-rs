@@ -198,6 +198,7 @@ async fn create_child_commits_metadata_and_membership_atomically_on_the_engine()
         blob_key: "k".into(),
         etag: "\"e\"".into(),
         last_modified: None,
+        size: None,
     };
 
     let err = sparq
@@ -234,6 +235,7 @@ async fn modified_time_round_trips_through_the_real_engine() {
         blob_key: "k".into(),
         etag: "\"e\"".into(),
         last_modified: Some(t),
+        size: None,
     };
     sparq.put_meta(iri, meta).await.unwrap();
     let read_back = sparq.get_meta(iri).await.unwrap();
@@ -250,6 +252,7 @@ async fn modified_time_round_trips_through_the_real_engine() {
         blob_key: "k2".into(),
         etag: "\"e2\"".into(),
         last_modified: Some(t2),
+        size: None,
     };
     sparq.put_meta(iri, meta2).await.unwrap();
     let after = sparq.get_meta(iri).await.unwrap();
@@ -266,6 +269,7 @@ async fn modified_time_round_trips_through_the_real_engine() {
         blob_key: "k3".into(),
         etag: "\"e3\"".into(),
         last_modified: None,
+        size: None,
     };
     sparq.put_meta(none_iri, meta_none).await.unwrap();
     assert_eq!(
@@ -505,6 +509,7 @@ async fn referenced_blob_keys_on_the_embedded_client_collects_all_pointers() {
         blob_key: bk.into(),
         etag: "\"e\"".into(),
         last_modified: None,
+        size: None,
     };
     sparq
         .put_meta("https://pod.example/a", m("k1"))
@@ -525,4 +530,138 @@ async fn referenced_blob_keys_on_the_embedded_client_collects_all_pointers() {
         !keys.contains("k1") && keys.contains("k2"),
         "k1 should drop out: {keys:?}"
     );
+}
+
+// --- M3: the user-linkset CAS against the REAL engine (the guarded builders end-to-end) ---------
+
+#[tokio::test]
+async fn linkset_cas_round_trips_on_the_embedded_engine() {
+    use solid_server_rs::store::LinksetCas;
+    let s = store();
+    // No record ⇒ the CAS never applies.
+    assert!(!s
+        .set_linkset(
+            IRI,
+            "{}",
+            "r1",
+            LinksetCas::ExpectNone {
+                record_etag: "\"e\""
+            }
+        )
+        .await
+        .unwrap());
+    let meta = s
+        .write(IRI, Bytes::from(TURTLE), "text/turtle")
+        .await
+        .unwrap();
+    assert_eq!(s.get_linkset(IRI).await.unwrap(), None);
+
+    // Stale observed record etag ⇒ lost, nothing written.
+    assert!(!s
+        .set_linkset(
+            IRI,
+            "{}",
+            "r1",
+            LinksetCas::ExpectNone {
+                record_etag: "\"stale\""
+            }
+        )
+        .await
+        .unwrap());
+    assert_eq!(s.get_linkset(IRI).await.unwrap(), None);
+
+    // First write under the correct guard ⇒ applied; the JSON literal (with quotes/braces —
+    // injection-relevant characters) round-trips byte-exact through the escaped literal.
+    let json =
+        r#"{"describedby":[{"href":"https://pod.example/alice/meta","type":"text/turtle"}]}"#;
+    assert!(s
+        .set_linkset(
+            IRI,
+            json,
+            "r1",
+            LinksetCas::ExpectNone {
+                record_etag: &meta.etag
+            }
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        s.get_linkset(IRI).await.unwrap(),
+        Some((json.to_string(), "r1".to_string()))
+    );
+    // A raced second first-write ⇒ lost.
+    assert!(!s
+        .set_linkset(
+            IRI,
+            "{}",
+            "r2",
+            LinksetCas::ExpectNone {
+                record_etag: &meta.etag
+            }
+        )
+        .await
+        .unwrap());
+
+    // Revision-guarded update: stale rev loses (state unchanged), current rev wins + rotates.
+    assert!(!s
+        .set_linkset(IRI, "{}", "r2", LinksetCas::ExpectRev("r0"))
+        .await
+        .unwrap());
+    assert_eq!(
+        s.get_linkset(IRI).await.unwrap(),
+        Some((json.to_string(), "r1".to_string()))
+    );
+    assert!(s
+        .set_linkset(IRI, "{}", "r2", LinksetCas::ExpectRev("r1"))
+        .await
+        .unwrap());
+    assert_eq!(
+        s.get_linkset(IRI).await.unwrap(),
+        Some(("{}".into(), "r2".into()))
+    );
+
+    // A content RE-WRITE preserves the linkset (put_meta never touches the linkset predicates)…
+    s.write(IRI, Bytes::from(TURTLE), "text/turtle")
+        .await
+        .unwrap();
+    assert_eq!(
+        s.get_linkset(IRI).await.unwrap(),
+        Some(("{}".into(), "r2".into()))
+    );
+    // …and DELETE drops it atomically with the resource's graph.
+    s.delete(IRI, None).await.unwrap();
+    assert_eq!(s.get_linkset(IRI).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn size_round_trips_on_the_embedded_engine() {
+    let s = store();
+    let meta = s
+        .write(IRI, Bytes::from("12345"), "text/plain")
+        .await
+        .unwrap();
+    assert_eq!(meta.size, Some(5));
+    let read_back = s.meta(IRI).await.unwrap().unwrap();
+    assert_eq!(
+        read_back.size,
+        Some(5),
+        "pss:size round-trips through the engine"
+    );
+    // A re-write replaces it (single-valued).
+    s.write(IRI, Bytes::from("123"), "text/plain")
+        .await
+        .unwrap();
+    assert_eq!(s.meta(IRI).await.unwrap().unwrap().size, Some(3));
+    // And through the atomic create-child path (the other write builder).
+    let container = "https://pod.example/alice/c/";
+    s.write(container, Bytes::new(), "text/turtle")
+        .await
+        .unwrap();
+    let child = "https://pod.example/alice/c/kid";
+    let meta = s
+        .create_in_container(container, child, Bytes::from("1234567"), "text/plain")
+        .await
+        .unwrap();
+    assert_eq!(meta.size, Some(7));
+    assert_eq!(s.meta(child).await.unwrap().unwrap().size, Some(7));
 }

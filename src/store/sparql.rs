@@ -45,6 +45,27 @@ pub fn p_etag() -> String {
 pub fn p_modified() -> String {
     format!("{PSS_NS}modified")
 }
+/// Predicate: a resource's stored byte length (an integer literal). Recorded at write time (M3 —
+/// the LWS container listing's SHOULD-level `size` member); OPTIONAL on read, so a pre-M3 record
+/// simply reports no size. A RESERVED `urn:pss:index#` predicate — the reserved-term guard
+/// ([`is_reserved_term`]) already forbids untrusted body RDF from writing it.
+pub fn p_size() -> String {
+    format!("{PSS_NS}size")
+}
+/// Predicate: the USER-MANAGED half of a resource's RFC 9264 linkset (M3 — `crate::lws::linkset`),
+/// stored as one validated JSON literal *in the resource's own graph*. Living in the graph is
+/// load-bearing: `DROP GRAPH` (delete) removes the linkset ATOMICALLY with the resource — the
+/// spec's "deleting a resource MUST delete its linkset resource" with no second operation.
+pub fn p_linkset_json() -> String {
+    format!("{PSS_NS}linksetUser")
+}
+/// Predicate: the user-linkset REVISION tag (a server-minted opaque literal). It doubles as the
+/// linkset resource's ETag material and as the compare-and-swap guard for linkset updates (see
+/// [`update_set_linkset`]) — a fresh unique value per successful update, so re-reading it after a
+/// guarded update proves whether THIS operation's write landed (the create-marker trick).
+pub fn p_linkset_rev() -> String {
+    format!("{PSS_NS}linksetRev")
+}
 /// The `xsd:dateTime` datatype IRI — the datatype of the `pss:modified` literal.
 pub const XSD_DATETIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
 /// Predicate: a per-operation create marker (a unique-nonce literal), written atomically with a
@@ -232,15 +253,17 @@ pub fn ask_create_marker(child: &str, nonce: &str) -> Result<String, BuildError>
 /// `If-Modified-Since`, never a spurious 304.
 pub fn select_meta(resource: &str) -> Result<String, BuildError> {
     Ok(format!(
-        "SELECT ?ct ?bk ?etag ?mod WHERE {{ GRAPH {g} {{ \
+        "SELECT ?ct ?bk ?etag ?mod ?size WHERE {{ GRAPH {g} {{ \
             {s} {pct} ?ct ; {pbk} ?bk ; {pet} ?etag . \
-            OPTIONAL {{ {s} {pmod} ?mod }} }} }} LIMIT 1",
+            OPTIONAL {{ {s} {pmod} ?mod }} \
+            OPTIONAL {{ {s} {psize} ?size }} }} }} LIMIT 1",
         g = iri(resource)?,
         s = iri_const(&s_record()),
         pct = iri_const(&p_content_type()),
         pbk = iri_const(&p_blob_key()),
         pet = iri_const(&p_etag()),
         pmod = iri_const(&p_modified()),
+        psize = iri_const(&p_size()),
     ))
 }
 
@@ -269,15 +292,17 @@ pub fn select_read_plan(target: &str, acl_candidates: &[String]) -> Result<Strin
         values.push_str(&iri(raw)?);
     }
     Ok(format!(
-        "SELECT ?g ?ct ?bk ?etag ?mod WHERE {{ VALUES ?g {{ {values} }} \
+        "SELECT ?g ?ct ?bk ?etag ?mod ?size WHERE {{ VALUES ?g {{ {values} }} \
             GRAPH ?g {{ {s} {pct} ?ct ; {pbk} ?bk ; {pet} ?etag . \
-            OPTIONAL {{ {s} {pmod} ?mod }} }} }}",
+            OPTIONAL {{ {s} {pmod} ?mod }} \
+            OPTIONAL {{ {s} {psize} ?size }} }} }}",
         values = values,
         s = iri_const(&s_record()),
         pct = iri_const(&p_content_type()),
         pbk = iri_const(&p_blob_key()),
         pet = iri_const(&p_etag()),
         pmod = iri_const(&p_modified()),
+        psize = iri_const(&p_size()),
     ))
 }
 
@@ -299,6 +324,94 @@ pub fn select_children(container: &str) -> Result<String, BuildError> {
         g = iri(container)?,
         s = iri_const(&s_record()),
         p = iri_const(LDP_CONTAINS),
+    ))
+}
+
+/// SELECT a resource's USER-MANAGED linkset state (M3 — `crate::lws::linkset`): the stored JSON
+/// literal + its revision tag, from the resource's own graph. No row ⇒ no user linkset (the
+/// linkset resource then serves system links only).
+pub fn select_linkset(resource: &str) -> Result<String, BuildError> {
+    Ok(format!(
+        "SELECT ?json ?rev WHERE {{ GRAPH {g} {{ \
+            {s} {pj} ?json ; {pr} ?rev . }} }} LIMIT 1",
+        g = iri(resource)?,
+        s = iri_const(&s_record()),
+        pj = iri_const(&p_linkset_json()),
+        pr = iri_const(&p_linkset_rev()),
+    ))
+}
+
+/// The compare-and-swap guard for a user-linkset update ([`update_set_linkset`]): what the caller
+/// OBSERVED before computing the merge, which must still hold for the write to apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinksetCas<'a> {
+    /// A user linkset existed with THIS revision tag — the update applies only if it is unchanged.
+    ExpectRev(&'a str),
+    /// NO user linkset existed; the guard additionally pins the resource RECORD's etag (the
+    /// never-patched linkset's ETag derives from it — see `crate::lws::linkset`), so a concurrent
+    /// content re-write between the caller's read and this update also fails the CAS.
+    ExpectNone {
+        /// The resource record's `pss:etag` the caller observed.
+        record_etag: &'a str,
+    },
+}
+
+/// UPDATE: ATOMICALLY compare-and-swap a resource's USER-MANAGED linkset (M3).
+///
+/// One guarded `DELETE/INSERT … WHERE`: the WHERE requires the resource's index record to exist
+/// AND the [`LinksetCas`] guard to hold — a lost race (the observed revision/etag moved, or a
+/// first-write raced another first-write) yields no solution and NOTHING is written. Success is
+/// confirmed by the caller re-ASKing for `new_rev` ([`ask_linkset_rev`]): `new_rev` is a fresh
+/// server-minted unique value, so its presence proves THIS operation's write landed (the same
+/// race-resistant confirm discipline as the create marker — no other operation ever writes it).
+///
+/// The untrusted-adjacent values (`json` is server-VALIDATED, `rev`s are server-minted) all still
+/// flow through the injection-safe [`literal`] renderer — even a hypothetically hostile value is an
+/// inert escaped string term.
+pub fn update_set_linkset(
+    resource: &str,
+    json: &str,
+    new_rev: &str,
+    expected: LinksetCas<'_>,
+) -> Result<String, BuildError> {
+    let g = iri(resource)?;
+    let s = iri_const(&s_record());
+    let pj = iri_const(&p_linkset_json());
+    let pr = iri_const(&p_linkset_rev());
+    let pet = iri_const(&p_etag());
+    let guard = match expected {
+        LinksetCas::ExpectRev(old) => format!(
+            "GRAPH {g} {{ {s} {pr} ?curRev . FILTER(?curRev = {old}) \
+                OPTIONAL {{ {s} {pj} ?oldJson }} }}",
+            old = literal(old),
+        ),
+        LinksetCas::ExpectNone { record_etag } => format!(
+            "GRAPH {g} {{ {s} {pet} ?curEt . FILTER(?curEt = {et}) \
+                FILTER NOT EXISTS {{ {s} {pr} ?anyRev }} }}",
+            et = literal(record_etag),
+        ),
+    };
+    // The DELETE template's `?curRev`/`?oldJson` are bound only on the ExpectRev arm; template
+    // triples with unbound variables are skipped per SPARQL 1.1 Update §3.1.3, so the ExpectNone
+    // arm deletes nothing (there is nothing to delete — the guard proved absence).
+    Ok(format!(
+        "DELETE {{ GRAPH {g} {{ {s} {pj} ?oldJson . {s} {pr} ?curRev . }} }} \
+         INSERT {{ GRAPH {g} {{ {s} {pj} {json} ; {pr} {rev} . }} }} \
+         WHERE {{ {guard} }}",
+        json = literal(json),
+        rev = literal(new_rev),
+    ))
+}
+
+/// ASK whether a resource's user-linkset revision equals `rev` — the [`update_set_linkset`]
+/// success confirm (the rev is operation-unique, so `true` proves THIS operation's write landed).
+pub fn ask_linkset_rev(resource: &str, rev: &str) -> Result<String, BuildError> {
+    Ok(format!(
+        "ASK {{ GRAPH {g} {{ {s} {p} {rev} }} }}",
+        g = iri(resource)?,
+        s = iri_const(&s_record()),
+        p = iri_const(&p_linkset_rev()),
+        rev = literal(rev),
     ))
 }
 
@@ -344,6 +457,7 @@ pub fn update_put_meta(
     blob_key: &str,
     etag: &str,
     modified: Option<&str>,
+    size: Option<u64>,
 ) -> Result<String, BuildError> {
     let g = iri(resource)?;
     let s = iri_const(&s_record());
@@ -351,24 +465,36 @@ pub fn update_put_meta(
     let pbk = iri_const(&p_blob_key());
     let pet = iri_const(&p_etag());
     let pmod = iri_const(&p_modified());
+    let psize = iri_const(&p_size());
     // `pss:modified` is single-valued exactly like the other record predicates, so its stale value is
     // ALWAYS DELETE-cleared — even when `modified` is `None`. This makes the written state faithful to
     // the `ResourceMeta`: writing `last_modified: None` genuinely clears any prior timestamp, so a
     // later read returns `None` (never a stale `Some(...)` that could drive a wrong 304). Only the
-    // INSERT of a fresh value is conditional on `Some`.
+    // INSERT of a fresh value is conditional on `Some`. `pss:size` follows the identical discipline
+    // (a server-generated `u64` rendered as a plain SPARQL integer — no untrusted-input surface).
+    //
+    // NB the user-linkset predicates ([`p_linkset_json`]/[`p_linkset_rev`]) are deliberately NOT
+    // touched here: a content re-write must PRESERVE the resource's user-managed metadata (the spec's
+    // metadata model — content and metadata have independent lifecycles until DELETE drops both).
     let mod_insert = match modified {
         Some(m) => format!(" ; {pmod} {dt}", dt = datetime_literal(m)),
         None => String::new(),
     };
+    let size_insert = match size {
+        Some(n) => format!(" ; {psize} {n}"),
+        None => String::new(),
+    };
     Ok(format!(
         "DELETE WHERE {{ GRAPH {g} {{ {s} {pmod} ?oldMod }} }} ; \
+         DELETE WHERE {{ GRAPH {g} {{ {s} {psize} ?oldSize }} }} ; \
          DELETE WHERE {{ GRAPH {g} {{ {s} {pct} ?oldCt }} }} ; \
          DELETE WHERE {{ GRAPH {g} {{ {s} {pbk} ?oldBk }} }} ; \
          DELETE WHERE {{ GRAPH {g} {{ {s} {pet} ?oldEt }} }} ; \
-         INSERT DATA {{ GRAPH {g} {{ {s} {pct} {ct} ; {pbk} {bk} ; {pet} {et}{mod_insert} . }} }}",
+         INSERT DATA {{ GRAPH {g} {{ {s} {pct} {ct} ; {pbk} {bk} ; {pet} {et}{mod_insert}{size_insert} . }} }}",
         g = g,
         s = s,
         pmod = pmod,
+        psize = psize,
         pct = pct,
         ct = literal(content_type),
         pbk = pbk,
@@ -376,6 +502,7 @@ pub fn update_put_meta(
         pet = pet,
         et = literal(etag),
         mod_insert = mod_insert,
+        size_insert = size_insert,
     ))
 }
 
@@ -410,6 +537,7 @@ pub fn update_put_meta(
 /// harmless; pruning them is a reconciler-GC concern (M3-next). Only the single-valued record
 /// predicates (`contentType`/`blobKey`/`etag`) are DELETE-replaced (so `select_meta(... LIMIT 1)`
 /// stays deterministic — the round-3 finding); the marker is purely additive.
+#[allow(clippy::too_many_arguments)]
 pub fn update_create_child(
     container: &str,
     child: &str,
@@ -417,6 +545,7 @@ pub fn update_create_child(
     blob_key: &str,
     etag: &str,
     modified: Option<&str>,
+    size: Option<u64>,
     nonce: &str,
 ) -> Result<String, BuildError> {
     let cg = iri(child)?;
@@ -426,6 +555,7 @@ pub fn update_create_child(
     let pet = iri_const(&p_etag());
     let pmark = iri_const(&p_create_marker());
     let pmod = iri_const(&p_modified());
+    let psize = iri_const(&p_size());
     let pg = iri(container)?;
     let prec = iri_const(&s_record());
     let contains = iri_const(LDP_CONTAINS);
@@ -434,18 +564,25 @@ pub fn update_create_child(
     // predicates (so a re-create replaces it, mirroring `update_put_meta`). The stale `?oldMod` is
     // ALWAYS DELETE-cleared (bound by the WHERE `OPTIONAL`) — even when `modified` is `None` — so a
     // re-create with no timestamp genuinely clears any prior one (a later read returns `None`, never a
-    // stale `Some(...)`). Only the INSERT of a fresh value is conditional on `Some`.
+    // stale `Some(...)`). Only the INSERT of a fresh value is conditional on `Some`. `pss:size`
+    // follows the identical discipline (a server-generated integer).
     let mod_del = format!(" ; {pmod} ?oldMod");
     let mod_opt = format!("OPTIONAL {{ GRAPH {cg} {{ {crec} {pmod} ?oldMod }} }} ");
     let mod_ins = match modified {
         Some(m) => format!(" ; {pmod} {dt}", dt = datetime_literal(m)),
         None => String::new(),
     };
+    let size_del = format!(" ; {psize} ?oldSize");
+    let size_opt = format!("OPTIONAL {{ GRAPH {cg} {{ {crec} {psize} ?oldSize }} }} ");
+    let size_ins = match size {
+        Some(n) => format!(" ; {psize} {n}"),
+        None => String::new(),
+    };
     Ok(format!(
         "DELETE {{ \
-            GRAPH {cg} {{ {crec} {pct} ?oldCt ; {pbk} ?oldBk ; {pet} ?oldEt{mod_del} . }} \
+            GRAPH {cg} {{ {crec} {pct} ?oldCt ; {pbk} ?oldBk ; {pet} ?oldEt{mod_del}{size_del} . }} \
          }} INSERT {{ \
-            GRAPH {cg} {{ {crec} {pct} {ct} ; {pbk} {bk} ; {pet} {et}{mod_ins} ; {pmark} {nce} . }} \
+            GRAPH {cg} {{ {crec} {pct} {ct} ; {pbk} {bk} ; {pet} {et}{mod_ins}{size_ins} ; {pmark} {nce} . }} \
             GRAPH {pg} {{ {prec} {contains} {childi} . }} \
          }} WHERE {{ \
             GRAPH {pg} {{ {prec} {pct} ?anyCt }} \
@@ -453,10 +590,14 @@ pub fn update_create_child(
             OPTIONAL {{ GRAPH {cg} {{ {crec} {pbk} ?oldBk }} }} \
             OPTIONAL {{ GRAPH {cg} {{ {crec} {pet} ?oldEt }} }} \
             {mod_opt}\
+            {size_opt}\
          }}",
         mod_del = mod_del,
         mod_ins = mod_ins,
         mod_opt = mod_opt,
+        size_del = size_del,
+        size_ins = size_ins,
+        size_opt = size_opt,
         cg = cg,
         crec = crec,
         pct = pct,
@@ -798,6 +939,7 @@ mod tests {
             "blob-key",
             "\"etag\"",
             None,
+            None,
             "op-1",
         )
         .unwrap();
@@ -818,6 +960,7 @@ mod tests {
             "bk",
             "\"e\"",
             None,
+            None,
             "op-1",
         );
         assert_eq!(r, Err(BuildError::InvalidIri));
@@ -827,14 +970,14 @@ mod tests {
     fn put_meta_does_not_drop_the_whole_graph() {
         // The metadata re-write must DELETE only the three reserved record predicates, never the
         // whole graph (which would erase containment edges + user RDF — the roborev finding).
-        let q = update_put_meta("http://pod/c/", "text/turtle", "bk", "\"e\"", None).unwrap();
+        let q = update_put_meta("http://pod/c/", "text/turtle", "bk", "\"e\"", None, None).unwrap();
         assert!(!q.contains("DROP"), "must not DROP the graph: {q}");
         // It targets exactly the four single-valued reserved predicates for deletion (modified is
         // ALWAYS cleared, even with None), then re-inserts.
         assert_eq!(
             q.matches("DELETE WHERE").count(),
-            4,
-            "four targeted deletes (incl. modified): {q}"
+            5,
+            "five targeted deletes (incl. modified + size): {q}"
         );
         assert!(q.contains("INSERT DATA"));
         assert!(q.contains(&iri_const(&p_content_type())));
@@ -867,13 +1010,14 @@ mod tests {
             "bk",
             "\"e\"",
             Some("2026-07-05T12:34:56Z"),
+            None,
         )
         .unwrap();
         // Four targeted deletes now: the three record predicates + the old modified.
         assert_eq!(
             q.matches("DELETE WHERE").count(),
-            4,
-            "three record deletes + one modified delete: {q}"
+            5,
+            "three record deletes + the modified + size deletes: {q}"
         );
         assert!(
             q.contains(&iri_const(&p_modified())),
@@ -897,6 +1041,7 @@ mod tests {
             "bk",
             "\"e\"",
             Some("2026-07-05T12:34:56Z"),
+            None,
             "op-1",
         )
         .unwrap();
@@ -921,6 +1066,7 @@ mod tests {
             "text/turtle",
             "bk",
             "\"e\"",
+            None,
             None,
             "op-1",
         )
@@ -1054,6 +1200,7 @@ mod tests {
             "text/turtle",
             "bk",
             "\"e\"",
+            None,
             None,
             "op-1",
         )
@@ -1365,5 +1512,105 @@ mod tests {
         assert_eq!(validate_lang("en-"), Err(BuildError::InvalidLangTag));
         assert_eq!(validate_lang("en--US"), Err(BuildError::InvalidLangTag));
         assert_eq!(validate_lang("-en"), Err(BuildError::InvalidLangTag));
+    }
+
+    #[test]
+    fn linkset_builders_are_injection_safe_and_guarded() {
+        // select round-trip shape.
+        let q = select_linkset("http://pod/c/doc").unwrap();
+        assert!(q.contains(&iri_const(&p_linkset_json())));
+        assert!(q.contains(&iri_const(&p_linkset_rev())));
+        assert!(q.contains("LIMIT 1"));
+        assert!(
+            select_linkset("http://pod/c/no doc").is_err(),
+            "invalid IRI rejected"
+        );
+
+        // ExpectRev: guarded on the CURRENT revision; the old pair is DELETE-replaced.
+        let u = update_set_linkset(
+            "http://pod/c/doc",
+            "{\"describedby\":[]}",
+            "rev-new",
+            LinksetCas::ExpectRev("rev-old"),
+        )
+        .unwrap();
+        assert!(u.contains("DELETE {"), "replaces the old pair: {u}");
+        assert!(u.contains("INSERT {"));
+        assert!(
+            u.contains("FILTER(?curRev = \"rev-old\")"),
+            "rev guard: {u}"
+        );
+        // The JSON literal is escaped inside ONE string term (quotes become \").
+        assert!(
+            u.contains("\\\"describedby\\\""),
+            "escaped JSON literal: {u}"
+        );
+        assert!(!u.contains("DROP"), "never drops the graph: {u}");
+
+        // ExpectNone: guarded on record-etag equality + NOT EXISTS a revision.
+        let u = update_set_linkset(
+            "http://pod/c/doc",
+            "{}",
+            "rev-1",
+            LinksetCas::ExpectNone {
+                record_etag: "\"e1\"",
+            },
+        )
+        .unwrap();
+        assert!(u.contains("FILTER NOT EXISTS"), "first-write guard: {u}");
+        assert!(u.contains(&iri_const(&p_etag())), "record-etag pin: {u}");
+
+        // The confirm ASK names the operation-unique revision.
+        let a = ask_linkset_rev("http://pod/c/doc", "rev-1").unwrap();
+        assert!(a.starts_with("ASK"));
+        assert!(a.contains("\"rev-1\""));
+
+        // A hostile "revision" value cannot break out of its literal.
+        let u = update_set_linkset(
+            "http://pod/c/doc",
+            "{}",
+            "x\" . } ; DROP GRAPH <http://pod/c/doc> ; INSERT DATA { GRAPH <g> { <s> <p> \"y",
+            LinksetCas::ExpectRev("r"),
+        )
+        .unwrap();
+        // The injected text survives only ESCAPED inside one literal — the update still contains
+        // exactly one DELETE/INSERT/WHERE spine and no DROP token outside the literal.
+        assert!(u.contains("\\\" . } ; DROP GRAPH"), "escaped, inert: {u}");
+        assert_eq!(u.matches("INSERT {").count(), 1);
+    }
+
+    #[test]
+    fn size_is_written_and_selected_optionally() {
+        let q = select_meta("http://pod/c/doc").unwrap();
+        assert!(q.contains("?size"), "size selected: {q}");
+        assert!(q.contains(&iri_const(&p_size())));
+        let u = update_put_meta(
+            "http://pod/c/doc",
+            "text/turtle",
+            "bk",
+            "\"e\"",
+            None,
+            Some(47),
+        )
+        .unwrap();
+        assert!(
+            u.contains(&format!("{} 47", iri_const(&p_size()))),
+            "integer literal: {u}"
+        );
+        // size None: the stale value is still DELETE-cleared, nothing inserted.
+        let u =
+            update_put_meta("http://pod/c/doc", "text/turtle", "bk", "\"e\"", None, None).unwrap();
+        assert!(u.contains("?oldSize"), "stale size cleared: {u}");
+        let ins = u.split("INSERT DATA").nth(1).unwrap();
+        assert!(
+            !ins.contains(&iri_const(&p_size())),
+            "no size inserted when None: {u}"
+        );
+        // put_meta must never touch the user-linkset predicates (content re-writes preserve them).
+        assert!(
+            !u.contains(&iri_const(&p_linkset_json())),
+            "linkset preserved: {u}"
+        );
+        assert!(!u.contains(&iri_const(&p_linkset_rev())));
     }
 }

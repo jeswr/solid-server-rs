@@ -609,6 +609,7 @@ mod tests {
             blob_key: blob_key.to_string(),
             etag: "\"e\"".into(),
             last_modified: None,
+            size: None,
         }
     }
 

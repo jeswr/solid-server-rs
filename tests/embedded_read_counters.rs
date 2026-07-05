@@ -424,6 +424,7 @@ fn meta(bk: &str) -> ResourceMeta {
         blob_key: bk.into(),
         etag: "\"e1\"".into(),
         last_modified: None,
+        size: None,
     }
 }
 

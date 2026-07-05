@@ -683,3 +683,290 @@ async fn hostile_target_spellings_cannot_escape_the_audience() {
     let resp = h.bearer("GET", "/alice/%2e%2e/bob/doc", &owner, None).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// --- 6. RFC 9396 authorization_details — NARROWING-ONLY, over HTTP (M3, spec §rar) --------------
+
+/// Baseline LWS claims + an `authorization_details` member.
+fn lws_claims_with_details(sub: &str, aud: Value, details: Value) -> Value {
+    let mut claims = lws_claims(sub, aud);
+    claims["authorization_details"] = details;
+    claims
+}
+
+fn access_request(locations: Value, actions: Value) -> Value {
+    json!({
+        "type": "https://w3id.org/jeswr/lws#AccessRequest",
+        "locations": locations,
+        "actions": actions,
+    })
+}
+
+#[tokio::test]
+async fn authorization_details_narrows_locations_and_actions() {
+    let h = Harness::build(Mode::Full).await;
+    // Seed two docs as the (un-narrowed) owner.
+    let owner = mint_lws(
+        &h.issuer_key,
+        &lws_claims(WEBID, json!(format!("{BASE_URL}/"))),
+    );
+    for path in ["/alice/notes/a.txt", "/alice/other.txt"] {
+        let resp = h
+            .bearer("PUT", path, &owner, Some(("text/plain", "x")))
+            .await;
+        assert_eq!(resp.status(), StatusCode::CREATED, "{path}");
+    }
+
+    // The SAME agent, narrowed to read-only on /alice/notes/ — WAC allows everything for this
+    // agent, so every denial below is attributable to the narrowing alone.
+    let narrowed = mint_lws(
+        &h.issuer_key,
+        &lws_claims_with_details(
+            WEBID,
+            json!(format!("{BASE_URL}/")),
+            json!([access_request(
+                json!([format!("{BASE_URL}/alice/notes/")]),
+                json!(["read"])
+            )]),
+        ),
+    );
+
+    // Covered (location + action): permitted — the WAC decision stands (rar-covering-claim vector).
+    let resp = h.bearer("GET", "/alice/notes/a.txt", &narrowed, None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // A target OUTSIDE the locations: 403 insufficient_scope, even though WAC would allow
+    // (rar-narrows-locations). NB 403 — the token is VALID; its scope is not.
+    let resp = h.bearer("GET", "/alice/other.txt", &narrowed, None).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(
+        lws_challenge(&resp)
+            .expect("narrowing denial advertises the challenge")
+            .contains("error=\"insufficient_scope\""),
+        "the RFC 6750 §3.1 insufficient_scope challenge"
+    );
+
+    // An ACTION outside the grant (write under a read-only narrowing): 403 insufficient_scope.
+    let resp = h
+        .bearer(
+            "PUT",
+            "/alice/notes/a.txt",
+            &narrowed,
+            Some(("text/plain", "overwrite")),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // …and DELETE likewise (delete is NOT implied by anything but odrl:delete).
+    let resp = h
+        .bearer("DELETE", "/alice/notes/a.txt", &narrowed, None)
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // The narrowing denial reveals nothing about existence: a MISSING in-scope target and an
+    // out-of-scope one answer the same shape for a non-covered action.
+    let resp = h
+        .bearer("DELETE", "/alice/notes/missing.txt", &narrowed, None)
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // The narrowed token still cannot escape its AUDIENCE either — narrowing composes UNDER the
+    // aud ceiling, it never replaces it.
+    let scoped_narrowed = mint_lws(
+        &h.issuer_key,
+        &lws_claims_with_details(
+            WEBID,
+            json!(format!("{BASE_URL}/alice/notes/")),
+            json!([access_request(
+                json!([format!("{BASE_URL}/")]), // WIDER location than the aud
+                json!(["read"])
+            )]),
+        ),
+    );
+    let resp = h
+        .bearer("GET", "/alice/other.txt", &scoped_narrowed, None)
+        .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a location wider than the aud never widens past the aud ceiling"
+    );
+}
+
+#[tokio::test]
+async fn authorization_details_can_never_widen_beyond_wac() {
+    let h = Harness::build(Mode::Full).await;
+    // Seed a private doc as the owner.
+    let owner = mint_lws(
+        &h.issuer_key,
+        &lws_claims(WEBID, json!(format!("{BASE_URL}/"))),
+    );
+    let resp = h
+        .bearer(
+            "PUT",
+            "/alice/private",
+            &owner,
+            Some(("text/plain", "secret")),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // BOB's token carries a claim "granting" read+modify+delete on the whole storage — WAC (the
+    // ceiling) still denies: 403, and the resource is untouched (the spec's rar-cannot-widen
+    // MUST).
+    let bob_widened = mint_lws(
+        &h.issuer_key,
+        &lws_claims_with_details(
+            BOB,
+            json!(format!("{BASE_URL}/")),
+            json!([access_request(
+                json!([format!("{BASE_URL}/")]),
+                json!(["read", "modify", "delete"])
+            )]),
+        ),
+    );
+    let resp = h.bearer("GET", "/alice/private", &bob_widened, None).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "WAC remains the ceiling"
+    );
+    let resp = h
+        .bearer(
+            "PUT",
+            "/alice/private",
+            &bob_widened,
+            Some(("text/plain", "clobber")),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = h
+        .bearer("DELETE", "/alice/private", &bob_widened, None)
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // The owner still reads the ORIGINAL content — nothing was widened into existence.
+    let resp = h.bearer("GET", "/alice/private", &owner, None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&bytes[..], b"secret");
+}
+
+#[tokio::test]
+async fn malformed_authorization_details_fail_closed_as_401() {
+    let h = Harness::build(Mode::Full).await;
+    let owner = mint_lws(
+        &h.issuer_key,
+        &lws_claims(WEBID, json!(format!("{BASE_URL}/"))),
+    );
+    let resp = h
+        .bearer("PUT", "/alice/doc", &owner, Some(("text/plain", "x")))
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Every malformed shape rejects the TOKEN (401 invalid_token) — never "ignored ⇒ full WAC
+    // baseline", which would silently widen past the AS's encoded decision.
+    for bad in [
+        json!("read-everything"), // not an array
+        json!([]),                // empty
+        json!([{ "type": "https://other.example/Grant",
+                 "locations": [format!("{BASE_URL}/")],
+                 "actions": ["read"] }]), // foreign entry type
+        json!([{ "type": "https://w3id.org/jeswr/lws#AccessRequest",
+                 "actions": ["read"] }]), // no locations
+        json!([access_request(json!(["not-a-uri"]), json!(["read"]))]), // relative location
+        json!([access_request(json!([format!("{BASE_URL}/")]), json!([]))]), // empty actions
+    ] {
+        let token = mint_lws(
+            &h.issuer_key,
+            &lws_claims_with_details(WEBID, json!(format!("{BASE_URL}/")), bad.clone()),
+        );
+        let resp = h.bearer("GET", "/alice/doc", &token, None).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "must reject: {bad}"
+        );
+        assert!(
+            lws_challenge(&resp)
+                .expect("fail-closed rejection carries the challenge")
+                .contains("error=\"invalid_token\""),
+            "{bad}"
+        );
+    }
+
+    // An entry carrying constraints this server cannot evaluate (purposes/datatypes) is
+    // intelligible but GRANTS NOTHING — a valid token whose scope covers nothing: 403.
+    let constrained = mint_lws(
+        &h.issuer_key,
+        &lws_claims_with_details(
+            WEBID,
+            json!(format!("{BASE_URL}/")),
+            json!([{
+                "type": "https://w3id.org/jeswr/lws#AccessRequest",
+                "locations": [format!("{BASE_URL}/")],
+                "actions": ["read"],
+                "purposes": ["https://purpose.example/marketing"],
+            }]),
+        ),
+    );
+    let resp = h.bearer("GET", "/alice/doc", &constrained, None).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(lws_challenge(&resp)
+        .expect("challenge")
+        .contains("error=\"insufficient_scope\""));
+}
+
+#[tokio::test]
+async fn delete_only_narrowing_permits_exactly_delete() {
+    let h = Harness::build(Mode::Full).await;
+    let owner = mint_lws(
+        &h.issuer_key,
+        &lws_claims(WEBID, json!(format!("{BASE_URL}/"))),
+    );
+    let resp = h
+        .bearer("PUT", "/alice/tmp/x", &owner, Some(("text/plain", "x")))
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let delete_only = mint_lws(
+        &h.issuer_key,
+        &lws_claims_with_details(
+            WEBID,
+            json!(format!("{BASE_URL}/")),
+            json!([access_request(
+                json!([format!("{BASE_URL}/alice/tmp/")]),
+                json!(["delete"])
+            )]),
+        ),
+    );
+    // Read/write under a delete-only grant: 403.
+    let resp = h.bearer("GET", "/alice/tmp/x", &delete_only, None).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = h
+        .bearer(
+            "PUT",
+            "/alice/tmp/x",
+            &delete_only,
+            Some(("text/plain", "y")),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // The granted action works (WAC allows — the owner).
+    let resp = h.bearer("DELETE", "/alice/tmp/x", &delete_only, None).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn absent_authorization_details_leaves_the_wac_baseline() {
+    // The rar-absent vector: no claim ⇒ the storage-server policy alone decides. This is exactly
+    // the M2 baseline every earlier test in this file exercises; pin it explicitly beside the
+    // narrowing cases.
+    let h = Harness::build(Mode::Full).await;
+    let owner = mint_lws(
+        &h.issuer_key,
+        &lws_claims(WEBID, json!(format!("{BASE_URL}/"))),
+    );
+    let resp = h
+        .bearer("PUT", "/alice/base", &owner, Some(("text/plain", "x")))
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = h.bearer("GET", "/alice/base", &owner, None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}

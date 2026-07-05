@@ -340,7 +340,7 @@ impl<S: Store> LdpState<S> {
     /// the same plan (`None` ⇒ the caller's 404, decided AFTER authorization exactly as before);
     /// on a denial the SAME spec error (401 + challenge when anonymous, 403 when
     /// authenticated-but-unauthorized).
-    async fn authorize_read(
+    pub(crate) async fn authorize_read(
         &self,
         method: &str,
         target: &LdpTarget,
@@ -383,7 +383,7 @@ impl<S: Store> LdpState<S> {
     ///
     /// write-2: the ACL walk is PLANNED — one combined [`Store::read_plan`] round-trip replaces the
     /// sequential k+1 per-candidate probes (see [`authorize_planned_iri`](Self::authorize_planned_iri)).
-    async fn authorize_mode(
+    pub(crate) async fn authorize_mode(
         &self,
         target: &LdpTarget,
         required: AccessMode,
@@ -539,7 +539,7 @@ impl<S: Store> LdpState<S> {
     /// nothing. A requester WITHOUT a conditional header is unaffected (no validator is consulted on
     /// their path), and a requester who holds the read-mode keeps full conditional semantics. `granted`
     /// is the mode set the write authorization already returned (no extra ACL resolution).
-    fn guard_conditional_requires_read(
+    pub(crate) fn guard_conditional_requires_read(
         &self,
         target_iri: &str,
         headers: &HeaderMap,
@@ -725,6 +725,15 @@ pub(crate) async fn serve_read<S: Store>(
     with_body: bool,
 ) -> Result<Response, ServerError> {
     let target = parse_target(&state.base_url, uri.path())?;
+    let origin = request_origin(req_headers);
+
+    // LWS linkset (M3, flag-gated): `?linkset` selects the resource's standalone RFC 9264
+    // metadata document (`lws::linkset`). The flag-off surface never inspects the query string,
+    // so this branch is dead code when off (byte-identical — pinned).
+    if state.lws().is_some() && crate::lws::linkset::selects_linkset(uri.query()) {
+        return crate::lws::linkset::serve(state, &target, token, origin, req_headers, with_body)
+            .await;
+    }
 
     // WAC read authorization (real per-resource `.acl` evaluation). A GET/HEAD requires `acl:Read`
     // (Control for an `.acl` target); the public-read class is whatever the effective ACL grants to
@@ -738,7 +747,6 @@ pub(crate) async fn serve_read<S: Store>(
     // decision (Allow / 401 / 403) AND the `WAC-Allow` audiences (`user` + `public`) derive from
     // that one resolution. `perms` is reused below to emit `WAC-Allow` with no further ACL work;
     // `target_meta` is the SAME plan's target row, so no second metadata query is needed.
-    let origin = request_origin(req_headers);
     let (perms, target_meta) = state
         .authorize_read(
             if with_body { "GET" } else { "HEAD" },
@@ -787,15 +795,32 @@ pub(crate) async fn serve_read<S: Store>(
         None
     };
 
+    let mut lws_page_links: Vec<HeaderValue> = Vec::new();
     let (rendered, etag): (Option<(Bytes, String)>, String) = if target.is_container {
         if let Some(variant) = lws_container_variant {
             // The LWS flat `{id, type, totalItems, items[]}` listing — server-managed, fail-closed
-            // per member (D12). Its representation ETag derives from the rendered bytes exactly
-            // like the LDP listing's, so the 304/Vary machinery below applies unchanged.
-            let body = crate::lws::container::render(state, &target, token, origin).await?;
-            let etag = representation_etag(&body);
+            // per member (D12), PAGED per §pagination (M3: `?lws-page=N` + the RFC 8288 Link set;
+            // single-response snapshot — the multi-request consistency caveat is documented in
+            // `lws::container`). Its representation ETag derives from the rendered PAGE bytes
+            // exactly like the LDP listing's, so the 304/Vary machinery below applies unchanged
+            // (each page carries its own validator).
+            let page = crate::lws::container::page_from_query(uri.query())?;
+            let listing = crate::lws::container::render(
+                state,
+                &target,
+                token,
+                origin,
+                page,
+                state.lws().and_then(|l| l.page_size),
+            )
+            .await?;
+            let etag = representation_etag(&listing.body);
+            lws_page_links = listing.page_links;
             (
-                Some((Bytes::from(body), variant.content_type().to_string())),
+                Some((
+                    Bytes::from(listing.body),
+                    variant.content_type().to_string(),
+                )),
                 etag,
             )
         } else {
@@ -895,6 +920,12 @@ pub(crate) async fn serve_read<S: Store>(
             if let Ok(v) = HeaderValue::from_str(&format!("<{parent}>; rel=\"up\"")) {
                 out.append(header::LINK, v);
             }
+        }
+        // M3: the per-resource linkset discovery link (spec §metadata — a MUST on GET/HEAD), and
+        // the pagination Link set when this is a paged LWS listing (empty otherwise).
+        crate::lws::linkset::add_linkset_link(&mut out, &target.iri);
+        for v in lws_page_links {
+            out.append(header::LINK, v);
         }
     }
     // WAC-Allow (Solid Protocol): advertise the requester's + the public's effective access modes for
@@ -1049,6 +1080,13 @@ pub async fn put_handler<S: Store>(
     body: Bytes,
 ) -> Result<Response, ServerError> {
     let target = parse_target(&state.base_url, uri.path())?;
+
+    // LWS linkset (M3, flag-gated): a linkset URI supports GET/HEAD/PATCH only — its lifecycle is
+    // its resource's (405 + Allow + problem details). Header-only (no state consulted): leaks
+    // nothing, and the flag-off surface never inspects the query string.
+    if state.lws().is_some() && crate::lws::linkset::selects_linkset(uri.query()) {
+        return Ok(crate::lws::linkset::method_not_allowed());
+    }
 
     // WAC for PUT — EXISTENCE-NON-DISCLOSURE (decisions/0003): a PUT requires `acl:Write` on the
     // TARGET's effective ACL (inherited via `acl:default` for a not-yet-existing target), authorized
@@ -1245,7 +1283,13 @@ pub async fn put_handler<S: Store>(
     // `invalidate_acl_if_acl`).
     state.invalidate_acl_if_acl(&target.iri);
 
-    Ok(write_response(existed, &meta, &target.iri))
+    let mut resp = write_response(existed, &meta, &target.iri);
+    // LWS (M3, flag-gated): a 201 create carries the spec-required `rel="linkset"` + `rel="up"`
+    // links (§http-create). Replaces carry no create links (their metadata surface is unchanged).
+    if !existed && state.lws().is_some() {
+        crate::lws::linkset::append_create_links(resp.headers_mut(), &target.iri);
+    }
+    Ok(resp)
 }
 
 /// `POST /{path}` — create a child resource inside a container.
@@ -1261,6 +1305,14 @@ pub async fn post_handler<S: Store>(
     body: Bytes,
 ) -> Result<Response, ServerError> {
     let container = parse_target(&state.base_url, uri.path())?;
+
+    // LWS linkset (M3, flag-gated): a linkset URI supports GET/HEAD/PATCH only — its lifecycle is
+    // its resource's (405 + Allow + problem details). Header-only (no state consulted): leaks
+    // nothing, and the flag-off surface never inspects the query string.
+    if state.lws().is_some() && crate::lws::linkset::selects_linkset(uri.query()) {
+        return Ok(crate::lws::linkset::method_not_allowed());
+    }
+
     // WAC: a POST to a container requires `acl:Append` on the container (a writer also satisfies it).
     // Anonymous ⇒ 401, authenticated-but-unauthorized ⇒ 403. Authorize BEFORE the container-shape /
     // existence checks so an unauthorized caller cannot probe existence (the read-access POST cases
@@ -1400,6 +1452,10 @@ pub async fn post_handler<S: Store>(
     let mut out = HeaderMap::new();
     set_str(&mut out, header::ETAG, &meta.etag);
     set_str(&mut out, header::LOCATION, &child_iri);
+    // LWS (M3, flag-gated): the spec-required create links on the 201 (§http-create).
+    if state.lws().is_some() {
+        crate::lws::linkset::append_create_links(&mut out, &child_iri);
+    }
     Ok((StatusCode::CREATED, out).into_response())
 }
 
@@ -1425,6 +1481,13 @@ pub async fn delete_handler<S: Store>(
     headers: HeaderMap,
 ) -> Result<Response, ServerError> {
     let target = parse_target(&state.base_url, uri.path())?;
+
+    // LWS linkset (M3, flag-gated): a linkset URI supports GET/HEAD/PATCH only — its lifecycle is
+    // its resource's (405 + Allow + problem details). Header-only (no state consulted): leaks
+    // nothing, and the flag-off surface never inspects the query string.
+    if state.lws().is_some() && crate::lws::linkset::selects_linkset(uri.query()) {
+        return Ok(crate::lws::linkset::method_not_allowed());
+    }
 
     // WAC for DELETE (Solid WAC write-access matrix). Authorize BEFORE the existence check so an
     // unauthorized caller cannot probe existence (a missing target below is reported as a denial, not
@@ -1552,6 +1615,14 @@ pub async fn patch_handler<S: Store>(
     body: Bytes,
 ) -> Result<Response, ServerError> {
     let target = parse_target(&state.base_url, uri.path())?;
+
+    // LWS linkset (M3, flag-gated): `PATCH … ?linkset` is the spec's metadata update — an RFC 7386
+    // merge-patch under the strict If-Match/428 discipline (`lws::linkset::patch`), fully distinct
+    // from the resource-content PATCH below. Flag-off never inspects the query string.
+    if state.lws().is_some() && crate::lws::linkset::selects_linkset(uri.query()) {
+        let origin = request_origin(&headers);
+        return crate::lws::linkset::patch(&state, &target, &token, origin, &headers, body).await;
+    }
 
     // Select the PATCH language from the Content-Type (ABSENT ⇒ 400, unsupported ⇒ 415) and parse the
     // document. `text/n3` is the Solid N3 Patch; `application/sparql-update` is the INSERT/DELETE DATA
@@ -1760,7 +1831,13 @@ pub async fn patch_handler<S: Store>(
     // read resolves against the patched ACL immediately.
     state.invalidate_acl_if_acl(&target.iri);
 
-    Ok(write_response(existed, &meta, &target.iri))
+    let mut resp = write_response(existed, &meta, &target.iri);
+    // LWS (M3, flag-gated): a 201 create carries the spec-required `rel="linkset"` + `rel="up"`
+    // links (§http-create). Replaces carry no create links (their metadata surface is unchanged).
+    if !existed && state.lws().is_some() {
+        crate::lws::linkset::append_create_links(resp.headers_mut(), &target.iri);
+    }
+    Ok(resp)
 }
 
 /// `OPTIONS /{path}` — advertise the methods + write media types for a target (RFC 9110 §9.3.7 +
@@ -2275,8 +2352,14 @@ fn sanitise_slug(raw: &str) -> Option<String> {
 /// Derive the parent container IRI of a target (for detaching containment on DELETE). The parent is
 /// the IRI up to and including the last interior slash. The root has no parent.
 fn parent_container(target: &LdpTarget) -> Option<String> {
+    parent_container_of(&target.iri)
+}
+
+/// As [`parent_container`], from a bare IRI (`pub(crate)` for the LWS linkset module, which
+/// derives the system-managed `up` link from the same containment rule the handlers use).
+pub(crate) fn parent_container_of(target_iri: &str) -> Option<String> {
     // Strip a trailing slash for a container target so we find its PARENT, not itself.
-    let iri = target.iri.trim_end_matches('/');
+    let iri = target_iri.trim_end_matches('/');
     // Find the last '/' that is part of the path (after the scheme's "//").
     let scheme_end = iri.find("://").map(|i| i + 3).unwrap_or(0);
     let path_part = &iri[scheme_end..];
@@ -2906,6 +2989,7 @@ mod tests {
                     blob_key: "k".into(),
                     etag: "\"acl\"".into(),
                     last_modified: None,
+                    size: None,
                 };
                 return Ok(Resource { body, meta });
             }
@@ -2930,6 +3014,7 @@ mod tests {
                     blob_key: "k".into(),
                     etag: "\"acl\"".into(),
                     last_modified: None,
+                    size: None,
                 }));
             }
             Ok(None)
@@ -4228,6 +4313,7 @@ mod tests {
                 blob_key: "k".into(),
                 etag: "\"acl\"".into(),
                 last_modified: None,
+                size: None,
             }
         }
     }
@@ -4568,6 +4654,7 @@ mod tests {
                 blob_key: "b".into(),
                 etag: "\"fixed\"".into(),
                 last_modified: self.last_modified,
+                size: None,
             }
         }
         fn acl_meta() -> ResourceMeta {
@@ -4576,6 +4663,7 @@ mod tests {
                 blob_key: "bacl".into(),
                 etag: "\"acl\"".into(),
                 last_modified: None,
+                size: None,
             }
         }
         fn acl_body() -> AxBytes {

@@ -227,18 +227,24 @@ impl SparqClient for EmbeddedSparqClient {
             let last_modified = var_col(&result, "mod")
                 .and_then(|col| term_value(row.get(col).and_then(|c| c.as_ref())))
                 .and_then(|s| timestamp::from_xsd_datetime(&s));
+            // `?size` (`pss:size`) is likewise OPTIONAL — absent/unbound/unparseable ⇒ `None`
+            // (descriptive metadata only).
+            let size = var_col(&result, "size")
+                .and_then(|col| term_value(row.get(col).and_then(|c| c.as_ref())))
+                .and_then(|s| s.parse::<u64>().ok());
             Ok(ResourceMeta {
                 content_type,
                 blob_key,
                 etag,
                 last_modified,
+                size,
             })
         })
         .await
     }
 
     async fn put_meta(&self, iri: &str, meta: ResourceMeta) -> Result<(), SparqError> {
-        // The SAME `update_put_meta` builder — a single `;`-joined update (3 targeted deletes + one
+        // The SAME `update_put_meta` builder — a single `;`-joined update (the targeted deletes + one
         // insert). Run it request-ATOMICALLY (`update_in_place_atomic`): the whole request commits
         // all-or-nothing, so a re-write never leaves a half-deleted record (the safe public default
         // for a direct library consumer, per the sparq-engine docs).
@@ -249,6 +255,7 @@ impl SparqClient for EmbeddedSparqClient {
             &meta.blob_key,
             &meta.etag,
             modified.as_deref(),
+            meta.size,
         )?;
         let graph = Arc::clone(&self.graph);
         self.dispatch(move || {
@@ -348,6 +355,7 @@ impl SparqClient for EmbeddedSparqClient {
             &meta.blob_key,
             &meta.etag,
             modified.as_deref(),
+            meta.size,
             &nonce,
         )?;
         let graph = Arc::clone(&self.graph);
@@ -477,6 +485,7 @@ impl SparqClient for EmbeddedSparqClient {
                 SparqError::Backend("fatal: read-plan result missing ?etag column".into())
             })?;
             let mod_col = var_col(&result, "mod"); // OPTIONAL — may be absent from the header.
+            let size_col = var_col(&result, "size"); // OPTIONAL — may be absent from the header.
 
             // Key each row by its graph IRI. First row per graph wins (the record is single-valued
             // per graph — `update_put_meta`/`update_create_child` keep it so — mirroring
@@ -506,11 +515,16 @@ impl SparqClient for EmbeddedSparqClient {
                 let last_modified = mod_col
                     .and_then(|col| term_value(row.get(col).and_then(|c| c.as_ref())))
                     .and_then(|s| timestamp::from_xsd_datetime(&s));
+                // `?size` (`pss:size`) is OPTIONAL too — absent/unbound/unparseable ⇒ `None`.
+                let size = size_col
+                    .and_then(|col| term_value(row.get(col).and_then(|c| c.as_ref())))
+                    .and_then(|s| s.parse::<u64>().ok());
                 by_graph.entry(graph_iri).or_insert(ResourceMeta {
                     content_type,
                     blob_key,
                     etag,
                     last_modified,
+                    size,
                 });
             }
 
@@ -525,6 +539,56 @@ impl SparqClient for EmbeddedSparqClient {
                     .map(|c| (c.clone(), by_graph.get(c).map(|m| m.etag.clone())))
                     .collect(),
             })
+        })
+        .await
+    }
+
+    async fn get_linkset(&self, iri: &str) -> Result<Option<(String, String)>, SparqError> {
+        // The SAME `select_linkset` builder as the HTTP path.
+        let q = sparql::select_linkset(iri)?;
+        let graph = Arc::clone(&self.graph);
+        self.dispatch(move || {
+            let g = lock(&graph)?;
+            let result =
+                sparq_engine::query(&g, &q).map_err(|e| engine_err("select_linkset", e))?;
+            let Some(row) = result.rows.first() else {
+                return Ok(None);
+            };
+            let json_col = var_col(&result, "json").ok_or_else(|| {
+                SparqError::Backend("fatal: linkset result missing ?json column".into())
+            })?;
+            let rev_col = var_col(&result, "rev").ok_or_else(|| {
+                SparqError::Backend("fatal: linkset result missing ?rev column".into())
+            })?;
+            // The pair is written atomically, so a half-bound row is a malformed result — fatal,
+            // never a half-linkset.
+            let json = term_value(row.get(json_col).and_then(|c| c.as_ref()))
+                .ok_or_else(|| SparqError::Backend("fatal: linkset row missing json".into()))?;
+            let rev = term_value(row.get(rev_col).and_then(|c| c.as_ref()))
+                .ok_or_else(|| SparqError::Backend("fatal: linkset row missing rev".into()))?;
+            Ok(Some((json, rev)))
+        })
+        .await
+    }
+
+    async fn set_linkset(
+        &self,
+        iri: &str,
+        json: &str,
+        new_rev: &str,
+        expected: sparql::LinksetCas<'_>,
+    ) -> Result<bool, SparqError> {
+        // The SAME guarded `update_set_linkset` builder as the HTTP path, run request-atomically
+        // under the one lock; the rev confirm (an ASK for the operation-unique `new_rev`) then runs
+        // under the SAME held lock, so the applied/lost verdict is race-free in-process.
+        let u = sparql::update_set_linkset(iri, json, new_rev, expected)?;
+        let confirm = sparql::ask_linkset_rev(iri, new_rev)?;
+        let graph = Arc::clone(&self.graph);
+        self.dispatch(move || {
+            let mut g = lock(&graph)?;
+            sparq_engine::update_in_place_atomic(&mut g, &u)
+                .map_err(|e| engine_err("set_linkset", e))?;
+            sparq_engine::ask(&g, &confirm).map_err(|e| engine_err("set_linkset/confirm", e))
         })
         .await
     }
@@ -572,6 +636,7 @@ mod tests {
             blob_key: bk.into(),
             etag: etag.into(),
             last_modified: None,
+            size: None,
         }
     }
 
