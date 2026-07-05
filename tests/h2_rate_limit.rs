@@ -84,6 +84,7 @@ fn app_with_rate_limit(rate: f64, burst: f64) -> axum::Router {
             rate, burst, /* trusted_proxy_hops */ 0, /* exempt_loopback */ false,
             /* exempt_internal */ false,
         )),
+        body_limit_bytes: solid_server_rs::body_limit::DEFAULT_MAX_BODY_BYTES,
     };
     build_router_with_overload(AppState::new(ctx, ldp), overload)
 }
@@ -101,7 +102,7 @@ async fn boot_app_over_tls(
         cert_path: CERT_PATH.into(),
         key_path: KEY_PATH.into(),
     };
-    let rustls_config = build_rustls_config(&mode)
+    let rustls_config = build_rustls_config(&mode, /* mtls_bound_tokens */ false)
         .await
         .expect("build rustls config")
         .expect("tls mode yields a config");

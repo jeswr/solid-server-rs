@@ -421,8 +421,8 @@ async fn per_source_connection_cap_bounds_a_single_source() {
         handshake_timeout: None,
         max_connections_per_ip: Some(2), // at most 2 concurrent connections from one source IP
         conn_exempt_internal: false,     // so the loopback test source IS subject to the cap
-        idle_timeout: None,              // disabled — not under test here (held connections stay idle)
-        max_requests_per_conn: None,     // disabled — not under test here
+        idle_timeout: None, // disabled — not under test here (held connections stay idle)
+        max_requests_per_conn: None, // disabled — not under test here
     };
     let (addr, handle) = boot_hardened_server(transport).await;
 
