@@ -2419,6 +2419,59 @@ mod tests {
         );
     }
 
+    /// REGRESSION (roborev round-C follow-up): `set_base_url` — the ONLY sanctioned writer of the now
+    /// PRIVATE `base_url` — MUST rebuild the derived `discovery_link_values` cache so the two can never
+    /// desync. Without the rebuild, a post-construction base-URL change would leave the read path
+    /// advertising the OLD storage-description `Link` on every response while parsing/type links used
+    /// the NEW base. Construct a state on one base, reset it, and assert BOTH the accessor AND the
+    /// cached discovery `Link` values track the new base (byte-identical to a fresh precompute) and no
+    /// longer reference the old one.
+    #[test]
+    fn set_base_url_rebuilds_discovery_link_cache() {
+        let old_base = "https://old.example";
+        let new_base = "https://new.example";
+        let mut state = LdpState::new(
+            CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new()),
+            old_base,
+        );
+        // Precondition: the cache was built from the OLD base at construction (and is non-empty).
+        let before: Vec<String> = state
+            .discovery_link_values
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !before.is_empty() && before.iter().all(|l| l.contains(old_base)),
+            "cache must start derived from the old base: {before:?}"
+        );
+
+        state.set_base_url(new_base);
+
+        // The read accessor tracks the new value.
+        assert_eq!(state.base_url(), new_base);
+        // The derived cache was REBUILT: it is byte-identical to a fresh precompute on the new base,
+        // every line now names the NEW base, and NONE still references the old one.
+        let after: Vec<String> = state
+            .discovery_link_values
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        let expected: Vec<String> = build_discovery_link_values(new_base)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            after, expected,
+            "set_base_url must rebuild the discovery-link cache to the new base"
+        );
+        assert!(
+            after
+                .iter()
+                .all(|l| l.contains(new_base) && !l.contains(old_base)),
+            "no discovery Link may still reference the old base after set_base_url: {after:?}"
+        );
+    }
+
     /// `set_u64` emits the SAME decimal bytes the prior `value.to_string()` did (the `itoa` fast path
     /// is a formatting optimisation, not a representation change) — pins `Content-Length` byte-equality.
     #[test]
