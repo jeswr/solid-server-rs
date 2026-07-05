@@ -323,9 +323,12 @@ fn description_content_type(accept: &str) -> &'static str {
 
 /// Parse one comma-separated `Accept` part into `(media-essence-lowercase, q, has-lws-profile)`.
 ///
-/// The q handling mirrors [`crate::ldp::content::negotiate_accept`] exactly (default 1.0; a
-/// malformed q is 0 — "not accepted"; clamped to `[0,1]`), so LWS-side negotiation can never
-/// disagree with the existing negotiator about a part's weight. `has-lws-profile` is true when a
+/// Parameter NAMES are matched case-insensitively (RFC 9110 §5.6.6 — the roborev Low on c3eb4da:
+/// `Profile=`/`Q=` mixed-case variants must negotiate identically). For `q` this is
+/// behaviour-identical to [`crate::ldp::content::negotiate_accept`]'s `q=`/`Q=` matching (the
+/// single-letter name has no other case), so the q handling still mirrors the existing negotiator
+/// exactly (default 1.0; a malformed q is 0 — "not accepted"; clamped to `[0,1]`) and LWS-side
+/// negotiation can never disagree with it about a part's weight. `has-lws-profile` is true when a
 /// `profile` parameter names [`JLWS_CONTEXT`] (quoted or bare) — the profiled-JSON-LD selector for
 /// the container representation.
 pub(crate) fn parse_accept_part(part: &str) -> (String, f32, bool) {
@@ -334,14 +337,14 @@ pub(crate) fn parse_accept_part(part: &str) -> (String, f32, bool) {
     let mut q: f32 = 1.0;
     let mut profiled = false;
     for param in it {
-        let p = param.trim();
-        if let Some(v) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
-            q = v.trim().parse::<f32>().unwrap_or(0.0).clamp(0.0, 1.0);
-        } else if let Some(v) = p
-            .strip_prefix("profile=")
-            .or_else(|| p.strip_prefix("PROFILE="))
-        {
-            let v = v.trim().trim_matches('"');
+        let Some((name, value)) = param.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("q") {
+            q = value.trim().parse::<f32>().unwrap_or(0.0).clamp(0.0, 1.0);
+        } else if name.eq_ignore_ascii_case("profile") {
+            let v = value.trim().trim_matches('"');
             if v == JLWS_CONTEXT {
                 profiled = true;
             }
@@ -440,6 +443,15 @@ mod tests {
         let (_, _, p) =
             parse_accept_part("application/ld+json;profile=https://w3id.org/jeswr/lws/v1");
         assert!(p);
+        // Parameter NAMES are case-insensitive (RFC 9110 §5.6.6 — the roborev Low on c3eb4da):
+        // mixed-case `Profile=` / `Q=` parse identically.
+        let (_, _, p) =
+            parse_accept_part("application/ld+json;Profile=\"https://w3id.org/jeswr/lws/v1\"");
+        assert!(p);
+        let (_, q, p) =
+            parse_accept_part("application/ld+json;PrOfIlE=https://w3id.org/jeswr/lws/v1;Q=0.4");
+        assert!(p);
+        assert!((q - 0.4).abs() < 1e-6);
         let (_, _, p) = parse_accept_part("application/ld+json;profile=\"https://other.example/\"");
         assert!(!p);
         // Malformed q ⇒ 0 (not accepted) — mirrors the existing negotiator.

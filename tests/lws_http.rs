@@ -740,6 +740,52 @@ async fn transform_write_guard_blocks_nt_over_rdf_only_when_on() {
         "https://w3id.org/jeswr/lws/problems/not-a-source-type"
     );
 
+    // ORDERING (the roborev Medium on c3eb4da): a FAILING precondition wins over the media-type
+    // guard. An idempotent-create RETRY (`If-None-Match: *`) with N-Triples content against the
+    // existing RDF resource keeps its non-mutating, retry-safe 412 (D2) — never a 415…
+    let retry = h
+        .request_with(
+            "PUT",
+            "/alice/doc",
+            Some(NT),
+            &[("if-none-match", "*")],
+            Body::from(NTRIPLES_LINE.to_string() + "\n"),
+        )
+        .await;
+    assert_eq!(retry.status(), StatusCode::PRECONDITION_FAILED);
+    // …and a STALE If-Match is likewise 412 before any media-type judgement.
+    let stale = h
+        .request_with(
+            "PUT",
+            "/alice/doc",
+            Some(NT),
+            &[("if-match", "\"0-bogus\"")],
+            Body::from(NTRIPLES_LINE.to_string() + "\n"),
+        )
+        .await;
+    assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+    // A PASSING precondition still reaches the guard: If-Match with the CURRENT tag + NT ⇒ 415.
+    let get = h
+        .request_with(
+            "GET",
+            "/alice/doc",
+            None,
+            &[("accept", "text/turtle")],
+            Body::empty(),
+        )
+        .await;
+    let etag = header_value(&get, "etag").unwrap().to_string();
+    let guarded = h
+        .request_with(
+            "PUT",
+            "/alice/doc",
+            Some(NT),
+            &[("if-match", &etag)],
+            Body::from(NTRIPLES_LINE.to_string() + "\n"),
+        )
+        .await;
+    assert_eq!(guarded.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
     // A fresh CREATE in N-Triples is byte-native storage (no transform expectations) — allowed.
     let create = h
         .request(

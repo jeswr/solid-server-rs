@@ -1136,18 +1136,6 @@ pub async fn put_handler<S: Store>(
         validate_writable(&content_type, &body, &target.iri)?
     };
 
-    // LWS RDF-transform WRITE GUARD (flag-gated — `rdf-transform.html` §authoritative-bytes): a
-    // write in an advertised-target-but-not-source type (`application/n-triples`) over an existing
-    // RDF-readable resource would strand the resource in a type the server cannot transform from —
-    // 415 with problem details. A create, a container, and any non-RDF-readable target pass
-    // through unchanged (byte-native).
-    if state.lws_transform_on() && !target.is_container {
-        crate::lws::transform::write_type_guard(
-            current.as_ref().map(|m| m.content_type.as_str()),
-            &stored_type,
-        )?;
-    }
-
     // Conditional write: evaluate preconditions against the CURRENT representation's ETag.
     let current_etag = current.as_ref().map(|m| m.etag.as_str());
     conditional::require(eval_preconditions(
@@ -1155,6 +1143,24 @@ pub async fn put_handler<S: Store>(
         header_str(&headers, header::IF_NONE_MATCH),
         current_etag,
     ))?;
+
+    // LWS RDF-transform WRITE GUARD (flag-gated — `rdf-transform.html` §authoritative-bytes): a
+    // write in an advertised-target-but-not-source type (`application/n-triples`) over an existing
+    // RDF-readable resource would strand the resource in a type the server cannot transform from —
+    // 415 with problem details. A create, a container, and any non-RDF-readable target pass
+    // through unchanged (byte-native).
+    //
+    // ORDER (the roborev Medium on c3eb4da): the guard runs AFTER the precondition evaluation
+    // above, so a request whose precondition already fails keeps its non-mutating `412` — in
+    // particular a `PUT + If-None-Match: *` idempotent-create RETRY against an existing RDF
+    // resource answers 412 (retry-safe, per D2) rather than 415, and a stale `If-Match` is 412
+    // before any media-type judgement. The guard only vets a write that WOULD otherwise proceed.
+    if state.lws_transform_on() && !target.is_container {
+        crate::lws::transform::write_type_guard(
+            current.as_ref().map(|m| m.content_type.as_str()),
+            &stored_type,
+        )?;
+    }
 
     let parent = parent_container(&target);
 
