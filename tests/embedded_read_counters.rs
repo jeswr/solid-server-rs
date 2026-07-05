@@ -16,14 +16,20 @@
 //!    backend — so the per-op counts match `read_path_counters.rs`. It proves the counters + the
 //!    app-layer round-trip model hold over the real engine (not just the in-memory double), and guards
 //!    against a regression that adds a store call on the embedded read path.
-//! 2. **True engine round-trips** (`embedded_read_plan_fans_out`): the embedded backend has NO
-//!    combined-`read_plan` override, so it inherits the trait DEFAULT, which decomposes a read plan
-//!    into `1 (target) + N (ACL candidates)` sequential `get_meta` round-trips. A `RawSeamCounter`
-//!    (a seam counter WITHOUT the read_plan override, so the default fan-out is visible) pins that
-//!    `1 + N`. This is the round-trip cost the collapsed backends (in-memory / the live HTTP client's
-//!    one combined SELECT) already avoid — i.e. the exact reduction the next phase buys by
-//!    implementing a combined `read_plan` on `EmbeddedSparqClient`. When it lands, this pin DROPS (an
-//!    intended, measured win), and the app-view seam counts in (1) stay flat.
+//! 2. **True engine round-trips** — the round-trip-reduction WIN, now landed (76ea):
+//!    - `embedded_read_plan_override_is_one_engine_round_trip` measures the REAL engine round-trips
+//!      of `EmbeddedSparqClient::read_plan` via its own `engine_round_trips()` counter (one increment
+//!      per blocking engine dispatch): the combined `VALUES ?g { … } GRAPH ?g { … }` SELECT answers
+//!      the whole plan in **ONE** round-trip (down from `1 + N`), and returns the byte-identical
+//!      `ReadPlan` the sequential loop would — a round-trip reduction, not a behaviour change.
+//!    - `embedded_read_plan_default_loop_would_fan_out_to_one_plus_n` keeps the BASELINE pinned: the
+//!      trait DEFAULT (which a client WITHOUT the override inherits) still decomposes a read plan into
+//!      `1 (target) + N (ACL candidates)` sequential `get_meta` round-trips — the cost the override
+//!      collapses. A `RawSeamCounter` (a seam counter WITHOUT the read_plan override, so the default
+//!      fan-out is visible) pins that `1 + N`.
+//!
+//!    The app-view seam counts in (1) stay FLAT across the win, because `CountingSparqClient::read_plan`
+//!    forwards to the wrapped client's override and counts ONE seam query regardless of backend.
 
 #![cfg(feature = "embedded-sparq")]
 
@@ -315,7 +321,7 @@ async fn embedded_get_304_warm_seam_counts() {
 }
 
 // ---------------------------------------------------------------------------------------------------
-// (2) True engine round-trips — the embedded backend's default read_plan FAN-OUT.
+// (2) True engine round-trips — the combined read_plan WIN (1) vs the trait-default FAN-OUT (1 + N).
 // ---------------------------------------------------------------------------------------------------
 
 /// A [`SparqClient`] seam decorator that counts `get_meta` round-trips (via its own plain atomic —
@@ -394,15 +400,14 @@ fn meta(bk: &str) -> ResourceMeta {
     }
 }
 
-/// **The round-trip-reduction target for the next phase.** The embedded backend has no combined
-/// `read_plan`, so it inherits the trait default: a plan over a target + `N` ACL candidates costs
-/// exactly `1 + N` sequential `get_meta` round-trips against the engine. Here `N = 4` (a doc at
-/// depth k = 3: `doc.acl`, `c/.acl`, `alice/.acl`, `/.acl`), so **5 queries**, strictly sequential.
-/// The collapsed backends (in-memory / the live HTTP one-combined-SELECT) do this in ONE round-trip;
-/// implementing a combined `read_plan` on `EmbeddedSparqClient` collapses this pin from `1 + N` to 1
-/// (a measured, intended win that this test will then re-pin).
+/// **The BASELINE the combined override collapses.** A `SparqClient` WITHOUT a combined `read_plan`
+/// (here surfaced by `RawSeamCounter`, which does not override it) inherits the trait default: a plan
+/// over a target + `N` ACL candidates costs exactly `1 + N` sequential `get_meta` round-trips. Here
+/// `N = 4` (a doc at depth k = 3: `doc.acl`, `c/.acl`, `alice/.acl`, `/.acl`), so **5 queries**,
+/// strictly sequential. This pins the cost `EmbeddedSparqClient::read_plan`'s one combined SELECT now
+/// avoids (see `embedded_read_plan_override_is_one_engine_round_trip`).
 #[tokio::test]
-async fn embedded_read_plan_fans_out_to_one_plus_n_get_meta_round_trips() {
+async fn embedded_read_plan_default_loop_would_fan_out_to_one_plus_n() {
     let (raw, get_meta_calls) =
         RawSeamCounter::new(EmbeddedSparqClient::in_memory().expect("empty in-memory graph"));
 
@@ -446,13 +451,81 @@ async fn embedded_read_plan_fans_out_to_one_plus_n_get_meta_round_trips() {
 
     // … and it cost 1 (target) + N (candidates) = 5 sequential get_meta round-trips. The default
     // read_plan awaits each get_meta before the next (a sequential `for` loop), so the round-trip
-    // count IS the sequential RTT depth. The collapsed backends (in-memory / the live HTTP
-    // one-combined-SELECT) do this in ONE round-trip; a combined read_plan on EmbeddedSparqClient is
-    // the next phase's win that collapses this pin from 1 + N to 1.
+    // count IS the sequential RTT depth. `EmbeddedSparqClient::read_plan` now collapses this to ONE
+    // combined round-trip (`embedded_read_plan_override_is_one_engine_round_trip`); this test keeps
+    // the `1 + N` cost of the trait default pinned as the baseline that win is measured against.
     assert_eq!(
         get_meta_calls.load(Ordering::Relaxed),
         1 + candidates.len() as u64,
-        "embedded default read_plan = 1 target + N candidate get_meta round-trips (N={})",
+        "trait-default read_plan = 1 target + N candidate get_meta round-trips (N={})",
         candidates.len()
+    );
+}
+
+/// **The round-trip-reduction WIN (76ea), measured on the REAL engine.** `EmbeddedSparqClient` now
+/// overrides `read_plan` with ONE combined `VALUES ?g { … } GRAPH ?g { … }` SELECT. Its
+/// `engine_round_trips()` counter (one increment per blocking engine dispatch — the embedded analogue
+/// of a network round-trip) proves the whole plan over a target + `N = 4` ACL candidates costs
+/// exactly **1** round-trip, down from the `1 + N = 5` the trait default (pinned above) would spend.
+/// And the returned `ReadPlan` is byte-identical to what the sequential loop produces — a round-trip
+/// reduction, NOT a behaviour change (the ACL candidate set the override resolves is the SAME set the
+/// WAC walk would see, so no authz decision can differ).
+#[tokio::test]
+async fn embedded_read_plan_override_is_one_engine_round_trip() {
+    let client = EmbeddedSparqClient::in_memory().expect("empty in-memory graph");
+
+    let target = "https://pod.example/alice/c/doc";
+    let root_acl = "https://pod.example/.acl";
+    client.put_meta(target, meta("doc-blob")).await.unwrap();
+    client.put_meta(root_acl, meta("acl-blob")).await.unwrap();
+
+    let candidates: Vec<String> = [
+        "https://pod.example/alice/c/doc.acl",
+        "https://pod.example/alice/c/.acl",
+        "https://pod.example/alice/.acl",
+        "https://pod.example/.acl",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    // The OVERRIDE: exactly ONE engine round-trip for the whole plan.
+    let before = client.engine_round_trips();
+    let plan: ReadPlan = client.read_plan(target, &candidates).await.unwrap();
+    assert_eq!(
+        client.engine_round_trips() - before,
+        1,
+        "combined read_plan is ONE engine round-trip (was 1 + N = {} via the default loop)",
+        1 + candidates.len()
+    );
+
+    // The plan is correct: target present; only the root ACL present among the candidates.
+    assert!(plan.target.is_some(), "target metadata present");
+    let present: Vec<&String> = plan
+        .acls
+        .iter()
+        .filter(|(_, etag)| etag.is_some())
+        .map(|(iri, _)| iri)
+        .collect();
+    assert_eq!(present, vec![root_acl], "only the root ACL is present");
+
+    // Semantic identity: the combined plan equals the sequential-loop plan (same metas + ACL set).
+    let mut loop_acls = Vec::with_capacity(candidates.len());
+    for cand in &candidates {
+        let etag = match client.get_meta(cand).await {
+            Ok(m) => Some(m.etag),
+            Err(SparqError::NotFound) => None,
+            Err(e) => panic!("unexpected error: {e}"),
+        };
+        loop_acls.push((cand.clone(), etag));
+    }
+    let loop_target = client.get_meta(target).await.ok();
+    assert_eq!(
+        plan,
+        ReadPlan {
+            target: loop_target,
+            acls: loop_acls,
+        },
+        "combined read_plan is semantically identical to the 1 + N loop"
     );
 }

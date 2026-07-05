@@ -44,12 +44,13 @@
 //! directory-backed `update_in_place` path (a follow-up to wire through).
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use sparq_core::Graph;
 
-use super::sparq::{DeleteOutcome, ResourceMeta, SparqClient, SparqError};
+use super::sparq::{DeleteOutcome, ReadPlan, ResourceMeta, SparqClient, SparqError};
 use super::sparql;
 use super::timestamp;
 
@@ -63,6 +64,16 @@ pub struct EmbeddedSparqClient {
     /// moved into a `spawn_blocking` closure. `Graph` is `Send + Sync` (compile-time asserted in
     /// sparq-core), so this is sound.
     graph: Arc<Mutex<Graph>>,
+    /// The count of ENGINE ROUND-TRIPS this client has dispatched — one increment per
+    /// [`Self::dispatch`], i.e. one per blocking engine call (`spawn_blocking` → lock the [`Graph`] →
+    /// run the query/update). This is the embedded analogue of the HTTP client's network round-trips
+    /// and the deterministic observability the beyond-50k round-trip work targets: each
+    /// [`SparqClient`] method costs EXACTLY one dispatch (the lock is taken once per dispatch, so a
+    /// check-then-act op like `create_child`/`delete_meta_if_empty` — many engine ops under one held
+    /// lock — is still ONE round-trip). Shared by `Arc` across clones (a clone is the same logical
+    /// backend). Exposed via [`Self::engine_round_trips`] for benchmarks/tests; not on the hot path
+    /// beyond one relaxed atomic increment.
+    round_trips: Arc<AtomicU64>,
 }
 
 impl EmbeddedSparqClient {
@@ -76,6 +87,7 @@ impl EmbeddedSparqClient {
             .map_err(|e| SparqError::Backend(format!("fatal: empty graph init failed: {e}")))?;
         Ok(Self {
             graph: Arc::new(Mutex::new(graph)),
+            round_trips: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -87,7 +99,34 @@ impl EmbeddedSparqClient {
         })?;
         Ok(Self {
             graph: Arc::new(Mutex::new(graph)),
+            round_trips: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// The number of engine round-trips ([`Self::dispatch`] calls) this client — and every clone
+    /// sharing its `Arc` — has issued. The deterministic round-trip metric the beyond-50k benchmarks
+    /// pin: each [`SparqClient`] read/write method is exactly ONE round-trip, so a combined
+    /// [`SparqClient::read_plan`] (one dispatch) vs the trait-default fan-out (`1 + N` `get_meta`
+    /// dispatches) is directly observable here.
+    pub fn engine_round_trips(&self) -> u64 {
+        self.round_trips.load(Ordering::Relaxed)
+    }
+
+    /// Dispatch a BLOCKING engine closure off the reactor, counting it as ONE engine round-trip.
+    ///
+    /// The single choke point every [`SparqClient`] engine call routes through: it increments the
+    /// [`Self::round_trips`] counter (one relaxed atomic add) BEFORE handing the closure to
+    /// [`run_blocking`], so the round-trip count is the number of blocking engine dispatches — the
+    /// embedded analogue of the HTTP client's request count. A query that fails to BUILD (a rejected
+    /// untrusted IRI) returns before ever reaching here, so a fail-closed rejection is correctly NOT
+    /// counted as a round-trip.
+    async fn dispatch<T, F>(&self, f: F) -> Result<T, SparqError>
+    where
+        F: FnOnce() -> Result<T, SparqError> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.round_trips.fetch_add(1, Ordering::Relaxed);
+        run_blocking(f).await
     }
 
     /// Snapshot the current graph to `dir` (the durable seam for the in-memory path). Runs the
@@ -163,7 +202,7 @@ impl SparqClient for EmbeddedSparqClient {
         // SAME query as the HTTP/in-mem paths — the injection-safe `select_meta` builder VERBATIM.
         let q = sparql::select_meta(iri)?;
         let graph = Arc::clone(&self.graph);
-        run_blocking(move || {
+        self.dispatch(move || {
             let g = lock(&graph)?;
             let result = sparq_engine::query(&g, &q).map_err(|e| engine_err("select_meta", e))?;
             // No row ⇒ the resource is not indexed (fail-closed: never invent metadata).
@@ -212,7 +251,7 @@ impl SparqClient for EmbeddedSparqClient {
             modified.as_deref(),
         )?;
         let graph = Arc::clone(&self.graph);
-        run_blocking(move || {
+        self.dispatch(move || {
             let mut g = lock(&graph)?;
             sparq_engine::update_in_place_atomic(&mut g, &u).map_err(|e| engine_err("put_meta", e))
         })
@@ -222,7 +261,7 @@ impl SparqClient for EmbeddedSparqClient {
     async fn exists(&self, iri: &str) -> Result<bool, SparqError> {
         let q = sparql::ask_exists(iri)?;
         let graph = Arc::clone(&self.graph);
-        run_blocking(move || {
+        self.dispatch(move || {
             let g = lock(&graph)?;
             sparq_engine::ask(&g, &q).map_err(|e| engine_err("ask_exists", e))
         })
@@ -234,7 +273,7 @@ impl SparqClient for EmbeddedSparqClient {
         // `update_delete_resource` builder. Atomic single-op.
         let u = sparql::update_delete_resource(iri)?;
         let graph = Arc::clone(&self.graph);
-        run_blocking(move || {
+        self.dispatch(move || {
             let mut g = lock(&graph)?;
             sparq_engine::update_in_place_atomic(&mut g, &u)
                 .map_err(|e| engine_err("delete_meta", e))
@@ -263,7 +302,7 @@ impl SparqClient for EmbeddedSparqClient {
         let nonce = next_nonce();
         let delete_u = sparql::update_delete_container_if_empty(iri, parent, &nonce)?;
         let graph = Arc::clone(&self.graph);
-        run_blocking(move || {
+        self.dispatch(move || {
             let mut g = lock(&graph)?;
             // 1. Exists? (absent ⇒ NotFound, nothing deleted.)
             if !sparq_engine::ask(&g, &exists_q)
@@ -312,7 +351,7 @@ impl SparqClient for EmbeddedSparqClient {
             &nonce,
         )?;
         let graph = Arc::clone(&self.graph);
-        run_blocking(move || {
+        self.dispatch(move || {
             let mut g = lock(&graph)?;
             // Container must exist (else 404). Checked under the lock, so no concurrent delete can
             // race between this check and the insert.
@@ -330,7 +369,7 @@ impl SparqClient for EmbeddedSparqClient {
     async fn remove_child(&self, container: &str, child: &str) -> Result<(), SparqError> {
         let u = sparql::update_remove_child(container, child)?;
         let graph = Arc::clone(&self.graph);
-        run_blocking(move || {
+        self.dispatch(move || {
             let mut g = lock(&graph)?;
             sparq_engine::update_in_place_atomic(&mut g, &u)
                 .map_err(|e| engine_err("remove_child", e))
@@ -341,7 +380,7 @@ impl SparqClient for EmbeddedSparqClient {
     async fn list_children(&self, container: &str) -> Result<Vec<String>, SparqError> {
         let q = sparql::select_children(container)?;
         let graph = Arc::clone(&self.graph);
-        run_blocking(move || {
+        self.dispatch(move || {
             let g = lock(&graph)?;
             let result = sparq_engine::query(&g, &q).map_err(|e| engine_err("list_children", e))?;
             let child_col = var_col(&result, "child").ok_or_else(|| {
@@ -370,7 +409,7 @@ impl SparqClient for EmbeddedSparqClient {
     async fn referenced_blob_keys(&self) -> Result<std::collections::HashSet<String>, SparqError> {
         let q = sparql::select_referenced_blob_keys();
         let graph = Arc::clone(&self.graph);
-        run_blocking(move || {
+        self.dispatch(move || {
             let g = lock(&graph)?;
             let result =
                 sparq_engine::query(&g, &q).map_err(|e| engine_err("referenced_blob_keys", e))?;
@@ -390,6 +429,102 @@ impl SparqClient for EmbeddedSparqClient {
                 keys.insert(bk);
             }
             Ok(keys)
+        })
+        .await
+    }
+
+    /// ONE combined read-plan lookup in a SINGLE engine round-trip — the embedded analogue of the
+    /// HTTP client's one combined SELECT (`super::http::HttpSparqClient::read_plan`), replacing the
+    /// trait DEFAULT's `1 + N` sequential `get_meta` dispatches with ONE.
+    ///
+    /// It executes the SAME injection-safe [`sparql::select_read_plan`] query the HTTP client uses,
+    /// VERBATIM — `VALUES ?g { <target> <cand₁> … } GRAPH ?g { <record> … }` — against the in-process
+    /// engine under ONE held lock (one [`Self::dispatch`]). The engine JOINs the `VALUES` graph list
+    /// with the per-graph record pattern, so the returned rows are EXACTLY the target + present
+    /// candidates keyed by graph IRI — semantically identical to probing each IRI with
+    /// [`sparql::select_meta`] in turn (the default loop), only in one pass. Every IRI flows through
+    /// the fallible `iri` builder inside `select_read_plan`, so an IRIREF-invalid value REJECTS the
+    /// whole build (fail-closed) BEFORE any dispatch — never string-concatenated. Fail-closed on
+    /// execution too: any engine/parse error fails the WHOLE plan (no per-candidate partial degrade —
+    /// trait invariant 4).
+    async fn read_plan(
+        &self,
+        target: &str,
+        acl_candidates: &[String],
+    ) -> Result<ReadPlan, SparqError> {
+        // Build the combined SELECT (fail-closed on any invalid IRI — never reaches the engine).
+        let q = sparql::select_read_plan(target, acl_candidates)?;
+        let target = target.to_string();
+        let candidates: Vec<String> = acl_candidates.to_vec();
+        let graph = Arc::clone(&self.graph);
+        self.dispatch(move || {
+            let g = lock(&graph)?;
+            let result =
+                sparq_engine::query(&g, &q).map_err(|e| engine_err("select_read_plan", e))?;
+            // Resolve the result columns once (a row missing a REQUIRED binding is a malformed
+            // result — fatal, never silently dropped: dropping a present own-ACL row could wrongly
+            // inherit an ancestor's grants, an authz-affecting change).
+            let g_col = var_col(&result, "g").ok_or_else(|| {
+                SparqError::Backend("fatal: read-plan result missing ?g column".into())
+            })?;
+            let ct_col = var_col(&result, "ct").ok_or_else(|| {
+                SparqError::Backend("fatal: read-plan result missing ?ct column".into())
+            })?;
+            let bk_col = var_col(&result, "bk").ok_or_else(|| {
+                SparqError::Backend("fatal: read-plan result missing ?bk column".into())
+            })?;
+            let et_col = var_col(&result, "etag").ok_or_else(|| {
+                SparqError::Backend("fatal: read-plan result missing ?etag column".into())
+            })?;
+            let mod_col = var_col(&result, "mod"); // OPTIONAL — may be absent from the header.
+
+            // Key each row by its graph IRI. First row per graph wins (the record is single-valued
+            // per graph — `update_put_meta`/`update_create_child` keep it so — mirroring
+            // `select_meta`'s `LIMIT 1` determinism and the HTTP client's `entry().or_insert`).
+            let mut by_graph: std::collections::HashMap<String, ResourceMeta> =
+                std::collections::HashMap::with_capacity(result.rows.len());
+            for row in &result.rows {
+                let graph_iri =
+                    term_value(row.get(g_col).and_then(|c| c.as_ref())).ok_or_else(|| {
+                        SparqError::Backend("fatal: read-plan row missing the ?g binding".into())
+                    })?;
+                let content_type = term_value(row.get(ct_col).and_then(|c| c.as_ref()))
+                    .ok_or_else(|| {
+                        SparqError::Backend("fatal: read-plan row missing contentType".into())
+                    })?;
+                let blob_key =
+                    term_value(row.get(bk_col).and_then(|c| c.as_ref())).ok_or_else(|| {
+                        SparqError::Backend("fatal: read-plan row missing blobKey".into())
+                    })?;
+                let etag =
+                    term_value(row.get(et_col).and_then(|c| c.as_ref())).ok_or_else(|| {
+                        SparqError::Backend("fatal: read-plan row missing etag".into())
+                    })?;
+                // `?mod` (`pss:modified`) is OPTIONAL — an absent column, an unbound cell, or an
+                // unparseable value all ⇒ `None` (fail OPEN — never a spurious 304), exactly as
+                // `get_meta` treats it.
+                let last_modified = mod_col
+                    .and_then(|col| term_value(row.get(col).and_then(|c| c.as_ref())))
+                    .and_then(|s| timestamp::from_xsd_datetime(&s));
+                by_graph.entry(graph_iri).or_insert(ResourceMeta {
+                    content_type,
+                    blob_key,
+                    etag,
+                    last_modified,
+                });
+            }
+
+            // Assemble the plan in the caller's roles: the RAW target's metadata, and one entry per
+            // candidate in the caller's (nearest-first) order — `Some(etag)` iff indexed. Absence
+            // here is authoritative (the row came from the engine, not a cache), so a missing entry
+            // is a genuinely-absent ACL, keeping the "nearest present wins" WAC walk exact.
+            Ok(ReadPlan {
+                target: by_graph.get(&target).cloned(),
+                acls: candidates
+                    .iter()
+                    .map(|c| (c.clone(), by_graph.get(c).map(|m| m.etag.clone())))
+                    .collect(),
+            })
         })
         .await
     }
@@ -571,6 +706,159 @@ mod tests {
             let keys = c.referenced_blob_keys().await.unwrap();
             assert!(keys.contains("k1") && keys.contains("k2"), "got {keys:?}");
             assert_eq!(keys.len(), 2);
+        });
+    }
+
+    /// The combined `read_plan` override is a SINGLE engine round-trip AND returns exactly the same
+    /// `ReadPlan` as the trait-default `1 + N` `get_meta` loop — a round-trip reduction, not a
+    /// behaviour change. This is the semantic-equivalence + round-trip-count proof for the WAC read
+    /// path (the ACL candidate set the override resolves MUST match the loop's, or an authz decision
+    /// could differ).
+    #[test]
+    fn read_plan_is_one_round_trip_and_matches_the_default_loop() {
+        block_on(async {
+            let c = client();
+            // A doc at depth k = 3 with only the ROOT ACL present among its candidates (the
+            // `read_path_counters.rs` / `embedded_read_counters.rs` fixture shape).
+            let target = "https://pod.example/alice/c/doc";
+            let root_acl = "https://pod.example/.acl";
+            c.put_meta(target, meta("text/turtle", "doc-blob", "\"d1\""))
+                .await
+                .unwrap();
+            c.put_meta(root_acl, meta("text/turtle", "acl-blob", "\"a1\""))
+                .await
+                .unwrap();
+            let candidates: Vec<String> = [
+                "https://pod.example/alice/c/doc.acl",
+                "https://pod.example/alice/c/.acl",
+                "https://pod.example/alice/.acl",
+                "https://pod.example/.acl",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+            // (1) The OVERRIDE: exactly ONE engine round-trip for the whole plan.
+            let before = c.engine_round_trips();
+            let plan = c.read_plan(target, &candidates).await.unwrap();
+            let combined_cost = c.engine_round_trips() - before;
+            assert_eq!(
+                combined_cost, 1,
+                "combined read_plan is ONE engine round-trip (was 1 + N via the default loop)"
+            );
+
+            // (2) The plan is CORRECT: target present; only the root ACL present among candidates.
+            assert_eq!(
+                plan.target,
+                Some(meta("text/turtle", "doc-blob", "\"d1\"")),
+                "target metadata returned exactly"
+            );
+            let present: Vec<&String> = plan
+                .acls
+                .iter()
+                .filter(|(_, etag)| etag.is_some())
+                .map(|(iri, _)| iri)
+                .collect();
+            assert_eq!(present, vec![root_acl], "only the root ACL is present");
+            // Every candidate is represented, in the caller's nearest-first order.
+            assert_eq!(
+                plan.acls.iter().map(|(i, _)| i.clone()).collect::<Vec<_>>(),
+                candidates,
+                "one entry per candidate, order preserved"
+            );
+
+            // (3) BASELINE on the SAME client + SAME metric: the sequential `get_meta` probes the
+            // default loop performs cost `1 + N` round-trips — the cost the override collapses to 1.
+            let before_loop = c.engine_round_trips();
+            let loop_target = match c.get_meta(target).await {
+                Ok(m) => Some(m),
+                Err(SparqError::NotFound) => None,
+                Err(e) => panic!("unexpected error: {e}"),
+            };
+            let mut loop_acls = Vec::with_capacity(candidates.len());
+            for cand in &candidates {
+                let etag = match c.get_meta(cand).await {
+                    Ok(m) => Some(m.etag),
+                    Err(SparqError::NotFound) => None,
+                    Err(e) => panic!("unexpected error: {e}"),
+                };
+                loop_acls.push((cand.clone(), etag));
+            }
+            let loop_cost = c.engine_round_trips() - before_loop;
+            assert_eq!(
+                loop_cost,
+                1 + candidates.len() as u64,
+                "the sequential loop costs 1 + N round-trips (N={})",
+                candidates.len()
+            );
+            // The override's plan is byte-for-byte the loop's plan — same metas, same ACL set.
+            assert_eq!(
+                plan,
+                ReadPlan {
+                    target: loop_target,
+                    acls: loop_acls,
+                },
+                "combined read_plan is semantically identical to the 1 + N loop"
+            );
+        });
+    }
+
+    /// A `.acl` target (the "two roles" case): the RAW target IS a candidate's IRI. The combined
+    /// query DEDUPES it in the `VALUES` list, and the plan still resolves both roles correctly in
+    /// ONE round-trip.
+    #[test]
+    fn read_plan_handles_acl_target_that_is_its_own_candidate() {
+        block_on(async {
+            let c = client();
+            let acl = "https://pod.example/alice/c/.acl";
+            c.put_meta(acl, meta("text/turtle", "acl-blob", "\"a1\""))
+                .await
+                .unwrap();
+            // The target IS the acl; its first candidate is the SAME IRI (a GET of `.acl` serves
+            // `.acl`'s bytes, and its own ACL chain starts at itself).
+            let candidates = vec![acl.to_string(), "https://pod.example/.acl".to_string()];
+            let before = c.engine_round_trips();
+            let plan = c.read_plan(acl, &candidates).await.unwrap();
+            assert_eq!(c.engine_round_trips() - before, 1, "one round-trip");
+            assert_eq!(
+                plan.target,
+                Some(meta("text/turtle", "acl-blob", "\"a1\"")),
+                "the .acl target's own bytes-metadata is returned"
+            );
+            assert_eq!(
+                plan.acls,
+                vec![
+                    (acl.to_string(), Some("\"a1\"".to_string())),
+                    ("https://pod.example/.acl".to_string(), None),
+                ],
+                "the self-candidate resolves present; the absent ancestor resolves None"
+            );
+        });
+    }
+
+    /// An IRIREF-invalid candidate REJECTS the whole build fail-closed BEFORE any dispatch — no
+    /// engine round-trip is spent on a malformed (potentially injection-vector) IRI.
+    #[test]
+    fn read_plan_rejects_invalid_iri_without_dispatching() {
+        block_on(async {
+            let c = client();
+            let before = c.engine_round_trips();
+            let err = c
+                .read_plan(
+                    "https://pod.example/ok",
+                    &["https://pod.example/> DROP GRAPH <urn:x".to_string()],
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, SparqError::Backend(_)),
+                "fail-closed: {err:?}"
+            );
+            assert_eq!(
+                c.engine_round_trips(),
+                before,
+                "a rejected build never reaches the engine — no round-trip counted"
+            );
         });
     }
 }
