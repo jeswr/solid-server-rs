@@ -462,6 +462,7 @@ mod tests {
             content_type: "text/turtle".into(),
             blob_key: "k1".into(),
             etag: "\"e1\"".into(),
+            last_modified: None,
         };
         sparq.put_meta("https://p/c/", meta.clone()).await.unwrap();
         let s0 = counters.snapshot();

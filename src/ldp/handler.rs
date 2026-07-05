@@ -772,12 +772,12 @@ pub(crate) async fn serve_read<S: Store>(
     //
     // Pre-size the map (perf round-C, MALLOC band) so the inserts below never trigger an incremental
     // `HeaderMap` grow-and-rehash: the full read response carries ETag, Vary, Allow[+Accept-Post],
-    // Accept-Patch, 2 discovery Links, 1–4 type Links, 1 acl Link, WAC-Allow, and then (full path
-    // only) Content-Type + Accept-Ranges + Content-Length/Content-Range — ≈16 entries at most.
-    // `with_capacity` rounds up to a power of two ≥ the request, so sizing for the
-    // container/storage-root maximum means neither the 304 path (fewer entries) nor a full
-    // plain-resource/container response reallocates. Byte-identical output.
-    let mut out = HeaderMap::with_capacity(16);
+    // Accept-Patch, 2 discovery Links, 1–4 type Links, 1 acl Link, WAC-Allow, a plain resource's
+    // Last-Modified, and then (full path only) Content-Type + Accept-Ranges + Content-Length/
+    // Content-Range — ≈18 entries at most. `with_capacity` rounds up to a power of two ≥ the request,
+    // so sizing for the container/storage-root maximum means neither the 304 path (fewer entries) nor
+    // a full plain-resource/container response reallocates. Byte-identical output.
+    let mut out = HeaderMap::with_capacity(18);
     // V5 (decisions/0003) — the membership-derived container `etag` computed above shifts on every
     // child add/remove, so it is a listing oracle. It is exposed ONLY here, on the GET/HEAD read path,
     // which is gated above by `authorize_read` requiring `acl:Read` on the container — so a non-reader
@@ -832,17 +832,49 @@ pub(crate) async fn serve_read<S: Store>(
     // already ran above) and BEFORE serialising a plain resource's body / computing Range.
     // `If-None-Match` (weak comparison, `*`) takes PRECEDENCE over `If-Modified-Since`. A match ⇒ 304
     // Not Modified carrying the validators + no body; when a `Range` is present alongside a matching
-    // `If-None-Match` the precondition WINS (304, never a 206). `last_modified` is `None` because the
-    // SPARQ-index metadata does not yet surface a modification time — so `If-Modified-Since` does not
-    // fire end-to-end today (its decision logic + precedence are exhaustively unit-tested in
-    // `conditional`, and it activates the instant the store surfaces `last_modified`; see the
-    // follow-up). `If-None-Match` (the ETag validator, what the Solid conformance conditional tests +
-    // caches use) is fully live.
+    // `If-None-Match` the precondition WINS (304, never a 206).
+    //
+    // `If-Modified-Since` is now LIVE (jx3c): the store surfaces the resource's server-recorded
+    // modification time (`pss:modified` → `ResourceMeta::last_modified`), which the evaluator
+    // compares against the header — a `last_modified ≤ header` ⇒ 304, an absent time ⇒ a fresh 200.
+    // A write bumps the stored time, so a re-written resource correctly re-serves.
+    //
+    // GRANULARITY (why whole seconds is correct, not a defect): an HTTP date (RFC 9110 §5.6.7
+    // IMF-fixdate) has NO sub-second field, so a client can never send a sub-second
+    // `If-Modified-Since` — whole-second comparison is the only representable resolution, and storing
+    // sub-second precision would instead BREAK the common 304 (a mid-second `last_modified` would
+    // exceed the whole-second header even when unchanged). The one residual — two rewrites within the
+    // SAME second producing an `If-Modified-Since`-only stale 304 — is inherent to HTTP's whole-second
+    // `Last-Modified` (shared by every conformant server) and is covered by the STRONG validator: the
+    // content-derived `ETag` differs across a changed body and `If-None-Match` takes precedence here,
+    // so a client sending both correctly gets a 200. `Last-Modified` is the weak fallback, `ETag` the
+    // authority — the RFC 9110 §8.8.2 model.
+    //
+    // CONTAINERS are deliberately excluded (pass `None`): a container's body is GENERATED from LIVE
+    // `ldp:contains` membership, which changes WITHOUT touching the container record's own
+    // `pss:modified` — so the stored record time is a STALE validator for the listing (exactly why
+    // the container `etag` above is representation-derived, not the stored etag). Using it for
+    // `If-Modified-Since` could 304 a listing that actually changed (serving stale content). So a
+    // container always fails OPEN to a fresh 200; only a PLAIN resource's `last_modified` (whose
+    // stored state IS its representation, across conneg) drives a 304.
+    let effective_last_modified = if target.is_container {
+        None
+    } else {
+        resource.meta.last_modified
+    };
+    // Advertise a plain resource's modification time as `Last-Modified` (RFC 9110 §8.8.2) so a client
+    // can OBTAIN the validator and echo it in a later `If-Modified-Since` — without it the conditional
+    // path is unusable in normal cache flows. Set on the SHARED headers (so the 304 carries it too,
+    // §15.4.5) and only for a plain resource with a known time; a container's stale record time is
+    // deliberately not advertised (matching the 304 exclusion above). GET and HEAD emit it identically.
+    if let Some(imf) = effective_last_modified.and_then(crate::store::timestamp::to_imf_fixdate) {
+        set_str(&mut out, header::LAST_MODIFIED, &imf);
+    }
     if conditional::evaluate_read(
         header_str(req_headers, header::IF_NONE_MATCH),
         header_str(req_headers, header::IF_MODIFIED_SINCE),
         &etag,
-        None,
+        effective_last_modified,
     ) == conditional::ReadPrecondition::NotModified
     {
         // 304 Not Modified: the shared headers above (validator + advertisements), NO body and NO
@@ -2716,6 +2748,7 @@ mod tests {
                     content_type: "text/turtle".into(),
                     blob_key: "k".into(),
                     etag: "\"acl\"".into(),
+                    last_modified: None,
                 };
                 return Ok(Resource { body, meta });
             }
@@ -2739,6 +2772,7 @@ mod tests {
                     content_type: "text/turtle".into(),
                     blob_key: "k".into(),
                     etag: "\"acl\"".into(),
+                    last_modified: None,
                 }));
             }
             Ok(None)
@@ -4036,6 +4070,7 @@ mod tests {
                 content_type: "text/turtle".into(),
                 blob_key: "k".into(),
                 etag: "\"acl\"".into(),
+                last_modified: None,
             }
         }
     }
@@ -4264,6 +4299,354 @@ mod tests {
         assert!(
             body_bytes(not_mod).await.is_empty(),
             "a 304 carries no body"
+        );
+    }
+
+    // --- Conditional GET → 304/200 on `If-Modified-Since` (jx3c: last_modified from the index) -----
+
+    /// A far-FUTURE `If-Modified-Since` date on a freshly-written PLAIN resource ⇒ the resource's
+    /// server-recorded modification time (≈ now) is `≤` the header ⇒ **304**. This is the end-to-end
+    /// proof that `If-Modified-Since` is now LIVE: before the store surfaced `last_modified` the
+    /// handler passed `None` and this was always a 200.
+    #[tokio::test]
+    async fn get_if_modified_since_far_future_is_304() {
+        let state = state_with_owner_resource(
+            "/alice/doc",
+            "<https://pod.example/alice/doc#me> <http://xmlns.com/foaf/0.1/name> \"X\" .",
+        )
+        .await;
+        let ok = get_with(&state, owner_token(), "/alice/doc", HeaderMap::new()).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        let etag = etag_of(&ok);
+
+        let mut cond = HeaderMap::new();
+        // Far future — later than the write instant, so `last_modified ≤ header` ⇒ 304.
+        cond.insert(
+            header::IF_MODIFIED_SINCE,
+            HeaderValue::from_static("Sat, 06 Nov 2100 08:49:37 GMT"),
+        );
+        let not_mod = get_with(&state, owner_token(), "/alice/doc", cond).await;
+        assert_eq!(
+            not_mod.status(),
+            StatusCode::NOT_MODIFIED,
+            "last_modified ≤ If-Modified-Since must be 304 (feature is live)"
+        );
+        assert_eq!(etag_of(&not_mod), etag, "the 304 ETag equals the 200 ETag");
+        assert!(
+            body_bytes(not_mod).await.is_empty(),
+            "a 304 carries no body"
+        );
+    }
+
+    /// A far-PAST `If-Modified-Since` date ⇒ the resource was modified AFTER it ⇒ **200** with a body.
+    #[tokio::test]
+    async fn get_if_modified_since_far_past_is_200() {
+        let state = state_with_owner_resource(
+            "/alice/doc",
+            "<https://pod.example/alice/doc#me> <http://xmlns.com/foaf/0.1/name> \"X\" .",
+        )
+        .await;
+        let mut cond = HeaderMap::new();
+        cond.insert(
+            header::IF_MODIFIED_SINCE,
+            HeaderValue::from_static("Sun, 06 Nov 1994 08:49:37 GMT"),
+        );
+        let resp = get_with(&state, owner_token(), "/alice/doc", cond).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "last_modified > If-Modified-Since must be a fresh 200"
+        );
+        assert!(!body_bytes(resp).await.is_empty(), "a 200 carries the body");
+    }
+
+    /// A CONTAINER is deliberately excluded from `If-Modified-Since`: its listing is derived from LIVE
+    /// membership, which changes without touching the container record's `pss:modified`, so the stored
+    /// time is a STALE validator. Even a far-future header must yield a fresh **200**, never a 304 —
+    /// otherwise a changed listing could be served as unchanged.
+    #[tokio::test]
+    async fn get_if_modified_since_on_container_is_200_never_304() {
+        // PUT-creating `/alice/doc` also creates the `/alice/` container (ensure_ancestor_containers).
+        let state = state_with_owner_resource(
+            "/alice/doc",
+            "<https://pod.example/alice/doc#me> <http://xmlns.com/foaf/0.1/name> \"X\" .",
+        )
+        .await;
+        // Sanity: the container reads 200 unconditionally.
+        let ok = get_with(&state, owner_token(), "/alice/", HeaderMap::new()).await;
+        assert_eq!(ok.status(), StatusCode::OK, "container reads 200");
+
+        let mut cond = HeaderMap::new();
+        cond.insert(
+            header::IF_MODIFIED_SINCE,
+            HeaderValue::from_static("Sat, 06 Nov 2100 08:49:37 GMT"),
+        );
+        let resp = get_with(&state, owner_token(), "/alice/", cond).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a container must fail OPEN to 200 on If-Modified-Since (never a stale-listing 304)"
+        );
+    }
+
+    // A minimal public-readable [`Store`] serving ONE plain resource with a CONFIGURABLE
+    // `last_modified`, so the exact `≤` boundary + the no-recorded-time path can be driven
+    // deterministically end-to-end (the real store stamps `now()`, which is not exactly controllable).
+    // Public read = a `foaf:Agent acl:Read` ACL served for the resource's `.acl`, so an anonymous GET
+    // is authorized and reaches the precondition check.
+    struct FixedTimeStore {
+        /// The modification time the index surfaces for the one served resource (`None` ⇒ untracked).
+        last_modified: Option<std::time::SystemTime>,
+    }
+
+    const FT_TARGET: &str = "https://pod.example/pub/note";
+
+    impl FixedTimeStore {
+        fn is_acl(iri: &str) -> bool {
+            iri.ends_with(".acl")
+        }
+        fn resource_meta(&self) -> ResourceMeta {
+            ResourceMeta {
+                content_type: "text/turtle".into(),
+                blob_key: "b".into(),
+                etag: "\"fixed\"".into(),
+                last_modified: self.last_modified,
+            }
+        }
+        fn acl_meta() -> ResourceMeta {
+            ResourceMeta {
+                content_type: "text/turtle".into(),
+                blob_key: "bacl".into(),
+                etag: "\"acl\"".into(),
+                last_modified: None,
+            }
+        }
+        fn acl_body() -> AxBytes {
+            AxBytes::from(format!(
+                "@prefix acl: <http://www.w3.org/ns/auth/acl#>.\n\
+                 @prefix foaf: <http://xmlns.com/foaf/0.1/>.\n\
+                 <#public> a acl:Authorization;\n\
+                 acl:agentClass foaf:Agent;\n\
+                 acl:accessTo <{FT_TARGET}>;\n\
+                 acl:mode acl:Read."
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl Store for FixedTimeStore {
+        async fn read(&self, iri: &str) -> ServerResult<Resource> {
+            if iri == FT_TARGET {
+                let body = AxBytes::from(
+                    "<https://pod.example/pub/note#me> <http://xmlns.com/foaf/0.1/name> \"P\" .",
+                );
+                return Ok(Resource {
+                    body,
+                    meta: self.resource_meta(),
+                });
+            }
+            if Self::is_acl(iri) {
+                return Ok(Resource {
+                    body: Self::acl_body(),
+                    meta: Self::acl_meta(),
+                });
+            }
+            Err(ServerError::NotFound)
+        }
+        async fn meta(&self, iri: &str) -> ServerResult<Option<ResourceMeta>> {
+            if iri == FT_TARGET {
+                return Ok(Some(self.resource_meta()));
+            }
+            if Self::is_acl(iri) {
+                return Ok(Some(Self::acl_meta()));
+            }
+            Ok(None)
+        }
+        async fn exists(&self, iri: &str) -> ServerResult<bool> {
+            Ok(iri == FT_TARGET || Self::is_acl(iri))
+        }
+        async fn write(
+            &self,
+            _iri: &str,
+            _body: AxBytes,
+            _content_type: &str,
+        ) -> ServerResult<ResourceMeta> {
+            panic!("write unused in these read tests");
+        }
+        async fn create_in_container(
+            &self,
+            _container: &str,
+            _child: &str,
+            _body: AxBytes,
+            _content_type: &str,
+        ) -> ServerResult<ResourceMeta> {
+            panic!("create_in_container unused in these read tests");
+        }
+        async fn delete(&self, _iri: &str, _parent: Option<&str>) -> ServerResult<()> {
+            Ok(())
+        }
+        async fn delete_container_if_empty(
+            &self,
+            _iri: &str,
+            _parent: Option<&str>,
+        ) -> ServerResult<DeleteOutcome> {
+            Ok(DeleteOutcome::NotFound)
+        }
+        async fn list_children(
+            &self,
+            _container: &str,
+        ) -> ServerResult<Vec<crate::store::ValidatedChildIri>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Drive an anonymous GET of the fixed-time resource with one `If-Modified-Since` value.
+    async fn get_fixed(last_modified: Option<std::time::SystemTime>, ims: &str) -> StatusCode {
+        let state = Arc::new(LdpState::new(
+            FixedTimeStore { last_modified },
+            "https://pod.example",
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::IF_MODIFIED_SINCE,
+            HeaderValue::from_str(ims).unwrap(),
+        );
+        let uri: axum::http::Uri = "/pub/note".parse().unwrap();
+        get_handler(State(state), Extension(anon()), uri, headers)
+            .await
+            .expect("public GET must not error")
+            .status()
+    }
+
+    /// The exact `≤` boundary + either side, driven against a FIXED index time
+    /// (`2026-07-05T12:34:56Z` — a Sunday): equal ⇒ 304, one second later ⇒ still 304, one second
+    /// earlier ⇒ 200. Deterministic end-to-end proof that the surfaced `last_modified` decides 304 vs
+    /// 200 with the RFC 9110 §13.1.3 `≤` semantics.
+    #[tokio::test]
+    async fn get_if_modified_since_fixed_time_boundary_end_to_end() {
+        let fixed = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_783_254_896));
+        // Equal instant ⇒ last_modified ≤ header ⇒ 304.
+        assert_eq!(
+            get_fixed(fixed, "Sun, 05 Jul 2026 12:34:56 GMT").await,
+            StatusCode::NOT_MODIFIED,
+            "equal ⇒ 304 (≤ boundary)"
+        );
+        // Header one second AFTER ⇒ still ≤ ⇒ 304.
+        assert_eq!(
+            get_fixed(fixed, "Sun, 05 Jul 2026 12:34:57 GMT").await,
+            StatusCode::NOT_MODIFIED,
+            "header after last_modified ⇒ 304"
+        );
+        // Header one second BEFORE ⇒ modified since ⇒ 200.
+        assert_eq!(
+            get_fixed(fixed, "Sun, 05 Jul 2026 12:34:55 GMT").await,
+            StatusCode::OK,
+            "header before last_modified ⇒ 200"
+        );
+    }
+
+    /// A PLAIN resource whose index records NO modification time (`last_modified = None`) ⇒ the
+    /// condition cannot be proven ⇒ a fresh **200**, NEVER a spurious 304 — even for a header date
+    /// far in the future. (The literal "no recorded modification time" case.)
+    #[tokio::test]
+    async fn get_if_modified_since_without_recorded_time_is_200() {
+        assert_eq!(
+            get_fixed(None, "Sat, 06 Nov 2100 08:49:37 GMT").await,
+            StatusCode::OK,
+            "no recorded last_modified ⇒ 200, never a wrong 304"
+        );
+    }
+
+    /// The plain resource's modification time is advertised as `Last-Modified` (IMF-fixdate) on the
+    /// 200, the HEAD, AND the 304 that shares the validators — so a client can obtain it and echo it
+    /// back. `None`-time resources carry no header.
+    #[tokio::test]
+    async fn get_emits_last_modified_header() {
+        let fixed = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_783_254_896));
+        let expected = "Sun, 05 Jul 2026 12:34:56 GMT";
+        let uri: axum::http::Uri = "/pub/note".parse().unwrap();
+
+        // 200 GET carries Last-Modified.
+        let state = Arc::new(LdpState::new(
+            FixedTimeStore {
+                last_modified: fixed,
+            },
+            "https://pod.example",
+        ));
+        let ok = get_handler(
+            State(state.clone()),
+            Extension(anon()),
+            uri.clone(),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(
+            ok.headers().get(header::LAST_MODIFIED).unwrap(),
+            expected,
+            "200 carries Last-Modified"
+        );
+
+        // HEAD carries it identically.
+        let head = head_handler(
+            State(state.clone()),
+            Extension(anon()),
+            uri.clone(),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            head.headers().get(header::LAST_MODIFIED).unwrap(),
+            expected,
+            "HEAD carries Last-Modified"
+        );
+
+        // A 304 (If-None-Match match) still carries it (§15.4.5).
+        let etag = etag_of(&ok);
+        let mut cond = HeaderMap::new();
+        cond.insert(header::IF_NONE_MATCH, HeaderValue::from_str(&etag).unwrap());
+        let not_mod = get_handler(State(state), Extension(anon()), uri.clone(), cond)
+            .await
+            .unwrap();
+        assert_eq!(not_mod.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            not_mod.headers().get(header::LAST_MODIFIED).unwrap(),
+            expected,
+            "the 304 carries Last-Modified too"
+        );
+
+        // A None-time resource carries NO Last-Modified.
+        let state_none = Arc::new(LdpState::new(
+            FixedTimeStore {
+                last_modified: None,
+            },
+            "https://pod.example",
+        ));
+        let ok_none = get_handler(State(state_none), Extension(anon()), uri, HeaderMap::new())
+            .await
+            .unwrap();
+        assert!(
+            ok_none.headers().get(header::LAST_MODIFIED).is_none(),
+            "a resource with no recorded time advertises no Last-Modified"
+        );
+    }
+
+    /// A CONTAINER advertises no `Last-Modified` — its stale record time is deliberately not exposed
+    /// (matching the If-Modified-Since exclusion).
+    #[tokio::test]
+    async fn get_container_emits_no_last_modified() {
+        let state = state_with_owner_resource(
+            "/alice/doc",
+            "<https://pod.example/alice/doc#me> <http://xmlns.com/foaf/0.1/name> \"X\" .",
+        )
+        .await;
+        let resp = get_with(&state, owner_token(), "/alice/", HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get(header::LAST_MODIFIED).is_none(),
+            "a container must not advertise its stale record modification time"
         );
     }
 

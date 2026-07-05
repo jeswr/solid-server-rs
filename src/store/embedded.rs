@@ -51,6 +51,7 @@ use sparq_core::Graph;
 
 use super::sparq::{DeleteOutcome, ResourceMeta, SparqClient, SparqError};
 use super::sparql;
+use super::timestamp;
 
 /// A live [`SparqClient`] backed by an IN-PROCESS SPARQ [`Graph`] + the `sparq-engine` query/update
 /// entry points. Cheap to clone (the inner `Arc` is shared); construct once and share.
@@ -182,10 +183,16 @@ impl SparqClient for EmbeddedSparqClient {
                 .ok_or_else(|| SparqError::Backend("fatal: meta row missing blobKey".into()))?;
             let etag = term_value(row.get(et_col).and_then(|c| c.as_ref()))
                 .ok_or_else(|| SparqError::Backend("fatal: meta row missing etag".into()))?;
+            // `?mod` (`pss:modified`) is OPTIONAL — the column may be absent or unbound. Absent /
+            // unbound / unparseable ⇒ `None` (fail OPEN — never a spurious 304).
+            let last_modified = var_col(&result, "mod")
+                .and_then(|col| term_value(row.get(col).and_then(|c| c.as_ref())))
+                .and_then(|s| timestamp::from_xsd_datetime(&s));
             Ok(ResourceMeta {
                 content_type,
                 blob_key,
                 etag,
+                last_modified,
             })
         })
         .await
@@ -196,7 +203,14 @@ impl SparqClient for EmbeddedSparqClient {
         // insert). Run it request-ATOMICALLY (`update_in_place_atomic`): the whole request commits
         // all-or-nothing, so a re-write never leaves a half-deleted record (the safe public default
         // for a direct library consumer, per the sparq-engine docs).
-        let u = sparql::update_put_meta(iri, &meta.content_type, &meta.blob_key, &meta.etag)?;
+        let modified = meta.last_modified.and_then(timestamp::to_xsd_datetime);
+        let u = sparql::update_put_meta(
+            iri,
+            &meta.content_type,
+            &meta.blob_key,
+            &meta.etag,
+            modified.as_deref(),
+        )?;
         let graph = Arc::clone(&self.graph);
         run_blocking(move || {
             let mut g = lock(&graph)?;
@@ -287,12 +301,14 @@ impl SparqClient for EmbeddedSparqClient {
         // used VERBATIM, so the committed triples are identical to the HTTP path.
         let exists_q = sparql::ask_exists(container)?;
         let nonce = next_nonce();
+        let modified = meta.last_modified.and_then(timestamp::to_xsd_datetime);
         let create_u = sparql::update_create_child(
             container,
             child,
             &meta.content_type,
             &meta.blob_key,
             &meta.etag,
+            modified.as_deref(),
             &nonce,
         )?;
         let graph = Arc::clone(&self.graph);
@@ -420,6 +436,7 @@ mod tests {
             content_type: ct.into(),
             blob_key: bk.into(),
             etag: etag.into(),
+            last_modified: None,
         }
     }
 

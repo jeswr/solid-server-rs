@@ -311,6 +311,7 @@ async fn create_child_commits_metadata_and_membership_atomically() {
         content_type: "text/turtle".into(),
         blob_key: "k".into(),
         etag: "\"e\"".into(),
+        last_modified: None,
     };
 
     // Missing container ⇒ NotFound, no metadata + no edge written.
@@ -569,6 +570,7 @@ async fn delete_meta_if_empty_on_the_sparq_client_is_atomic() {
         content_type: "text/turtle".into(),
         blob_key: "k".into(),
         etag: "\"e\"".into(),
+        last_modified: None,
     };
 
     // Absent ⇒ NotFound.
@@ -617,6 +619,7 @@ async fn delete_meta_if_empty_folds_the_parent_detach_into_the_one_op() {
         content_type: "text/turtle".into(),
         blob_key: "k".into(),
         etag: "\"e\"".into(),
+        last_modified: None,
     };
     sparq.put_meta(parent, meta.clone()).await.unwrap();
     // Index the empty sub-container AND its edge in the parent (create_child commits both).

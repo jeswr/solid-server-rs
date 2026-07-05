@@ -197,6 +197,7 @@ async fn create_child_commits_metadata_and_membership_atomically_on_the_engine()
         content_type: "text/turtle".into(),
         blob_key: "k".into(),
         etag: "\"e\"".into(),
+        last_modified: None,
     };
 
     let err = sparq
@@ -213,6 +214,64 @@ async fn create_child_commits_metadata_and_membership_atomically_on_the_engine()
     assert_eq!(
         sparq.list_children(container).await.unwrap(),
         vec![child.to_string()]
+    );
+}
+
+#[tokio::test]
+async fn modified_time_round_trips_through_the_real_engine() {
+    // The `pss:modified` `xsd:dateTime` written by `put_meta` must survive storage + retrieval
+    // through the ACTUAL sparq-engine (not just the query-string builders): a whole-second instant
+    // in ⇒ the same instant back out of `get_meta`. This is the end-to-end proof the OPTIONAL SELECT
+    // + the typed-literal storage work on a real engine — the basis of a correct `If-Modified-Since`.
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let sparq = EmbeddedSparqClient::in_memory().unwrap();
+    let iri = "https://pod.example/alice/data";
+    // Whole seconds (the write truncates sub-second precision).
+    let t = UNIX_EPOCH + Duration::from_secs(1_783_254_896);
+    let meta = ResourceMeta {
+        content_type: "text/turtle".into(),
+        blob_key: "k".into(),
+        etag: "\"e\"".into(),
+        last_modified: Some(t),
+    };
+    sparq.put_meta(iri, meta).await.unwrap();
+    let read_back = sparq.get_meta(iri).await.unwrap();
+    assert_eq!(
+        read_back.last_modified,
+        Some(t),
+        "the modification time must round-trip exactly through the engine"
+    );
+
+    // A re-write with a NEW time REPLACES it (single-valued), never accumulates.
+    let t2 = UNIX_EPOCH + Duration::from_secs(1_783_254_900);
+    let meta2 = ResourceMeta {
+        content_type: "text/turtle".into(),
+        blob_key: "k2".into(),
+        etag: "\"e2\"".into(),
+        last_modified: Some(t2),
+    };
+    sparq.put_meta(iri, meta2).await.unwrap();
+    let after = sparq.get_meta(iri).await.unwrap();
+    assert_eq!(
+        after.last_modified,
+        Some(t2),
+        "a re-write bumps the modification time (single-valued replace)"
+    );
+
+    // A record written with NO modification time reads back `None` (the untracked case → 200).
+    let none_iri = "https://pod.example/alice/untimed";
+    let meta_none = ResourceMeta {
+        content_type: "text/turtle".into(),
+        blob_key: "k3".into(),
+        etag: "\"e3\"".into(),
+        last_modified: None,
+    };
+    sparq.put_meta(none_iri, meta_none).await.unwrap();
+    assert_eq!(
+        sparq.get_meta(none_iri).await.unwrap().last_modified,
+        None,
+        "no recorded modification time reads back as None"
     );
 }
 
@@ -445,6 +504,7 @@ async fn referenced_blob_keys_on_the_embedded_client_collects_all_pointers() {
         content_type: "text/turtle".into(),
         blob_key: bk.into(),
         etag: "\"e\"".into(),
+        last_modified: None,
     };
     sparq
         .put_meta("https://pod.example/a", m("k1"))

@@ -608,6 +608,7 @@ mod tests {
             content_type: "text/turtle".into(),
             blob_key: blob_key.to_string(),
             etag: "\"e\"".into(),
+            last_modified: None,
         }
     }
 

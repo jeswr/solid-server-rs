@@ -38,6 +38,15 @@ pub fn p_blob_key() -> String {
 pub fn p_etag() -> String {
     format!("{PSS_NS}etag")
 }
+/// Predicate: a resource's server-recorded modification time (an `xsd:dateTime` literal). Read back
+/// into [`ResourceMeta::last_modified`](super::sparq::ResourceMeta::last_modified) to make
+/// `If-Modified-Since` live (jx3c). It is a RESERVED `urn:pss:index#` predicate, so the existing
+/// reserved-term guard ([`is_reserved_term`]) already forbids untrusted body RDF from writing it.
+pub fn p_modified() -> String {
+    format!("{PSS_NS}modified")
+}
+/// The `xsd:dateTime` datatype IRI — the datatype of the `pss:modified` literal.
+pub const XSD_DATETIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
 /// Predicate: a per-operation create marker (a unique-nonce literal), written atomically with a
 /// guarded `create_child` so the success confirm is race-resistant (no other op touches it).
 pub fn p_create_marker() -> String {
@@ -129,6 +138,21 @@ pub fn literal(value: &str) -> String {
     out
 }
 
+/// Render an `xsd:dateTime` lexical form as a datatyped SPARQL literal
+/// (`"<lexical>"^^<http://www.w3.org/2001/XMLSchema#dateTime>`).
+///
+/// The lexical value is server-generated (from [`super::timestamp::to_xsd_datetime`], not untrusted
+/// input), but it STILL flows through [`literal`] — so even a hypothetically malformed value can
+/// only ever be an inert escaped string term, never injected syntax. The datatype IRI is a
+/// compile-time constant wrapped via [`iri_const`].
+pub fn datetime_literal(lexical: &str) -> String {
+    format!(
+        "{lit}^^{dt}",
+        lit = literal(lexical),
+        dt = iri_const(XSD_DATETIME)
+    )
+}
+
 /// Map a 4-bit nibble to an uppercase hex digit (for the injective bnode-label byte escapes).
 fn nibble_hex(n: u8) -> char {
     match n {
@@ -199,16 +223,24 @@ pub fn ask_create_marker(child: &str, nonce: &str) -> Result<String, BuildError>
     ))
 }
 
-/// SELECT a resource's index-record metadata (content type, blob-key, ETag) from its graph.
+/// SELECT a resource's index-record metadata (content type, blob-key, ETag, + the OPTIONAL modified
+/// time) from its graph.
+///
+/// `pss:modified` is bound via `OPTIONAL` — a record written before the modification time was tracked
+/// (or by a path that records none) still yields its `ct`/`bk`/`etag` row, with `?mod` simply
+/// unbound. The read side then treats an absent `?mod` as "no modification time" ⇒ a fresh 200 on
+/// `If-Modified-Since`, never a spurious 304.
 pub fn select_meta(resource: &str) -> Result<String, BuildError> {
     Ok(format!(
-        "SELECT ?ct ?bk ?etag WHERE {{ GRAPH {g} {{ \
-            {s} {pct} ?ct ; {pbk} ?bk ; {pet} ?etag . }} }} LIMIT 1",
+        "SELECT ?ct ?bk ?etag ?mod WHERE {{ GRAPH {g} {{ \
+            {s} {pct} ?ct ; {pbk} ?bk ; {pet} ?etag . \
+            OPTIONAL {{ {s} {pmod} ?mod }} }} }} LIMIT 1",
         g = iri(resource)?,
         s = iri_const(&s_record()),
         pct = iri_const(&p_content_type()),
         pbk = iri_const(&p_blob_key()),
         pet = iri_const(&p_etag()),
+        pmod = iri_const(&p_modified()),
     ))
 }
 
@@ -237,13 +269,15 @@ pub fn select_read_plan(target: &str, acl_candidates: &[String]) -> Result<Strin
         values.push_str(&iri(raw)?);
     }
     Ok(format!(
-        "SELECT ?g ?ct ?bk ?etag WHERE {{ VALUES ?g {{ {values} }} \
-            GRAPH ?g {{ {s} {pct} ?ct ; {pbk} ?bk ; {pet} ?etag . }} }}",
+        "SELECT ?g ?ct ?bk ?etag ?mod WHERE {{ VALUES ?g {{ {values} }} \
+            GRAPH ?g {{ {s} {pct} ?ct ; {pbk} ?bk ; {pet} ?etag . \
+            OPTIONAL {{ {s} {pmod} ?mod }} }} }}",
         values = values,
         s = iri_const(&s_record()),
         pct = iri_const(&p_content_type()),
         pbk = iri_const(&p_blob_key()),
         pet = iri_const(&p_etag()),
+        pmod = iri_const(&p_modified()),
     ))
 }
 
@@ -289,40 +323,59 @@ pub fn select_referenced_blob_keys() -> String {
 }
 
 /// UPDATE: create-or-replace ONLY a resource's reserved index-record triples (content type, blob-key,
-/// ETag) — leaving everything else in the graph (containment `ldp:contains` edges, the resource's own
-/// RDF) untouched.
+/// ETag, and — when a value is given — modification time) — leaving everything else in the graph
+/// (containment `ldp:contains` edges, the resource's own RDF) untouched.
 ///
 /// This must NOT `DROP` the whole graph: a container's graph also holds its `ldp:contains` edges, and
 /// a resource's graph holds its user RDF, so a blanket drop would silently erase children / body
-/// data on every metadata re-write (the bug roborev flagged). Instead it `DELETE`s only the three
-/// reserved predicates hanging off the reserved record subject (each via an OPTIONAL-free
-/// `DELETE WHERE`, idempotent on an absent record), then `INSERT DATA`s the new record. The three
-/// `DELETE WHERE` + the `INSERT DATA` are submitted as ONE SPARQL update (`;`-separated), so they
+/// data on every metadata re-write (the bug roborev flagged). Instead it `DELETE`s only the reserved
+/// record predicates hanging off the reserved record subject (each via an OPTIONAL-free
+/// `DELETE WHERE`, idempotent on an absent record), then `INSERT DATA`s the new record. The
+/// `DELETE WHERE`s + the `INSERT DATA` are submitted as ONE SPARQL update (`;`-separated), so they
 /// commit atomically as a single generation on the server.
+///
+/// `pss:modified` is treated like the other single-valued predicates: its stale value is ALWAYS
+/// cleared (so writing `last_modified: None` faithfully leaves NO modification time — a later read
+/// returns `None`, never a stale `Some(...)` that could drive a wrong 304); the fresh value is
+/// INSERTed only when `modified` is `Some`.
 pub fn update_put_meta(
     resource: &str,
     content_type: &str,
     blob_key: &str,
     etag: &str,
+    modified: Option<&str>,
 ) -> Result<String, BuildError> {
     let g = iri(resource)?;
     let s = iri_const(&s_record());
     let pct = iri_const(&p_content_type());
     let pbk = iri_const(&p_blob_key());
     let pet = iri_const(&p_etag());
+    let pmod = iri_const(&p_modified());
+    // `pss:modified` is single-valued exactly like the other record predicates, so its stale value is
+    // ALWAYS DELETE-cleared — even when `modified` is `None`. This makes the written state faithful to
+    // the `ResourceMeta`: writing `last_modified: None` genuinely clears any prior timestamp, so a
+    // later read returns `None` (never a stale `Some(...)` that could drive a wrong 304). Only the
+    // INSERT of a fresh value is conditional on `Some`.
+    let mod_insert = match modified {
+        Some(m) => format!(" ; {pmod} {dt}", dt = datetime_literal(m)),
+        None => String::new(),
+    };
     Ok(format!(
-        "DELETE WHERE {{ GRAPH {g} {{ {s} {pct} ?oldCt }} }} ; \
+        "DELETE WHERE {{ GRAPH {g} {{ {s} {pmod} ?oldMod }} }} ; \
+         DELETE WHERE {{ GRAPH {g} {{ {s} {pct} ?oldCt }} }} ; \
          DELETE WHERE {{ GRAPH {g} {{ {s} {pbk} ?oldBk }} }} ; \
          DELETE WHERE {{ GRAPH {g} {{ {s} {pet} ?oldEt }} }} ; \
-         INSERT DATA {{ GRAPH {g} {{ {s} {pct} {ct} ; {pbk} {bk} ; {pet} {et} . }} }}",
+         INSERT DATA {{ GRAPH {g} {{ {s} {pct} {ct} ; {pbk} {bk} ; {pet} {et}{mod_insert} . }} }}",
         g = g,
         s = s,
+        pmod = pmod,
         pct = pct,
         ct = literal(content_type),
         pbk = pbk,
         bk = literal(blob_key),
         pet = pet,
         et = literal(etag),
+        mod_insert = mod_insert,
     ))
 }
 
@@ -363,6 +416,7 @@ pub fn update_create_child(
     content_type: &str,
     blob_key: &str,
     etag: &str,
+    modified: Option<&str>,
     nonce: &str,
 ) -> Result<String, BuildError> {
     let cg = iri(child)?;
@@ -371,22 +425,38 @@ pub fn update_create_child(
     let pbk = iri_const(&p_blob_key());
     let pet = iri_const(&p_etag());
     let pmark = iri_const(&p_create_marker());
+    let pmod = iri_const(&p_modified());
     let pg = iri(container)?;
     let prec = iri_const(&s_record());
     let contains = iri_const(LDP_CONTAINS);
     let childi = iri(child)?;
+    // `pss:modified` is threaded into the SAME atomic modify as the other single-valued record
+    // predicates (so a re-create replaces it, mirroring `update_put_meta`). The stale `?oldMod` is
+    // ALWAYS DELETE-cleared (bound by the WHERE `OPTIONAL`) — even when `modified` is `None` — so a
+    // re-create with no timestamp genuinely clears any prior one (a later read returns `None`, never a
+    // stale `Some(...)`). Only the INSERT of a fresh value is conditional on `Some`.
+    let mod_del = format!(" ; {pmod} ?oldMod");
+    let mod_opt = format!("OPTIONAL {{ GRAPH {cg} {{ {crec} {pmod} ?oldMod }} }} ");
+    let mod_ins = match modified {
+        Some(m) => format!(" ; {pmod} {dt}", dt = datetime_literal(m)),
+        None => String::new(),
+    };
     Ok(format!(
         "DELETE {{ \
-            GRAPH {cg} {{ {crec} {pct} ?oldCt ; {pbk} ?oldBk ; {pet} ?oldEt . }} \
+            GRAPH {cg} {{ {crec} {pct} ?oldCt ; {pbk} ?oldBk ; {pet} ?oldEt{mod_del} . }} \
          }} INSERT {{ \
-            GRAPH {cg} {{ {crec} {pct} {ct} ; {pbk} {bk} ; {pet} {et} ; {pmark} {nce} . }} \
+            GRAPH {cg} {{ {crec} {pct} {ct} ; {pbk} {bk} ; {pet} {et}{mod_ins} ; {pmark} {nce} . }} \
             GRAPH {pg} {{ {prec} {contains} {childi} . }} \
          }} WHERE {{ \
             GRAPH {pg} {{ {prec} {pct} ?anyCt }} \
             OPTIONAL {{ GRAPH {cg} {{ {crec} {pct} ?oldCt }} }} \
             OPTIONAL {{ GRAPH {cg} {{ {crec} {pbk} ?oldBk }} }} \
             OPTIONAL {{ GRAPH {cg} {{ {crec} {pet} ?oldEt }} }} \
+            {mod_opt}\
          }}",
+        mod_del = mod_del,
+        mod_ins = mod_ins,
+        mod_opt = mod_opt,
         cg = cg,
         crec = crec,
         pct = pct,
@@ -727,6 +797,7 @@ mod tests {
             "text/turtle",
             "blob-key",
             "\"etag\"",
+            None,
             "op-1",
         )
         .unwrap();
@@ -746,6 +817,7 @@ mod tests {
             "text/turtle",
             "bk",
             "\"e\"",
+            None,
             "op-1",
         );
         assert_eq!(r, Err(BuildError::InvalidIri));
@@ -755,13 +827,14 @@ mod tests {
     fn put_meta_does_not_drop_the_whole_graph() {
         // The metadata re-write must DELETE only the three reserved record predicates, never the
         // whole graph (which would erase containment edges + user RDF — the roborev finding).
-        let q = update_put_meta("http://pod/c/", "text/turtle", "bk", "\"e\"").unwrap();
+        let q = update_put_meta("http://pod/c/", "text/turtle", "bk", "\"e\"", None).unwrap();
         assert!(!q.contains("DROP"), "must not DROP the graph: {q}");
-        // It targets exactly the three reserved predicates for deletion, then re-inserts.
+        // It targets exactly the four single-valued reserved predicates for deletion (modified is
+        // ALWAYS cleared, even with None), then re-inserts.
         assert_eq!(
             q.matches("DELETE WHERE").count(),
-            3,
-            "three targeted deletes: {q}"
+            4,
+            "four targeted deletes (incl. modified): {q}"
         );
         assert!(q.contains("INSERT DATA"));
         assert!(q.contains(&iri_const(&p_content_type())));
@@ -771,6 +844,117 @@ mod tests {
         assert!(
             !q.contains(LDP_CONTAINS),
             "put_meta must not touch containment: {q}"
+        );
+        // With no modification time, the modified predicate is CLEARED (present in a DELETE) but no
+        // fresh timestamp is INSERTed — so no typed dateTime literal appears.
+        assert!(
+            q.contains(&iri_const(&p_modified())),
+            "modified is still delete-cleared when None: {q}"
+        );
+        assert!(
+            !q.contains("^^<http://www.w3.org/2001/XMLSchema#dateTime>"),
+            "no dateTime INSERTed when None: {q}"
+        );
+    }
+
+    #[test]
+    fn put_meta_with_modified_writes_a_typed_datetime_and_a_fourth_delete() {
+        // A put carrying a modification time DELETE-replaces `pss:modified` (single-valued, like the
+        // other record predicates) and INSERTs it as an `xsd:dateTime`-typed literal.
+        let q = update_put_meta(
+            "http://pod/c/note",
+            "text/turtle",
+            "bk",
+            "\"e\"",
+            Some("2026-07-05T12:34:56Z"),
+        )
+        .unwrap();
+        // Four targeted deletes now: the three record predicates + the old modified.
+        assert_eq!(
+            q.matches("DELETE WHERE").count(),
+            4,
+            "three record deletes + one modified delete: {q}"
+        );
+        assert!(
+            q.contains(&iri_const(&p_modified())),
+            "modified predicate: {q}"
+        );
+        // The timestamp is a DATATYPED literal, not a plain string — so a consumer reads it as a
+        // dateTime. The lexical value is escaped inside one literal (injection-safe).
+        assert!(
+            q.contains("\"2026-07-05T12:34:56Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime>"),
+            "typed xsd:dateTime literal: {q}"
+        );
+        assert!(!q.contains("DROP"), "still never DROPs the graph: {q}");
+    }
+
+    #[test]
+    fn create_child_with_modified_includes_the_typed_timestamp() {
+        let q = update_create_child(
+            "http://pod/c/",
+            "http://pod/c/note",
+            "text/turtle",
+            "bk",
+            "\"e\"",
+            Some("2026-07-05T12:34:56Z"),
+            "op-1",
+        )
+        .unwrap();
+        assert!(
+            q.contains(&iri_const(&p_modified())),
+            "modified predicate: {q}"
+        );
+        assert!(
+            q.contains("\"2026-07-05T12:34:56Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime>"),
+            "typed xsd:dateTime literal in the INSERT: {q}"
+        );
+        // The old modified is bound via an OPTIONAL (so the DELETE replaces it on a re-create).
+        assert!(
+            q.contains("?oldMod"),
+            "old modified bound for single-valued replace: {q}"
+        );
+        // Symmetry: without a modification time the stale value is still CLEARED (predicate present in
+        // the DELETE) but no fresh typed timestamp is INSERTed.
+        let none = update_create_child(
+            "http://pod/c/",
+            "http://pod/c/note",
+            "text/turtle",
+            "bk",
+            "\"e\"",
+            None,
+            "op-1",
+        )
+        .unwrap();
+        assert!(
+            none.contains(&iri_const(&p_modified())),
+            "modified is still delete-cleared when None: {none}"
+        );
+        assert!(
+            !none.contains("^^<http://www.w3.org/2001/XMLSchema#dateTime>"),
+            "no dateTime INSERTed when None: {none}"
+        );
+    }
+
+    #[test]
+    fn select_meta_binds_modified_optionally() {
+        let q = select_meta("http://pod/c/note").unwrap();
+        assert!(q.contains("?mod"), "selects the modified var: {q}");
+        assert!(q.contains("OPTIONAL"), "modified is OPTIONAL: {q}");
+        assert!(
+            q.contains(&iri_const(&p_modified())),
+            "modified predicate: {q}"
+        );
+    }
+
+    #[test]
+    fn select_read_plan_binds_modified_optionally() {
+        let q =
+            select_read_plan("http://pod/c/note", &["http://pod/c/note.acl".to_string()]).unwrap();
+        assert!(q.contains("?mod"), "selects the modified var: {q}");
+        assert!(q.contains("OPTIONAL"), "modified is OPTIONAL: {q}");
+        assert!(
+            q.contains(&iri_const(&p_modified())),
+            "modified predicate: {q}"
         );
     }
 
@@ -870,6 +1054,7 @@ mod tests {
             "text/turtle",
             "bk",
             "\"e\"",
+            None,
             "op-1",
         )
         .unwrap();

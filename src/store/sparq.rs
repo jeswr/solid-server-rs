@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 
@@ -24,6 +25,16 @@ pub struct ResourceMeta {
     pub blob_key: String,
     /// An opaque entity tag for conditional requests. M2: derived from the SPARQ index state.
     pub etag: String,
+    /// The resource's server-recorded modification time (the `pss:modified` `xsd:dateTime` in the
+    /// index), or `None` when the index holds no modification time for this resource.
+    ///
+    /// This is what makes conditional `If-Modified-Since` (RFC 9110 §13.1.3) LIVE: the read path
+    /// threads it into [`crate::ldp::conditional::evaluate_read`], which serves a 304 iff this time
+    /// is `≤` the header date. `None` ⇒ the modification time is unknown ⇒ the evaluator serves a
+    /// fresh 200 (never a spurious 304). A write ([`super::Store::write`] /
+    /// [`super::Store::create_in_container`]) stamps it to the write instant, so a re-write bumps it
+    /// and a subsequent `If-Modified-Since` correctly re-serves the changed representation.
+    pub last_modified: Option<SystemTime>,
 }
 
 /// The result of ONE combined read-plan lookup ([`SparqClient::read_plan`]) — the whole per-read

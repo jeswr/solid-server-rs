@@ -67,6 +67,7 @@ use serde_json::Value;
 
 use super::sparq::{DeleteOutcome, ReadPlan, ResourceMeta, SparqClient, SparqError};
 use super::sparql;
+use super::timestamp;
 
 /// The maximum SPARQL response body this client will buffer (fail-closed bound — a runaway response
 /// is an error, never an OOM). 16 MiB comfortably covers index records + a single resource's RDF.
@@ -358,15 +359,26 @@ impl SparqClient for HttpSparqClient {
             .get("etag")
             .cloned()
             .ok_or_else(|| SparqError::Backend("fatal: meta row missing etag".into()))?;
+        // `?mod` is OPTIONAL: absent ⇒ no recorded modification time; present-but-unparseable ⇒
+        // `None` too (fail OPEN — never a spurious 304, per `timestamp::from_xsd_datetime`).
+        let last_modified = row.get("mod").and_then(|m| timestamp::from_xsd_datetime(m));
         Ok(ResourceMeta {
             content_type,
             blob_key,
             etag,
+            last_modified,
         })
     }
 
     async fn put_meta(&self, iri: &str, meta: ResourceMeta) -> Result<(), SparqError> {
-        let u = sparql::update_put_meta(iri, &meta.content_type, &meta.blob_key, &meta.etag)?;
+        let modified = meta.last_modified.and_then(timestamp::to_xsd_datetime);
+        let u = sparql::update_put_meta(
+            iri,
+            &meta.content_type,
+            &meta.blob_key,
+            &meta.etag,
+            modified.as_deref(),
+        )?;
         self.update_raw(&u)
             .await
             .map_err(SparqHttpError::into_sparq)
@@ -453,12 +465,14 @@ impl SparqClient for HttpSparqClient {
         // ONE atomic update: DELETE any stale child record + marker, INSERT the child record + the
         // containment edge + THIS operation's marker, guarded by the container-record EXISTS in the
         // WHERE clause. A missing container ⇒ the WHERE yields nothing ⇒ nothing inserted.
+        let modified = meta.last_modified.and_then(timestamp::to_xsd_datetime);
         let u = sparql::update_create_child(
             container,
             child,
             &meta.content_type,
             &meta.blob_key,
             &meta.etag,
+            modified.as_deref(),
             &nonce,
         )?;
         self.update_raw(&u)
@@ -575,10 +589,14 @@ impl SparqClient for HttpSparqClient {
                 })
             };
             let g = bind("g")?;
+            // `?mod` is OPTIONAL: absent/unparseable ⇒ `None` (fail open — the ACL candidates only
+            // need the etag anyway; the target's `last_modified` feeds `If-Modified-Since`).
+            let last_modified = row.get("mod").and_then(|m| timestamp::from_xsd_datetime(m));
             let meta = ResourceMeta {
                 content_type: bind("ct")?,
                 blob_key: bind("bk")?,
                 etag: bind("etag")?,
+                last_modified,
             };
             // First row per graph wins (a well-formed index holds exactly one record per graph —
             // `update_put_meta`/`update_create_child` keep the record single-valued; this mirrors
