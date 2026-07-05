@@ -121,6 +121,17 @@ pub fn append_create_links(headers: &mut HeaderMap, created_iri: &str) {
     }
 }
 
+/// The linkset resource's method-advertisement headers (`Allow` + `Accept-Patch`) — shared by the
+/// linkset GET/HEAD response and the OPTIONS handler's linkset branch (roborev Low on 53296c0: an
+/// `OPTIONS …?linkset` must advertise the LINKSET surface, not the LDP verb set).
+pub fn add_method_advertisement(headers: &mut HeaderMap) {
+    headers.insert(header::ALLOW, HeaderValue::from_static(ALLOW));
+    headers.insert(
+        HeaderName::from_static("accept-patch"),
+        HeaderValue::from_static(MEDIA_MERGE_PATCH),
+    );
+}
+
 /// A `405 Method Not Allowed` for a write verb on a linkset URI — with the RFC 9110-required
 /// `Allow` header and the D17 problem-details body (which `ServerError` cannot carry together).
 pub fn method_not_allowed() -> Response {
@@ -183,11 +194,12 @@ pub async fn serve<S: Store>(
     if let Ok(v) = HeaderValue::from_str(&etag) {
         out.insert(header::ETAG, v);
     }
-    out.insert(header::ALLOW, HeaderValue::from_static(ALLOW));
-    out.insert(
-        HeaderName::from_static("accept-patch"),
-        HeaderValue::from_static(MEDIA_MERGE_PATCH),
-    );
+    add_method_advertisement(&mut out);
+    // `Vary: Accept` (RFC 9110 §12.5.5 — the roborev Medium on 53296c0): the linkset's BYTES never
+    // vary by `Accept`, but its STATUS does (a non-accepting `Accept` is a 406 above), so a shared
+    // cache must key on `Accept` or it could serve a cached 200 to a client that negotiated a 406.
+    // On the shared header map, so the 200, HEAD, and 304 all carry it.
+    out.insert(header::VARY, HeaderValue::from_static("Accept"));
 
     // Conditional GET: If-None-Match (weak comparison) against the linkset's own validator. The
     // linkset has no advertised Last-Modified, so If-Modified-Since does not participate.

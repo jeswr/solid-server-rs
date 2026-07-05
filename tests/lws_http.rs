@@ -1216,6 +1216,10 @@ async fn linkset_serves_the_system_links_and_discovery() {
         header_value(&ls, "allow").unwrap(),
         "GET, HEAD, PATCH, OPTIONS"
     );
+    // Vary: Accept — the linkset's STATUS varies by Accept (a non-accepting Accept is a 406), so
+    // shared caches must key on it (the roborev Medium on 53296c0). The CORS layer merges its
+    // own `Origin` dependency onto it (the same wire shape as the main read path).
+    assert_eq!(header_value(&ls, "vary").unwrap(), "Accept, Origin");
     let etag = header_value(&ls, "etag").unwrap().to_string();
     assert!(
         etag.starts_with("\"ls0-"),
@@ -1257,6 +1261,26 @@ async fn linkset_serves_the_system_links_and_discovery() {
     assert_eq!(head.status(), StatusCode::OK);
     assert_eq!(header_value(&head, "etag").unwrap(), etag);
     assert!(body_bytes(head).await.is_empty());
+
+    // A non-preflight OPTIONS on the linkset URI advertises the LINKSET method surface, not the
+    // LDP verb set (the roborev Low on 53296c0).
+    let opt = h
+        .request("OPTIONS", "/alice/notes/a.ttl?linkset", None, Body::empty())
+        .await;
+    assert_eq!(opt.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        header_value(&opt, "allow").unwrap(),
+        "GET, HEAD, PATCH, OPTIONS"
+    );
+    assert_eq!(
+        header_value(&opt, "accept-patch").unwrap(),
+        "application/merge-patch+json"
+    );
+    // …while a plain resource's OPTIONS still advertises the full LDP verb set.
+    let opt = h
+        .request("OPTIONS", "/alice/notes/a.ttl", None, Body::empty())
+        .await;
+    assert!(header_value(&opt, "allow").unwrap().contains("PUT"));
 
     // A linkset of a MISSING resource is a 404 problem (post-authorization).
     let missing = h

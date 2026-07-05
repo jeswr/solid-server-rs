@@ -1853,10 +1853,18 @@ pub async fn patch_handler<S: Store>(
 /// response. The `read-method-support` / `read-method-allow` scenarios require OPTIONS ≠ 405 and an
 /// `Allow` listing GET + HEAD.
 pub async fn options_handler<S: Store>(
-    State(_state): State<Arc<LdpState<S>>>,
+    State(state): State<Arc<LdpState<S>>>,
     Extension(_token): Extension<VerifiedToken>,
     uri: axum::http::Uri,
 ) -> Result<Response, ServerError> {
+    // LWS linkset (M3, flag-gated — roborev Low on 53296c0): a linkset URI advertises ITS method
+    // surface (GET/HEAD/PATCH/OPTIONS + merge-patch), not the LDP verb set. Header-only; the
+    // flag-off surface never inspects the query string.
+    if state.lws().is_some() && crate::lws::linkset::selects_linkset(uri.query()) {
+        let mut out = HeaderMap::new();
+        crate::lws::linkset::add_method_advertisement(&mut out);
+        return Ok((StatusCode::NO_CONTENT, out).into_response());
+    }
     let is_container = uri.path().ends_with('/');
     let mut out = HeaderMap::new();
     add_method_advertisement(&mut out, is_container);
