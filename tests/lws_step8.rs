@@ -460,15 +460,31 @@ async fn cnf_bound_token_is_never_dispatched_to_the_lws_bearer_path() {
         "bare cnf LWS-shaped"
     );
 
-    // The SAME cnf-bound token WITH its DPoP proof validates via the PoP path (a seed write, so
-    // the accept is a real end-to-end WAC-authorized mutation).
+    // The SAME cnf-bound token (`access` — the exact string rejected bare above) WITH its DPoP
+    // proof validates via the PoP path (a seed write, so the accept is a real end-to-end
+    // WAC-authorized mutation): the bare rejection was the presentation, never the token.
+    let proof = mint_dpop_proof(
+        &h.client_key,
+        "PUT",
+        &format!("{BASE_URL}/alice/pop-doc"),
+        &access,
+    );
     let resp = h
-        .dpop("PUT", "/alice/pop-doc", Some(("text/plain", "pop")))
+        .send(
+            Request::builder()
+                .method("PUT")
+                .uri("/alice/pop-doc")
+                .header(header::AUTHORIZATION, format!("DPoP {access}"))
+                .header("dpop", proof)
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from("pop"))
+                .unwrap(),
+        )
         .await;
     assert_eq!(
         resp.status(),
         StatusCode::CREATED,
-        "cnf + proof via PoP path"
+        "the same cnf-bound token + its proof, via the PoP path"
     );
 }
 
