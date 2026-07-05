@@ -76,12 +76,20 @@ M4 (the last gated on `sparq#992`).
    function of the membership (no skip/dup within a snapshot) and the listing ETag
    iteration-order-independent. Each page is its own representation with its own
    rendered-bytes ETag (the existing 304 machinery applies per page unchanged).
-3. **The consistency caveat is documented, not papered over:** each response derives from ONE
-   membership query, but a multi-request walk can see a member twice/miss one if the membership
-   changes between requests (sorted offsets shift). True cross-request snapshot consistency
-   needs versioned/snapshot reads in SPARQ — **filed as `sparq#1572`**; this implementation
-   claims none (the spec requires none). A past-the-end page is an empty 200 (opaque page URIs
-   may outlive shrinkage), an unparseable one a 400 problem.
+3. **Multi-request snapshot consistency — filed as `sparq#1572`, landed as sparq PR #1584, now
+   consumed:** each response derives from ONE combined membership+metadata query
+   (`Store::list_children_snapshot`); when the backend advertises a generation token (sparq's
+   default-build `Sparq-Generation` header), the paged listing's own links carry it as
+   `lws-gen=<g>` and every follow-up page re-reads the SAME immutable snapshot (sparq's
+   `?generation=N` pin) — pages of one walk tile exactly one membership+metadata state. Honest
+   bounds (documented in `src/lws/container.rs`): the D12 WAC filter stays LIVE (revocation
+   applies immediately — an ACL change mid-walk may still shift visible offsets, deliberately);
+   an aged-out/unknown pin is a 410 `snapshot-gone` problem (restart from the container URI,
+   never a silent substitute — a pinned response is accepted ONLY when the backend echoes
+   exactly the pinned generation); a generation-less backend (in-memory, the embedded engine,
+   a pre-#1584 sparq) mints no pinned links and keeps the previous single-response-snapshot
+   contract. A past-the-end page is an empty 200 (opaque page URIs may outlive shrinkage), an
+   unparseable page/generation token a 400 problem.
 4. **Existence-non-disclosure preserved:** the WAC filter runs over the WHOLE membership before
    any slicing, so counts/offsets are functions of the visible view only — pagination adds no
    oracle over hidden members. Cost: the same O(children) ACL walks per listing as M1 (the
@@ -166,6 +174,8 @@ default + `embedded-sparq`, fmt + clippy `-D warnings`.
 
 SSE/WebSocket notification bindings under the WD subscription API (+ linkset/metadata change
 activities), the DPoP-bound LWS-audience PoP profile (§presentation-pop end-to-end),
-`SparqlQueryService`/AC-SPARQL (gated on `sparq#992`), multi-request pagination snapshot
-consistency (gated on `sparq#1572`), operation-precise narrowing (PUT-create / append-only
-PATCH), and the batching of per-member listing ACL walks.
+`SparqlQueryService`/AC-SPARQL (gated on `sparq#992`), operation-precise narrowing (PUT-create /
+append-only PATCH), and the batching of per-member listing ACL walks. (Multi-request pagination
+snapshot consistency — formerly gated on `sparq#1572` — landed via sparq PR #1584 and is consumed
+on the HTTP-backend path; an EMBEDDED-engine pin needs a library-level snapshot/generation API in
+sparq, which does not exist yet.)

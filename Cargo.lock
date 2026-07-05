@@ -2339,7 +2339,7 @@ dependencies = [
 [[package]]
 name = "sparq-core"
 version = "0.1.0"
-source = "git+https://github.com/jeswr/sparq?rev=98259ecdd66ff87683bca482fbc8ee786c4328a8#98259ecdd66ff87683bca482fbc8ee786c4328a8"
+source = "git+https://github.com/jeswr/sparq?rev=cef945af64bd8595198db56ca9f2282b9d242838#cef945af64bd8595198db56ca9f2282b9d242838"
 dependencies = [
  "hashbrown",
  "memchr",
@@ -2353,7 +2353,7 @@ dependencies = [
 [[package]]
 name = "sparq-engine"
 version = "0.1.0"
-source = "git+https://github.com/jeswr/sparq?rev=98259ecdd66ff87683bca482fbc8ee786c4328a8#98259ecdd66ff87683bca482fbc8ee786c4328a8"
+source = "git+https://github.com/jeswr/sparq?rev=cef945af64bd8595198db56ca9f2282b9d242838#cef945af64bd8595198db56ca9f2282b9d242838"
 dependencies = [
  "md-5",
  "oxiri",
@@ -2366,7 +2366,19 @@ dependencies = [
  "smallvec",
  "spargebra",
  "sparq-core",
+ "sparq-substrate",
  "uuid",
+]
+
+[[package]]
+name = "sparq-substrate"
+version = "0.1.0"
+source = "git+https://github.com/jeswr/sparq?rev=cef945af64bd8595198db56ca9f2282b9d242838#cef945af64bd8595198db56ca9f2282b9d242838"
+dependencies = [
+ "oxrdf 0.3.3",
+ "rustc-hash",
+ "smallvec",
+ "sparq-core",
 ]
 
 [[package]]

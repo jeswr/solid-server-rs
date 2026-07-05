@@ -363,6 +363,20 @@ impl<S: SparqClient> SparqClient for CountingSparqClient<S> {
         self.inner.list_children(container).await
     }
 
+    async fn list_children_snapshot(
+        &self,
+        container: &str,
+        pin: Option<u64>,
+    ) -> Result<super::sparq::ChildrenSnapshot, SparqError> {
+        let _g = self.counters.op_guard();
+        // ONE combined (optionally pinned) membership+metadata SELECT on the live client — the
+        // snapshot-listing win this decorator evidences. Forwarded to `inner` (never the trait
+        // default), so the wrapped client's one-round-trip pinned override is what answers (the
+        // same accounting model as `read_plan`: 1 query per snapshot fetch).
+        self.counters.count_queries(1);
+        self.inner.list_children_snapshot(container, pin).await
+    }
+
     async fn referenced_blob_keys(&self) -> Result<HashSet<String>, SparqError> {
         let _g = self.counters.op_guard();
         self.counters.count_queries(1);

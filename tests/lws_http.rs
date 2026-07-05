@@ -1889,6 +1889,84 @@ async fn lws_listing_paginates_deterministically_with_rfc8288_links() {
     }
 }
 
+#[tokio::test]
+async fn lws_gen_pin_is_honest_against_a_generation_less_backend() {
+    // The snapshot-pin surface (sparq#1572 → sparq PR #1584) over a backend with NO generation
+    // concept (this harness's in-memory store — same posture as the embedded engine or a
+    // pre-#1584 sparq): (a) no pinned links are ever MINTED, and (b) a hand-crafted pin is a 410
+    // `snapshot-gone` problem (the fail-closed honesty contract: the server never silently serves
+    // a DIFFERENT snapshot under a pinned URI), while (c) an unusable token is a 400.
+    let h = Harness::lws_paged(2).await;
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        let put = h
+            .request(
+                "PUT",
+                &format!("/alice/notes/{name}"),
+                Some("text/plain"),
+                Body::from("x"),
+            )
+            .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+    }
+
+    // (a) The paged listing's own links carry NO `lws-gen` (generation: None ⇒ unpinned links —
+    // the graceful-degradation contract; a pinned link the server could not honour would strand
+    // every walker at (b)).
+    let p1 = h
+        .request_with(
+            "GET",
+            "/alice/notes/",
+            None,
+            &[("accept", LWS_JSON)],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(p1.status(), StatusCode::OK);
+    assert!(
+        !link_values(&p1).iter().any(|l| l.contains("lws-gen")),
+        "a generation-less backend must mint no pinned links: {:?}",
+        link_values(&p1)
+    );
+
+    // (b) A pin this backend cannot honour: 410 snapshot-gone, with problem details.
+    let pinned = h
+        .request_with(
+            "GET",
+            "/alice/notes/?lws-page=2&lws-gen=7",
+            None,
+            &[("accept", LWS_JSON)],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(pinned.status(), StatusCode::GONE);
+    assert_eq!(
+        header_value(&pinned, "content-type").unwrap(),
+        "application/problem+json"
+    );
+    let problem = body_json(pinned).await;
+    assert_eq!(
+        problem["type"],
+        "https://w3id.org/jeswr/lws/problems/snapshot-gone"
+    );
+
+    // (c) An unusable generation token is a 400 problem (opaque — only server-minted links count).
+    let bad = h
+        .request_with(
+            "GET",
+            "/alice/notes/?lws-gen=abc",
+            None,
+            &[("accept", LWS_JSON)],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    let problem = body_json(bad).await;
+    assert_eq!(
+        problem["type"],
+        "https://w3id.org/jeswr/lws/problems/invalid-generation"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // M3 §flag-off — byte-invariance pins for every new query surface
 // ---------------------------------------------------------------------------------------------
@@ -1963,9 +2041,22 @@ async fn flag_off_ignores_linkset_and_page_queries_byte_identically() {
             Body::empty(),
         )
         .await;
+    // …and `?lws-gen` (the snapshot pin) is likewise never inspected when the flag is off.
+    let c3 = h
+        .request_with(
+            "GET",
+            "/alice/?lws-page=2&lws-gen=7",
+            None,
+            &[("accept", "text/turtle")],
+            Body::empty(),
+        )
+        .await;
     assert_eq!(c1.status(), StatusCode::OK);
     assert_eq!(c2.status(), StatusCode::OK);
-    assert_eq!(body_bytes(c1).await, body_bytes(c2).await);
+    assert_eq!(c3.status(), StatusCode::OK);
+    let b1 = body_bytes(c1).await;
+    assert_eq!(b1, body_bytes(c2).await);
+    assert_eq!(b1, body_bytes(c3).await);
 
     // And the 201 create response carries NO LWS links.
     let put = h

@@ -48,7 +48,8 @@ pub use reconcile::{
     DEFAULT_GRACE,
 };
 pub use sparq::{
-    DeleteOutcome, InMemorySparqClient, ReadPlan, ResourceMeta, SparqClient, SparqError,
+    ChildrenSnapshot, DeleteOutcome, InMemorySparqClient, ReadPlan, ResourceMeta, SparqClient,
+    SparqError,
 };
 pub use sparql::{BodyObject, BuildError, LinksetCas};
 
@@ -102,6 +103,33 @@ impl ValidatedChildIri {
     /// Consume into the validated [`NamedNode`] (moved into an RDF term on the render path).
     pub fn into_named_node(self) -> NamedNode {
         self.0
+    }
+}
+
+/// One snapshot-consistent container listing at the [`Store`] boundary (the validated counterpart
+/// of [`ChildrenSnapshot`] — see [`Store::list_children_snapshot`]): every member IRI is
+/// RFC-3987-validated (same fail-closed omission rule as [`Store::list_children`]), each carrying
+/// its index metadata FROM THE SAME SNAPSHOT, plus the backend generation token the snapshot was
+/// served at (`None` ⇒ the backend has no generation concept; the caller then mints no pinned
+/// links).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListingSnapshot {
+    /// The container's direct members (validated), each with its snapshot metadata.
+    pub members: Vec<(ValidatedChildIri, ResourceMeta)>,
+    /// The generation this snapshot is pinned to / was served at (see
+    /// [`ChildrenSnapshot::generation`]).
+    pub generation: Option<u64>,
+}
+
+/// The 410 `snapshot-gone` problem a no-longer-servable pinned listing maps to (RFC 9457, the LWS
+/// problem registry): the walker restarts from the container's own URI (an unpinned first page —
+/// a fresh snapshot), it never gets a silently different snapshot under its pinned links.
+fn snapshot_gone_problem() -> ServerError {
+    ServerError::LwsProblem {
+        status: 410,
+        type_uri: crate::lws::PROBLEM_SNAPSHOT_GONE,
+        title: "the pagination snapshot is no longer available; restart from the container URI \
+                (an unpinned first page)",
     }
 }
 
@@ -191,6 +219,44 @@ pub trait Store: Send + Sync {
     /// is NOT deleted. Do NOT introduce an emptiness check over this filtered list — use the atomic
     /// path.
     async fn list_children(&self, container: &str) -> ServerResult<Vec<ValidatedChildIri>>;
+
+    /// One snapshot-consistent membership+metadata listing for the LWS paginated render (the
+    /// multi-request `LIMIT`/`OFFSET` consistency PSS filed as sparq#1572, landed as sparq
+    /// PR #1584) — see [`SparqClient::list_children_snapshot`] for the full contract.
+    ///
+    /// `pin: None` lists at the current backend state and returns the generation token the backend
+    /// advertises (`None` when it has no generation concept — then no pinned links are ever
+    /// minted). `pin: Some(g)` re-reads the SAME snapshot a prior response was served at, or fails
+    /// with the 410 `snapshot-gone` problem when `g` can no longer be served — NEVER a silent
+    /// substitute. Same render-only SCOPE as [`list_children`](Store::list_children): not
+    /// authoritative for emptiness.
+    ///
+    /// The DEFAULT implementation composes [`list_children`](Store::list_children) + per-member
+    /// [`meta`](Store::meta) (skipping record-less members — the same omission rule as the
+    /// combined query's inner join) with `generation: None`, and FAILS CLOSED on a pin — so every
+    /// handler-level test double keeps exact semantics; [`CompositeStore`] overrides it to
+    /// delegate to the [`SparqClient`] seam, where the live client answers it in ONE (pinned)
+    /// combined query.
+    async fn list_children_snapshot(
+        &self,
+        container: &str,
+        pin: Option<u64>,
+    ) -> ServerResult<ListingSnapshot> {
+        if pin.is_some() {
+            return Err(snapshot_gone_problem());
+        }
+        let children = self.list_children(container).await?;
+        let mut members = Vec::with_capacity(children.len());
+        for child in children {
+            if let Some(meta) = self.meta(child.as_str()).await? {
+                members.push((child, meta));
+            }
+        }
+        Ok(ListingSnapshot {
+            members,
+            generation: None,
+        })
+    }
 
     /// ONE combined read-plan lookup for the read path (read-2 —
     /// `docs/design/backend-read-path.md` §3.1): the target's authoritative metadata + the
@@ -383,6 +449,9 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
         let meta = match self.sparq.get_meta(iri).await {
             Ok(m) => m,
             Err(SparqError::NotFound) => return Err(ServerError::NotFound),
+            // Unreachable from `get_meta` (only the snapshot listing raises it) — map like any
+            // other backend fault rather than panicking.
+            Err(e @ SparqError::SnapshotGone) => return Err(ServerError::Storage(e.to_string())),
             Err(SparqError::Backend(e)) => return Err(ServerError::Storage(e)),
         };
         let body = self.fetch_body(&meta).await?;
@@ -393,6 +462,8 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
         match self.sparq.get_meta(iri).await {
             Ok(m) => Ok(Some(m)),
             Err(SparqError::NotFound) => Ok(None),
+            // Unreachable from `get_meta` — map like any other backend fault.
+            Err(e @ SparqError::SnapshotGone) => Err(ServerError::Storage(e.to_string())),
             Err(SparqError::Backend(e)) => Err(ServerError::Storage(e)),
         }
     }
@@ -490,6 +561,8 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
         {
             Ok(()) => Ok(meta),
             Err(SparqError::NotFound) => Err(ServerError::NotFound),
+            // Unreachable from `create_child` — map like any other backend fault.
+            Err(e @ SparqError::SnapshotGone) => Err(ServerError::Storage(e.to_string())),
             Err(SparqError::Backend(e)) => Err(ServerError::Storage(e)),
         }
     }
@@ -499,6 +572,8 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
         let blob_key = match self.sparq.get_meta(iri).await {
             Ok(m) => Some(m.blob_key),
             Err(SparqError::NotFound) => None,
+            // Unreachable from `get_meta` — map like any other backend fault.
+            Err(e @ SparqError::SnapshotGone) => return Err(ServerError::Storage(e.to_string())),
             Err(SparqError::Backend(e)) => return Err(ServerError::Storage(e)),
         };
         // Detach from the parent's containment first, then drop the index record, then the bytes.
@@ -566,6 +641,8 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
             .await
             .map_err(|e| match e {
                 SparqError::NotFound => ServerError::NotFound,
+                // Unreachable from `read_plan` — map like any other backend fault.
+                e @ SparqError::SnapshotGone => ServerError::Storage(e.to_string()),
                 SparqError::Backend(msg) => ServerError::Storage(msg),
             })
     }
@@ -628,6 +705,44 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
             }
         }
         Ok(out)
+    }
+
+    async fn list_children_snapshot(
+        &self,
+        container: &str,
+        pin: Option<u64>,
+    ) -> ServerResult<ListingSnapshot> {
+        // Delegate to the SparqClient seam (the live client answers membership + per-member
+        // metadata in ONE — optionally generation-pinned — combined query; sparq PR #1584).
+        let snapshot = self
+            .sparq
+            .list_children_snapshot(container, pin)
+            .await
+            .map_err(|e| match e {
+                // The pinned snapshot can no longer be served (aged out / unknown token / pins
+                // unsupported): the 410 restart problem, never a 500 (the walker recovers by
+                // restarting unpinned from the container URI).
+                SparqError::SnapshotGone => snapshot_gone_problem(),
+                other => ServerError::Storage(format!("{other}")),
+            })?;
+        // The same RFC-3987 fail-closed validation boundary as `list_children` (see above): a
+        // malformed/injected member row is OMITTED, never flowed unchecked into the render.
+        let mut members = Vec::with_capacity(snapshot.members.len());
+        for (iri, meta) in snapshot.members {
+            match ValidatedChildIri::parse(&iri) {
+                Some(v) => members.push((v, meta)),
+                None => {
+                    debug_assert!(false, "store yielded a non-RFC-3987 child IRI: {iri}");
+                    eprintln!(
+                        "  STORE: omitting non-RFC-3987 child IRI from list_children_snapshot: {iri:?}"
+                    );
+                }
+            }
+        }
+        Ok(ListingSnapshot {
+            members,
+            generation: snapshot.generation,
+        })
     }
 }
 

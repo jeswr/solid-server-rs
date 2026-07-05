@@ -42,14 +42,28 @@
 //! are a deterministic function of the (visible) membership — no member is skipped or duplicated
 //! across the pages of one snapshot, and the representation ETag is iteration-order-independent.
 //!
-//! **Consistency caveat (documented, deliberate — sparq#1572)**: each RESPONSE is built from ONE
-//! authoritative membership query (a single-query snapshot — internally consistent), but a
-//! MULTI-REQUEST page walk is only as consistent as the membership is stable between requests: a
-//! member created/deleted between page fetches can shift the sorted offsets, so a walker may see
-//! a member twice or miss one relative to either endpoint state. Cross-request snapshot
-//! consistency needs snapshot/versioned reads in the SPARQ backend — filed as `sparq#1572`; until
-//! then this implementation makes no cross-request consistency claim (and the spec's §pagination
-//! requires none).
+//! ## Multi-request snapshot consistency (sparq#1572 — landed as sparq PR #1584)
+//! Each response is built from ONE combined membership+metadata query
+//! ([`Store::list_children_snapshot`]). When the backend advertises a **generation token** for
+//! that snapshot (sparq's default-build `Sparq-Generation` header), a paged listing's own
+//! `first`/`next`/`prev`/`last` links carry it as `lws-gen=<g>`, and every follow-up page request
+//! **re-reads the SAME immutable snapshot** (sparq's `?generation=N` pin) — so a member
+//! created/deleted between page fetches can no longer shift the sorted offsets: the pages of one
+//! walk tile exactly one membership+metadata state (the sparq#1572 acceptance property).
+//!
+//! The honest bounds of that claim:
+//! - **Authorization stays LIVE — deliberately.** The D12 per-member WAC filter always evaluates
+//!   at REQUEST time, never at the pinned snapshot (pinning ACL reads would keep serving revoked
+//!   access — security over consistency). An ACL change mid-walk may therefore still shift the
+//!   VISIBLE offsets; that residual is the security-correct behaviour, not a gap.
+//! - **The pin is retention-bounded.** sparq keeps only its concurrency-retention window (the
+//!   last K generations, default 4); a pin that ages out fails as a **410**
+//!   `snapshot-gone` problem and the walker restarts from the container URI (an unpinned first
+//!   page — a fresh snapshot). Never a silent substitute of a different snapshot.
+//! - **Graceful degradation.** A backend with no generation concept (the in-memory double, the
+//!   embedded engine — no library-level snapshot API yet — or a pre-#1584 sparq) yields
+//!   `generation: None`: links carry no `lws-gen`, and behaviour is exactly the previous
+//!   single-response-snapshot contract (the spec's §pagination requires no more).
 //!
 //! ## Fail-closed membership × pagination
 //! The D12 per-member WAC filter runs over the WHOLE membership BEFORE slicing (`totalItems` and
@@ -170,24 +184,44 @@ pub(crate) struct Listing {
     pub page_links: Vec<axum::http::HeaderValue>,
 }
 
-/// Parse the requested page from the query string: absent ⇒ page 1; `lws-page=N` (N ≥ 1) ⇒ N;
-/// anything unusable ⇒ a 400 problem (page URIs are opaque — only the server's own links count).
-pub(crate) fn page_from_query(query: Option<&str>) -> Result<usize, ServerError> {
-    let Some(query) = query else { return Ok(1) };
+/// Parse the requested page + snapshot pin from the query string: absent ⇒ page 1, unpinned;
+/// `lws-page=N` (N ≥ 1) ⇒ page N; `lws-gen=G` (a u64 generation token from the server's OWN
+/// pagination links) ⇒ the page walk is pinned to snapshot G. Anything unusable ⇒ a 400 problem
+/// (page URIs and generation tokens are opaque — only the server's own links count).
+pub(crate) fn page_from_query(query: Option<&str>) -> Result<(usize, Option<u64>), ServerError> {
+    let Some(query) = query else {
+        return Ok((1, None));
+    };
+    let mut page: usize = 1;
+    let mut pin: Option<u64> = None;
     for pair in query.split('&') {
         if let Some(v) = pair.strip_prefix("lws-page=") {
-            return match v.parse::<usize>() {
-                Ok(n) if n >= 1 => Ok(n),
-                _ => Err(ServerError::LwsProblem {
-                    status: 400,
-                    type_uri: super::PROBLEM_INVALID_PAGE,
-                    title: "lws-page must be a positive integer (follow the server's own \
-                            first/next/prev/last links)",
-                }),
+            page = match v.parse::<usize>() {
+                Ok(n) if n >= 1 => n,
+                _ => {
+                    return Err(ServerError::LwsProblem {
+                        status: 400,
+                        type_uri: super::PROBLEM_INVALID_PAGE,
+                        title: "lws-page must be a positive integer (follow the server's own \
+                                first/next/prev/last links)",
+                    })
+                }
+            };
+        } else if let Some(v) = pair.strip_prefix("lws-gen=") {
+            pin = match v.parse::<u64>() {
+                Ok(g) => Some(g),
+                _ => {
+                    return Err(ServerError::LwsProblem {
+                        status: 400,
+                        type_uri: super::PROBLEM_INVALID_GENERATION,
+                        title: "lws-gen must be the opaque generation token from the server's \
+                                own pagination links",
+                    })
+                }
             };
         }
     }
-    Ok(1)
+    Ok((page, pin))
 }
 
 /// The [0-based) slice bounds + the link set for `page` of a `total`-member visible listing under
@@ -235,31 +269,41 @@ fn page_plan(total: usize, page: usize, page_size: Option<std::num::NonZeroUsize
 }
 
 /// Render the LWS container listing for `target` as the requesting agent sees it — `page` of a
-/// `page_size`-paged listing (see the module doc; `page_size: None` ⇒ single-page).
+/// `page_size`-paged listing (see the module doc; `page_size: None` ⇒ single-page), optionally
+/// **pinned** to the snapshot generation a prior page of the same walk was served at (`pin` — the
+/// `lws-gen` token from the server's own links; the sparq#1572 consistency, module doc above).
 ///
 /// Fail-closed per D12: each authoritative child is included only when the agent holds `acl:Read`
-/// on it (via the same planned WAC walk the read path uses); a denial omits the child, a backend
-/// FAULT fails the request (never a silently-shorter listing). A listed child whose metadata row
-/// is missing (a byte/index inconsistency window) is likewise omitted — `mediaType` is a MUST on
-/// data-resource members, so emitting a member we cannot describe would violate the shape. The
-/// filter runs over the WHOLE membership (never just the page) so `totalItems` and the page
-/// boundaries are functions of the visible view only.
+/// on it (via the same planned WAC walk the read path uses — always evaluated LIVE, never at the
+/// pinned snapshot); a denial omits the child, a backend FAULT fails the request (never a
+/// silently-shorter listing). A listed child whose metadata row is missing at the snapshot (a
+/// byte/index inconsistency window) is likewise omitted — `mediaType` is a MUST on data-resource
+/// members, so emitting a member we cannot describe would violate the shape. The filter runs over
+/// the WHOLE membership (never just the page) so `totalItems` and the page boundaries are
+/// functions of the visible view only.
 pub(crate) async fn render<S: Store>(
     state: &LdpState<S>,
     target: &LdpTarget,
     token: &VerifiedToken,
     origin: Option<&str>,
     page: usize,
+    pin: Option<u64>,
     page_size: Option<std::num::NonZeroUsize>,
 ) -> Result<Listing, ServerError> {
-    let mut children = state.store.list_children(&target.iri).await?;
+    // ONE combined membership+metadata read from ONE backend state (pinned when the walker
+    // presented a server-minted `lws-gen` token). A no-longer-servable pin surfaces as the 410
+    // `snapshot-gone` problem from the store — the walker restarts unpinned.
+    let snapshot = state.store.list_children_snapshot(&target.iri, pin).await?;
+    let generation = snapshot.generation;
+    let mut children = snapshot.members;
     // Deterministic member order (M3): lexicographic by IRI, so page slicing is a pure function
     // of the visible membership (and the representation ETag is iteration-order-independent).
-    children.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    children.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
 
-    // The VISIBLE view first (D12), across the whole membership.
+    // The VISIBLE view first (D12), across the whole membership. Membership + metadata come from
+    // the snapshot; the WAC decision is LIVE (deliberate — see the module doc's honest bounds).
     let mut visible: Vec<(String, crate::store::ResourceMeta)> = Vec::with_capacity(children.len());
-    for child in children {
+    for (child, meta) in children {
         let iri = child.as_str();
         // D12: only members the requesting agent can read are disclosed. A deny (401/403-class
         // decision) omits the member; a backend error propagates (fail-closed on faults).
@@ -270,11 +314,6 @@ pub(crate) async fn render<S: Store>(
             Decision::Allow(_) => {}
             Decision::Unauthenticated | Decision::Forbidden => continue,
         }
-        let Some(meta) = state.store.meta(iri).await? else {
-            // Listed but meta-less (an index inconsistency window): omit — a data-resource member
-            // without its MUST-level mediaType would be malformed.
-            continue;
-        };
         visible.push((iri.to_string(), meta));
     }
 
@@ -319,20 +358,32 @@ pub(crate) async fn render<S: Store>(
         .map_err(|e| ServerError::Storage(format!("lws container serialise: {e}")))?;
     Ok(Listing {
         body,
-        page_links: page_links(&target.iri, page, &plan),
+        page_links: page_links(&target.iri, page, &plan, generation),
     })
 }
 
 /// The RFC 8288 pagination `Link` values for `page` under `plan` (§pagination): `first` always,
 /// `next` on all but the last page (omitted on the last — a MUST both ways), `prev`/`last` when
 /// meaningful. Empty when the listing is single-page.
-fn page_links(container_iri: &str, page: usize, plan: &PagePlan) -> Vec<axum::http::HeaderValue> {
+///
+/// When the backend advertised a snapshot `generation`, every link carries it as `lws-gen=<g>` so
+/// the walker's follow-up requests re-read the SAME snapshot (the sparq#1572 consistency — module
+/// doc). `None` ⇒ plain unpinned links (the graceful-degradation contract).
+fn page_links(
+    container_iri: &str,
+    page: usize,
+    plan: &PagePlan,
+    generation: Option<u64>,
+) -> Vec<axum::http::HeaderValue> {
     if !plan.paged {
         return Vec::new();
     }
     let link = |n: usize, rel: &str| {
-        axum::http::HeaderValue::from_str(&format!("<{container_iri}?lws-page={n}>; rel=\"{rel}\""))
-            .ok()
+        let uri = match generation {
+            Some(g) => format!("{container_iri}?lws-page={n}&lws-gen={g}"),
+            None => format!("{container_iri}?lws-page={n}"),
+        };
+        axum::http::HeaderValue::from_str(&format!("<{uri}>; rel=\"{rel}\"")).ok()
     };
     let mut out = Vec::with_capacity(4);
     out.extend(link(1, "first"));
@@ -486,7 +537,7 @@ mod tests {
     fn page_links_follow_rfc8288() {
         let c = "https://pod.example/alice/";
         let strs = |page: usize, plan: &PagePlan| -> Vec<String> {
-            page_links(c, page, plan)
+            page_links(c, page, plan, None)
                 .iter()
                 .map(|v| v.to_str().unwrap().to_string())
                 .collect()
@@ -521,14 +572,64 @@ mod tests {
     }
 
     #[test]
+    fn page_links_carry_the_snapshot_pin_when_a_generation_is_known() {
+        // The sparq#1572 consistency wiring: a backend-advertised generation rides EVERY link as
+        // `lws-gen=<g>`, so a walker following the server's own links re-reads the SAME snapshot.
+        let c = "https://pod.example/alice/";
+        let plan = page_plan(5, 2, std::num::NonZeroUsize::new(2));
+        let links: Vec<String> = page_links(c, 2, &plan, Some(42))
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            links,
+            vec![
+                format!("<{c}?lws-page=1&lws-gen=42>; rel=\"first\""),
+                format!("<{c}?lws-page=1&lws-gen=42>; rel=\"prev\""),
+                format!("<{c}?lws-page=3&lws-gen=42>; rel=\"next\""),
+                format!("<{c}?lws-page=3&lws-gen=42>; rel=\"last\""),
+            ]
+        );
+        // No generation ⇒ plain unpinned links (graceful degradation — asserted exactly in
+        // `page_links_follow_rfc8288` above).
+        assert!(page_links(c, 2, &plan, None)
+            .iter()
+            .all(|l| !l.to_str().unwrap().contains("lws-gen")));
+    }
+
+    #[test]
     fn page_query_parsing_fails_closed() {
-        assert_eq!(page_from_query(None).unwrap(), 1);
-        assert_eq!(page_from_query(Some("")).unwrap(), 1);
-        assert_eq!(page_from_query(Some("lws-page=3")).unwrap(), 3);
-        assert_eq!(page_from_query(Some("a=b&lws-page=2")).unwrap(), 2);
+        assert_eq!(page_from_query(None).unwrap(), (1, None));
+        assert_eq!(page_from_query(Some("")).unwrap(), (1, None));
+        assert_eq!(page_from_query(Some("lws-page=3")).unwrap(), (3, None));
+        assert_eq!(page_from_query(Some("a=b&lws-page=2")).unwrap(), (2, None));
         // Other queries are ignored (page 1) — the surface-preserving default.
-        assert_eq!(page_from_query(Some("foo=bar")).unwrap(), 1);
+        assert_eq!(page_from_query(Some("foo=bar")).unwrap(), (1, None));
         for bad in ["lws-page=0", "lws-page=-1", "lws-page=abc", "lws-page="] {
+            assert!(page_from_query(Some(bad)).is_err(), "{bad} must be a 400");
+        }
+    }
+
+    #[test]
+    fn generation_pin_parsing_fails_closed() {
+        // The server's own pinned-link shape round-trips.
+        assert_eq!(
+            page_from_query(Some("lws-page=2&lws-gen=42")).unwrap(),
+            (2, Some(42))
+        );
+        assert_eq!(
+            page_from_query(Some("lws-gen=7")).unwrap(),
+            (1, Some(7)),
+            "a pin without an explicit page pins page 1"
+        );
+        // Unusable tokens are a 400 problem (opaque — only server-minted links count), never a
+        // silent unpin (which would hand the walker a DIFFERENT snapshot than its links name).
+        for bad in [
+            "lws-gen=",
+            "lws-gen=abc",
+            "lws-gen=-1",
+            "lws-page=2&lws-gen=1.5",
+        ] {
             assert!(page_from_query(Some(bad)).is_err(), "{bad} must be a 400");
         }
     }

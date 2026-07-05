@@ -104,8 +104,20 @@ solid-oidc-verifier = { git = "https://github.com/jeswr/solid-oidc-verifier", re
 # `mmap` enables `Graph::open`/`save` (the directory-backed persistence seam — memory-mapped
 # on-disk indexes); without it only the in-memory path is available. The default `parallel` feature
 # rides along (parallel index build).
-sparq-core = { git = "https://github.com/jeswr/sparq", rev = "98259ecdd66ff87683bca482fbc8ee786c4328a8", features = ["mmap"], optional = true }
-sparq-engine = { git = "https://github.com/jeswr/sparq", rev = "98259ecdd66ff87683bca482fbc8ee786c4328a8", optional = true }
+# Re-pinned `98259ec → cef945a` (sparq `main`, 2026-07-05): the rev that includes the three
+# beyond-50k throughput landings PSS filed as sparq#1570/#1571/#1572 — PR #1577 (persistent
+# per-generation AclIndex), PR #1584 (default-build `?generation=N` pin + `Sparq-Generation`
+# header — the HTTP surface `HttpSparqClient::list_children_snapshot` consumes for
+# snapshot-consistent LWS pagination), and PR #1585 (origin-scoped session-cache invalidation).
+# #1577/#1585 live in sparq's solid/decide layer — not consumed by this embedded LIBRARY path
+# (they speed the sparq-server HTTP deployment's WAC decide); #1584's generation ring likewise
+# lives in sparq-server, so the embedded path has NO library-level snapshot pin (see the
+# `list_children_snapshot` trait default). DELIBERATELY stops BEFORE `289956c` (#1593,
+# `feat(solid)!` — spec-compliant EMPTY default graph by default), a BREAKING query-semantics
+# change that needs its own adjudicated bump (this crate's embedded queries are all
+# `GRAPH <g>`-scoped, but a semantics break is not taken as a silent ride-along).
+sparq-core = { git = "https://github.com/jeswr/sparq", rev = "cef945af64bd8595198db56ca9f2282b9d242838", features = ["mmap"], optional = true }
+sparq-engine = { git = "https://github.com/jeswr/sparq", rev = "cef945af64bd8595198db56ca9f2282b9d242838", optional = true }
 # RDF parse/serialise: oxttl (Turtle/N-Triples) + oxjsonld (JSON-LD ↔ RDF), via oxrdf model (spike §4).
 # oxttl 0.2 + oxjsonld 0.2 both pin `oxrdf =0.3.3`, so this is a coherent Oxigraph set.
 oxrdf = "0.3"

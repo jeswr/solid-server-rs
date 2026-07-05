@@ -88,8 +88,35 @@ pub enum DeleteOutcome {
 pub enum SparqError {
     #[error("resource not indexed")]
     NotFound,
+    /// A pinned listing snapshot ([`SparqClient::list_children_snapshot`]) can no longer be served
+    /// at the requested generation: it aged out of the backend's retention window (sparq answers
+    /// `410 Gone` — PR sparq#1584), the backend instance no longer knows the token (a restart), or
+    /// the backend cannot honour pins at all. NEVER a silent substitute: the caller restarts the
+    /// page walk from an unpinned first page rather than being handed a different snapshot.
+    #[error("listing snapshot no longer available at the pinned generation")]
+    SnapshotGone,
     #[error("sparq backend error: {0}")]
     Backend(String),
+}
+
+/// One snapshot-consistent container listing ([`SparqClient::list_children_snapshot`]): the members
+/// **with their index metadata from the same snapshot**, plus the backend generation token the
+/// snapshot was served at (`None` when the backend has no generation concept — the unpinned,
+/// single-request behaviour).
+///
+/// Membership and metadata come from ONE backend query, so within a snapshot no member can appear
+/// with metadata from a different store state. A member whose graph carries no index record at the
+/// snapshot simply yields no row (same inner-join semantics as the render's previous
+/// `list_children` + per-member `meta` omission rule).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildrenSnapshot {
+    /// The container's direct members, each with its index metadata AT THE SNAPSHOT.
+    pub members: Vec<(String, ResourceMeta)>,
+    /// The backend generation this snapshot is pinned to / was served at. `Some(g)` iff the backend
+    /// acknowledged a generation (sparq's `Sparq-Generation` header); a pinned request that comes
+    /// back is always `Some(pin)` (an unacknowledged pin is [`SparqError::SnapshotGone`], never a
+    /// silently-unpinned result).
+    pub generation: Option<u64>,
 }
 
 /// A query-build failure (an IRIREF-invalid untrusted IRI) is a FATAL backend error — fail-closed,
@@ -169,6 +196,57 @@ pub trait SparqClient: Send + Sync {
 
     /// List the IRIs of `container`'s direct children (its `ldp:contains` members).
     async fn list_children(&self, container: &str) -> Result<Vec<String>, SparqError>;
+
+    /// One snapshot-consistent membership+metadata listing for the LWS paginated render
+    /// (`crate::lws::container` — the multi-request `LIMIT`/`OFFSET` consistency PSS filed as
+    /// sparq#1572, landed as sparq PR #1584): the container's members WITH their index metadata,
+    /// answered from ONE backend state, optionally **pinned** to a previously-returned generation.
+    ///
+    /// - `pin: None` — list at the backend's CURRENT state and return the generation token it
+    ///   advertises (`None` when it advertises none). The caller embeds the token in its own
+    ///   pagination links so a multi-request page walk re-reads the SAME snapshot.
+    /// - `pin: Some(g)` — serve the listing AS OF generation `g`, or fail with
+    ///   [`SparqError::SnapshotGone`] when `g` can no longer be served (aged out of the backend's
+    ///   retention window, unknown to the instance, or pins unsupported). NEVER a silent
+    ///   substitute: an implementation must not answer a pinned request from a different state.
+    ///
+    /// SCOPE (same as [`list_children`](SparqClient::list_children)): this is a **render-only**
+    /// view — a member whose graph carries no index record at the snapshot yields no row, so this
+    /// list is NOT authoritative for emptiness. The empty-container DELETE decision stays on the
+    /// atomic [`delete_meta_if_empty`](SparqClient::delete_meta_if_empty) path.
+    ///
+    /// The DEFAULT implementation has no snapshot machinery: unpinned it composes
+    /// [`list_children`](SparqClient::list_children) + per-member
+    /// [`get_meta`](SparqClient::get_meta) (skipping `NotFound` members — the inner-join
+    /// semantics) and reports `generation: None` (so no caller ever mints a pin against it);
+    /// pinned it FAILS CLOSED with [`SparqError::SnapshotGone`]. The HTTP client overrides it
+    /// with ONE combined pinned SELECT (sparq's `?generation=N` + `Sparq-Generation` surface).
+    async fn list_children_snapshot(
+        &self,
+        container: &str,
+        pin: Option<u64>,
+    ) -> Result<ChildrenSnapshot, SparqError> {
+        if pin.is_some() {
+            // No generation concept here — a pin can never be honoured. Fail closed (the caller
+            // restarts unpinned) rather than serve a different snapshot under a pinned link.
+            return Err(SparqError::SnapshotGone);
+        }
+        let children = self.list_children(container).await?;
+        let mut members = Vec::with_capacity(children.len());
+        for child in children {
+            match self.get_meta(&child).await {
+                Ok(meta) => members.push((child, meta)),
+                // Listed but record-less (an index inconsistency window): omit — the same
+                // inner-join rule as the combined query (and the render's previous behaviour).
+                Err(SparqError::NotFound) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(ChildrenSnapshot {
+            members,
+            generation: None,
+        })
+    }
 
     /// The set of blob-store keys that ANY index record currently references (the `pss:blobKey`
     /// pointers across every resource graph).
@@ -629,5 +707,43 @@ mod tests {
             DeleteOutcome::Deleted
         );
         assert_eq!(c.get_linkset(cont).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn default_snapshot_composes_members_and_meta_with_no_generation() {
+        // The trait DEFAULT (in-memory double / embedded engine — no snapshot machinery):
+        // unpinned it composes list_children + per-member get_meta (skipping record-less members)
+        // and reports generation: None, so no caller ever mints a pinned link against it.
+        let c = InMemorySparqClient::new();
+        let cont = "https://pod/alice/";
+        c.put_meta(cont, meta("\"c\"")).await.unwrap();
+        c.create_child(cont, "https://pod/alice/a", meta("\"a\""))
+            .await
+            .unwrap();
+        c.create_child(cont, "https://pod/alice/b", meta("\"b\""))
+            .await
+            .unwrap();
+        // A member whose record vanished (an index-inconsistency window) is OMITTED — the same
+        // inner-join rule as the live combined query.
+        c.delete_meta("https://pod/alice/b").await.unwrap();
+
+        let snap = c.list_children_snapshot(cont, None).await.unwrap();
+        assert_eq!(snap.generation, None);
+        assert_eq!(
+            snap.members,
+            vec![("https://pod/alice/a".to_string(), meta("\"a\""))]
+        );
+    }
+
+    #[tokio::test]
+    async fn default_snapshot_fails_closed_on_a_pin() {
+        // A backend with no generation concept can never honour a pin — SnapshotGone (the caller
+        // restarts unpinned), NEVER a silently different snapshot under a pinned link.
+        let c = InMemorySparqClient::new();
+        let err = c
+            .list_children_snapshot("https://pod/alice/", Some(7))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SparqError::SnapshotGone), "got: {err:?}");
     }
 }

@@ -92,8 +92,10 @@
 //!   `first`/`next`/`prev`/`last` links (`?lws-page=N`), deterministic lexicographic order, page
 //!   arithmetic strictly over the D12-filtered visible view; `items[]` members now carry the
 //!   SHOULD-level `size` (the `ResourceMeta::size` byte length stamped at write time). Each
-//!   response is a single-query snapshot; cross-request snapshot consistency is gated on
-//!   `sparq#1572` (documented in [`container`]).
+//!   response is a single-query snapshot; a MULTI-REQUEST page walk is additionally
+//!   snapshot-PINNED (`lws-gen` in the server's own links) when the backend advertises a
+//!   generation token — the sparq#1572 ask, landed as sparq PR #1584 and consumed via
+//!   [`crate::store::Store::list_children_snapshot`] (documented in [`container`]).
 //! - **RFC 9396 `authorization_details` — narrowing-only** ([`rar`]; spec §rar): the LWS `at+jwt`
 //!   claim is enforced at the same single verify-chokepoint as the audience containment, as a
 //!   pure DENY-gate — effective access = WAC ∩ aud ∩ narrowing, so it can only ever reduce (a
@@ -123,10 +125,11 @@
 //! LWS-audience `at+jwt` — a webid-less token from the LWS AS cannot yet establish a DPoP proof
 //! or DPoP-SK session through the Solid-OIDC verifier path; step-8 A composes the EXISTING
 //! engine with the LWS realm, it does not widen the establishment token policy), the
-//! `SparqlQueryService`/AC-SPARQL companion (a gated increment on `sparq#992`), multi-request
-//! pagination snapshot-consistency (`sparq#1572`), operation-precise narrowing for
-//! PUT-create/append-only-PATCH (today conservatively under-granted — [`rar`]), and the
-//! container `application/json`-vs-`text/turtle` preference refinement.
+//! `SparqlQueryService`/AC-SPARQL companion (a gated increment on `sparq#992`), operation-precise
+//! narrowing for PUT-create/append-only-PATCH (today conservatively under-granted — [`rar`]), and
+//! the container `application/json`-vs-`text/turtle` preference refinement. (Multi-request
+//! pagination snapshot-consistency — formerly gated on `sparq#1572` — LANDED via sparq PR #1584
+//! and is consumed on the HTTP-backend path; see [`container`].)
 
 pub mod auth;
 pub mod container;
@@ -207,6 +210,15 @@ pub const PROBLEM_LINKSET_METHOD: &str = "https://w3id.org/jeswr/lws/problems/me
 /// Pagination (M3, §pagination): an unusable `lws-page` value — 400 (page URIs are opaque; only
 /// the server's own emitted links are meaningful).
 pub const PROBLEM_INVALID_PAGE: &str = "https://w3id.org/jeswr/lws/problems/invalid-page";
+/// Pagination snapshot pinning: an unusable `lws-gen` value — 400 (the generation token is opaque;
+/// only the server's own emitted pinned links are meaningful).
+pub const PROBLEM_INVALID_GENERATION: &str =
+    "https://w3id.org/jeswr/lws/problems/invalid-generation";
+/// Pagination snapshot pinning: the pinned snapshot can no longer be served (it aged out of the
+/// backend's retention window, or the backend instance no longer knows the token) — 410; the
+/// walker restarts from the container's own URI (an unpinned first page — a fresh snapshot).
+/// Never a silent substitute.
+pub const PROBLEM_SNAPSHOT_GONE: &str = "https://w3id.org/jeswr/lws/problems/snapshot-gone";
 
 /// Env flag that enables the LWS surface (`1`/`true`).
 pub const ENV_LWS: &str = "SOLID_SERVER_LWS";

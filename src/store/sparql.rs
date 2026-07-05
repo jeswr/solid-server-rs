@@ -327,6 +327,34 @@ pub fn select_children(container: &str) -> Result<String, BuildError> {
     ))
 }
 
+/// SELECT a container's direct members TOGETHER WITH each member's index-record metadata, in ONE
+/// query — the snapshot-consistent LWS listing read (`SparqClient::list_children_snapshot`):
+/// membership and per-member metadata answered from ONE backend state, so a pinned page walk
+/// (sparq PR #1584's `?generation=N`) re-reads the SAME snapshot for both.
+///
+/// The member's record is an INNER join (`GRAPH ?child { … }` — the graph term is the bound member
+/// IRI, the same graph-IRI == resource-IRI model as every other query here): a member whose graph
+/// carries no record simply yields no row, which is exactly the render's previous
+/// `list_children` + per-member-`meta` omission rule (a record-less member was omitted from the
+/// listing either way). `?mod`/`?size` stay OPTIONAL, mirroring [`select_meta`].
+pub fn select_children_meta(container: &str) -> Result<String, BuildError> {
+    Ok(format!(
+        "SELECT ?child ?ct ?bk ?etag ?mod ?size WHERE {{ \
+            GRAPH {g} {{ {s} {p} ?child }} \
+            GRAPH ?child {{ {s} {pct} ?ct ; {pbk} ?bk ; {pet} ?etag . \
+            OPTIONAL {{ {s} {pmod} ?mod }} \
+            OPTIONAL {{ {s} {psize} ?size }} }} }}",
+        g = iri(container)?,
+        s = iri_const(&s_record()),
+        p = iri_const(LDP_CONTAINS),
+        pct = iri_const(&p_content_type()),
+        pbk = iri_const(&p_blob_key()),
+        pet = iri_const(&p_etag()),
+        pmod = iri_const(&p_modified()),
+        psize = iri_const(&p_size()),
+    ))
+}
+
 /// SELECT a resource's USER-MANAGED linkset state (M3 — `crate::lws::linkset`): the stored JSON
 /// literal + its revision tag, from the resource's own graph. No row ⇒ no user linkset (the
 /// linkset resource then serves system links only).
@@ -1102,6 +1130,26 @@ mod tests {
             q.contains(&iri_const(&p_modified())),
             "modified predicate: {q}"
         );
+    }
+
+    #[test]
+    fn select_children_meta_joins_membership_and_records_in_one_query() {
+        let q = select_children_meta("http://pod/c/").unwrap();
+        // ONE query carrying membership (the container graph's ldp:contains) AND each member's
+        // record (the member's OWN graph — `GRAPH ?child`), with mod/size OPTIONAL like select_meta.
+        assert!(
+            q.starts_with("SELECT ?child ?ct ?bk ?etag ?mod ?size"),
+            "{q}"
+        );
+        assert!(q.contains(&iri_const(LDP_CONTAINS)), "membership edge: {q}");
+        assert!(
+            q.contains("GRAPH ?child"),
+            "member record from the member's graph: {q}"
+        );
+        assert!(q.contains("OPTIONAL"), "mod/size are OPTIONAL: {q}");
+        // The untrusted container IRI flows through the fail-closed `iri` builder.
+        assert!(select_children_meta("http://pod/c/\u{0}bad").is_err());
+        assert!(select_children_meta("not an iri>").is_err());
     }
 
     #[test]

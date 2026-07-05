@@ -65,7 +65,9 @@ use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
 use serde_json::Value;
 
-use super::sparq::{DeleteOutcome, ReadPlan, ResourceMeta, SparqClient, SparqError};
+use super::sparq::{
+    ChildrenSnapshot, DeleteOutcome, ReadPlan, ResourceMeta, SparqClient, SparqError,
+};
 use super::sparql;
 use super::timestamp;
 
@@ -194,9 +196,39 @@ impl HttpSparqClient {
         sparql: &str,
         accept: &str,
     ) -> Result<(Bytes, String), SparqHttpError> {
+        let resp = self.query_raw_pinned(sparql, accept, None).await?;
+        Ok((resp.body, resp.content_type))
+    }
+
+    /// Issue a SPARQL **query**, optionally **pinned** to a generation (sparq PR #1584): the pin
+    /// rides the endpoint URL's query string (`?generation=N` — the wire form the SPARQL 1.1
+    /// Protocol leaves free alongside a POSTed `application/sparql-query` body), and the response's
+    /// `Sparq-Generation` header (the generation the result was produced against) is surfaced on
+    /// the returned [`QueryResponse`]. Absent/unparsable header ⇒ `generation: None` (an older
+    /// sparq without the header — the caller decides whether that is acceptable; for a PINNED
+    /// request it is not, see `list_children_snapshot`).
+    async fn query_raw_pinned(
+        &self,
+        sparql: &str,
+        accept: &str,
+        pin: Option<u64>,
+    ) -> Result<QueryResponse, SparqHttpError> {
+        let uri = match pin {
+            // The operator-configured endpoint is a plain path URL (`…/sparql`); join defensively
+            // in case it already carries a query string.
+            Some(g) => {
+                let sep = if self.endpoint.contains('?') {
+                    '&'
+                } else {
+                    '?'
+                };
+                format!("{}{}generation={}", self.endpoint, sep, g)
+            }
+            None => self.endpoint.clone(),
+        };
         let req = Request::builder()
             .method(Method::POST)
-            .uri(&self.endpoint)
+            .uri(uri)
             .header(header::CONTENT_TYPE, CT_SPARQL_QUERY)
             .header(header::ACCEPT, accept)
             .body(Full::new(Bytes::from(sparql.to_string())))
@@ -218,7 +250,8 @@ impl HttpSparqClient {
     }
 
     /// Send a request under the timeout, classify the status, and read the bounded body. Returns the
-    /// body bytes + `Content-Type` for a 2xx; a typed error otherwise.
+    /// body bytes + `Content-Type` (+ the `Sparq-Generation` header, when present) for a 2xx; a
+    /// typed error otherwise.
     ///
     /// The timeout wraps the WHOLE exchange — connect, header receipt, AND the bounded body read —
     /// via one inner async block, so a server that sends headers then stalls the body cannot hang the
@@ -226,7 +259,7 @@ impl HttpSparqClient {
     /// classified from the response HEADERS *before* the body is read, so a non-2xx returns its typed
     /// status error regardless of whether the (ignored) error body reads cleanly — a 5xx with an
     /// oversized/unreadable body stays a retryable `ServerStatus`, never a fatal `Body`.
-    async fn send(&self, req: Request<Full<Bytes>>) -> Result<(Bytes, String), SparqHttpError> {
+    async fn send(&self, req: Request<Full<Bytes>>) -> Result<QueryResponse, SparqHttpError> {
         let client = self.client.clone();
         let exchange = async move {
             let resp = client
@@ -240,6 +273,14 @@ impl HttpSparqClient {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
+            // The generation the response was produced against (sparq PR #1584's
+            // `Sparq-Generation`). Absent/unparsable ⇒ `None` — load-bearing ONLY for pinned
+            // snapshot listings, where the caller fails closed on `None` (never a silent unpin).
+            let generation = resp
+                .headers()
+                .get("sparq-generation")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
 
             // Classify the status FIRST (header-only) so a non-2xx's typed error does not depend on a
             // clean body read. 2xx → ok (read the body, which IS the result); 501 → fatal (a permanent
@@ -249,7 +290,11 @@ impl HttpSparqClient {
             // not needed (errors are conveyed by status), so it is dropped unread.
             if status.is_success() {
                 let body = read_bounded(resp.into_body()).await?;
-                Ok((body, content_type))
+                Ok(QueryResponse {
+                    body,
+                    content_type,
+                    generation,
+                })
             } else if status == StatusCode::NOT_IMPLEMENTED {
                 Err(SparqHttpError::ClientStatus {
                     status: status.as_u16(),
@@ -334,6 +379,16 @@ fn parse_select_json(body: &[u8]) -> Result<SelectResult, SparqHttpError> {
 #[derive(Debug)]
 struct SelectResult {
     rows: Vec<std::collections::HashMap<String, String>>,
+}
+
+/// A successful (2xx) protocol exchange: the result bytes, the response `Content-Type`, and the
+/// `Sparq-Generation` header when the backend advertised one (sparq PR #1584 — the snapshot-pin
+/// token for [`SparqClient::list_children_snapshot`]; `None` on an older backend).
+#[derive(Debug)]
+struct QueryResponse {
+    body: Bytes,
+    content_type: String,
+    generation: Option<u64>,
 }
 
 #[async_trait]
@@ -534,6 +589,75 @@ impl SparqClient for HttpSparqClient {
             }
         }
         Ok(children)
+    }
+
+    async fn list_children_snapshot(
+        &self,
+        container: &str,
+        pin: Option<u64>,
+    ) -> Result<ChildrenSnapshot, SparqError> {
+        // ONE combined membership+metadata SELECT (see `sparql::select_children_meta`), optionally
+        // pinned to a prior generation over sparq's `?generation=N` surface (PR #1584) so a
+        // multi-request page walk re-reads the SAME immutable snapshot.
+        let q = sparql::select_children_meta(container)?;
+        let resp = self
+            .query_raw_pinned(&q, ACCEPT_RESULTS_JSON, pin)
+            .await
+            .map_err(|e| match (pin, &e) {
+                // A PINNED re-issue of a builder-generated query that succeeds unpinned: sparq
+                // answers 410 Gone when the pin aged out of its retention window, and 400 when the
+                // instance does not know the token (e.g. a restart reset the generation ring —
+                // "not yet published"). Both mean THIS snapshot can no longer be served — a
+                // restartable condition for the page walker, never a query bug (the identical
+                // query shape already ran unpinned to mint the pin).
+                (Some(_), SparqHttpError::ClientStatus { status: 400 | 410 }) => {
+                    SparqError::SnapshotGone
+                }
+                _ => e.into_sparq(),
+            })?;
+
+        // FAIL CLOSED on an unacknowledged pin: a backend that ignored `?generation=` (a pre-#1584
+        // sparq treats it as an unknown parameter and serves CURRENT state) must not be allowed to
+        // silently substitute a different snapshot under a pinned link. The pin is honoured iff the
+        // response advertises exactly the pinned generation.
+        if let Some(p) = pin {
+            if resp.generation != Some(p) {
+                return Err(SparqError::SnapshotGone);
+            }
+        }
+
+        let result = parse_select_json(&resp.body).map_err(SparqHttpError::into_sparq)?;
+        let mut members = Vec::with_capacity(result.rows.len());
+        for row in result.rows {
+            // Every row of this SELECT must carry the member IRI + the three mandatory record
+            // fields (the inner join guarantees them together). A row missing one is a malformed
+            // backend response — surface it as a fatal error rather than silently dropping it
+            // (a silently-shortened listing would misreport `totalItems`/page boundaries).
+            let bind = |var: &str| -> Result<String, SparqError> {
+                row.get(var).cloned().ok_or_else(|| {
+                    SparqHttpError::Malformed(format!(
+                        "children-meta row missing the '{var}' binding"
+                    ))
+                    .into_sparq()
+                })
+            };
+            let child = bind("child")?;
+            // `?mod`/`?size` are OPTIONAL, with the same fail-open semantics as `get_meta`.
+            let last_modified = row.get("mod").and_then(|m| timestamp::from_xsd_datetime(m));
+            let size = row.get("size").and_then(|s| s.parse::<u64>().ok());
+            let meta = ResourceMeta {
+                content_type: bind("ct")?,
+                blob_key: bind("bk")?,
+                etag: bind("etag")?,
+                last_modified,
+                size,
+            };
+            members.push((child, meta));
+        }
+        Ok(ChildrenSnapshot {
+            members,
+            generation: resp.generation,
+        })
     }
 
     async fn referenced_blob_keys(&self) -> Result<std::collections::HashSet<String>, SparqError> {

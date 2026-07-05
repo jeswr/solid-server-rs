@@ -49,8 +49,22 @@ struct MockMode {
     /// Return a `SELECT ?child` body whose single row is MISSING the `child` binding — for the
     /// list_children malformed-row fatal test.
     children_row_missing_binding: bool,
+    /// Return a children-meta row that carries `child` but is MISSING the mandatory `ct` binding —
+    /// for the list_children_snapshot malformed-row fatal test.
+    children_meta_row_missing_ct: bool,
     /// Sleep this long BEFORE sending any response (headers + body) — for the whole-request timeout.
     delay: Option<Duration>,
+    /// Model sparq PR #1584's generation surface: when `Some(g)`, every successful QUERY response
+    /// carries a `Sparq-Generation` header — the request's honoured `?generation=N` pin when one
+    /// was sent, else `g` (the mock's "current" generation).
+    advertise_generation: Option<u64>,
+    /// A pinned (`?generation=N`) request answers **410 Gone** — the pin aged out of the retention
+    /// window (sparq's honesty contract: never a silent substitute).
+    pin_gone: bool,
+    /// Model a PRE-#1584 sparq: `generation` is just an ignored unknown parameter and NO
+    /// `Sparq-Generation` header is ever sent (the silently-current-state server the client must
+    /// fail closed against).
+    ignore_pin: bool,
 }
 
 /// The mock's tiny store: resource IRI → its index record; container IRI → child IRIs; resource IRI
@@ -70,6 +84,9 @@ struct MockStore {
     delete_markers: HashMap<String, Vec<String>>,
     /// The last SPARQL string the mock received (so a test can assert on the query text/escaping).
     last_sparql: Option<String>,
+    /// The last request's raw URL query string (so a test can assert whether/how the client sent
+    /// the `?generation=N` pin).
+    last_query_string: Option<String>,
     /// Total protocol requests received (so a test can pin how many round-trips an op cost).
     requests: usize,
 }
@@ -102,12 +119,24 @@ async fn spawn_mock() -> (String, MockState) {
 /// The mock `/sparql` handler — classifies query vs update + answers from the tiny store.
 async fn handle_sparql(
     State(state): State<MockState>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let mode = state.mode.lock().unwrap().clone();
     if let Some(delay) = mode.delay {
         tokio::time::sleep(delay).await;
+    }
+    // The request's `?generation=N` pin (sparq PR #1584's URL-query form — the one the client
+    // sends alongside a POSTed `application/sparql-query` body).
+    let pin: Option<u64> = raw_query.as_deref().and_then(|q| {
+        q.split('&')
+            .find_map(|p| p.strip_prefix("generation="))
+            .and_then(|v| v.parse().ok())
+    });
+    {
+        let mut store = state.store.lock().unwrap();
+        store.last_query_string = raw_query.clone();
     }
     if let Some(status) = mode.force_status {
         // A non-empty error body (the realistic case) must NOT flip the retryable classification —
@@ -118,6 +147,15 @@ async fn handle_sparql(
             r#"{"error":"forced"}"#.to_string()
         };
         return (status, body).into_response();
+    }
+    // sparq's retention honesty: a pinned request whose generation aged out is 410 Gone — never a
+    // silent substitute. (`ignore_pin` models a PRE-#1584 server that never inspects the param.)
+    if !mode.ignore_pin && mode.pin_gone && pin.is_some() {
+        return (
+            StatusCode::GONE,
+            r#"{"error":"generation aged out of the retention window"}"#,
+        )
+            .into_response();
     }
     let ct = headers
         .get(header::CONTENT_TYPE)
@@ -136,16 +174,40 @@ async fn handle_sparql(
         return StatusCode::NO_CONTENT.into_response();
     }
     // Otherwise a query (application/sparql-query). Answer ASK / SELECT / CONSTRUCT.
-    if mode.malformed {
-        return results_json("this is not json{");
-    }
-    if mode.children_row_missing_binding && sparql.starts_with("SELECT ?child") {
+    let resp = if mode.malformed {
+        results_json("this is not json{")
+    } else if mode.children_meta_row_missing_ct && sparql.starts_with("SELECT ?child ?ct") {
+        // A children-meta result whose row carries the member IRI but not the mandatory `ct`
+        // binding (a malformed backend response — the client must fail closed, never drop it).
+        results_json(
+            r#"{"head":{"vars":["child","ct","bk","etag"]},"results":{"bindings":[{"child":{"type":"uri","value":"http://x/c/a"}}]}}"#,
+        )
+    } else if mode.children_row_missing_binding && sparql.starts_with("SELECT ?child") {
         // A SELECT-children result whose row is missing the `child` binding (a malformed backend).
-        return results_json(
+        results_json(
             r#"{"head":{"vars":["child"]},"results":{"bindings":[{"other":{"type":"uri","value":"http://x"}}]}}"#,
-        );
+        )
+    } else {
+        answer_query(&state, &sparql)
+    };
+    // Stamp `Sparq-Generation` on successful query responses when the mock advertises generations
+    // (PR #1584: the honoured pin, else the current generation). A PRE-#1584 mock (`ignore_pin`)
+    // sends no header at all.
+    if mode.ignore_pin {
+        return resp;
     }
-    answer_query(&state, &sparql)
+    if let Some(current) = mode.advertise_generation {
+        let g = pin.unwrap_or(current);
+        let mut resp = resp;
+        if resp.status().is_success() {
+            resp.headers_mut().insert(
+                axum::http::HeaderName::from_static("sparq-generation"),
+                axum::http::HeaderValue::from_str(&g.to_string()).unwrap(),
+            );
+        }
+        return resp;
+    }
+    resp
 }
 
 /// Apply a (mock) SPARQL update by recognising the client's fixed-shape statements. This is NOT a
@@ -343,6 +405,30 @@ fn answer_query(state: &MockState, sparql: &str) -> Response {
                 results_json(r#"{"head":{"vars":["ct","bk","etag"]},"results":{"bindings":[]}}"#)
             }
         };
+    }
+    if sparql.starts_with("SELECT ?child ?ct") {
+        // select_children_meta (the snapshot listing): one row per member THAT HAS an index record
+        // (the inner join), carrying the member IRI + its record fields.
+        let container = first_graph_iri(sparql).unwrap_or_default();
+        let kids = store.children.get(&container).cloned().unwrap_or_default();
+        let rows: Vec<String> = kids
+            .iter()
+            .filter_map(|child| {
+                store.meta.get(child).map(|(ct, bk, et)| {
+                    format!(
+                        r#"{{"child":{{"type":"uri","value":{c}}},"ct":{{"type":"literal","value":{ct}}},"bk":{{"type":"literal","value":{bk}}},"etag":{{"type":"literal","value":{et}}}}}"#,
+                        c = json_str(child),
+                        ct = json_str(ct),
+                        bk = json_str(bk),
+                        et = json_str(et),
+                    )
+                })
+            })
+            .collect();
+        return results_json(&format!(
+            r#"{{"head":{{"vars":["child","ct","bk","etag","mod","size"]}},"results":{{"bindings":[{}]}}}}"#,
+            rows.join(",")
+        ));
     }
     if sparql.starts_with("SELECT ?child") {
         // select_children
@@ -1159,6 +1245,160 @@ async fn client_4xx_is_a_fatal_backend_error() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// list_children_snapshot — the generation-pinned snapshot listing (sparq PR #1584's
+// `?generation=N` + `Sparq-Generation` surface).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn children_snapshot_unpinned_returns_members_meta_and_the_advertised_generation() {
+    // Page 1 of a walk: NO pin is sent, membership + per-member metadata come back from ONE
+    // combined SELECT, and the backend's advertised generation is captured (the token the caller
+    // then embeds in its own pagination links).
+    let (url, state) = spawn_mock().await;
+    state.mode.lock().unwrap().advertise_generation = Some(41);
+    let c = HttpSparqClient::new(url);
+    c.put_meta(CONTAINER, meta()).await.unwrap();
+    c.create_child(CONTAINER, CHILD, meta()).await.unwrap();
+
+    let before = state.store.lock().unwrap().requests;
+    let snap = c.list_children_snapshot(CONTAINER, None).await.unwrap();
+    let store = state.store.lock().unwrap();
+    assert_eq!(
+        store.requests - before,
+        1,
+        "membership + metadata is ONE protocol request"
+    );
+    // No pin was sent (page 1 is unpinned — it MINTS the snapshot).
+    assert!(
+        !store
+            .last_query_string
+            .clone()
+            .unwrap_or_default()
+            .contains("generation="),
+        "an unpinned snapshot request must not send ?generation"
+    );
+    drop(store);
+    assert_eq!(
+        snap.generation,
+        Some(41),
+        "the advertised generation is captured"
+    );
+    assert_eq!(snap.members.len(), 1);
+    assert_eq!(snap.members[0].0, CHILD);
+    assert_eq!(
+        snap.members[0].1,
+        meta(),
+        "member metadata rides the same query"
+    );
+}
+
+#[tokio::test]
+async fn children_snapshot_pinned_sends_the_pin_and_accepts_the_echoed_generation() {
+    // A follow-up page: the pin from the server's own links is sent as `?generation=N`, the
+    // backend echoes it in `Sparq-Generation`, and the result is accepted at exactly that pin.
+    let (url, state) = spawn_mock().await;
+    state.mode.lock().unwrap().advertise_generation = Some(99); // current has moved on…
+    let c = HttpSparqClient::new(url);
+    c.put_meta(CONTAINER, meta()).await.unwrap();
+    c.create_child(CONTAINER, CHILD, meta()).await.unwrap();
+
+    let snap = c.list_children_snapshot(CONTAINER, Some(41)).await.unwrap();
+    assert_eq!(
+        snap.generation,
+        Some(41),
+        "the honoured pin, not the current generation"
+    );
+    let q = state
+        .store
+        .lock()
+        .unwrap()
+        .last_query_string
+        .clone()
+        .unwrap_or_default();
+    assert!(
+        q.contains("generation=41"),
+        "the pin must ride the URL query string (got: {q})"
+    );
+}
+
+#[tokio::test]
+async fn children_snapshot_aged_out_pin_is_snapshot_gone() {
+    // sparq's retention honesty: a pin outside the retained window answers 410 Gone — the client
+    // maps it to the RESTARTABLE SnapshotGone, never a generic backend failure.
+    let (url, state) = spawn_mock().await;
+    {
+        let mut m = state.mode.lock().unwrap();
+        m.advertise_generation = Some(99);
+        m.pin_gone = true;
+    }
+    let c = HttpSparqClient::new(url);
+    let err = c
+        .list_children_snapshot(CONTAINER, Some(3))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SparqError::SnapshotGone), "got: {err:?}");
+}
+
+#[tokio::test]
+async fn children_snapshot_400_on_a_pinned_request_is_snapshot_gone_but_unpinned_stays_fatal() {
+    // A 400 on a PINNED re-issue of the (builder-generated, already-proven) query shape means the
+    // instance does not know the token (e.g. a restart reset the generation ring — "not yet
+    // published") ⇒ restartable SnapshotGone. The SAME 400 on an UNPINNED request keeps its fatal
+    // classification (there is no pin to blame).
+    let (url, state) = spawn_mock().await;
+    state.mode.lock().unwrap().force_status = Some(StatusCode::BAD_REQUEST);
+    let c = HttpSparqClient::new(url);
+    let err = c
+        .list_children_snapshot(CONTAINER, Some(7))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SparqError::SnapshotGone), "got: {err:?}");
+    let err = c.list_children_snapshot(CONTAINER, None).await.unwrap_err();
+    match err {
+        SparqError::Backend(msg) => assert!(msg.starts_with("fatal:"), "got: {msg}"),
+        other => panic!("expected fatal Backend, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn children_snapshot_fails_closed_on_an_unacknowledged_pin() {
+    // THE silent-substitute guard: a pre-#1584 backend ignores `?generation=` (an unknown
+    // parameter) and serves CURRENT state with no `Sparq-Generation` header. Accepting that under
+    // a pinned link would hand the walker a DIFFERENT snapshot than its links name — the client
+    // must fail closed (SnapshotGone ⇒ the walker restarts unpinned, correct on such a backend).
+    let (url, state) = spawn_mock().await;
+    state.mode.lock().unwrap().ignore_pin = true;
+    let c = HttpSparqClient::new(url);
+    c.put_meta(CONTAINER, meta()).await.unwrap();
+    c.create_child(CONTAINER, CHILD, meta()).await.unwrap();
+
+    let err = c
+        .list_children_snapshot(CONTAINER, Some(41))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SparqError::SnapshotGone), "got: {err:?}");
+    // …while the UNPINNED request against the same backend degrades gracefully: members are
+    // served, generation is None (so no pinned links are ever minted against it).
+    let snap = c.list_children_snapshot(CONTAINER, None).await.unwrap();
+    assert_eq!(snap.generation, None);
+    assert_eq!(snap.members.len(), 1);
+}
+
+#[tokio::test]
+async fn children_snapshot_row_missing_a_mandatory_binding_is_fatal() {
+    // A children-meta row missing `ct` is a malformed backend response — fatal, never a silently
+    // dropped member (which would misreport totalItems/page boundaries).
+    let (url, state) = spawn_mock().await;
+    state.mode.lock().unwrap().children_meta_row_missing_ct = true;
+    let c = HttpSparqClient::new(url);
+    let err = c.list_children_snapshot(CONTAINER, None).await.unwrap_err();
+    match err {
+        SparqError::Backend(msg) => assert!(msg.starts_with("fatal:"), "got: {msg}"),
+        other => panic!("expected fatal Backend, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn malformed_response_is_a_fatal_error() {
     let (url, state) = spawn_mock().await;
@@ -1315,6 +1555,52 @@ async fn live_sparq_round_trip() {
         c.list_children(parent).await.unwrap().is_empty(),
         "the parent edge is detached in the SAME atomic modify (no separate remove_child)"
     );
+
+    // Generation-pinned snapshot listing against the REAL endpoint (sparq PR #1584): the
+    // sparq#1572 acceptance property — a member created AFTER the pin is invisible at the pin,
+    // visible unpinned. Requires a sparq at/after `c7345ad` (the #1584 merge); on an OLDER sparq
+    // the client must fail CLOSED (SnapshotGone on the unacknowledged pin) rather than serve a
+    // silently-unpinned listing — asserted honestly in the `None` arm instead of failing the test.
+    c.put_meta(container, m.clone()).await.unwrap();
+    c.create_child(container, child, m.clone()).await.unwrap();
+    let snap = c.list_children_snapshot(container, None).await.unwrap();
+    assert_eq!(snap.members.len(), 1);
+    assert_eq!(snap.members[0].0, child);
+    match snap.generation {
+        Some(g) => {
+            // A post-pin write must be INVISIBLE at the pin, visible unpinned.
+            let child2 = "https://live.example/c/item2";
+            c.create_child(container, child2, m.clone()).await.unwrap();
+            let pinned = c.list_children_snapshot(container, Some(g)).await.unwrap();
+            assert_eq!(pinned.generation, Some(g));
+            assert_eq!(
+                pinned.members.len(),
+                1,
+                "the interleaved create is invisible at the pinned generation"
+            );
+            let current = c.list_children_snapshot(container, None).await.unwrap();
+            assert_eq!(current.members.len(), 2, "…and visible unpinned");
+            c.delete_meta(child2).await.ok();
+            c.remove_child(container, child2).await.ok();
+        }
+        None => {
+            eprintln!(
+                "live SPARQ did not advertise Sparq-Generation (pre-#1584?) — pin honesty only"
+            );
+            let err = c
+                .list_children_snapshot(container, Some(1))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, SparqError::SnapshotGone),
+                "an unacknowledged pin must fail closed, got: {err:?}"
+            );
+        }
+    }
+    // Clean up the pinned-listing fixtures.
+    c.delete_meta(child).await.ok();
+    c.remove_child(container, child).await.ok();
+    c.delete_meta(container).await.ok();
 
     // Clean up the parent.
     c.delete_meta(parent).await.ok();

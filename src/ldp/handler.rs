@@ -799,18 +799,20 @@ pub(crate) async fn serve_read<S: Store>(
     let (rendered, etag): (Option<(Bytes, String)>, String) = if target.is_container {
         if let Some(variant) = lws_container_variant {
             // The LWS flat `{id, type, totalItems, items[]}` listing — server-managed, fail-closed
-            // per member (D12), PAGED per §pagination (M3: `?lws-page=N` + the RFC 8288 Link set;
-            // single-response snapshot — the multi-request consistency caveat is documented in
-            // `lws::container`). Its representation ETag derives from the rendered PAGE bytes
-            // exactly like the LDP listing's, so the 304/Vary machinery below applies unchanged
-            // (each page carries its own validator).
-            let page = crate::lws::container::page_from_query(uri.query())?;
+            // per member (D12), PAGED per §pagination (M3: `?lws-page=N` + the RFC 8288 Link set),
+            // with multi-request page walks SNAPSHOT-PINNED via the server-minted `lws-gen` token
+            // when the backend advertises generations (sparq#1572 → sparq PR #1584 — the pinning
+            // design + its honest bounds are documented in `lws::container`). Its representation
+            // ETag derives from the rendered PAGE bytes exactly like the LDP listing's, so the
+            // 304/Vary machinery below applies unchanged (each page carries its own validator).
+            let (page, pin) = crate::lws::container::page_from_query(uri.query())?;
             let listing = crate::lws::container::render(
                 state,
                 &target,
                 token,
                 origin,
                 page,
+                pin,
                 state.lws().and_then(|l| l.page_size),
             )
             .await?;
