@@ -12,15 +12,19 @@
 //! (0 = its own `.acl`). BEFORE read-2 (pinned at the read-1 commit, `git log` this file) a read
 //! cost `k+1` sequential ACL probes + 1 target meta = **k+2 SPARQL queries** warm (k+3 cold), +1
 //! blob get (+1 cold), +1 query for a container listing. AFTER read-2 (the §3.1 combined read-plan
-//! query) the O(depth) ACL WALK collapses into ONE combined query — the pins below are the AFTER
-//! table, each test recording its before→after delta (the deterministic evidence of the win):
+//! query) the O(depth) ACL WALK collapses into ONE combined query; AFTER read-4 (the §3.4
+//! `(blob_key, etag)`-keyed blob-BODY cache) a warm same-version read pays ZERO blob gets. The pins
+//! below are the AFTER table, each test recording its before→after delta (the deterministic
+//! evidence of both wins):
 //!
-//!   op                         queries before → after   blob gets
-//!   doc GET  warm (any k)              k+2 → 2              1
-//!   doc GET  cold ACL                  k+3 → 2              2   (ACL bytes ride read-3 next)
-//!   HEAD     warm                      k+2 → 2              1
-//!   GET 304  warm                      k+2 → 2              1
-//!   container GET warm                 k+3 → 3              1   (plan + found-ACL re-confirm + listing)
+//!   op                         queries before → after   blob gets before → after (read-4)
+//!   doc GET  warm (any k)              k+2 → 2              1 → 0   (body-cache hit)
+//!   doc GET  cold ACL                  k+3 → 2              2 → 1   (fresh ACL bytes only; warm target body hits)
+//!   HEAD     warm                      k+2 → 2              1 → 0
+//!   GET 304  warm                      k+2 → 2              1 → 0
+//!   container GET warm                 k+3 → 3              1 → 0   (plan + found-ACL re-confirm + listing)
+//!   doc GET  first-ever (cold body)          2              1       (the fetch that populates the cache)
+//!   doc GET  after a REWRITE (new etag)      2              1       (new (blob_key, etag) ⇒ MISS — never stale)
 //!
 //! Depth-independence is the point: the per-read query count no longer scales with k — it is a flat
 //! `plan(1) + found-ACL existence re-confirm(1) [+ container listing(1)]`. The found-ACL re-confirm
@@ -29,7 +33,12 @@
 //! from a stale cache), so the ONE governing ACL is re-confirmed live while the k absent-candidate
 //! probes stay collapsed into the plan. The walk-collapse win is real and depth-independent; the
 //! honest warm count is 2, not 1 (an earlier pin of 1 trusted the plan-time etag, the roborev
-//! Medium). read-3 removes the remaining cold duplicate `get_meta`.
+//! Medium). read-3 removed the cold duplicate `get_meta`; read-4 (this table's blob column) serves
+//! a hot unchanged body from the `(blob_key, etag)` LRU — a hit is provably current because the
+//! lookup key comes from THIS request's authoritative read-plan round and blob keys are minted
+//! unique per write (a rewrite ⇒ new key ⇒ miss; see `src/store/body_cache.rs`), and it can never
+//! bypass WAC (authorization runs BEFORE the body fetch, hit or miss — pinned by
+//! `warm_body_cache_never_serves_an_unauthorized_request` below).
 
 mod common;
 
@@ -188,10 +197,11 @@ async fn fixture(h: &Harness) {
 
 /// §3.7 row 1 — **doc GET, warm (k = 3)**: the O(depth) ACL walk collapses into ONE combined
 /// read-plan query; the ONE governing ACL is then re-confirmed live (fail-closed on delete) — so
-/// **2 SPARQL queries** (plan + found-ACL re-confirm), + **1 blob get**. Before read-2 this was 5
-/// (k+2); the pin is now DEPTH-INDEPENDENT (flat 2 at any k). `max_in_flight == 1` ⇒ RTT depth = 3.
+/// **2 SPARQL queries** (plan + found-ACL re-confirm), + **0 blob gets** (read-4: the unchanged
+/// body is a `(blob_key, etag)` cache HIT — was 1 before the body cache, k+2 = 5 queries before
+/// read-2). The pin is DEPTH-INDEPENDENT (flat 2 at any k). `max_in_flight == 1` ⇒ RTT depth = 2.
 #[tokio::test]
-async fn get_doc_warm_k3_pins_plan_plus_confirm_query_1_blob_get() {
+async fn get_doc_warm_k3_pins_plan_plus_confirm_query_0_blob_gets() {
     let h = Harness::new().await;
     fixture(&h).await;
 
@@ -205,19 +215,21 @@ async fn get_doc_warm_k3_pins_plan_plus_confirm_query_1_blob_get() {
         "warm doc GET = plan + found-ACL live re-confirm, depth-independent (was k+2 = 5): {d:?}"
     );
     assert_eq!(
-        d.blob_gets, 1,
-        "warm doc GET fetches exactly the target bytes: {d:?}"
+        d.blob_gets, 0,
+        "warm doc GET serves the unchanged body from the read-4 cache (was 1): {d:?}"
     );
     assert_eq!(d.sparql_updates, 0);
     assert_eq!(d.blob_puts, 0);
-    assert_eq!(d.max_in_flight, 1, "strictly sequential ⇒ RTT depth = 3");
+    assert_eq!(d.max_in_flight, 1, "strictly sequential ⇒ RTT depth = 2");
 }
 
 /// §3.7 rows 1+3 — **doc GET with an OWN `.acl` (k = 0), cold then warm**: cold = 1 combined
 /// read-plan query + 1 live found-ACL re-confirm (its parse-cache miss fetches the bytes via
-/// `read_at` — no duplicate `get_meta`) = **2 queries** + **2 blob gets** (ACL bytes + target
-/// bytes); warm = **2 queries** (plan + the cache-hit re-confirm) + **1 blob**. The found-ACL
-/// re-confirm is the fail-closed-on-delete probe (was, insecurely, elided to warm = 1).
+/// `read_at` — no duplicate `get_meta`) = **2 queries** + **1 blob get** (the FRESH ACL's bytes;
+/// the target body — unchanged since the fixture's warm GET — is a read-4 body-cache HIT; before
+/// the body cache this was 2 blob gets); warm = **2 queries** (plan + the cache-hit re-confirm) +
+/// **0 blob gets** (ACL parse cached, target body cached — was 1). The found-ACL re-confirm is the
+/// fail-closed-on-delete probe (was, insecurely, elided to warm = 1).
 #[tokio::test]
 async fn get_doc_own_acl_cold_then_warm_pins_k0_counts() {
     let h = Harness::new().await;
@@ -251,12 +263,13 @@ async fn get_doc_own_acl_cold_then_warm_pins_k0_counts() {
         "cold doc GET = plan + found-ACL live re-confirm (parse miss reads via read_at): {cold:?}"
     );
     assert_eq!(
-        cold.blob_gets, 2,
-        "cold pays the ACL byte-fetch + the target bytes: {cold:?}"
+        cold.blob_gets, 1,
+        "cold pays only the FRESH ACL's byte-fetch — the unchanged target body is a read-4 \
+         body-cache hit (was 2 before the body cache): {cold:?}"
     );
     assert_eq!(cold.max_in_flight, 1);
 
-    // WARM: the parse is cached under the ACL's etag.
+    // WARM: the ACL parse is cached under its etag AND the target body under its (blob_key, etag).
     let (resp, warm) = h.measured("GET", "/alice/c/doc", &[]).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
@@ -264,14 +277,15 @@ async fn get_doc_own_acl_cold_then_warm_pins_k0_counts() {
         "warm doc GET = plan + found-ACL cache-hit re-confirm (was k+2 = 2): {warm:?}"
     );
     assert_eq!(
-        warm.blob_gets, 1,
-        "warm fetches only the target bytes: {warm:?}"
+        warm.blob_gets, 0,
+        "warm serves the unchanged target body from the read-4 cache (was 1): {warm:?}"
     );
     assert_eq!(warm.max_in_flight, 1);
 }
 
-/// **HEAD, warm (k = 3)** — same backend cost as GET (the read path fetches the bytes for HEAD
-/// too): **2 queries** (plan + found-ACL re-confirm, was k+2 = 5), **1 blob get**.
+/// **HEAD, warm (k = 3)** — same backend cost as GET (the read path materialises the bytes for
+/// HEAD too): **2 queries** (plan + found-ACL re-confirm, was k+2 = 5), **0 blob gets** (read-4:
+/// the unchanged body is a cache hit — was 1).
 #[tokio::test]
 async fn head_doc_warm_k3_pins_same_as_get() {
     let h = Harness::new().await;
@@ -283,13 +297,17 @@ async fn head_doc_warm_k3_pins_same_as_get() {
         d.sparql_queries, 2,
         "warm HEAD = plan + found-ACL re-confirm (was k+2 = 5): {d:?}"
     );
-    assert_eq!(d.blob_gets, 1, "HEAD still fetches the bytes today: {d:?}");
+    assert_eq!(
+        d.blob_gets, 0,
+        "warm HEAD serves the unchanged body from the read-4 cache (was 1): {d:?}"
+    );
     assert_eq!(d.max_in_flight, 1);
 }
 
 /// **304 path, warm (k = 3)** — a matching `If-None-Match` returns 304; the metadata cost is
-/// **2 queries** (plan + found-ACL re-confirm, was k+2 = 5). The body byte-fetch (**1 blob get**)
-/// still happens (the precondition is evaluated after the read — skipping it is read-4 territory).
+/// **2 queries** (plan + found-ACL re-confirm, was k+2 = 5). The body is still materialised (the
+/// precondition is evaluated after the read) but the unchanged bytes are a read-4 body-cache HIT —
+/// **0 blob gets** (was 1).
 #[tokio::test]
 async fn get_304_warm_k3_pins_plan_plus_confirm_query() {
     let h = Harness::new().await;
@@ -314,8 +332,8 @@ async fn get_304_warm_k3_pins_plan_plus_confirm_query() {
         "304 path = plan + found-ACL re-confirm (was k+2 = 5): {d:?}"
     );
     assert_eq!(
-        d.blob_gets, 1,
-        "304 path still fetches the bytes today: {d:?}"
+        d.blob_gets, 0,
+        "304 path serves the unchanged bytes from the read-4 cache (was 1): {d:?}"
     );
     assert_eq!(d.max_in_flight, 1);
 }
@@ -329,14 +347,31 @@ async fn get_container_warm_k2_pins_plan_confirm_listing_queries() {
     let h = Harness::new().await;
     fixture(&h).await;
 
-    let (resp, d) = h.measured("GET", "/alice/c/", &[]).await;
+    // First-ever read of the container itself (the fixture warmed only the doc): COLD body — the
+    // 1 blob get that populates the read-4 cache.
+    let (resp, cold) = h.measured("GET", "/alice/c/", &[]).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        d.sparql_queries, 3,
-        "warm container GET = plan + found-ACL re-confirm + ONE membership listing (was k+3 = 5): {d:?}"
+        cold.sparql_queries, 3,
+        "container GET = plan + found-ACL re-confirm + ONE membership listing (was k+3 = 5): {cold:?}"
     );
-    assert_eq!(d.blob_gets, 1, "container body bytes: {d:?}");
-    assert_eq!(d.max_in_flight, 1);
+    assert_eq!(
+        cold.blob_gets, 1,
+        "the container's FIRST read pays its stored-body fetch: {cold:?}"
+    );
+    assert_eq!(cold.max_in_flight, 1);
+
+    // WARM: same queries, and the container's stored body is a read-4 cache hit (0 blob gets —
+    // was 1). The LISTING is still rendered from LIVE membership (its query is counted above), so
+    // the cached stored bytes can never serve a stale member list.
+    let (resp, warm) = h.measured("GET", "/alice/c/", &[]).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(warm.sparql_queries, 3, "warm container queries: {warm:?}");
+    assert_eq!(
+        warm.blob_gets, 0,
+        "warm container stored-body is a read-4 cache hit (was 1): {warm:?}"
+    );
+    assert_eq!(warm.max_in_flight, 1);
 }
 
 /// The no-N+1 pin (§7): a container LISTING is ONE membership query **independent of child
@@ -345,6 +380,13 @@ async fn get_container_warm_k2_pins_plan_confirm_listing_queries() {
 async fn container_listing_query_count_is_independent_of_child_count() {
     let h = Harness::new().await;
     fixture(&h).await;
+
+    // Warm the container's stored-body cache (un-measured) so BOTH measured reads below are the
+    // same WARM shape — the equality then isolates child-count independence from cache warm-up.
+    let warm = h
+        .request("GET", "/alice/c/", None, &[], Body::empty())
+        .await;
+    assert_eq!(warm.status(), StatusCode::OK);
 
     // Baseline: 1 child (the fixture doc).
     let (resp, one_child) = h.measured("GET", "/alice/c/", &[]).await;
@@ -373,4 +415,235 @@ async fn container_listing_query_count_is_independent_of_child_count() {
         "listing queries must be independent of child count: {one_child:?} vs {five_children:?}"
     );
     assert_eq!(five_children.blob_gets, one_child.blob_gets);
+}
+
+// ---------------------------------------------------------------------------------------------------
+// read-4 (§3.4) — the blob-body cache: the cold/warm/rewrite measurement + the two critical
+// adversarial properties (no stale serve, no authz bypass).
+// ---------------------------------------------------------------------------------------------------
+
+/// **The read-4 measurement, pinned end-to-end: blob-gets/op = 1 cold → 0 warm → 1 after the etag
+/// changes — and the post-change body is the NEW bytes, never the old.** A fresh resource's first
+/// read pays the blob fetch (populating the cache); an unchanged repeat read is a `(blob_key, etag)`
+/// HIT (0 blob gets, byte-identical body); a REWRITE commits a new blob key + etag into the index,
+/// so the next read's authoritative metadata can only MISS (1 blob get) and serves the rewritten
+/// bytes — the stale-serve the etag/unique-key keying makes impossible by construction.
+#[tokio::test]
+async fn body_cache_cold_warm_then_rewrite_pins_1_0_1_and_never_serves_stale() {
+    let h = Harness::new().await;
+    fixture(&h).await;
+
+    const V1: &str =
+        "<https://pod.example/alice/c/fresh#it> <http://xmlns.com/foaf/0.1/name> \"version-one\" .";
+    const V2: &str = "<https://pod.example/alice/c/fresh#it> <http://xmlns.com/foaf/0.1/name> \"VERSION-TWO-different-bytes\" .";
+
+    // A NEVER-READ resource (writes do not populate the cache — only a read's miss does).
+    let put = h
+        .request(
+            "PUT",
+            "/alice/c/fresh",
+            Some("text/turtle"),
+            &[],
+            Body::from(V1),
+        )
+        .await;
+    assert_eq!(put.status(), StatusCode::CREATED);
+
+    // COLD: 1 blob get — the fetch that populates the cache.
+    let (resp, cold) = h.measured("GET", "/alice/c/fresh", &[]).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], V1.as_bytes());
+    assert_eq!(cold.blob_gets, 1, "cold read pays the blob fetch: {cold:?}");
+
+    // WARM (same etag): 0 blob gets, byte-identical body.
+    let (resp, warm) = h.measured("GET", "/alice/c/fresh", &[]).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        &body[..],
+        V1.as_bytes(),
+        "a hit is byte-identical to the fetch"
+    );
+    assert_eq!(
+        warm.blob_gets, 0,
+        "warm same-etag read is a body-cache hit (the read-4 win, 1 → 0): {warm:?}"
+    );
+
+    // REWRITE: new bytes ⇒ the index now holds a NEW (blob_key, etag) pair.
+    let rewrite = h
+        .request(
+            "PUT",
+            "/alice/c/fresh",
+            Some("text/turtle"),
+            &[],
+            Body::from(V2),
+        )
+        .await;
+    assert!(
+        rewrite.status().is_success(),
+        "rewrite PUT: {}",
+        rewrite.status()
+    );
+
+    // POST-CHANGE: the authoritative metadata names the new key ⇒ a MISS (1 blob get) — and the
+    // served body MUST be the new bytes. Serving V1 here would be the stale-serve bug this cache's
+    // keying exists to make impossible.
+    let (resp, after) = h.measured("GET", "/alice/c/fresh", &[]).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        &body[..],
+        V2.as_bytes(),
+        "a changed resource must NEVER serve the old cached body"
+    );
+    assert_eq!(
+        after.blob_gets, 1,
+        "the new (blob_key, etag) is a guaranteed miss — 1 fresh fetch: {after:?}"
+    );
+
+    // And the NEW version is now itself cached: warm again = 0.
+    let (resp, warm2) = h.measured("GET", "/alice/c/fresh", &[]).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], V2.as_bytes());
+    assert_eq!(
+        warm2.blob_gets, 0,
+        "the rewritten body caches too: {warm2:?}"
+    );
+}
+
+/// **A Range request over a CACHED body slices correctly (0 blob gets).** The handler slices the
+/// rendered full body (`range::evaluate`) — a cache hit hands it the same full `Bytes` a blob fetch
+/// would, so the 206 slice is byte-identical and the Content-Range math unchanged.
+#[tokio::test]
+async fn range_request_over_a_cached_body_slices_correctly_with_0_blob_gets() {
+    let h = Harness::new().await;
+    fixture(&h).await;
+
+    // The fixture's warm GET already populated the cache for /alice/c/doc.
+    let (resp, d) = h
+        .measured("GET", "/alice/c/doc", &[("range", "bytes=0-9")])
+        .await;
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    let content_range = resp
+        .headers()
+        .get(header::CONTENT_RANGE)
+        .expect("content-range")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        content_range,
+        format!("bytes 0-9/{}", TURTLE.len()),
+        "Content-Range math over the cached full body is unchanged"
+    );
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        &body[..],
+        &TURTLE.as_bytes()[0..10],
+        "the 206 slice over a cached body is byte-identical to a fetched one"
+    );
+    assert_eq!(
+        d.blob_gets, 0,
+        "the Range read served the slice from the cached body: {d:?}"
+    );
+}
+
+/// **A warm body cache can never serve an UNAUTHORIZED request (the authz-bypass adversarial
+/// check).** The cache sits inside the store, BELOW the WAC gate: `serve_read` authorizes BEFORE
+/// any body lookup, hit or miss. So after the owner has warmed the cache for a private resource, an
+/// ANONYMOUS request for the same resource is still 401 — and (design invariant 5: no speculative
+/// byte work for a denied request) it triggers ZERO blob gets, cached or not.
+#[tokio::test]
+async fn warm_body_cache_never_serves_an_unauthorized_request() {
+    let h = Harness::new().await;
+    fixture(&h).await; // the owner's warm GET has populated the cache for /alice/c/doc
+
+    // Sanity: the owner's warm read IS a cache hit (the cache is live for this resource).
+    let (resp, owner) = h.measured("GET", "/alice/c/doc", &[]).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        owner.blob_gets, 0,
+        "owner warm read hits the cache: {owner:?}"
+    );
+
+    // The ADVERSARIAL probe: the SAME resource, ANONYMOUS (no Authorization/DPoP). The root ACL
+    // grants only the owner, so WAC denies with 401 — the warm cache must change NOTHING about
+    // that, and no body may be touched for the denied request.
+    let scope = h.counters.measure();
+    let resp = h
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/alice/c/doc")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let anon = scope.delta();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "an anonymous read of a private resource stays 401 with a warm body cache"
+    );
+    assert_eq!(
+        anon.blob_gets, 0,
+        "a denied request performs no blob fetch (no speculative byte work): {anon:?}"
+    );
+}
+
+/// **A DELETE is never resurrected from the body cache, and a RECREATE serves the new bytes.**
+/// Existence is decided by the authoritative index BEFORE any body lookup, so a deleted resource
+/// 404s regardless of what the cache still holds; a recreate mints a fresh blob key + etag, so its
+/// first read is a miss that fetches the NEW bytes (never the tombstoned entry).
+#[tokio::test]
+async fn deleted_resource_404s_and_a_recreate_never_serves_the_old_cached_body() {
+    let h = Harness::new().await;
+    fixture(&h).await; // /alice/c/doc read + cached (TURTLE)
+
+    let del = h
+        .request("DELETE", "/alice/c/doc", None, &[], Body::empty())
+        .await;
+    assert_eq!(del.status(), StatusCode::NO_CONTENT);
+
+    // The cache still physically holds the old entry — but the index says GONE, so 404 (and no
+    // blob work: the 404 decision precedes any byte fetch).
+    let (resp, d) = h.measured("GET", "/alice/c/doc", &[]).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a deleted resource must 404 — the body cache can never resurrect it"
+    );
+    assert_eq!(
+        d.blob_gets, 0,
+        "no byte fetch for an absent resource: {d:?}"
+    );
+
+    // RECREATE with different bytes: a fresh (blob_key, etag) ⇒ first read is a MISS serving the
+    // NEW body, never the old cached one.
+    const RECREATED: &str =
+        "<https://pod.example/alice/c/doc#it> <http://xmlns.com/foaf/0.1/name> \"recreated\" .";
+    let put = h
+        .request(
+            "PUT",
+            "/alice/c/doc",
+            Some("text/turtle"),
+            &[],
+            Body::from(RECREATED),
+        )
+        .await;
+    assert_eq!(put.status(), StatusCode::CREATED);
+    let (resp, d) = h.measured("GET", "/alice/c/doc", &[]).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        &body[..],
+        RECREATED.as_bytes(),
+        "a recreate must serve its own bytes, never the pre-delete cached body"
+    );
+    assert_eq!(d.blob_gets, 1, "the recreate's first read is a miss: {d:?}");
 }

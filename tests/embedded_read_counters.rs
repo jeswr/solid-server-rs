@@ -194,10 +194,11 @@ async fn fixture(h: &Harness) {
 }
 
 /// App-view seam counts, warm doc GET (k = 3), over the embedded engine. The app issues ONE
-/// `store.read_plan` (seam count 1) + one live found-ACL re-confirm = **2 SPARQL queries**, + **1
-/// blob get** — identical to the in-memory pins (`read_path_counters.rs`), because these are
-/// app-layer store-method invocation counts, backend-agnostic. (The embedded engine's TRUE per-read
-/// round-trips are higher — see `embedded_read_plan_fans_out`.)
+/// `store.read_plan` (seam count 1) + one live found-ACL re-confirm = **2 SPARQL queries**, + **0
+/// blob gets** (read-4: the unchanged body is a `(blob_key, etag)` cache hit — was 1) — identical
+/// to the in-memory pins (`read_path_counters.rs`), because these are app-layer store-method
+/// invocation counts, backend-agnostic. (The embedded engine's TRUE per-read round-trips are
+/// higher — see `embedded_read_plan_fans_out`.)
 #[tokio::test]
 async fn embedded_get_doc_warm_k3_seam_counts_match_in_memory() {
     let h = Harness::new().await;
@@ -213,8 +214,8 @@ async fn embedded_get_doc_warm_k3_seam_counts_match_in_memory() {
         "warm doc GET seam count = read_plan(1) + found-ACL re-confirm(1) over the embedded engine: {d:?}"
     );
     assert_eq!(
-        d.blob_gets, 1,
-        "warm doc GET fetches exactly the target bytes: {d:?}"
+        d.blob_gets, 0,
+        "warm doc GET serves the unchanged body from the read-4 cache (was 1): {d:?}"
     );
     assert_eq!(d.sparql_updates, 0);
     assert_eq!(d.blob_puts, 0);
@@ -222,7 +223,7 @@ async fn embedded_get_doc_warm_k3_seam_counts_match_in_memory() {
 }
 
 /// App-view seam counts, warm HEAD (k = 3): same as GET — read_plan(1) + re-confirm(1) = 2 queries,
-/// 1 blob get.
+/// 0 blob gets (read-4 body-cache hit — was 1).
 #[tokio::test]
 async fn embedded_head_doc_warm_k3_seam_counts() {
     let h = Harness::new().await;
@@ -234,25 +235,44 @@ async fn embedded_head_doc_warm_k3_seam_counts() {
         d.sparql_queries, 2,
         "warm HEAD seam count = read_plan(1) + re-confirm(1): {d:?}"
     );
-    assert_eq!(d.blob_gets, 1, "HEAD still fetches the bytes today: {d:?}");
+    assert_eq!(
+        d.blob_gets, 0,
+        "warm HEAD serves the unchanged body from the read-4 cache (was 1): {d:?}"
+    );
     assert_eq!(d.max_in_flight, 1);
 }
 
 /// App-view seam counts, warm container GET (k = 2): read_plan(1) + found-ACL re-confirm(1) + ONE
-/// membership listing(1) = **3 queries**, **1 blob get** — matching `read_path_counters.rs`.
+/// membership listing(1) = **3 queries**, **0 blob gets** (read-4 body-cache hit — was 1) —
+/// matching `read_path_counters.rs`.
 #[tokio::test]
 async fn embedded_get_container_warm_seam_counts() {
     let h = Harness::new().await;
     fixture(&h).await;
 
-    let (resp, d) = h.measured("GET", "/alice/c/", &[]).await;
+    // First-ever read of the container itself (the fixture warmed only the doc): COLD stored body.
+    let (resp, cold) = h.measured("GET", "/alice/c/", &[]).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        d.sparql_queries, 3,
-        "warm container GET seam count = read_plan(1) + re-confirm(1) + ONE listing(1): {d:?}"
+        cold.sparql_queries, 3,
+        "container GET seam count = read_plan(1) + re-confirm(1) + ONE listing(1): {cold:?}"
     );
-    assert_eq!(d.blob_gets, 1, "container body bytes: {d:?}");
-    assert_eq!(d.max_in_flight, 1);
+    assert_eq!(
+        cold.blob_gets, 1,
+        "the container's FIRST read pays its stored-body fetch: {cold:?}"
+    );
+    assert_eq!(cold.max_in_flight, 1);
+
+    // WARM: the stored body is a read-4 cache hit (0 blob gets — was 1); the listing still renders
+    // from LIVE membership (query counted above), so no stale member list can be served.
+    let (resp, warm) = h.measured("GET", "/alice/c/", &[]).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(warm.sparql_queries, 3, "warm container queries: {warm:?}");
+    assert_eq!(
+        warm.blob_gets, 0,
+        "warm container stored-body is a read-4 cache hit (was 1): {warm:?}"
+    );
+    assert_eq!(warm.max_in_flight, 1);
 }
 
 /// The no-N+1 pin over the embedded engine: a container LISTING is ONE membership query independent
@@ -261,6 +281,13 @@ async fn embedded_get_container_warm_seam_counts() {
 async fn embedded_container_listing_seam_count_independent_of_child_count() {
     let h = Harness::new().await;
     fixture(&h).await;
+
+    // Warm the container's stored-body cache (un-measured) so BOTH measured reads are the same
+    // WARM shape — the equality then isolates child-count independence from cache warm-up.
+    let warm = h
+        .request("GET", "/alice/c/", None, &[], Body::empty())
+        .await;
+    assert_eq!(warm.status(), StatusCode::OK);
 
     let (resp, one_child) = h.measured("GET", "/alice/c/", &[]).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -289,8 +316,8 @@ async fn embedded_container_listing_seam_count_independent_of_child_count() {
     assert_eq!(five_children.blob_gets, one_child.blob_gets);
 }
 
-/// App-view 304 path (warm, k = 3): read_plan(1) + re-confirm(1) = 2 queries; the body byte-fetch
-/// still happens today (1 blob get).
+/// App-view 304 path (warm, k = 3): read_plan(1) + re-confirm(1) = 2 queries; the body is still
+/// materialised but the unchanged bytes are a read-4 cache hit (0 blob gets — was 1).
 #[tokio::test]
 async fn embedded_get_304_warm_seam_counts() {
     let h = Harness::new().await;
@@ -314,8 +341,8 @@ async fn embedded_get_304_warm_seam_counts() {
         "304 path seam count = read_plan(1) + re-confirm(1): {d:?}"
     );
     assert_eq!(
-        d.blob_gets, 1,
-        "304 path still fetches the bytes today: {d:?}"
+        d.blob_gets, 0,
+        "304 path serves the unchanged bytes from the read-4 cache (was 1): {d:?}"
     );
     assert_eq!(d.max_in_flight, 1);
 }

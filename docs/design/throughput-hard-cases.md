@@ -30,13 +30,15 @@ An authed LDP GET/HEAD today (`src/ldp/handler.rs`):
    with a live probe (`WacAuthorizer::read_acl_confirmed` — fail-closed on delete-after-plan);
    its parsed triples come from the etag-keyed LRU `AclCache` (`src/acl_cache.rs`), else via
    `read_at` + `oxttl` parse; rule matching is `modes_for` (`src/authz/acl.rs`).
-4. 404 decided after auth; bytes via `Store::read_at` (one `BlobStore::get`, full `Bytes`
-   buffer). Containers additionally run `render_container` → `Store::list_children` (one more
+4. 404 decided after auth; bytes via `Store::read_at` — a `(blob_key, etag)` body-cache hit
+   (`src/store/body_cache.rs`, read-4) or one `BlobStore::get` on a miss, full `Bytes` buffer
+   either way. Containers additionally run `render_container` → `Store::list_children` (one more
    SELECT) and serialize the whole listing to compute the representation ETag.
 
 Pinned per-op backend counts (`tests/read_path_counters.rs`, `tests/write_path_counters.rs`):
-**warm doc GET = 2 sparq queries + 1 blob get; container GET = 3 queries; every write verb's
-ACL walk = flat 2 — all depth-independent** (read-2/write-2, `backend-read-path.md` §3.7).
+**warm doc GET = 2 sparq queries + 0 blob gets (the read-4 body cache — 1 on the cold/populating
+read); container GET = 3 queries; every write verb's ACL walk = flat 2 — all depth-independent**
+(read-2/write-2/read-4, `backend-read-path.md` §3.7/§3.4).
 That flatness means *deep hierarchies are already solved*; the three hard cases stress
 different axes: query **concurrency**, result/pod **size**, and **decision cost**.
 
@@ -153,8 +155,10 @@ memory + latency per request, and concurrent large GETs multiply resident bytes.
 stream; `GetOptions.range` pushes a client `Range` down to the store — already flagged in
 `backend-read-path.md` §4) with a size threshold below which today's buffered path stays (the
 byte-exactness + conditional/ETag semantics are unchanged; streaming must keep the
-Range/206/416 behaviour bit-identical). Plus the already-designed bead `read-4-bodycache`
-(§3.4 of the read-path doc, not yet landed) so the hot set stops re-fetching at all.
+Range/206/416 behaviour bit-identical). The companion bead `read-4-bodycache` (§3.4 of the
+read-path doc) is now LANDED (`src/store/body_cache.rs`), so the hot set no longer re-fetches
+at all — the streaming bead's remaining scope is the LARGE/cold-object path (oversize bodies
+bypass the cache by design).
 **(b) SPARQ:** none — bytes never touch sparq.
 
 ### 3.3 The reconciler's referenced-set is O(pod) in one response
@@ -242,7 +246,7 @@ land would regress hard-case throughput**, not improve it.
 | id | case | change | deterministic gate | expected effect |
 |---|---|---|---|---|
 | `hc1-embed-ring` | 1 (+2 convoy) | rebuild `EmbeddedSparqClient` on the sparq-serve generation ring / `embed` surface (pinned rev; ADR-0001 follow-up) — lock-free concurrent reads, sequenced writes | round-trip counters unchanged; new "K concurrent readers, zero exclusive read locks" test | removes the global-mutex serialization — the largest single hard-case-1 lever in-repo |
-| `read-4-bodycache` | 2 | the already-designed `(blob_key, etag)` LRU (`backend-read-path.md` §3.4) | blob gets/op 1→0 on hit | hot-set reads stop paying the blob RTT |
+| `read-4-bodycache` | 2 | **LANDED** — `src/store/body_cache.rs`, the §3.4 `(blob_key, etag)` LRU wired into `CompositeStore::read`/`read_at` (byte-budgeted, per-entry cap, `=0` disables) | blob gets/op 1→0 on hit — pinned in `tests/read_path_counters.rs` (cold 1 / warm 0 / post-rewrite 1, + no-stale-serve, no-authz-bypass, no-resurrect, Range-over-hit adversarial tests) | hot-set reads stop paying the blob RTT |
 | `hc2-listing-page` | 2 | page `list_children` + stream the container render + the deterministic 16 MiB-cliff test; protocol cap/paging decision as an ADR | listing of N* children no longer 5xx; queries/listing O(N/page); bytes buffered bounded | removes the large-container failure cliff |
 | `hc2-blob-streaming` | 2 | stream large blob bodies + `object_store` Range pushdown above a size threshold | bytes buffered per large GET bounded; Range/206 bit-identical | large-media pods stop buffering whole objects |
 | `hc2-gc-paged` | 2 | page `referenced_blob_keys` (consistency per §3.3 / issue D) | referenced-set retrieval works at ≥10⁶ keys | GC functions on large pods |

@@ -62,7 +62,8 @@ use solid_server_rs::ldp::handler::LdpState;
 use solid_server_rs::overload::{self, AdmissionControl};
 use solid_server_rs::rate_limit::{self, RateConfig, RateLimiter};
 use solid_server_rs::store::{
-    CompositeStore, HttpSparqClient, InMemoryBlobStore, InMemorySparqClient, Store,
+    BodyCache, CompositeStore, HttpSparqClient, InMemoryBlobStore, InMemorySparqClient, Store,
+    DEFAULT_BODY_CACHE_BYTES,
 };
 use solid_server_rs::tls::{self, TlsMode};
 use solid_server_rs::transport::{ConnectionLimiter, TransportConfig};
@@ -140,6 +141,19 @@ const ENV_TOKEN_CACHE_CAPACITY: &str = "SOLID_SERVER_TOKEN_CACHE_CAPACITY";
 /// etag/`meta` gate). Set to `0` to DISABLE the cache (every read re-reads + re-parses each ACL — the
 /// pre-cache path). Conformance-neutral. See [`solid_server_rs::acl_cache`].
 const ENV_ACL_CACHE_CAPACITY: &str = "SOLID_SERVER_ACL_CACHE_CAPACITY";
+/// Blob-body cache byte budget (read-4 — `docs/design/backend-read-path.md` §3.4). Unset =>
+/// [`DEFAULT_BODY_CACHE_BYTES`]. The cache holds resource BODIES keyed by `(blob_key, etag)` in front
+/// of the blob store, so a hot UNCHANGED resource's repeat read pays ZERO blob round-trips — without
+/// ever serving stale bytes (every lookup is keyed by the request's own authoritative index metadata;
+/// blob keys are unique per write, so a rewrite is a guaranteed miss) and without touching
+/// authorization (WAC runs before any body fetch, hit or miss). Set to `0` to DISABLE (every read
+/// pays the blob fetch — the pre-cache path). Conformance-neutral. See
+/// [`solid_server_rs::store::body_cache`].
+const ENV_BODY_CACHE_BYTES: &str = "SOLID_SERVER_BODY_CACHE_BYTES";
+/// Per-entry size cap for the blob-body cache: a body larger than this BYPASSES the cache (served,
+/// never stored), so one large media blob cannot evict the whole hot set. Unset => 1/8 of the byte
+/// budget; clamped into `1..=budget`.
+const ENV_BODY_CACHE_MAX_ENTRY_BYTES: &str = "SOLID_SERVER_BODY_CACHE_MAX_ENTRY_BYTES";
 /// Select the SPARQ data-path backend (the authoritative-RDF [`SparqClient`] impl):
 /// - `memory` (DEFAULT) — the in-memory [`InMemorySparqClient`] double: boots without SPARQ/S3 and
 ///   is what conformance + the unit/integration suites run against. UNCHANGED default.
@@ -598,7 +612,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = match backend.as_str() {
         "memory" => {
             eprintln!("  STORAGE: SPARQ backend = MEMORY (in-memory double — boot-without-SPARQ; the conformance/test default).");
-            let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+            let store = CompositeStore::with_body_cache(
+                InMemorySparqClient::new(),
+                InMemoryBlobStore::new(),
+                body_cache_from_env(),
+            );
             build_app_for_store(
                 store,
                 &base_url,
@@ -616,8 +634,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
             })?;
             eprintln!("  STORAGE: SPARQ backend = HTTP (live SPARQL endpoint {endpoint}).");
-            let store =
-                CompositeStore::new(HttpSparqClient::new(endpoint), InMemoryBlobStore::new());
+            let store = CompositeStore::with_body_cache(
+                HttpSparqClient::new(endpoint),
+                InMemoryBlobStore::new(),
+                body_cache_from_env(),
+            );
             build_app_for_store(
                 store,
                 &base_url,
@@ -649,7 +670,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map_err(|e| format!("failed to init the embedded SPARQ graph: {e}"))?
                 }
             };
-            let store = CompositeStore::new(sparq, InMemoryBlobStore::new());
+            let store = CompositeStore::with_body_cache(
+                sparq,
+                InMemoryBlobStore::new(),
+                body_cache_from_env(),
+            );
             build_app_for_store(
                 store,
                 &base_url,
@@ -973,14 +998,47 @@ fn parse_cache_capacity(raw: Option<String>) -> usize {
 }
 
 /// As [`parse_cache_capacity`], but with an explicit `default` for the absent/empty/non-numeric case —
-/// shared by the token cache (`DEFAULT_CACHE_CAPACITY`) and the ACL cache
-/// ([`DEFAULT_ACL_CACHE_CAPACITY`]). `0` is the explicit DISABLE; a fat-fingered non-numeric value
-/// falls back to `default` (enabled) rather than silently dropping the perf win.
+/// shared by the token cache (`DEFAULT_CACHE_CAPACITY`), the ACL cache
+/// ([`DEFAULT_ACL_CACHE_CAPACITY`]), and the blob-body cache ([`DEFAULT_BODY_CACHE_BYTES`]). `0` is
+/// the explicit DISABLE; a fat-fingered non-numeric value falls back to `default` (enabled) rather
+/// than silently dropping the perf win.
 fn parse_cache_capacity_for(raw: Option<String>, default: usize) -> usize {
     match raw.as_deref().map(str::trim) {
         None | Some("") => default,
         Some(s) => s.parse::<usize>().unwrap_or(default),
     }
+}
+
+/// Build the blob-body cache (read-4) from the env: `SOLID_SERVER_BODY_CACHE_BYTES` (byte budget,
+/// unset ⇒ [`DEFAULT_BODY_CACHE_BYTES`], `0` ⇒ DISABLED) + `SOLID_SERVER_BODY_CACHE_MAX_ENTRY_BYTES`
+/// (per-entry cap, unset ⇒ 1/8 of the budget). Logs the resolved config (called once — exactly one
+/// backend arm runs per boot). The cache can never serve stale bytes or bypass authorization — see
+/// [`solid_server_rs::store::body_cache`]'s module docs for both arguments.
+fn body_cache_from_env() -> BodyCache {
+    let budget = parse_cache_capacity_for(
+        std::env::var(ENV_BODY_CACHE_BYTES).ok(),
+        DEFAULT_BODY_CACHE_BYTES,
+    );
+    if budget == 0 {
+        eprintln!("  STORAGE: blob-body cache DISABLED (every read pays the blob fetch).");
+        return BodyCache::disabled();
+    }
+    let cache = match std::env::var(ENV_BODY_CACHE_MAX_ENTRY_BYTES)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        Some(cap) => BodyCache::with_max_entry_bytes(budget, cap),
+        None => BodyCache::new(budget),
+    };
+    eprintln!(
+        "  STORAGE: blob-body cache ENABLED (budget {} bytes, per-entry cap {} bytes; keyed \
+         (blob_key, etag) from the authoritative index — never stale, never an authz surface).",
+        cache.max_bytes(),
+        cache.max_entry_bytes()
+    );
+    cache
 }
 
 /// Resolve the bench-seed child count from `key`. Returns `None` when bench seeding is OFF

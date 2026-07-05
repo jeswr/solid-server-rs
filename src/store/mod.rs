@@ -7,6 +7,11 @@
 //! whole stack is testable without a running SPARQ or S3.
 
 pub mod blob;
+// The blob-body LRU cache (read-4 — backend-read-path.md §3.4): `(blob_key, etag)`-keyed,
+// byte-budgeted, sat in front of BlobStore::get inside CompositeStore so a hot unchanged
+// resource's repeat read pays zero blob round-trips. Immutable-by-construction (unique-per-write
+// blob keys), so a hit can never be stale — see the module docs.
+pub mod body_cache;
 // Deterministic backend round-trip counters at the SparqClient/BlobStore seams (read-1 of the
 // read-path perf plan — docs/design/backend-read-path.md §7). Decorators used by the pinned
 // counter tests + the bench harness; zero-cost when not wired in.
@@ -31,6 +36,7 @@ use bytes::Bytes;
 use oxrdf::NamedNode;
 
 pub use blob::{BlobEntry, BlobError, BlobStore, InMemoryBlobStore};
+pub use body_cache::{BodyCache, DEFAULT_BODY_CACHE_BYTES};
 pub use counting::{
     BackendCounters, CounterSnapshot, CountingBlobStore, CountingSparqClient, MeasureScope,
 };
@@ -224,15 +230,52 @@ pub trait Store: Send + Sync {
     }
 }
 
-/// The default [`Store`]: SPARQ (authoritative metadata) + a blob store (backup bytes).
+/// The default [`Store`]: SPARQ (authoritative metadata) + a blob store (backup bytes), with a
+/// [`BodyCache`] (read-4 — `backend-read-path.md` §3.4) in front of the blob byte-fetch.
 pub struct CompositeStore<S: SparqClient, B: BlobStore> {
     sparq: S,
     blob: B,
+    /// The `(blob_key, etag)`-keyed blob-body LRU (read-4). Every lookup is keyed with THIS
+    /// request's authoritative index metadata, so a hit is provably the bytes that metadata
+    /// committed with — never stale, never an authz surface (see [`body_cache`]'s module docs).
+    body_cache: BodyCache,
 }
 
 impl<S: SparqClient, B: BlobStore> CompositeStore<S, B> {
+    /// Build with the DEFAULT-ON body cache ([`DEFAULT_BODY_CACHE_BYTES`] budget) — mirroring the
+    /// default-on `AclCache`. Use [`with_body_cache`](Self::with_body_cache) to size or disable it
+    /// (`BodyCache::disabled()` ⇒ byte-identical pre-cache behaviour).
     pub fn new(sparq: S, blob: B) -> Self {
-        Self { sparq, blob }
+        Self::with_body_cache(sparq, blob, BodyCache::new(DEFAULT_BODY_CACHE_BYTES))
+    }
+
+    /// Build with an explicitly-configured [`BodyCache`] (the `SOLID_SERVER_BODY_CACHE_BYTES` /
+    /// `SOLID_SERVER_BODY_CACHE_MAX_ENTRY_BYTES` boot wiring, or a disabled sentinel in tests).
+    pub fn with_body_cache(sparq: S, blob: B, body_cache: BodyCache) -> Self {
+        Self {
+            sparq,
+            blob,
+            body_cache,
+        }
+    }
+
+    /// Fetch a resource's bytes through its AUTHORITATIVE metadata: body-cache first (keyed by this
+    /// request's `(blob_key, etag)` — read-4), then the blob store on a miss (inserting the fetched
+    /// bytes so the next same-version read hits). The error mapping is exactly the pre-cache
+    /// `blob.get` mapping, so a MISS is byte- and error-identical to the uncached path; a HIT skips
+    /// only the blob round-trip (blob-gets/op 1 → 0), never a decision — authorization has already
+    /// run upstream of every caller (see [`body_cache`]'s no-bypass argument).
+    async fn fetch_body(&self, meta: &ResourceMeta) -> ServerResult<Bytes> {
+        if let Some(body) = self.body_cache.get(&meta.blob_key, &meta.etag) {
+            return Ok(body);
+        }
+        let body = self.blob.get(&meta.blob_key).await.map_err(|e| match e {
+            // The index says it exists but bytes are missing: a reconciler-class inconsistency.
+            BlobError::NotFound => ServerError::Storage("byte/index inconsistency".into()),
+            BlobError::Backend(msg) => ServerError::Storage(msg),
+        })?;
+        self.body_cache.insert(&meta.blob_key, &meta.etag, &body);
+        Ok(body)
     }
 
     /// Mint a fresh, **unique-per-write** opaque blob-store key for an IRI.
@@ -309,18 +352,15 @@ impl<S: SparqClient, B: BlobStore> CompositeStore<S, B> {
 #[async_trait]
 impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
     async fn read(&self, iri: &str) -> ServerResult<Resource> {
-        // Authoritative existence + metadata FIRST (SPARQ), then fetch the bytes it points at.
+        // Authoritative existence + metadata FIRST (SPARQ), then fetch the bytes it points at —
+        // through the read-4 body cache, keyed by THIS lookup's authoritative `(blob_key, etag)`
+        // (a hit is exactly the bytes this metadata committed with; a miss is the pre-cache path).
         let meta = match self.sparq.get_meta(iri).await {
             Ok(m) => m,
             Err(SparqError::NotFound) => return Err(ServerError::NotFound),
             Err(SparqError::Backend(e)) => return Err(ServerError::Storage(e)),
         };
-        let body = self.blob.get(&meta.blob_key).await.map_err(|e| match e {
-            // The index says it exists but bytes are missing: a reconciler-class inconsistency.
-            // M2: the reconciler resolves this; for the slice we surface it as a storage error.
-            BlobError::NotFound => ServerError::Storage("byte/index inconsistency".into()),
-            BlobError::Backend(msg) => ServerError::Storage(msg),
-        })?;
+        let body = self.fetch_body(&meta).await?;
         Ok(Resource { body, meta })
     }
 
@@ -499,17 +539,14 @@ impl<S: SparqClient, B: BlobStore> Store for CompositeStore<S, B> {
     }
 
     async fn read_at(&self, iri: &str, meta: &ResourceMeta) -> ServerResult<Bytes> {
-        // The §3.3 direct byte fetch through the held pointer — NO second `get_meta`. The unique-
-        // per-write blob key names an immutable object, so these are exactly the bytes the held
-        // metadata committed with. `iri` is not needed here (the pointer is authoritative); it is
-        // part of the trait signature so the default (re-read) impl can exist for test doubles.
+        // The §3.3 direct byte fetch through the held pointer — NO second `get_meta` — now through
+        // the read-4 body cache: the held `(blob_key, etag)` came from THIS request's authoritative
+        // read-plan round, so a hit is exactly the bytes that metadata committed with (the unique-
+        // per-write blob key names an immutable object). A miss pays the same blob fetch (and the
+        // same error mapping) as before. `iri` is not needed here (the pointer is authoritative);
+        // it is part of the trait signature so the default (re-read) impl can exist for doubles.
         let _ = iri;
-        self.blob.get(&meta.blob_key).await.map_err(|e| match e {
-            // The index says it exists but bytes are missing: a reconciler-class inconsistency —
-            // the SAME mapping `read` uses, so error behaviour is unchanged.
-            BlobError::NotFound => ServerError::Storage("byte/index inconsistency".into()),
-            BlobError::Backend(msg) => ServerError::Storage(msg),
-        })
+        self.fetch_body(meta).await
     }
 
     async fn list_children(&self, container: &str) -> ServerResult<Vec<ValidatedChildIri>> {
