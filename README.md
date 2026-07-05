@@ -106,6 +106,34 @@ still boots the in-memory store doubles — wiring it in needs a running SPARQ/S
 JWKS / WebID resolution are now **wired** (the verifier's network adapters). The code carries
 seam comments where each remaining piece plugs in.
 
+### LWS surface (opt-in, flag-gated — `SOLID_SERVER_LWS=1`)
+
+An ADDITIVE implementation of the **JLWS clean-slate LWS spec** (`jeswr/lws-spec`: core protocol +
+the RDF content-transformation companion) beside the Solid surface — OFF by default, and when off
+every LWS hook is dead code (the Solid LDP/auth/WAC/conditional behaviour is byte-identical;
+pinned by tests). With `SOLID_SERVER_LWS=1` the server additionally serves:
+
+- a **CID-shaped storage description** at `/.well-known/lws` (`conformsTo` version URIs + the
+  capability registry), bound to every GET/HEAD via
+  `Link rel="https://w3id.org/jeswr/lws#storageDescription"`, plus `rel="up"` containment links;
+- the **`application/lws+json` container listing** (flat server-managed `items`, fail-closed:
+  members + `totalItems` reflect only what the requesting agent can read) — selected by an
+  LWS-profile `Accept`; every other `Accept` keeps the Solid `ldp:contains` rendering;
+- the **RDF content-transformation opt-in** (`SOLID_SERVER_LWS_RDF_TRANSFORM`, default on with
+  LWS): stored `text/turtle`/`application/ld+json` negotiable to `application/n-triples` (and each
+  other) with per-representation ETags and authoritative-bytes semantics, advertised as
+  `ContentNegotiation` capability entries pinned to the `rdf-1` profile;
+- **idempotent create** (`PUT + If-None-Match: *` → 201/412) — plus, for PURE-LWS deployments
+  only, `SOLID_SERVER_LWS_STRICT_PUT=1` enforces the strict D2/D3 rules (every PUT conditional ⇒
+  428; no auto-created intermediate containers ⇒ 409 `missing-parent`; no container bodies),
+  which deliberately replace the Solid PUT semantics and are therefore NOT part of the composed
+  default.
+
+M2 seams (marked in `src/lws`): the LWS auth chain (RFC 9728 `resource_metadata` challenge +
+RFC 8693 token-exchange verify — the current DPoP path is reused meanwhile), RFC 9264 linkset
+metadata, the SSE/WebSocket notification bindings, pagination, and the
+`SparqlQueryService`/AC-SPARQL companion. See `decisions/0004-lws-surface-m1.md`.
+
 ## Build & run
 
 Requires a recent stable Rust toolchain and a C toolchain (`cmake`) for `aws-lc-rs`.
@@ -126,6 +154,9 @@ cargo run                   # boot the experimental server (defaults to 127.0.0.
 #   SOLID_SERVER_TLS_SESSION_CACHE_SIZE  TLS session-resumption cache size (default 10240; 0 disables)
 #   SOLID_SERVER_MAX_CONCURRENCY      max in-flight requests before load is shed (503); default 10000
 #   SOLID_SERVER_REQUEST_TIMEOUT_SECS per-request timeout ⇒ 504; default 30; 0 disables
+#   SOLID_SERVER_LWS                  opt-in LWS surface (default off — see "LWS surface" above)
+#   SOLID_SERVER_LWS_RDF_TRANSFORM    the RDF transform opt-in (default on WHEN LWS is on; 0 = off)
+#   SOLID_SERVER_LWS_STRICT_PUT       strict D2/D3 PUT semantics — PURE-LWS deployments only (default off)
 SOLID_SERVER_BIND=127.0.0.1:3000 \
 SOLID_SERVER_BASE_URL=https://pod.example \
 SOLID_SERVER_TRUSTED_ISSUER=https://idp.example/realms/solid \

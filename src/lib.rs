@@ -50,6 +50,11 @@ pub mod authz;
 pub mod body_limit;
 pub mod error;
 pub mod ldp;
+/// The ADDITIVE, FLAG-GATED LWS (Linked Web Storage / JLWS clean-slate spec) surface — storage
+/// description + capability registry, the `application/lws+json` container representation, the
+/// RDF content-transformation opt-in, and the strict idempotent-create semantics. OFF by default
+/// (`SOLID_SERVER_LWS` unset ⇒ every hook is dead code and the Solid surface is byte-identical).
+pub mod lws;
 pub mod nodelay;
 pub mod notifications;
 pub mod overload;

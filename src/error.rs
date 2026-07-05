@@ -70,6 +70,19 @@ pub enum ServerError {
     #[error("unsupported media type: {0}")]
     UnsupportedMediaType(String),
 
+    /// An RFC 9457 problem-details error minted by the **flag-gated LWS surface** (`crate::lws`;
+    /// DECISIONS.md D17: LWS 4xx responses carry machine-readable problem details). Only LWS code
+    /// paths construct this variant, so the flag-off Solid surface's error bytes are unchanged.
+    /// `status` is the HTTP status (e.g. 406/409/415/428); `type_uri` is a problem-type URI under
+    /// `https://w3id.org/jeswr/lws/problems/`; `title` is the human-readable summary. Both are
+    /// `&'static str` — LWS problems are a fixed registry, never request-derived (no leak surface).
+    #[error("{title}")]
+    LwsProblem {
+        status: u16,
+        type_uri: &'static str,
+        title: &'static str,
+    },
+
     /// A failure in the storage layer (SPARQ index or blob store).
     #[error("storage error: {0}")]
     Storage(String),
@@ -92,6 +105,11 @@ impl ServerError {
             ServerError::NotAcceptable => StatusCode::NOT_ACCEPTABLE,
             ServerError::UnprocessablePatch(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ServerError::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ServerError::LwsProblem { status, .. } => {
+                // The status is one of the fixed registry values the LWS code paths mint; an
+                // out-of-range value (unreachable) falls back to 400 rather than panicking.
+                StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_REQUEST)
+            }
             ServerError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -100,6 +118,26 @@ impl ServerError {
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
         let status = self.status();
+        // LWS problem details (D17): an `application/problem+json` body carrying the fixed
+        // registry `type` + `title` + `status`. Flag-gated paths only — see the variant doc.
+        if let ServerError::LwsProblem {
+            status: s,
+            type_uri,
+            title,
+        } = self
+        {
+            let body = serde_json::json!({
+                "type": type_uri,
+                "title": title,
+                "status": s,
+            });
+            let mut resp = (status, body.to_string()).into_response();
+            resp.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/problem+json"),
+            );
+            return resp;
+        }
         // Preserve the verifier's WWW-Authenticate challenge on auth failures (RFC 6750 §3).
         if let ServerError::Unauthorized {
             ref www_authenticate,

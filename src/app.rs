@@ -247,6 +247,21 @@ where
             .options(options_handler::<S>)
     };
 
+    // LWS (flag-gated, `crate::lws`): the storage-description discovery route — mounted ONLY when
+    // the LWS surface is enabled, so the flag-off route table is byte-identical to pre-LWS. A
+    // STATIC path (like the notification routes), so it precedes the `/{*path}` wildcard. PUBLIC
+    // (no auth), like `/.well-known/solid`: discovery must work for unauthenticated clients (the
+    // M2 RFC 9728 authorization-server discovery starts from this document). Built here (before
+    // `ldp` is moved into the protected routes); merged into the router below.
+    let lws_discovery = ldp.lws().is_some().then(|| {
+        Router::new()
+            .route(
+                crate::lws::STORAGE_DESCRIPTION_PATH,
+                get(crate::lws::description_handler::<S>),
+            )
+            .with_state(ldp.clone())
+    });
+
     // The protected LDP routes carry the LDP state.
     //
     // Layer order (axum/tower applies `.layer()` bottom-up, so the LAST one is OUTERMOST = runs
@@ -301,6 +316,10 @@ where
         .with_state(notify_state);
 
     let mut router = Router::new().merge(subscribe).merge(public_notify);
+
+    if let Some(lws_discovery) = lws_discovery {
+        router = router.merge(lws_discovery);
+    }
 
     // PoP Tier 2 (DPoP-SK, `SOLID_SERVER_DPOP_SK`) — the session establishment/termination
     // endpoint, mounted ONLY when the tier is enabled so a flag-off build's route table (and the

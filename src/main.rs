@@ -962,6 +962,24 @@ where
     };
     ldp.set_acl_cache(acl_cache);
 
+    // The FLAG-GATED LWS surface (`SOLID_SERVER_LWS`, see `solid_server_rs::lws`). Absent/off (the
+    // default) ⇒ `None` ⇒ every LWS hook is inert and the Solid surface is byte-identical.
+    let lws = solid_server_rs::lws::LwsConfig::from_env(base_url);
+    match &lws {
+        Some(cfg) => eprintln!(
+            "  LWS: surface ENABLED (rdf_transform={}, strict_put={}) — storage description at \
+             {}{}; container application/lws+json + rel=\"up\" active. Flag-gated: unset {} to \
+             restore the pure Solid surface.",
+            cfg.rdf_transform,
+            cfg.strict_put,
+            base_url.trim_end_matches('/'),
+            solid_server_rs::lws::STORAGE_DESCRIPTION_PATH,
+            solid_server_rs::lws::ENV_LWS,
+        ),
+        None => eprintln!("  LWS: surface disabled (default — set SOLID_SERVER_LWS=1 to enable)."),
+    }
+    ldp.set_lws(lws.map(std::sync::Arc::new));
+
     Ok(build_router_with_overload(
         AppState::new(auth, ldp),
         overload_config,

@@ -176,6 +176,13 @@ pub struct LdpState<S: Store> {
     /// they are the same for every resource and leak no per-resource pointer (cf. the per-request
     /// `.acl` Link, which is intentionally NOT cached — see `add_acl_link`).
     discovery_link_values: Vec<HeaderValue>,
+    /// The FLAG-GATED LWS surface configuration ([`crate::lws`]). `None` (the default) ⇒ every LWS
+    /// hook in this module is dead code and the Solid LDP behaviour is byte-identical to pre-LWS;
+    /// `Some` ⇒ the LWS discovery route is mounted, the LWS `Link` headers ride on reads, the
+    /// `application/lws+json` container shape and (if configured) the RDF transform + strict-PUT
+    /// semantics activate. Set at router assembly via [`set_lws`](Self::set_lws)
+    /// (`SOLID_SERVER_LWS` in the binary).
+    lws: Option<Arc<crate::lws::LwsConfig>>,
 }
 
 /// Precompute the discovery `Link` header VALUES for a given server `base_url`. Mirrors the prior
@@ -218,7 +225,30 @@ impl<S: Store> LdpState<S> {
             // from `SOLID_SERVER_ACL_CACHE_CAPACITY` at router assembly (`=0` ⇒ disabled).
             acl_cache: AclCache::new(crate::acl_cache::DEFAULT_ACL_CACHE_CAPACITY),
             discovery_link_values,
+            // The LWS surface is OFF by default — flag-gated at router assembly (`set_lws`).
+            lws: None,
         }
+    }
+
+    /// Enable (or disable) the FLAG-GATED LWS surface. Called at router assembly; `None` (the
+    /// default) keeps every LWS hook inert — the flag-off Solid behaviour is byte-identical.
+    pub fn set_lws(&mut self, lws: Option<Arc<crate::lws::LwsConfig>>) {
+        self.lws = lws;
+    }
+
+    /// The LWS surface configuration, when enabled.
+    pub fn lws(&self) -> Option<&crate::lws::LwsConfig> {
+        self.lws.as_deref()
+    }
+
+    /// Whether the LWS RDF content-transformation opt-in is on (`rdf-transform.html`).
+    fn lws_transform_on(&self) -> bool {
+        self.lws.as_deref().is_some_and(|l| l.rdf_transform)
+    }
+
+    /// Whether the LWS strict D2/D3 PUT semantics are on (pure-LWS deployments).
+    fn lws_strict_put(&self) -> bool {
+        self.lws.as_deref().is_some_and(|l| l.strict_put)
     }
 
     /// Set the `WWW-Authenticate` challenge emitted on a 401 (the verifier-derived one). Called by
@@ -420,7 +450,9 @@ impl<S: Store> LdpState<S> {
     /// `VALUES` set is exactly the candidate ACLs (the slot IRI is already candidate 0 — no extra
     /// row on the wire), its target row is ignored, and an ACL-probe fault still fails the plan
     /// (fail-closed) exactly as the sequential walk's ACL probes did.
-    async fn authorize_planned_iri(
+    /// `pub(crate)` so the LWS container renderer ([`crate::lws::container`]) can run the SAME
+    /// per-member fail-closed read check (D12) the read path uses — never a parallel ACL walk.
+    pub(crate) async fn authorize_planned_iri(
         &self,
         target_iri: &str,
         required: AccessMode,
@@ -746,17 +778,48 @@ pub(crate) async fn serve_read<S: Store>(
     //   tag's STATE part for If-Match (the GET → PUT round-trip — see `conditional`'s module doc).
     //   An Accept that matches NO producible type is a 406 here, BEFORE the precondition check (a
     //   conditional applies to the selected representation; with none selectable there is no 304).
+    // LWS (flag-gated): does this container GET's Accept select the LWS `application/lws+json`
+    // representation? `None` when the flag is off OR the Accept resolves to the existing surface
+    // (the negotiation is surface-preserving — see `lws::container::negotiate_container`).
+    let lws_container_variant = if target.is_container && state.lws().is_some() {
+        crate::lws::container::negotiate_container(accept)
+    } else {
+        None
+    };
+
     let (rendered, etag): (Option<(Bytes, String)>, String) = if target.is_container {
-        let (body, content_type) = render_container(
-            state,
-            &target.iri,
-            &resource.body,
+        if let Some(variant) = lws_container_variant {
+            // The LWS flat `{id, type, totalItems, items[]}` listing — server-managed, fail-closed
+            // per member (D12). Its representation ETag derives from the rendered bytes exactly
+            // like the LDP listing's, so the 304/Vary machinery below applies unchanged.
+            let body = crate::lws::container::render(state, &target, token, origin).await?;
+            let etag = representation_etag(&body);
+            (
+                Some((Bytes::from(body), variant.content_type().to_string())),
+                etag,
+            )
+        } else {
+            let (body, content_type) = render_container(
+                state,
+                &target.iri,
+                &resource.body,
+                &resource.meta.content_type,
+                accept,
+            )
+            .await?;
+            let etag = representation_etag(&body);
+            (Some((body, content_type)), etag)
+        }
+    } else if state.lws_transform_on() {
+        // LWS RDF content-transformation opt-in (flag-gated): the same validator rules extended
+        // with the N-Triples target — for every Accept the existing surface satisfied, the result
+        // is IDENTICAL (the equivalence property pinned in `lws::transform`).
+        let etag = crate::lws::transform::negotiated_validator(
+            &resource.meta.etag,
             &resource.meta.content_type,
             accept,
-        )
-        .await?;
-        let etag = representation_etag(&body);
-        (Some((body, content_type)), etag)
+        )?;
+        (None, etag)
     } else {
         let etag = negotiated_validator(&resource.meta.etag, &resource.meta.content_type, accept)?;
         (None, etag)
@@ -821,6 +884,19 @@ pub(crate) async fn serve_read<S: Store>(
     // of its access-control document (the conventional `<resource>.acl` / `<container>/.acl`). The
     // conformance harness reads this at bootstrap to locate where to write the test container's ACL.
     add_acl_link(&mut out, &target);
+    // LWS discovery + containment metadata (flag-gated — ZERO work when off): the storage-
+    // description binding Link (`rel="…lws#storageDescription"`, spec §discovery-binding; a
+    // precomputed base-URL-derived value, like the Solid discovery links) and the server-managed
+    // `rel="up"` parent link on every non-root resource (§containment). The `up` value is
+    // per-target (like the `.acl` link) so it is formatted per request, never cached.
+    if let Some(lws) = state.lws() {
+        lws.add_storage_description_link(&mut out);
+        if let Some(parent) = parent_container(&target) {
+            if let Ok(v) = HeaderValue::from_str(&format!("<{parent}>; rel=\"up\"")) {
+                out.append(header::LINK, v);
+            }
+        }
+    }
     // WAC-Allow (Solid Protocol): advertise the requester's + the public's effective access modes for
     // this target. Both audiences were resolved by `authorize_read` above in the SAME pass as the
     // access decision (no second ACL walk/read/parse) — `perms` is serialised directly.
@@ -883,9 +959,17 @@ pub(crate) async fn serve_read<S: Store>(
     }
 
     // Not a 304: materialise the body (negotiating a plain resource now) + its content type. For a
-    // container the body was already rendered above (reused, not re-rendered).
+    // container the body was already rendered above (reused, not re-rendered). With the LWS RDF
+    // transform on, the negotiation is the transform-aware superset (N-Triples target); identical
+    // to the flag-off path for every Accept the existing surface satisfied.
     let (body, content_type) = match rendered {
         Some(bc) => bc,
+        None if state.lws_transform_on() => crate::lws::transform::negotiate_body(
+            &resource.body,
+            &resource.meta.content_type,
+            accept,
+            &target.iri,
+        )?,
         None => negotiate_body(
             &resource.body,
             &resource.meta.content_type,
@@ -995,6 +1079,36 @@ pub async fn put_handler<S: Store>(
     // the requester holds no Read. Done BEFORE the existence probe so it adds no oracle of its own.
     state.guard_conditional_requires_read(&target.iri, &headers, &granted, &token)?;
 
+    // LWS STRICT PUT (flag-gated, D2 — pure-LWS deployments only): every PUT is explicitly
+    // conditional. A PUT carrying neither `If-Match` nor `If-None-Match: *` is a **428
+    // Precondition Required** — including toward a MISSING target ("an unconditional PUT is never
+    // a create"). Header-only (no state dependency), evaluated after authorization so the
+    // 401/403-first contract and the V4 non-disclosure closure are unchanged; a 428 leaks nothing
+    // (it does not depend on target existence).
+    if state.lws_strict_put() {
+        let has_if_match = headers.contains_key(header::IF_MATCH);
+        let has_star_create = header_str(&headers, header::IF_NONE_MATCH)
+            .is_some_and(crate::ldp::conditional::is_wildcard);
+        if !has_if_match && !has_star_create {
+            return Err(ServerError::LwsProblem {
+                status: 428,
+                type_uri: crate::lws::PROBLEM_UNCONDITIONAL_PUT,
+                title: "every PUT is conditional under LWS: carry If-Match (replace) or \
+                        If-None-Match: * (idempotent create)",
+            });
+        }
+        // D3 — a container is never a data resource: a container PUT must carry NO body (the only
+        // container representation is the server-managed listing).
+        if target.is_container && !body.is_empty() {
+            return Err(ServerError::LwsProblem {
+                status: 400,
+                type_uri: crate::lws::PROBLEM_CONTAINER_BODY,
+                title: "a container is not a data resource: a container PUT must have an empty \
+                        body (attach descriptive content via a separate resource)",
+            });
+        }
+    }
+
     // The caller IS authorized. Only NOW probe existence (an authorized writer is entitled to learn
     // create-vs-replace) — reused for the conditional-write ETag and the create/replace branch below.
     let current = state.store.meta(&target.iri).await?;
@@ -1007,12 +1121,32 @@ pub async fn put_handler<S: Store>(
 
     // A write MUST carry a Content-Type (Solid Protocol §writing — `content-type-reject`). An ABSENT
     // Content-Type is a 400 Bad Request.
-    let content_type = require_content_type(&headers)?;
-    // Validate + select the stored media type. An RDF type is parse-validated (400 on malformed); a
-    // NON-RDF type (e.g. `text/plain`, an image) is stored VERBATIM as an opaque binary resource —
-    // the Solid Protocol stores any content type, and a read serves a binary body unchanged (see
-    // `negotiate_body`). The stored media type is the (sanitised) declared one.
-    let stored_type = validate_writable(&content_type, &body, &target.iri)?;
+    //
+    // LWS STRICT PUT exception: a container PUT carries no body (enforced above) and therefore
+    // needs no Content-Type — the container's representation is server-managed. Its stored record
+    // type is the conventional Turtle-typed empty container the other create paths mint.
+    let stored_type = if state.lws_strict_put() && target.is_container {
+        RdfFormat::Turtle.media_type().to_string()
+    } else {
+        let content_type = require_content_type(&headers)?;
+        // Validate + select the stored media type. An RDF type is parse-validated (400 on malformed); a
+        // NON-RDF type (e.g. `text/plain`, an image) is stored VERBATIM as an opaque binary resource —
+        // the Solid Protocol stores any content type, and a read serves a binary body unchanged (see
+        // `negotiate_body`). The stored media type is the (sanitised) declared one.
+        validate_writable(&content_type, &body, &target.iri)?
+    };
+
+    // LWS RDF-transform WRITE GUARD (flag-gated — `rdf-transform.html` §authoritative-bytes): a
+    // write in an advertised-target-but-not-source type (`application/n-triples`) over an existing
+    // RDF-readable resource would strand the resource in a type the server cannot transform from —
+    // 415 with problem details. A create, a container, and any non-RDF-readable target pass
+    // through unchanged (byte-native).
+    if state.lws_transform_on() && !target.is_container {
+        crate::lws::transform::write_type_guard(
+            current.as_ref().map(|m| m.content_type.as_str()),
+            &stored_type,
+        )?;
+    }
 
     // Conditional write: evaluate preconditions against the CURRENT representation's ETag.
     let current_etag = current.as_ref().map(|m| m.etag.as_str());
@@ -1047,7 +1181,24 @@ pub async fn put_handler<S: Store>(
         state
             .authorize_container_modification(&target.iri, &token, origin)
             .await?;
-        ensure_ancestor_containers(state.as_ref(), &target.iri).await?;
+        // LWS STRICT PUT (D2): the parent container MUST already exist — NO auto-created
+        // intermediate containers (containment integrity: no implicit containers), 409
+        // `missing-parent` otherwise. The Solid surface (non-strict) keeps its
+        // "PUT creates intermediate containers" semantics unchanged.
+        if state.lws_strict_put() {
+            if let Some(p) = &parent {
+                if !state.store.exists(p).await? {
+                    return Err(ServerError::LwsProblem {
+                        status: 409,
+                        type_uri: crate::lws::PROBLEM_MISSING_PARENT,
+                        title: "the parent container does not exist; LWS create does not mint \
+                                intermediate containers — create the parent first",
+                    });
+                }
+            }
+        } else {
+            ensure_ancestor_containers(state.as_ref(), &target.iri).await?;
+        }
         match &parent {
             Some(p) => {
                 state
