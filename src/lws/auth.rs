@@ -33,6 +33,30 @@
 //!    `dpop_bound_access_tokens_required: true`. Validating a DPoP-bound *LWS-audience* token is
 //!    a documented follow-up seam (the Solid-OIDC DPoP surface is unaffected either way).
 //!
+//! ## DPoP-SK over LWS (step-8 A — `lws-spec` `docs/alignment/dpop-sk.md`, `decisions/0007`)
+//! DPoP-SK is the realm's second negotiated PoP presentation profile (spec §presentation-pop),
+//! and it composes with this chain STRUCTURALLY — no verification code changes hands:
+//! - **Discovery:** [`ENV_LWS_POP_SESSION`] enables the SAME engine `SOLID_SERVER_DPOP_SK`
+//!   enables ([`crate::pop::sk`] — one engine, two switches). The base RFC 9728 document then
+//!   carries the `pop_session` member (`endpoint`/`algs`/`channel_bindings`/`profile`, per
+//!   DPoP-SK §discovery), and [`extend_protected_resource_metadata`]
+//!   (LwsBearerAuth::extend_protected_resource_metadata) PRESERVES it while adding the LWS
+//!   members — `pop_session` sits beside `jlws_storage_description` exactly as the alignment doc
+//!   pins. `channel_bindings` gating is inherited: `tls-exporter` is offered only under
+//!   in-process TLS (the DPoP-SK spec's MUST NOT behind a terminating proxy).
+//! - **Verification:** a DPoP-SK-established token is `cnf`-bound, so the "never bare" rule IS
+//!   rs-validation step 5: [`is_lws_candidate`](LwsBearerAuth::is_lws_candidate) excludes every
+//!   `cnf`-bearing token from this Bearer path (and [`verify_bearer`](LwsBearerAuth::verify_bearer)
+//!   independently refuses bare `cnf` on VERIFIED claims), while the DPoP-SK attestation dispatch
+//!   in [`crate::auth`] runs BEFORE any Bearer routing and validates the attestation at full
+//!   strength ([`crate::pop::sk::verify`]). So a DPoP-SK presentation authenticates via the PoP
+//!   path, never a downgraded bearer one.
+//! - **D9 baseline preserved:** `dpop_bound_access_tokens_required` ALONE governs the realm's
+//!   posture (a DPoP-SK session is established FROM a DPoP-bound token, so the one registered
+//!   member covers both profiles — no separate required-member exists). `pop_session` is an
+//!   additive availability signal: advertising it neither closes the Bearer baseline nor changes
+//!   any 401.
+//!
 //! ## Trust model (vs the Solid-OIDC path)
 //! The Solid-OIDC verifier confirms the WebID↔issuer relationship (`webid` claim, optional
 //! bidirectional check). The LWS chain instead trusts the **configured issuer allowlist**
@@ -68,6 +92,14 @@ pub const ENV_LWS_REQUIRE_POP: &str = "SOLID_SERVER_LWS_REQUIRE_POP";
 /// [`DEFAULT_MAX_TOKEN_TTL_SECS`]; hard-capped at [`SPEC_MAX_TOKEN_TTL_SECS`] (the spec's MUST:
 /// "tokens with `exp` more than one hour ahead MUST be rejected").
 pub const ENV_LWS_MAX_TOKEN_TTL: &str = "SOLID_SERVER_LWS_MAX_TOKEN_TTL_SECS";
+/// Env flag (step-8 A, `1`/`true`; default off): offer the **DPoP-SK** PoP presentation profile
+/// on the LWS realm. INERT unless the LWS master flag (`SOLID_SERVER_LWS`) is also on — see
+/// [`pop_session_from_env`]. Turning it on enables the SAME DPoP-SK engine
+/// `SOLID_SERVER_DPOP_SK` enables ([`crate::pop::sk`]: the `/.pop/session` establishment
+/// endpoint, the attestation dispatch, and the `pop_session` RFC 9728 member) — an LWS-scoped
+/// second switch on ONE engine, never a second implementation, so the advertisement can never be
+/// dishonest (member present ⇔ endpoint + verify path mounted).
+pub const ENV_LWS_POP_SESSION: &str = "SOLID_SERVER_LWS_POP_SESSION";
 
 /// The default accepted remaining-lifetime window: the spec RECOMMENDS lifetimes of 300 s or less
 /// (§access-token) and the maintainer's lws-keycloak baseline issues ≤300 s tokens; enforcing the
@@ -188,6 +220,15 @@ impl LwsBearerAuth {
     /// the Bearer baseline (Bearer accepted, PoP optional), `true` only when the realm is
     /// designated PoP-required. RFC 9728 requires the member to be honest either way: a client
     /// must be able to distinguish *Bearer-accepted, PoP optional* from *PoP required*.
+    ///
+    /// This extension touches ONLY the three members above — every other member of the base
+    /// document is PRESERVED. In particular (step-8 A, the alignment merge point): the DPoP-SK
+    /// `pop_session` member built by
+    /// [`crate::pop::sk::handlers::protected_resource_metadata_json`] rides through unchanged, so
+    /// on an SK-enabled LWS realm the document carries `pop_session` beside
+    /// `jlws_storage_description` (the `prm-carries-pop-session` vector), and on a PoP-required
+    /// realm `dpop_bound_access_tokens_required: true` + `pop_session` coexist (the
+    /// `pop-required-single-member` vector — one required-member covers DPoP and DPoP-SK alike).
     pub fn extend_protected_resource_metadata(&self, doc: &mut Value) {
         doc["authorization_servers"] = Value::from(self.trusted_issuers.clone());
         doc[PRM_STORAGE_DESCRIPTION_MEMBER] = Value::from(format!(
@@ -589,6 +630,18 @@ pub fn require_pop_from_env() -> bool {
     std::env::var(ENV_LWS_REQUIRE_POP)
         .map(|v| super::is_truthy(&v))
         .unwrap_or(false)
+}
+
+/// Step-8 A: should the DPoP-SK engine be enabled FOR THE LWS REALM? True iff BOTH the LWS master
+/// flag (`SOLID_SERVER_LWS`) AND [`ENV_LWS_POP_SESSION`] are truthy — the master-flag conjunction
+/// is structural, so a stray `SOLID_SERVER_LWS_POP_SESSION=1` on a flag-off build changes nothing
+/// (the byte-invariance rule). The binary ORs this with the pre-existing `SOLID_SERVER_DPOP_SK`
+/// when constructing the ONE shared [`crate::pop::sk::SkState`].
+pub fn pop_session_from_env() -> bool {
+    super::flag_from_env()
+        && std::env::var(ENV_LWS_POP_SESSION)
+            .map(|v| super::is_truthy(&v))
+            .unwrap_or(false)
 }
 
 /// Read the max-token-TTL override (seconds) from the environment: [`DEFAULT_MAX_TOKEN_TTL_SECS`]
@@ -1242,6 +1295,46 @@ mod tests {
             json!("https://storage.example/.well-known/lws")
         );
         assert_eq!(doc["dpop_bound_access_tokens_required"], json!(false));
+    }
+
+    /// Step-8 A — the alignment merge point: the LWS extension PRESERVES the DPoP-SK `pop_session`
+    /// member the base builder emits, on BOTH postures. This is the Rust pin of the lws-spec
+    /// `dpop-sk` vectors' PRM-shape expectations (`prm-carries-pop-session`,
+    /// `pop-required-single-member`).
+    #[test]
+    fn prm_extension_preserves_the_pop_session_member() {
+        use crate::pop::sk::{handlers::protected_resource_metadata_json, SkConfig, SkState};
+
+        let kit = Kit::generate();
+        // No in-process TLS in this harness ⇒ the builder offers only cb=none (the DPoP-SK spec's
+        // MUST NOT advertise tls-exporter behind a terminating proxy) — inherited, not re-derived.
+        let sk = SkState::new(SkConfig::default());
+
+        for require_pop in [false, true] {
+            let auth = auth_with(&kit, require_pop);
+            let mut doc: Value =
+                serde_json::from_str(&protected_resource_metadata_json(BASE, false, Some(&sk)))
+                    .unwrap();
+            auth.extend_protected_resource_metadata(&mut doc);
+
+            // `prm-carries-pop-session`: pop_session + jlws_storage_description coexist, with the
+            // exact DPoP-SK §discovery member set.
+            let ps = &doc["pop_session"];
+            assert_eq!(ps["endpoint"], json!(format!("{BASE}/.pop/session")));
+            assert_eq!(ps["algs"], json!(["hmac-sha256"]));
+            assert_eq!(ps["channel_bindings"], json!(["none"]));
+            assert_eq!(ps["profile"], json!("https://w3id.org/jeswr/dpop-sk/v1"));
+            assert_eq!(
+                doc[PRM_STORAGE_DESCRIPTION_MEMBER],
+                json!(format!("{BASE}/.well-known/lws"))
+            );
+            assert_eq!(doc["authorization_servers"], json!([ISSUER]));
+            // `pop-required-single-member` / D9: the ONE registered member states the posture —
+            // honest `false` on the Bearer baseline (pop_session is additive availability, not a
+            // requirement flip), `true` on a PoP-required realm (covering DPoP AND DPoP-SK; no
+            // separate required-member exists).
+            assert_eq!(doc["dpop_bound_access_tokens_required"], json!(require_pop));
+        }
     }
 
     #[test]

@@ -100,9 +100,29 @@
 //!   widening attempt changes nothing: WAC remains the ceiling). Intelligible-but-uncovered ⇒
 //!   403 `insufficient_scope`; unintelligible ⇒ 401 fail-closed.
 //!
+//! ## What step 8 A/B ship (the spec-alignment increments — `decisions/0007`)
+//! - **A — DPoP-SK over LWS** (`lws-spec` `docs/alignment/dpop-sk.md`, verdict (c) AUTH-profile):
+//!   [`auth::ENV_LWS_POP_SESSION`] enables the SAME DPoP-SK engine [`crate::pop::sk`] ships (one
+//!   engine, two switches — never a second implementation), so the LWS-extended RFC 9728 document
+//!   carries the `pop_session` member (endpoint/algs/channel_bindings/profile) beside
+//!   `jlws_storage_description`, and an attested request authenticates via the PoP dispatch that
+//!   ALREADY precedes the Bearer paths in [`crate::auth`]. The composition is structural: a
+//!   `cnf`-bound token is never an LWS Bearer candidate (rs-validation step 5 — "never bare"),
+//!   and `dpop_bound_access_tokens_required` alone governs the PoP-required posture (the D9
+//!   Bearer baseline; `pop_session` is an additive availability signal, not a requirement flip).
+//! - **B — the a2a-rdf discovery affordance** (`docs/alignment/a2a-rdf.md`, verdict (d)
+//!   REFERENCE + optional extension service): [`ENV_LWS_AGENT_CARD_URL`] advertises the storage
+//!   controller's A2A agent as an [`A2A_AGENT_INTERACTION_SERVICE`] `service` entry in the
+//!   storage description (the registry's extension-URI mechanism — no core registry term is
+//!   minted). Emitted ONLY when the URL is configured AND validates (absolute http(s), no
+//!   userinfo — fail-closed to "not advertised"); it adds no `conformsTo`/`capability` entry.
+//!
 //! ## M4 (deferred, seams noted)
 //! Notification bindings (SSE + WebSocket under the WD subscription API), DPoP-bound
-//! LWS-audience token validation for a PoP-required realm (§presentation-pop end-to-end), the
+//! LWS-audience token validation for a PoP-required realm (§presentation-pop end-to-end for an
+//! LWS-audience `at+jwt` — a webid-less token from the LWS AS cannot yet establish a DPoP proof
+//! or DPoP-SK session through the Solid-OIDC verifier path; step-8 A composes the EXISTING
+//! engine with the LWS realm, it does not widen the establishment token policy), the
 //! `SparqlQueryService`/AC-SPARQL companion (a gated increment on `sparq#992`), multi-request
 //! pagination snapshot-consistency (`sparq#1572`), operation-precise narrowing for
 //! PUT-create/append-only-PATCH (today conservatively under-granted — [`rar`]), and the
@@ -203,6 +223,24 @@ pub const ENV_LWS_STRICT_PUT: &str = "SOLID_SERVER_LWS_STRICT_PUT";
 pub const ENV_LWS_PAGE_SIZE: &str = "SOLID_SERVER_LWS_PAGE_SIZE";
 /// The default pagination threshold/page size (members per page).
 pub const DEFAULT_LWS_PAGE_SIZE: usize = 1000;
+/// Env knob for the step-8-B a2a-rdf discovery affordance (`lws-spec` `docs/alignment/a2a-rdf.md`):
+/// the **A2A Agent Card URL** of the agent that speaks for this storage's controller. Set (to a
+/// valid absolute http(s) URL) ⇒ the storage description advertises an
+/// [`A2A_AGENT_INTERACTION_SERVICE`] extension-service entry pointing at it; unset/invalid (the
+/// default) ⇒ the entry is not emitted and the description bytes are unchanged. Purely a
+/// discovery advertisement — it grants nothing and changes no auth/WAC behaviour.
+pub const ENV_LWS_AGENT_CARD_URL: &str = "SOLID_SERVER_LWS_AGENT_CARD_URL";
+
+/// The A2A RDF extension URI (`jeswr/a2a-rdf-extension`) — the `conformsTo` value of the
+/// [`A2A_AGENT_INTERACTION_SERVICE`] entry (the extension defines the term; the JLWS core
+/// capability registry mints nothing — alignment verdict (d)).
+pub const A2A_RDF_EXTENSION: &str = "https://w3id.org/jeswr/a2a-rdf/v1";
+/// The extension-service `type` advertising the storage controller's A2A agent
+/// (`serviceEndpoint` = the agent's **Agent Card URL** — the card, not the A2A endpoint: the card
+/// carries the endpoint + the `capabilities.extensions` declaration). Consumers that don't
+/// recognise the type ignore the entry (spec §discovery-model forward-compatibility).
+pub const A2A_AGENT_INTERACTION_SERVICE: &str =
+    "https://w3id.org/jeswr/a2a-rdf/v1#AgentInteractionService";
 
 /// The LWS surface configuration. Present on the [`LdpState`] ⇒ the surface is ON; absent (the
 /// default) ⇒ every LWS hook is dead code and the Solid surface is byte-identical to pre-LWS.
@@ -220,6 +258,13 @@ pub struct LwsConfig {
     /// `totalItems` = the whole visible membership). `None` ⇒ pagination off (every listing
     /// single-page). Default `Some(`[`DEFAULT_LWS_PAGE_SIZE`]`)`.
     pub page_size: Option<std::num::NonZeroUsize>,
+    /// The server's public base URL (trailing slash trimmed) — kept so the builder-style setters
+    /// can rebuild the precomputed description body.
+    base: String,
+    /// The step-8-B a2a-rdf affordance: the controller-agent's Agent Card URL, VALIDATED
+    /// (absolute http(s), no userinfo). `None` (the default) ⇒ no
+    /// [`A2A_AGENT_INTERACTION_SERVICE`] entry and byte-identical description output.
+    agent_card_url: Option<String>,
     /// The precomputed storage-description document bytes (request-invariant per boot).
     description_body: Bytes,
     /// The precomputed `Link: <…/.well-known/lws>; rel="…#storageDescription"` header value
@@ -231,8 +276,8 @@ pub struct LwsConfig {
 impl LwsConfig {
     /// Build a config for `base_url` (the server's public base URL, no trailing slash needed).
     pub fn new(base_url: &str, rdf_transform: bool, strict_put: bool) -> Self {
-        let base = base_url.trim_end_matches('/');
-        let description_body = Bytes::from(build_storage_description(base, rdf_transform));
+        let base = base_url.trim_end_matches('/').to_string();
+        let description_body = Bytes::from(build_storage_description(&base, rdf_transform, None));
         let storage_description_link = HeaderValue::from_str(&format!(
             "<{base}{STORAGE_DESCRIPTION_PATH}>; rel=\"{JLWS_NS}storageDescription\""
         ))
@@ -241,6 +286,8 @@ impl LwsConfig {
             rdf_transform,
             strict_put,
             page_size: std::num::NonZeroUsize::new(DEFAULT_LWS_PAGE_SIZE),
+            base,
+            agent_card_url: None,
             description_body,
             storage_description_link,
         }
@@ -253,9 +300,26 @@ impl LwsConfig {
         self
     }
 
+    /// Set the step-8-B a2a-rdf affordance (the controller-agent's **Agent Card URL**;
+    /// [`ENV_LWS_AGENT_CARD_URL`]). The value is VALIDATED here — the single chokepoint — and
+    /// anything that is not an absolute http(s) URL without userinfo collapses to `None`
+    /// (fail-closed: a malformed advertisement is never emitted; the description bytes are then
+    /// identical to a config never given a URL). Builder-style so every existing `new` caller
+    /// keeps the default (no entry).
+    pub fn with_agent_card_url(mut self, url: Option<&str>) -> Self {
+        self.agent_card_url = url.and_then(validate_agent_card_url);
+        self.description_body = Bytes::from(build_storage_description(
+            &self.base,
+            self.rdf_transform,
+            self.agent_card_url.as_deref(),
+        ));
+        self
+    }
+
     /// Read the LWS configuration from the environment: `None` (surface off — the default) unless
     /// [`ENV_LWS`] is truthy; the transform defaults ON and strictness OFF per the constants' docs;
-    /// the page size per [`ENV_LWS_PAGE_SIZE`] (`0` = off, unset/unparseable = the default).
+    /// the page size per [`ENV_LWS_PAGE_SIZE`] (`0` = off, unset/unparseable = the default); the
+    /// a2a-rdf agent-card advertisement per [`ENV_LWS_AGENT_CARD_URL`] (unset/invalid = no entry).
     pub fn from_env(base_url: &str) -> Option<Self> {
         if !env_truthy(ENV_LWS) {
             return None;
@@ -273,7 +337,17 @@ impl LwsConfig {
             Some(n) => std::num::NonZeroUsize::new(n), // 0 ⇒ None ⇒ pagination off
             None => std::num::NonZeroUsize::new(DEFAULT_LWS_PAGE_SIZE),
         };
-        Some(Self::new(base_url, rdf_transform, strict_put).with_page_size(page_size))
+        let agent_card = std::env::var(ENV_LWS_AGENT_CARD_URL).ok();
+        Some(
+            Self::new(base_url, rdf_transform, strict_put)
+                .with_page_size(page_size)
+                .with_agent_card_url(agent_card.as_deref()),
+        )
+    }
+
+    /// The validated agent-card URL this config advertises (step-8 B), when configured.
+    pub fn agent_card_url(&self) -> Option<&str> {
+        self.agent_card_url.as_deref()
     }
 
     /// The precomputed storage-description bytes (identical for every conneg variant — the WD
@@ -296,8 +370,33 @@ fn env_truthy(key: &str) -> bool {
     std::env::var(key).map(|v| is_truthy(&v)).unwrap_or(false)
 }
 
-fn is_truthy(v: &str) -> bool {
+pub(crate) fn is_truthy(v: &str) -> bool {
     matches!(v.trim(), "1" | "true" | "TRUE" | "True")
+}
+
+/// Is the LWS MASTER flag ([`ENV_LWS`]) set? The cheap check the binary uses where it needs the
+/// on/off answer before/without building the full [`LwsConfig`] (e.g. the step-8-A
+/// [`auth::pop_session_from_env`] gate). Reads the SAME variable [`LwsConfig::from_env`] gates on,
+/// so the two can never disagree.
+pub fn flag_from_env() -> bool {
+    env_truthy(ENV_LWS)
+}
+
+/// Validate a step-8-B agent-card URL: an ABSOLUTE `http(s)` URL carrying **no userinfo** (a
+/// `user:pw@host` spelling could cosmetically impersonate an origin in an advertisement read by
+/// humans/agents — refused outright). Anything else ⇒ `None` — the entry is simply not emitted
+/// (fail-closed: never advertise a malformed/unshaped value). The URL is emitted as a JSON string
+/// via `serde_json` (escaped), so no injection is possible either way.
+fn validate_agent_card_url(v: &str) -> Option<String> {
+    let v = v.trim();
+    let u = url::Url::parse(v).ok()?;
+    if !matches!(u.scheme(), "http" | "https") {
+        return None;
+    }
+    if !u.username().is_empty() || u.password().is_some() {
+        return None;
+    }
+    Some(v.to_string())
 }
 
 /// Build the CID-shaped storage-description JSON (spec §discovery-model; D5): `id` + `type:
@@ -309,7 +408,13 @@ fn is_truthy(v: &str) -> bool {
 /// transform opt-in is on, one entry per advertised SOURCE type, each pinned to the `rdf-1`
 /// profile URI (`rdf-transform.html` §capability); `normalizes` is omitted (default `false`) —
 /// this store is byte-preserving (stored bytes are returned verbatim in the stored type).
-fn build_storage_description(base: &str, rdf_transform: bool) -> Vec<u8> {
+///
+/// `agent_card` (step-8 B, pre-validated by [`LwsConfig::with_agent_card_url`]) appends the
+/// OPTIONAL [`A2A_AGENT_INTERACTION_SERVICE`] extension-service entry — `serviceEndpoint` = the
+/// controller-agent's Agent Card URL, `conformsTo` = [`A2A_RDF_EXTENSION`]. It joins `service`
+/// ONLY (verdict (d): a reference affordance, not a capability — `conformsTo`/`capability` are
+/// untouched), and `None` leaves the document byte-identical to pre-step-8.
+fn build_storage_description(base: &str, rdf_transform: bool, agent_card: Option<&str>) -> Vec<u8> {
     use serde_json::{json, Value};
 
     let storage_root = format!("{base}/");
@@ -339,16 +444,28 @@ fn build_storage_description(base: &str, rdf_transform: bool) -> Vec<u8> {
         }));
     }
 
+    let mut service = vec![json!({
+        "type": "StorageDescription",
+        "serviceEndpoint": description_url,
+    })];
+    if let Some(card_url) = agent_card {
+        // The step-8-B a2a-rdf affordance: the storage controller's agent, discoverable from the
+        // storage (its Agent Card carries the A2A endpoint + extension declaration). Appended
+        // AFTER the required StorageDescription entry so the `None` case is byte-invariant.
+        service.push(json!({
+            "type": A2A_AGENT_INTERACTION_SERVICE,
+            "serviceEndpoint": card_url,
+            "conformsTo": A2A_RDF_EXTENSION,
+        }));
+    }
+
     let doc = json!({
         "@context": JLWS_CONTEXT,
         "id": storage_root,
         "type": "Storage",
         "conformsTo": conforms_to,
         "capability": capability,
-        "service": [{
-            "type": "StorageDescription",
-            "serviceEndpoint": description_url,
-        }],
+        "service": service,
     });
     // `serde_json`'s default map is a BTreeMap, so the serialisation is deterministic — the
     // same-bytes-across-conneg-variants rule holds trivially.
@@ -550,6 +667,131 @@ mod tests {
         // Malformed q ⇒ 0 (not accepted) — mirrors the existing negotiator.
         let (_, q, _) = parse_accept_part("application/json;q=abc");
         assert_eq!(q, 0.0);
+    }
+
+    // --- step-8 B: the a2a-rdf AgentInteractionService affordance --------------------------------
+
+    const CARD: &str = "https://agent.example/.well-known/agent-card.json";
+
+    #[test]
+    fn description_advertises_agent_interaction_service_when_configured() {
+        let cfg =
+            LwsConfig::new("https://pod.example", true, false).with_agent_card_url(Some(CARD));
+        assert_eq!(cfg.agent_card_url(), Some(CARD));
+        let doc: serde_json::Value = serde_json::from_slice(&cfg.description_body()).unwrap();
+        let services = doc["service"].as_array().unwrap();
+        // The required StorageDescription entry is untouched…
+        assert!(services.iter().any(|s| s["type"] == "StorageDescription"
+            && s["serviceEndpoint"] == "https://pod.example/.well-known/lws"));
+        // …and the extension entry carries EXACTLY the alignment-doc member set (the lws-spec
+        // `sd-agent-interaction-service` vector's expectation, server side).
+        let agent = services
+            .iter()
+            .find(|s| s["type"] == A2A_AGENT_INTERACTION_SERVICE)
+            .expect("AgentInteractionService entry");
+        assert_eq!(agent["serviceEndpoint"], CARD);
+        assert_eq!(agent["conformsTo"], A2A_RDF_EXTENSION);
+        assert_eq!(agent.as_object().unwrap().len(), 3, "exactly the 3 members");
+        // Verdict (d): a REFERENCE affordance — no capability entry, no conformsTo URI is added.
+        assert!(!doc["conformsTo"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c.as_str().unwrap().contains("a2a-rdf")));
+        assert!(!doc["capability"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["type"] == A2A_AGENT_INTERACTION_SERVICE));
+    }
+
+    #[test]
+    fn description_without_agent_card_is_byte_identical_to_pre_step_8() {
+        // The unset path — a config never given a URL and one explicitly given `None` — emits
+        // the SAME bytes as the pre-step-8 builder (the additive-only invariant).
+        let plain = LwsConfig::new("https://pod.example", true, false);
+        let explicit_none =
+            LwsConfig::new("https://pod.example", true, false).with_agent_card_url(None);
+        assert_eq!(plain.description_body(), explicit_none.description_body());
+        let doc: serde_json::Value = serde_json::from_slice(&plain.description_body()).unwrap();
+        let services = doc["service"].as_array().unwrap();
+        assert_eq!(services.len(), 1, "exactly the StorageDescription entry");
+        assert_eq!(services[0]["type"], "StorageDescription");
+    }
+
+    #[test]
+    fn agent_card_url_is_validated_fail_closed() {
+        // Every rejected spelling collapses to "not advertised" — byte-identical to unset.
+        let baseline = LwsConfig::new("https://pod.example", true, false);
+        for bad in [
+            "not-a-url",
+            "",
+            "   ",
+            "ftp://agent.example/card.json",
+            "javascript:alert(1)",
+            "//agent.example/card.json",          // scheme-relative
+            "https://user:pw@agent.example/card", // userinfo — refused (impersonation surface)
+            "https://evil@agent.example/card",    // username-only userinfo too
+            "/relative/card.json",
+        ] {
+            let cfg =
+                LwsConfig::new("https://pod.example", true, false).with_agent_card_url(Some(bad));
+            assert_eq!(cfg.agent_card_url(), None, "must reject: {bad}");
+            assert_eq!(
+                cfg.description_body(),
+                baseline.description_body(),
+                "rejected value must leave the bytes unchanged: {bad}"
+            );
+        }
+        // Valid spellings (http for dev/loopback deployments, https for real ones) are kept;
+        // surrounding whitespace is trimmed.
+        for good in [CARD, "http://localhost:8080/agent-card.json"] {
+            let cfg =
+                LwsConfig::new("https://pod.example", true, false).with_agent_card_url(Some(good));
+            assert_eq!(cfg.agent_card_url(), Some(good));
+        }
+        let cfg = LwsConfig::new("https://pod.example", true, false)
+            .with_agent_card_url(Some(&format!("  {CARD}  ")));
+        assert_eq!(cfg.agent_card_url(), Some(CARD));
+    }
+
+    /// The WHOLE env matrix for the step-8 flags in ONE test (env vars are process-global and
+    /// `cargo test` runs threads in parallel — these variables are mutated ONLY here, mirroring
+    /// the `pop::sk` env test's discipline).
+    #[test]
+    fn step8_env_flags_are_inert_without_the_master_flag() {
+        // Master flag OFF: everything is inert regardless of the step-8 knobs.
+        std::env::remove_var(ENV_LWS);
+        std::env::set_var(super::auth::ENV_LWS_POP_SESSION, "1");
+        std::env::set_var(ENV_LWS_AGENT_CARD_URL, CARD);
+        assert!(!flag_from_env());
+        assert!(LwsConfig::from_env("https://pod.example").is_none());
+        assert!(
+            !super::auth::pop_session_from_env(),
+            "pop_session is inert without SOLID_SERVER_LWS"
+        );
+
+        // Master flag ON: the knobs take effect…
+        std::env::set_var(ENV_LWS, "1");
+        assert!(flag_from_env());
+        assert!(super::auth::pop_session_from_env());
+        let cfg = LwsConfig::from_env("https://pod.example").expect("surface on");
+        assert_eq!(cfg.agent_card_url(), Some(CARD));
+
+        // …and default OFF individually when unset.
+        std::env::remove_var(super::auth::ENV_LWS_POP_SESSION);
+        std::env::remove_var(ENV_LWS_AGENT_CARD_URL);
+        assert!(!super::auth::pop_session_from_env());
+        let cfg = LwsConfig::from_env("https://pod.example").expect("surface on");
+        assert_eq!(cfg.agent_card_url(), None);
+
+        // An INVALID card URL from the env is fail-closed to "not advertised".
+        std::env::set_var(ENV_LWS_AGENT_CARD_URL, "ftp://nope.example/card");
+        let cfg = LwsConfig::from_env("https://pod.example").expect("surface on");
+        assert_eq!(cfg.agent_card_url(), None);
+
+        std::env::remove_var(ENV_LWS);
+        std::env::remove_var(ENV_LWS_AGENT_CARD_URL);
     }
 
     #[test]

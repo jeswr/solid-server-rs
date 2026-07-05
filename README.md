@@ -143,11 +143,22 @@ pinned by tests). With `SOLID_SERVER_LWS=1` the server additionally serves:
   `first`/`next`/`prev`/`last` links, deterministic order, visible-membership-only arithmetic;
 - **RFC 9396 `authorization_details` narrowing** (M3): enforced narrowing-ONLY at the token
   verify chokepoint (effective access = WAC ∩ audience ∩ narrowing — it can only reduce; a
-  widening attempt changes nothing), 403 `insufficient_scope` / fail-closed 401.
+  widening attempt changes nothing), 403 `insufficient_scope` / fail-closed 401;
+- **DPoP-SK offered on the LWS realm** (step-8 A, the spec-alignment increment):
+  `SOLID_SERVER_LWS_POP_SESSION=1` (inert without the master flag) enables the SAME DPoP-SK
+  engine as `SOLID_SERVER_DPOP_SK` — one engine, two switches — so the RFC 9728 document carries
+  the `pop_session` member beside `jlws_storage_description`, and attested requests authenticate
+  via the PoP dispatch (a `cnf`-bound token is never accepted bare on the LWS Bearer path;
+  `dpop_bound_access_tokens_required` alone still governs the PoP-required posture);
+- an optional **a2a-rdf discovery affordance** (step-8 B): `SOLID_SERVER_LWS_AGENT_CARD_URL`
+  (a validated absolute http(s) URL) advertises the storage controller's A2A agent as an
+  `…/a2a-rdf/v1#AgentInteractionService` extension-service entry in the storage description
+  (`serviceEndpoint` = the Agent Card URL; unset/invalid ⇒ no entry, unchanged bytes).
 
 M4 seams (marked in `src/lws`): the SSE/WebSocket notification bindings, DPoP-bound
-LWS-audience tokens for PoP-required realms, and the `SparqlQueryService`/AC-SPARQL companion
-(gated on `sparq#992`). See `decisions/0004` / `0005` / `0006`.
+LWS-audience tokens for PoP-required realms (§presentation-pop end-to-end for a webid-less
+LWS-audience `at+jwt`), and the `SparqlQueryService`/AC-SPARQL companion (gated on `sparq#992`).
+See `decisions/0004` / `0005` / `0006` / `0007`.
 
 ## Build & run
 
@@ -172,6 +183,8 @@ cargo run                   # boot the experimental server (defaults to 127.0.0.
 #   SOLID_SERVER_LWS                  opt-in LWS surface (default off — see "LWS surface" above)
 #   SOLID_SERVER_LWS_RDF_TRANSFORM    the RDF transform opt-in (default on WHEN LWS is on; 0 = off)
 #   SOLID_SERVER_LWS_STRICT_PUT       strict D2/D3 PUT semantics — PURE-LWS deployments only (default off)
+#   SOLID_SERVER_LWS_POP_SESSION      offer DPoP-SK on the LWS realm (default off; inert without _LWS)
+#   SOLID_SERVER_LWS_AGENT_CARD_URL   advertise the controller agent's A2A Agent Card URL (default unset)
 SOLID_SERVER_BIND=127.0.0.1:3000 \
 SOLID_SERVER_BASE_URL=https://pod.example \
 SOLID_SERVER_TRUSTED_ISSUER=https://idp.example/realms/solid \

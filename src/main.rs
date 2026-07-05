@@ -262,7 +262,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ignored). The `cb=tls-exporter` flavour additionally REQUIRES in-process TLS termination (the
     // acceptor exports the keying material); behind a TLS-terminating proxy only `cb=none` is
     // offered — the DPoP-SK spec forbids advertising tls-exporter there.
-    let dpop_sk = solid_server_rs::pop::sk::dpop_sk_from_env();
+    //
+    // Step-8 A (LWS × DPoP-SK alignment, `decisions/0007`): `SOLID_SERVER_LWS_POP_SESSION`
+    // (inert without `SOLID_SERVER_LWS` — the conjunction is inside `pop_session_from_env`) is a
+    // SECOND switch on the SAME engine, so an LWS realm can offer the DPoP-SK PoP presentation
+    // profile (`pop_session` in the LWS-extended RFC 9728 document) without separately enabling
+    // the Solid-surface tier flag. ONE SkState either way — never a second implementation.
+    let lws_pop_session = solid_server_rs::lws::auth::pop_session_from_env();
+    let dpop_sk = solid_server_rs::pop::sk::dpop_sk_from_env() || lws_pop_session;
     let sk_exporter_active = dpop_sk && matches!(tls_mode, TlsMode::Tls { .. });
     let sk_state = dpop_sk.then(|| {
         Arc::new(solid_server_rs::pop::sk::SkState::new(
@@ -402,6 +409,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "none only (no in-process TLS — tls-exporter not advertised)"
             }
         );
+        if lws_pop_session {
+            eprintln!(
+                "  AUTH: DPoP-SK offered on the LWS realm ({}=1) — the RFC 9728 document carries \
+                 pop_session beside the LWS discovery members.",
+                solid_server_rs::lws::auth::ENV_LWS_POP_SESSION
+            );
+        }
     }
 
     // --- Overload protection (admission control + request timeout). -------------------------------
@@ -966,16 +980,36 @@ where
     // default) ⇒ `None` ⇒ every LWS hook is inert and the Solid surface is byte-identical.
     let lws = solid_server_rs::lws::LwsConfig::from_env(base_url);
     match &lws {
-        Some(cfg) => eprintln!(
-            "  LWS: surface ENABLED (rdf_transform={}, strict_put={}) — storage description at \
-             {}{}; container application/lws+json + rel=\"up\" active. Flag-gated: unset {} to \
-             restore the pure Solid surface.",
-            cfg.rdf_transform,
-            cfg.strict_put,
-            base_url.trim_end_matches('/'),
-            solid_server_rs::lws::STORAGE_DESCRIPTION_PATH,
-            solid_server_rs::lws::ENV_LWS,
-        ),
+        Some(cfg) => {
+            eprintln!(
+                "  LWS: surface ENABLED (rdf_transform={}, strict_put={}) — storage description at \
+                 {}{}; container application/lws+json + rel=\"up\" active. Flag-gated: unset {} to \
+                 restore the pure Solid surface.",
+                cfg.rdf_transform,
+                cfg.strict_put,
+                base_url.trim_end_matches('/'),
+                solid_server_rs::lws::STORAGE_DESCRIPTION_PATH,
+                solid_server_rs::lws::ENV_LWS,
+            );
+            // Step-8 B (a2a-rdf alignment): the OPTIONAL AgentInteractionService advertisement.
+            // Surface a SET-but-invalid URL loudly — the entry is fail-closed to "not advertised",
+            // which an operator should not discover by absence alone.
+            match (
+                cfg.agent_card_url(),
+                std::env::var(solid_server_rs::lws::ENV_LWS_AGENT_CARD_URL).ok(),
+            ) {
+                (Some(card), _) => eprintln!(
+                    "  LWS: storage description advertises the controller agent \
+                     (AgentInteractionService → {card})."
+                ),
+                (None, Some(raw)) if !raw.trim().is_empty() => eprintln!(
+                    "  LWS: WARNING — {} is set but is not a valid absolute http(s) URL (no \
+                     userinfo allowed); the AgentInteractionService entry is NOT advertised.",
+                    solid_server_rs::lws::ENV_LWS_AGENT_CARD_URL
+                ),
+                _ => {}
+            }
+        }
         None => eprintln!("  LWS: surface disabled (default — set SOLID_SERVER_LWS=1 to enable)."),
     }
     let lws_enabled = lws.is_some();
