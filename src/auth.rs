@@ -431,9 +431,12 @@ where
     if let Some(sk) = ctx.sk.as_ref() {
         // The absolute target URI, reconstructed by the SERVER from its configured public origin
         // + the request's path-and-query (never from client-controlled Host/Forwarded headers).
+        // The origin is normalized exactly as `parse_target` normalizes it for the DPoP `htu`
+        // (trailing slash trimmed), so a trailing-slash-configured base_url cannot make every
+        // attestation fail on a double slash (roborev Medium on the Tier-2 commit).
         let target_uri = format!(
             "{}{}",
-            ctx.base_url,
+            ctx.base_url.trim_end_matches('/'),
             req.uri()
                 .path_and_query()
                 .map(|pq| pq.as_str())

@@ -951,3 +951,43 @@ async fn tls_exporter_without_ekm_is_refused_fail_closed() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(json.get("session_id").is_none());
 }
+
+#[tokio::test]
+async fn trailing_slash_base_url_still_verifies_attestations() {
+    // Regression (roborev Medium on the Tier-2 commit): an operator-configured base_url WITH a
+    // trailing slash must reconstruct the same @target-uri the client signed
+    // (https://host/path, not https://host//path) — mirroring parse_target's htu normalization.
+    let issuer_key = KeyKit::generate();
+    let client_key = KeyKit::generate();
+    let config = VerifierConfig::new(vec![common::ISSUER.to_string()], BASE_URL);
+    let replay = InMemoryReplayStore::with_window(config.replay_ttl());
+    let verifier = Verifier::new(config, jwks_provider(&issuer_key), replay).unwrap();
+    // The trailing-slash form of the SAME origin.
+    let ctx = AuthContext::new(verifier, format!("{BASE_URL}/"))
+        .with_dpop_sk(Some(Arc::new(SkState::new(SkConfig::default()))));
+    let store = CompositeStore::new(InMemorySparqClient::new(), InMemoryBlobStore::new());
+    seed_root_owner_acl(&store, common::WEBID).await;
+    let ldp = LdpState::new(store, BASE_URL);
+    let h = Harness {
+        app: build_router(AppState::new(ctx, ldp)),
+        issuer_key,
+        client_key,
+    };
+    let (session_id, key, access) = h.establish_none().await;
+    // The client signs the slash-normalized target (what a conforming client sends).
+    let resp = h
+        .send(attested_request(
+            "GET",
+            "/alice/data",
+            &access,
+            &session_id,
+            &key,
+            1,
+        ))
+        .await;
+    assert_ne!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "trailing-slash base_url must not break attestation verification"
+    );
+}
