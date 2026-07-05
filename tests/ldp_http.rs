@@ -562,10 +562,21 @@ async fn post_creates_a_child_with_slug() {
         .to_str()
         .unwrap()
         .to_string();
-    assert_eq!(location, "https://pod.example/alice/note1");
+    // V2 (decisions/0003): the `Location` is collision-INDEPENDENT — it CONTAINS the Slug (`note1`) as
+    // an opaque-suffixed prefix but is never the verbatim segment, so it leaks nothing about which
+    // child names already exist. (The CTH `post-uri-assignment-slug` row asserts `Location contains
+    // '<slug>'`, satisfied here.)
+    assert!(
+        location.starts_with("https://pod.example/alice/note1-"),
+        "Location must contain the Slug as an opaque-suffixed prefix: {location}"
+    );
 
     // The child is readable at its minted Location.
-    let get = h.request("GET", "/alice/note1", None, Body::empty()).await;
+    let child_path = location
+        .strip_prefix("https://pod.example")
+        .unwrap_or(&location)
+        .to_string();
+    let get = h.request("GET", &child_path, None, Body::empty()).await;
     assert_eq!(get.status(), StatusCode::OK);
 }
 
@@ -1288,6 +1299,19 @@ async fn container_get_renders_ldp_contains_listing() {
         )
         .await;
     assert_eq!(post.status(), StatusCode::CREATED);
+    // V2 (decisions/0003): the member's IRI is an opaque-suffixed `…/doc1-<opaque>` — capture the
+    // minted Location (and its path) instead of assuming the verbatim Slug.
+    let member_iri = post
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let member_path = member_iri
+        .strip_prefix("https://pod.example")
+        .unwrap_or(&member_iri)
+        .to_string();
 
     let get = h
         .request_with(
@@ -1307,14 +1331,12 @@ async fn container_get_renders_ldp_contains_listing() {
     );
     assert!(text.contains("ldp#contains"), "container body: {text}");
     assert!(
-        text.contains("https://pod.example/alice/doc1"),
+        text.contains(&member_iri),
         "container body must list the member: {text}"
     );
 
     // After deleting the member, the listing no longer contains it.
-    let del = h
-        .request("DELETE", "/alice/doc1", None, Body::empty())
-        .await;
+    let del = h.request("DELETE", &member_path, None, Body::empty()).await;
     assert_eq!(del.status(), StatusCode::NO_CONTENT);
     let get2 = h
         .request_with(
@@ -1328,7 +1350,7 @@ async fn container_get_renders_ldp_contains_listing() {
     let bytes2 = to_bytes(get2.into_body(), usize::MAX).await.unwrap();
     let text2 = String::from_utf8(bytes2.to_vec()).unwrap();
     assert!(
-        !text2.contains("https://pod.example/alice/doc1"),
+        !text2.contains(&member_iri),
         "deleted member must be gone from the listing: {text2}"
     );
 }
@@ -1448,6 +1470,18 @@ async fn container_etag_changes_when_membership_changes() {
         )
         .await;
     assert_eq!(post.status(), StatusCode::CREATED);
+    // V2 (decisions/0003): the member is at the opaque-suffixed minted Location — capture its path.
+    let member_iri = post
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let member_path = member_iri
+        .strip_prefix("https://pod.example")
+        .unwrap_or(&member_iri)
+        .to_string();
 
     let get1 = h
         .request_with(
@@ -1465,9 +1499,7 @@ async fn container_etag_changes_when_membership_changes() {
     );
 
     // Remove the member → the body changes back → the ETag MUST change again.
-    let del = h
-        .request("DELETE", "/alice/doc1", None, Body::empty())
-        .await;
+    let del = h.request("DELETE", &member_path, None, Body::empty()).await;
     assert_eq!(del.status(), StatusCode::NO_CONTENT);
     let get2 = h
         .request_with(
