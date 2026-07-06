@@ -1,8 +1,8 @@
 // AUTHORED-BY Claude Fable 5
 //! **Server-minted, authenticated `lws-gen` pagination-pin tokens** — the defence-in-depth half of
 //! the pinned-listing metadata-disclosure closure (see [`super::container`]'s module doc; the
-//! primary closure is the current-existence + incarnation re-bind guard in
-//! `LdpState::authorize_listing_member`).
+//! primary closure is the snapshot-incarnation guard — current existence + live WAC + snapshot
+//! `blob_key` equality + the re-bind loop — in `LdpState::authorize_listing_member`).
 //!
 //! ## Why the pin must be authenticated
 //! The backend's snapshot generation is a SMALL MONOTONIC integer. Accepting any client-supplied

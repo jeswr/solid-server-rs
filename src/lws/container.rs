@@ -56,6 +56,15 @@
 //!   at REQUEST time, never at the pinned snapshot (pinning ACL reads would keep serving revoked
 //!   access — security over consistency). An ACL change mid-walk may therefore still shift the
 //!   VISIBLE offsets; that residual is the security-correct behaviour, not a gap.
+//! - **A pinned walk only shows members UNCHANGED since the snapshot.** Because authorization is
+//!   live but the served metadata is pinned, a member REWRITTEN or deleted+recreated after the
+//!   snapshot is OMITTED from pinned pages (the snapshot-incarnation guard below): the server
+//!   cannot re-evaluate the SNAPSHOT-time ACL (pinning ACLs is exactly what the previous bullet
+//!   rules out), so it must not serve snapshot-time metadata a live decision never covered.
+//!   Fail-closed omission — not a stale serve, not a silent substitution of live metadata into a
+//!   pinned page — is the deliberate trade; the walker sees the changed member again on an
+//!   unpinned (fresh-snapshot) walk. This also shifts visible offsets under churn, same as the
+//!   ACL bound above.
 //! - **The pin is retention-bounded.** sparq keeps only its concurrency-retention window (the
 //!   last K generations, default 4); a pin that ages out fails as a **410**
 //!   `snapshot-gone` problem and the walker restarts from the container URI (an unpinned first
@@ -65,27 +74,37 @@
 //!   `generation: None`: links carry no `lws-gen`, and behaviour is exactly the previous
 //!   single-response-snapshot contract (the spec's §pagination requires no more).
 //!
-//! ## Pinned listings × live WAC — the deleted-member disclosure closure (two prongs)
-//! Snapshot membership + LIVE authorization compose into a hole unless guarded: a member that
-//! existed at the pinned generation under a RESTRICTIVE own-ACL, then was DELETED (its `.acl`
-//! with it), is still in the pinned snapshot — but the LIVE walk on its IRI now finds no own-ACL
-//! and falls back to an ancestor's (possibly more permissive) `acl:default`. Unguarded, an agent
-//! that member's own ACL denied at the snapshot would be handed its IRI + content-type + size +
-//! modified out of the pin. Closed with two independent prongs:
+//! ## Pinned listings × live WAC — the stale-member disclosure closure (two prongs)
+//! Snapshot membership + LIVE authorization compose into a hole unless guarded, in two shapes:
+//! a member that existed at the pinned generation under a RESTRICTIVE own-ACL, then was DELETED
+//! (its `.acl` with it), is still in the pinned snapshot — but the LIVE walk on its IRI now finds
+//! no own-ACL and falls back to an ancestor's (possibly more permissive) `acl:default`; and a
+//! member deleted+RECREATED (or rewritten) at the same IRI under a now-PERMISSIVE ACL is
+//! legitimately Allowed by the live walk — on the NEW incarnation — while the pinned row still
+//! carries the OLD incarnation's metadata. Unguarded, an agent that member's own ACL denied at
+//! the snapshot would be handed its IRI + content-type + size + modified out of the pin (in the
+//! second shape: the OLD incarnation's size/modified served under a NEW incarnation's grant).
+//! Closed with two independent prongs:
 //!
-//! 1. **The current-existence + incarnation re-bind guard (primary —
-//!    `LdpState::authorize_listing_member`).** A member is disclosed ONLY if it (a) EXISTS at the
-//!    CURRENT store state and (b) live WAC grants Read **on the incarnation that exists**: a
-//!    positive Allow is served only after a full confirm re-plan, read strictly AFTER the ACL
-//!    resolution completes, comes back IDENTICAL to the plan the decision consumed (the target's
-//!    `ResourceMeta` carries the per-write-unique `blob_key`, so any delete + same-IRI recreate
-//!    is a visible incarnation change that forces a re-walk against the recreated own-ACL). A
-//!    since-deleted member is excluded fail-closed, regardless of what the ancestor-`acl:default`
-//!    fallback would grant — including one deleted mid-decision (the T0/T2 TOCTOU) or deleted and
-//!    RECREATED under the same IRI inside the decision window (the round-4 recreate race, closed
-//!    by the re-bind); still-existing members keep the deliberate LIVE evaluation above (fresh
-//!    revocation applies immediately — the pin never freezes an ACL). See that method's doc for
-//!    the full invariant + the re-bind loop.
+//! 1. **The snapshot-incarnation guard (primary — `LdpState::authorize_listing_member`).** The
+//!    closed invariant: **served-metadata-incarnation == authorized-incarnation ==
+//!    snapshot-incarnation.** A member is disclosed ONLY if (a) it EXISTS at the CURRENT store
+//!    state, (b) live WAC grants Read **on the incarnation that exists**, and (c) that live
+//!    incarnation IS the snapshot incarnation whose pinned metadata this listing serves —
+//!    established by `blob_key` equality between the snapshot row and the live plan (blob keys
+//!    are minted unique per write, so equality proves the record was never replaced since the
+//!    snapshot). A positive Allow is additionally served only after a full confirm re-plan, read
+//!    strictly AFTER the ACL resolution completes, comes back IDENTICAL to the plan the decision
+//!    consumed (so any mid-decision delete/recreate/ACL-chain change forces a re-gate + re-walk).
+//!    A since-deleted member is excluded fail-closed regardless of what the ancestor-
+//!    `acl:default` fallback would grant — including one deleted mid-decision (the T0/T2 TOCTOU)
+//!    or deleted and RECREATED under the same IRI inside the decision window (the round-4
+//!    recreate race); a member CHANGED since the snapshot (any rewrite or delete+recreate, even
+//!    one whose new ACL grants the requester) is likewise excluded fail-closed — its pinned
+//!    metadata is stale by definition, and the requester can see the live incarnation through an
+//!    unpinned listing (the round-5 metadata-staleness closure). Still-existing unchanged members
+//!    keep the deliberate LIVE evaluation above (fresh revocation applies immediately — the pin
+//!    never freezes an ACL). See that method's doc for the full invariant + the re-bind loop.
 //! 2. **Authenticated pins (defence-in-depth — [`super::pin`]).** The backend generation is a
 //!    small guessable integer, so raw `lws-gen=<u64>` would let ANY requester rewind ANY
 //!    container to an arbitrary retained state. Instead `lws-gen` carries a server-MINTED
@@ -299,15 +318,17 @@ fn page_plan(total: usize, page: usize, page_size: Option<std::num::NonZeroUsize
 /// the module doc's disclosure closure).
 ///
 /// Fail-closed per D12: each authoritative child is included only when it EXISTS at the CURRENT
-/// store state AND the agent holds `acl:Read` on it — both checked LIVE, never at the pinned
-/// snapshot, by [`LdpState::authorize_listing_member`] (the same planned WAC walk the read path
-/// uses, plus the current-existence + incarnation re-bind guard that is prong 1 of the module
-/// doc's disclosure closure); a denial omits the child, a backend FAULT fails the request (never a
-/// silently-shorter listing). A listed child whose metadata row is missing at the snapshot (a
-/// byte/index inconsistency window) is likewise omitted — `mediaType` is a MUST on data-resource
-/// members, so emitting a member we cannot describe would violate the shape. The filter runs over
-/// the WHOLE membership (never just the page) so `totalItems` and the page boundaries are
-/// functions of the visible view only.
+/// store state AND the agent holds `acl:Read` on it AND its current incarnation IS the snapshot
+/// incarnation whose pinned metadata this listing serves (`blob_key` equality — a member changed
+/// since the snapshot is omitted rather than served with stale metadata) — all checked LIVE,
+/// never at the pinned snapshot, by [`LdpState::authorize_listing_member`] (the same planned WAC
+/// walk the read path uses, plus the snapshot-incarnation + re-bind guard that is prong 1 of the
+/// module doc's disclosure closure); a denial omits the child, a backend FAULT fails the request
+/// (never a silently-shorter listing). A listed child whose metadata row is missing at the
+/// snapshot (a byte/index inconsistency window) is likewise omitted — `mediaType` is a MUST on
+/// data-resource members, so emitting a member we cannot describe would violate the shape. The
+/// filter runs over the WHOLE membership (never just the page) so `totalItems` and the page
+/// boundaries are functions of the visible view only.
 pub(crate) async fn render<S: Store>(
     state: &LdpState<S>,
     target: &LdpTarget,
@@ -341,15 +362,24 @@ pub(crate) async fn render<S: Store>(
 
     // The VISIBLE view first (D12), across the whole membership. Membership + metadata come from
     // the snapshot; the disclosure decision is LIVE (deliberate — see the module doc's honest
-    // bounds): current existence AND live WAC Read, per member (prong 1 — the deleted-member
-    // guard lives inside `authorize_listing_member`).
+    // bounds): current existence AND live WAC Read AND live-incarnation == snapshot-incarnation,
+    // per member (prong 1 — the guard lives inside `authorize_listing_member`). The snapshot
+    // member's `blob_key` is threaded in because `meta` — what this loop SERVES — is the PINNED
+    // record: the guard only Allows when the incarnation live WAC authorized is provably the one
+    // `meta` describes (blob keys are minted unique per write), so a member changed since the
+    // snapshot is omitted rather than served with stale metadata.
     let mut visible: Vec<(String, crate::store::ResourceMeta)> = Vec::with_capacity(children.len());
     for (child, meta) in children {
         let iri = child.as_str();
-        // D12: only members that currently exist AND that the requesting agent can read are
-        // disclosed. A deny (401/403-class decision) — including the nonexistent-at-current-state
-        // case — omits the member; a backend error propagates (fail-closed on faults).
-        match state.authorize_listing_member(iri, token, origin).await? {
+        // D12: only members that currently exist, that the requesting agent can read, AND whose
+        // current incarnation is the snapshot incarnation (else `meta` below would be stale) are
+        // disclosed. A deny (401/403-class decision) — including the nonexistent- or
+        // changed-at-current-state cases — omits the member; a backend error propagates
+        // (fail-closed on faults).
+        match state
+            .authorize_listing_member(iri, &meta.blob_key, token, origin)
+            .await?
+        {
             Decision::Allow(_) => {}
             Decision::Unauthenticated | Decision::Forbidden => continue,
         }

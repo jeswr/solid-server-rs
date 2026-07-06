@@ -482,15 +482,27 @@ impl<S: Store> LdpState<S> {
     }
 
     /// The LWS container-listing MEMBER disclosure check (D12 — [`crate::lws::container`]): may
-    /// this snapshot member be shown to the requester? The SAME planned WAC read walk the read
-    /// path uses (never a parallel ACL implementation), PLUS the **current-existence guard** —
+    /// this snapshot member — whose PINNED metadata (`snapshot_blob_key`'s incarnation) the
+    /// caller would serve — be shown to the requester? The SAME planned WAC read walk the read
+    /// path uses (never a parallel ACL implementation), PLUS the **snapshot-incarnation guard** —
     /// prong 1 of the pinned-listing metadata-disclosure closure.
     ///
     /// # THE INVARIANT (metadata non-disclosure across snapshot pins)
-    /// A listing member is disclosed ONLY when BOTH hold at REQUEST time — live, never at the
-    /// pinned snapshot:
-    /// 1. the member EXISTS at the CURRENT store state, and
-    /// 2. live WAC grants the requester the read mode on it.
+    /// A listing member is disclosed ONLY when ALL THREE hold at REQUEST time — live, never at
+    /// the pinned snapshot:
+    /// 1. the member EXISTS at the CURRENT store state,
+    /// 2. live WAC grants the requester the read mode on it, and
+    /// 3. the CURRENT incarnation IS the SNAPSHOT incarnation whose metadata the caller serves —
+    ///    `snapshot_blob_key` equals the live plan's `blob_key` (keys are minted unique per
+    ///    write), i.e. the member is provably UNCHANGED since the snapshot.
+    ///
+    /// Together: **served-metadata-incarnation == authorized-incarnation == snapshot-incarnation.**
+    /// The caller emits the PINNED member's content-type + size + modified; this guard's Allow is
+    /// a decision about the LIVE incarnation; (3) is what makes them the SAME incarnation — a
+    /// `blob_key` match means the index record was never replaced since the snapshot (only a
+    /// write replaces it, and every write mints a fresh key — the store's
+    /// no-two-writes-share-a-key invariant), so the pinned metadata IS the live metadata the
+    /// decision was made about.
     ///
     /// (1) is load-bearing for pinned (`lws-gen`) walks. A pinned listing serves MEMBERSHIP +
     /// METADATA from a PAST snapshot while authorization deliberately stays LIVE (revocation must
@@ -507,6 +519,20 @@ impl<S: Store> LdpState<S> {
     /// (2) preserves the deliberate design for STILL-EXISTING members: their ACL evaluation is
     /// exactly the live planned walk — a fresh grant or revocation applies to the very next page
     /// request, pinned or not. The pin never freezes an ACL.
+    ///
+    /// (3) closes the METADATA-STALENESS leak (the round-5 residual an independent re-verify
+    /// found surviving rounds 1–4): a member deleted + RECREATED (or simply REWRITTEN) at the
+    /// same IRI with a now-PERMISSIVE effective ACL between the snapshot generation and the
+    /// request would pass (1) and (2) — the walk correctly authorizes the NEW incarnation — and
+    /// the caller would then serve the pinned OLD incarnation's size/modified/content-type: e.g.
+    /// a 4 GB confidential dump the requester was denied at the snapshot, replaced by a 3-byte
+    /// public note, hands the requester `size=4000000000` + the dump's write-time out of the pin.
+    /// Rounds 1–4 never compared anything to the SNAPSHOT: the re-bind loop compares two LIVE
+    /// plans to each other, so it proves the live incarnation held still across the decision but
+    /// not that it is the incarnation being SERVED. On a `blob_key` MISMATCH the member is
+    /// OMITTED fail-closed: a changed member's pinned metadata is stale by definition, and
+    /// omission discloses nothing (the requester can list it unpinned to see the incarnation
+    /// live WAC actually grants them).
     ///
     /// # The incarnation re-bind (the T0/T2 TOCTOU **and** its delete+recreate variant — closed)
     /// (1) and (2) are separate store observations, so their COMPOSITION is where every hole in
@@ -525,54 +551,62 @@ impl<S: Store> LdpState<S> {
     ///   old incarnation's ACL denied, the new one's denies, and the decision was computed over
     ///   the absence interval in between (the round-4 residual this closes).
     ///
-    /// **The closure: a positive Allow is served only after the decision is RE-BOUND to a live
-    /// incarnation.** When the walk returns Allow, the member's FULL plan (target metadata +
-    /// every ACL-candidate row) is re-read strictly AFTER the decision, and the Allow is served
-    /// only if that confirm plan is IDENTICAL to the plan the decision consumed; on any
-    /// difference the loop re-runs the whole authorization against the FRESH plan (bounded by
-    /// [`MEMBER_REBIND_ROUNDS`], then fail-closed omit). Identity is exact
-    /// [`crate::store::ReadPlan`] equality, and the target's [`crate::store::ResourceMeta`]
-    /// includes the **per-write-unique `blob_key`** (minted from OS entropy on EVERY write — the
-    /// store's no-two-writes-share-a-key invariant), so ANY recreate — even byte-identical, even
-    /// landing inside the old (T2, T3) window — is a visible incarnation change: the confirm plan
-    /// differs, the walk re-runs, and the RECREATED incarnation's own ACL governs (restrictive ⇒
-    /// deny ⇒ omit). Plan equality also brackets the walk's live confirm probes: every row the
-    /// decision consumed was observed unchanged both before AND after the walk, so a served Allow
-    /// is a decision about an ACL state that held WHILE that exact incarnation existed — never
-    /// about an absence interval.
+    /// **The closure: a positive Allow is served only after the decision is (a) ANCHORED to the
+    /// snapshot incarnation and (b) RE-BOUND to a live incarnation.** Each round first gates the
+    /// current plan's target `blob_key` against `snapshot_blob_key` (invariant (3): a mismatch —
+    /// including absence — omits immediately). When the walk then returns Allow, the member's
+    /// FULL plan (target metadata + every ACL-candidate row) is re-read strictly AFTER the
+    /// decision, and the Allow is served only if that confirm plan is IDENTICAL to the plan the
+    /// decision consumed; on any difference the loop re-runs the whole authorization against the
+    /// FRESH plan (bounded by [`MEMBER_REBIND_ROUNDS`], then fail-closed omit — and the fresh
+    /// plan passes through the same snapshot-`blob_key` gate, so a mid-decision recreate can
+    /// never swap in a different incarnation). Identity is exact [`crate::store::ReadPlan`]
+    /// equality, and the target's [`crate::store::ResourceMeta`] includes the **per-write-unique
+    /// `blob_key`** (minted from OS entropy on EVERY write — the store's
+    /// no-two-writes-share-a-key invariant), so ANY recreate — even byte-identical, even landing
+    /// inside the old (T2, T3) window — is a visible incarnation change. Plan equality also
+    /// brackets the walk's live confirm probes: every row the decision consumed was observed
+    /// unchanged both before AND after the walk, so a served Allow is a decision about an ACL
+    /// state that held WHILE the snapshot's exact incarnation existed — never about an absence
+    /// interval, and never about a DIFFERENT incarnation than the one whose metadata is served.
     ///
     /// What deliberately remains (and is NOT this finding): a pure ACL EDIT on a
     /// continuously-existing member between the served decision and the response bytes is the
     /// intrinsic authorize-then-serve window every live-ACL evaluation has (the
     /// [`crate::lws::container`] module doc's "authorization stays LIVE" bound) — at the decision
-    /// instant the member existed and its then-current ACL genuinely granted. Likewise an ACL
-    /// delete+recreate with byte-identical content (ACL plan rows carry content-derived etags) is
-    /// decision-equivalent by construction: identical bytes ⇒ identical grants ⇒ no outcome can
-    /// differ. Fail-closed everywhere: a member absent at ANY plan (initial or confirm) is
-    /// omitted; a world that will not hold still across [`MEMBER_REBIND_ROUNDS`] decision rounds
-    /// is omitted (an unbindable decision is never served); a probe FAULT propagates and fails
-    /// the whole listing (D12), never a silently-shorter page.
+    /// instant the member existed and its then-current ACL genuinely granted; and because the
+    /// member itself is unchanged (`blob_key` match), the pinned metadata served IS the current
+    /// metadata of the incarnation that grant covered. Likewise an ACL delete+recreate with
+    /// byte-identical content (ACL plan rows carry content-derived etags) is decision-equivalent
+    /// by construction: identical bytes ⇒ identical grants ⇒ no outcome can differ. Fail-closed
+    /// everywhere: a member absent at ANY plan (initial or confirm) is omitted; a member whose
+    /// live incarnation is not the snapshot's is omitted; a world that will not hold still across
+    /// [`MEMBER_REBIND_ROUNDS`] decision rounds is omitted (an unbindable decision is never
+    /// served); a probe FAULT propagates and fails the whole listing (D12), never a
+    /// silently-shorter page.
     ///
     /// # Mechanics
     /// ONE combined `read_plan` round-trip with the MEMBER in the plan's TARGET slot (the read
     /// path's `authorize_read` shape, NOT the write path's candidate-0 slot): the same query
     /// returns the member's plan-time existence and every ACL candidate row, so the absent
-    /// early-out costs no extra backend round-trip. The re-bind adds ONE further `read_plan`
-    /// round-trip — only for members the walk actually ALLOWS (a denial returns without it, so a
-    /// denied member's cost is unchanged) — replacing the bare `exists` probe with a probe that
-    /// carries existence AND incarnation identity AND the ACL-chain state in one observation.
-    /// Steady state (no churn) is exactly one iteration: plan → walk → confirm-plan (equal) →
-    /// serve. The write path's fault-oracle rationale for avoiding the raw target row does not
-    /// apply here — a backend fault on ANY row fails the whole LISTING request (D12's
-    /// fail-closed-on-faults: never a silently-shorter listing), which is the documented
-    /// behaviour, not an oracle. The guard runs for UNPINNED listings too: their snapshot is the
-    /// current state modulo an intra-request race, and excluding a member churned inside that
-    /// sliver is strictly safer — one uniform invariant, no pinned/unpinned fork. A nonexistent
-    /// member maps to [`Decision::Forbidden`] purely as "not disclosable"; the caller omits it
-    /// exactly like a WAC denial (no distinguishable surface).
+    /// early-out costs no extra backend round-trip; the snapshot-`blob_key` gate compares a field
+    /// already in that plan, so invariant (3) costs ZERO extra round-trips. The re-bind adds ONE
+    /// further `read_plan` round-trip — only for members the walk actually ALLOWS (a denial
+    /// returns without it, so a denied member's cost is unchanged) — replacing the bare `exists`
+    /// probe with a probe that carries existence AND incarnation identity AND the ACL-chain state
+    /// in one observation. Steady state (no churn) is exactly one iteration: plan → walk →
+    /// confirm-plan (equal) → serve. The write path's fault-oracle rationale for avoiding the raw
+    /// target row does not apply here — a backend fault on ANY row fails the whole LISTING
+    /// request (D12's fail-closed-on-faults: never a silently-shorter listing), which is the
+    /// documented behaviour, not an oracle. The guard runs for UNPINNED listings too: their
+    /// snapshot is the current state modulo an intra-request race, and excluding a member churned
+    /// inside that sliver is strictly safer — one uniform invariant, no pinned/unpinned fork. A
+    /// nonexistent or since-changed member maps to [`Decision::Forbidden`] purely as "not
+    /// disclosable"; the caller omits it exactly like a WAC denial (no distinguishable surface).
     pub(crate) async fn authorize_listing_member(
         &self,
         member_iri: &str,
+        snapshot_blob_key: &str,
         token: &VerifiedToken,
         origin: Option<&str>,
     ) -> Result<Decision, ServerError> {
@@ -587,21 +621,32 @@ impl<S: Store> LdpState<S> {
         let wac = WacAuthorizer::with_cache(&self.store, &self.base_url, &self.acl_cache);
         let candidates = wac.read_plan_candidates(member_iri);
         let acl_iris: Vec<String> = candidates.iter().map(|c| c.acl.clone()).collect();
-        // The incarnation re-bind loop (see the doc): each round is plan → walk → confirm-plan.
-        // A denial returns immediately (fail-closed direction — omitting is always safe, and it
-        // preserves live revocation + the 401-vs-403 split untouched). A positive Allow is served
-        // ONLY when the confirm plan — read strictly AFTER the decision — is IDENTICAL to the
-        // plan the decision consumed, which re-binds the decision to a live incarnation: the
-        // target's `ResourceMeta` carries the per-write-unique `blob_key`, so ANY delete+recreate
-        // under the same IRI (the round-4 residual) shows as a plan change, and the next round
-        // re-walks against the RECREATED incarnation's own ACL rows. Every probe fault
-        // propagates (fails the whole listing per D12 — never a silently-shorter page).
+        // The incarnation re-bind loop (see the doc): each round is snapshot-gate → walk →
+        // confirm-plan. A denial returns immediately (fail-closed direction — omitting is always
+        // safe, and it preserves live revocation + the 401-vs-403 split untouched). A positive
+        // Allow is served ONLY when (a) the plan's target `blob_key` EQUALS the snapshot's — so
+        // the incarnation being authorized is the incarnation whose PINNED metadata the caller
+        // will serve (the round-5 staleness closure) — AND (b) the confirm plan, read strictly
+        // AFTER the decision, is IDENTICAL to the plan the decision consumed, which re-binds the
+        // decision to a live incarnation: the target's `ResourceMeta` carries the per-write-
+        // unique `blob_key`, so ANY delete+recreate under the same IRI (the round-4 residual)
+        // shows as a plan change, and the next round re-gates + re-walks against the fresh rows.
+        // Every probe fault propagates (fails the whole listing per D12 — never a
+        // silently-shorter page).
         let mut plan = self.store.read_plan(member_iri, &acl_iris).await?;
         for _ in 0..MEMBER_REBIND_ROUNDS {
-            // Existence gate on the CURRENT plan: a member absent at plan time is not disclosable
-            // no matter what the ancestor-`acl:default` fallback would grant (fail-closed omit).
-            if plan.target.is_none() {
-                return Ok(Decision::Forbidden);
+            // Existence + snapshot-incarnation gate on the CURRENT plan (both fail-closed omit):
+            // a member absent at plan time is not disclosable no matter what the
+            // ancestor-`acl:default` fallback would grant, and a member whose LIVE incarnation is
+            // not the SNAPSHOT incarnation — `blob_key` inequality; keys are minted unique per
+            // write — is not disclosable either, because the caller serves the PINNED metadata,
+            // which belongs to an incarnation this walk never authorized (the round-5
+            // metadata-staleness residual: delete+recreate or rewrite with a now-permissive ACL
+            // between the snapshot and the request must not hand out the OLD size/modified).
+            match plan.target.as_ref() {
+                None => return Ok(Decision::Forbidden),
+                Some(t) if t.blob_key != snapshot_blob_key => return Ok(Decision::Forbidden),
+                Some(_) => {}
             }
             let decision = wac
                 .authorize_planned(
@@ -627,7 +672,9 @@ impl<S: Store> LdpState<S> {
             if confirm == plan {
                 // The world the decision consumed was observed unchanged on BOTH sides of the
                 // walk: the Allow is bound to an ACL state that held while this exact
-                // incarnation existed. Serve it.
+                // incarnation existed — and the gate above proved that incarnation IS the
+                // snapshot's, so the pinned metadata the caller emits describes exactly the
+                // incarnation this Allow covers. Serve it.
                 return Ok(decision);
             }
             // The member's world moved under the decision (a delete+recreate, an ACL-chain

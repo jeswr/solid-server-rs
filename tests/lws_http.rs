@@ -2095,10 +2095,14 @@ struct PinState {
 /// A GENERATION-CAPABLE store double modelling sparq PR #1584's snapshot surface at the `Store`
 /// seam (the in-memory backend has no generation concept): an UNPINNED listing captures the
 /// current members under a fresh monotonic generation and advertises it; a PINNED listing replays
-/// the captured snapshot EXACTLY, or fails with the 410 `snapshot-gone` problem for a generation
-/// it no longer holds — never a silent substitute. Every other method delegates to the shared
-/// composite store, so authorization/`read_plan` always see the CURRENT state (exactly the live
-/// posture the disclosure regression depends on).
+/// the captured snapshot EXACTLY — the full `(IRI, ResourceMeta)` rows, `blob_key`/`size`/
+/// `modified` included — or fails with the 410 `snapshot-gone` problem for a generation it no
+/// longer holds — never a silent substitute. Every other method delegates to the shared composite
+/// store, so authorization/`read_plan` always see the CURRENT state (exactly the live posture the
+/// disclosure regressions depend on). Replaying the pinned METADATA verbatim while `read_plan`
+/// reads live is what lets this double reproduce the round-5 metadata-STALENESS axis: a pinned
+/// walk taken after a member is rewritten/recreated serves rows whose `blob_key` + size +
+/// modified genuinely differ from the live incarnation the WAC walk authorizes.
 struct PinningStore {
     inner: Arc<TestStore>,
     state: Arc<std::sync::Mutex<PinState>>,
@@ -2821,6 +2825,257 @@ async fn member_deleted_and_recreated_in_the_decision_window_is_not_disclosed() 
     assert_eq!(resp.status(), StatusCode::OK);
     let doc = body_json(resp).await;
     assert_eq!(doc["totalItems"], 1);
+}
+
+#[tokio::test]
+async fn pinned_listing_never_serves_stale_metadata_for_a_member_changed_since_the_snapshot() {
+    // THE METADATA-STALENESS regression (round 5 — the residual an independent adversarial
+    // re-verify found surviving rounds 1–4): the guard authorized the LIVE incarnation and the
+    // re-bind loop compared two LIVE plans to each other, but NOTHING ever compared the live
+    // incarnation to the SNAPSHOT incarnation whose metadata the listing actually SERVES. So a
+    // member deleted+RECREATED (or simply REWRITTEN) at the same IRI with a now-PERMISSIVE
+    // effective ACL between generation G and the request was re-walked, GRANTED on the NEW
+    // incarnation → Allow → and served the gen-G OLD row: a big confidential file the requester
+    // was DENIED at G, replaced by a tiny public note, handed the requester the dump's size +
+    // write-time out of the pin.
+    //
+    // The double: `PinningStore` (generation-aware — the in-memory/embedded backends have no
+    // generation concept) replays the FULL gen-G member rows VERBATIM (blob_key_OLD, old
+    // size/modified) while every `read_plan` reads the live inner store (blob_key_NEW,
+    // permissive ACL) — exactly the snapshot-vs-live divergence this axis needs.
+    //
+    // The fix: `authorize_listing_member` is handed the SNAPSHOT row's `blob_key` and serves an
+    // Allow only when the live plan's `blob_key` EQUALS it (keys are minted unique per write, so
+    // equality proves the member is unchanged since the snapshot and the pinned row IS the
+    // incarnation live WAC just authorized). On mismatch the member is OMITTED fail-closed.
+    //
+    // MUTATION CHECK (why this test isolates exactly the snapshot comparison): the UNPINNED
+    // control below proves live WAC ALLOWS both changed members' new incarnations (they are
+    // listed, with the NEW metadata), and both members exist with rotated blob keys — so
+    // existence, live WAC, and the live-vs-live re-bind all PASS for them. With the
+    // snapshot-`blob_key` comparison removed, nothing else stands between the gen-G rows and the
+    // pinned pages: both members would be listed with the OLD sizes, failing the assertions
+    // below (this reproduces F1).
+    let h = Harness::lws_pinned(2, 300).await;
+    // Visible members (Alice, via the root default): a, b, c — 3 > page-size 2, so the walk is
+    // paged and a pin token is minted.
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        let put = h
+            .request(
+                "PUT",
+                &format!("/notes/{name}"),
+                Some("text/plain"),
+                Body::from("x"),
+            )
+            .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+    }
+    const SECRET: &str = "https://pod.example/notes/secret.txt";
+    const LOOSENED: &str = "https://pod.example/notes/loosened.txt";
+    const BOB: &str = "https://pod.example/bob/profile/card#me";
+    let bob_only = |target: &str| {
+        format!(
+            r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#bob> a acl:Authorization;
+       acl:agent <{BOB}>;
+       acl:accessTo <{target}>;
+       acl:mode acl:Read, acl:Write."#
+        )
+    };
+    // The gen-G incarnations: BIG confidential bodies (distinctive sizes 4096 / 8192) under
+    // restrictive Bob-only own ACLs — Alice (the requester) is DENIED both at G.
+    let put = h
+        .request(
+            "PUT",
+            "/notes/secret.txt",
+            Some("text/plain"),
+            Body::from("C".repeat(4096)),
+        )
+        .await;
+    assert_eq!(put.status(), StatusCode::CREATED);
+    let put = h
+        .request(
+            "PUT",
+            "/notes/loosened.txt",
+            Some("text/plain"),
+            Body::from("D".repeat(8192)),
+        )
+        .await;
+    assert_eq!(put.status(), StatusCode::CREATED);
+    for target in [SECRET, LOOSENED] {
+        h.store
+            .write(
+                &format!("{target}.acl"),
+                Bytes::from(bob_only(target)),
+                "text/turtle",
+            )
+            .await
+            .expect("seed the restrictive own ACL");
+    }
+    let old_secret_key = h.store.meta(SECRET).await.unwrap().expect("seeded").blob_key;
+    let old_loosened_key = h
+        .store
+        .meta(LOOSENED)
+        .await
+        .unwrap()
+        .expect("seeded")
+        .blob_key;
+
+    // Gen G: Alice's pinned walk starts — she sees a, b, c only; the snapshot (with the OLD
+    // secret/loosened rows) is captured behind the minted token.
+    let p1 = h
+        .request_with("GET", "/notes/", None, &[("accept", LWS_JSON)], Body::empty())
+        .await;
+    assert_eq!(p1.status(), StatusCode::OK);
+    let token = pin_token(&p1).expect("a generation-capable backend mints pinned links");
+    let doc1 = body_json(p1).await;
+    assert_eq!(doc1["totalItems"], 3, "a, b, c visible; the big members denied live at G");
+
+    // The changes since the snapshot — both flip the requester's live access to PERMISSIVE:
+    // (1) secret.txt: deleted (own ACL with it) and RECREATED at the same IRI as a tiny PUBLIC
+    //     note (no own ACL ⇒ the root's permissive acl:default now grants Alice) — the brief's
+    //     worked case;
+    // (2) loosened.txt: REWRITTEN in place (every write mints a fresh blob_key) and its own ACL
+    //     replaced with one granting Alice — the modify + ACL-loosen variant.
+    h.store
+        .delete(SECRET, Some("https://pod.example/notes/"))
+        .await
+        .expect("delete the confidential member");
+    h.store
+        .delete(&format!("{SECRET}.acl"), None)
+        .await
+        .expect("delete its own ACL");
+    let put = h
+        .request(
+            "PUT",
+            "/notes/secret.txt",
+            Some("text/plain"),
+            Body::from("pub"),
+        )
+        .await;
+    assert_eq!(put.status(), StatusCode::CREATED, "the public recreate");
+    h.store
+        .write(LOOSENED, Bytes::from("ok"), "text/plain")
+        .await
+        .expect("rewrite the member in place");
+    let alice_acl = format!(
+        r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#alice> a acl:Authorization;
+         acl:agent <{}>;
+         acl:accessTo <{LOOSENED}>;
+         acl:mode acl:Read."#,
+        common::WEBID
+    );
+    h.store
+        .write(&format!("{LOOSENED}.acl"), Bytes::from(alice_acl), "text/turtle")
+        .await
+        .expect("loosen the own ACL to grant Alice");
+    // Test-model checks: both members EXIST live, as NEW incarnations (rotated blob keys) — the
+    // shape on which existence + live WAC + the live-vs-live re-bind all pass.
+    let new_secret_key = h.store.meta(SECRET).await.unwrap().expect("recreated").blob_key;
+    let new_loosened_key = h
+        .store
+        .meta(LOOSENED)
+        .await
+        .unwrap()
+        .expect("rewritten")
+        .blob_key;
+    assert_ne!(old_secret_key, new_secret_key, "the recreate minted a new incarnation");
+    assert_ne!(old_loosened_key, new_loosened_key, "the rewrite minted a new incarnation");
+
+    // THE UNPINNED CONTROL (mutation-check half): a FRESH walk lists BOTH changed members to
+    // Alice with the NEW metadata — live WAC genuinely allows the new incarnations, so the only
+    // thing that can keep the OLD rows out of the pinned pages is the snapshot-incarnation
+    // comparison. (Fresh snapshot ⇒ snapshot rows == live rows ⇒ the guard's blob_key gate
+    // passes — no over-exclusion.)
+    let fresh1 = h
+        .request_with("GET", "/notes/", None, &[("accept", LWS_JSON)], Body::empty())
+        .await;
+    assert_eq!(fresh1.status(), StatusCode::OK);
+    let fresh_token = pin_token(&fresh1).expect("the fresh walk is paged too");
+    let fresh_doc1 = body_json(fresh1).await;
+    assert_eq!(
+        fresh_doc1["totalItems"], 5,
+        "live WAC allows the new incarnations: a, b, c + both changed members"
+    );
+    let mut fresh_items: Vec<serde_json::Value> = Vec::new();
+    for page in 1..=3 {
+        let resp = h
+            .request_with(
+                "GET",
+                &format!("/notes/?lws-page={page}&lws-gen={fresh_token}"),
+                None,
+                &[("accept", LWS_JSON)],
+                Body::empty(),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK, "fresh page {page}");
+        let doc = body_json(resp).await;
+        fresh_items.extend(doc["items"].as_array().cloned().unwrap_or_default());
+    }
+    let size_of = |items: &[serde_json::Value], iri: &str| -> Option<u64> {
+        items
+            .iter()
+            .find(|i| i["id"] == iri)
+            .and_then(|i| i["size"].as_u64())
+    };
+    assert_eq!(
+        size_of(&fresh_items, SECRET),
+        Some(3),
+        "the fresh walk serves the NEW incarnation's size (\"pub\"), never the old dump's"
+    );
+    assert_eq!(
+        size_of(&fresh_items, LOOSENED),
+        Some(2),
+        "the fresh walk serves the rewritten member's NEW size (\"ok\")"
+    );
+
+    // THE REGRESSION: Alice re-walks the ORIGINAL gen-G pin. The snapshot's rows for both
+    // changed members are STALE (blob_key_OLD, sizes 4096/8192) — incarnations live WAC never
+    // authorized for her. They must be OMITTED (blob_key mismatch ⇒ fail-closed), and no byte
+    // of the old metadata may appear.
+    let mut walked: Vec<String> = Vec::new();
+    let mut raw_bodies = String::new();
+    for page in 1..=2 {
+        let resp = h
+            .request_with(
+                "GET",
+                &format!("/notes/?lws-page={page}&lws-gen={token}"),
+                None,
+                &[("accept", LWS_JSON)],
+                Body::empty(),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK, "pinned page {page}");
+        let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        raw_bodies.push_str(&body);
+        let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            doc["totalItems"], 3,
+            "members changed since the snapshot must not join the pinned visible count"
+        );
+        walked.extend(item_ids(&doc));
+    }
+    for leaked in ["secret", "loosened", "\"size\":4096", "\"size\":8192"] {
+        assert!(
+            !raw_bodies.contains(leaked),
+            "REGRESSION (metadata staleness): no byte of a changed-since-snapshot member's \
+             pinned row may be served — the gen-G metadata belongs to an incarnation the \
+             requester was denied; found {leaked:?} in the pinned pages"
+        );
+    }
+    // …and no over-exclusion of the genuinely-unchanged members: a, b, c still tile the pinned
+    // walk with their (identical-to-live) pinned metadata.
+    let mut expect: Vec<String> = ["a", "b", "c"]
+        .iter()
+        .map(|n| format!("https://pod.example/notes/{n}.txt"))
+        .collect();
+    expect.sort();
+    walked.sort();
+    assert_eq!(
+        walked, expect,
+        "unchanged members remain visible across the pinned walk (blob_key equality holds)"
+    );
 }
 
 #[tokio::test]
