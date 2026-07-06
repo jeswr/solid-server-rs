@@ -77,8 +77,11 @@
 //!    is disclosed ONLY if it (a) EXISTS at the CURRENT store state and (b) live WAC grants Read.
 //!    A since-deleted member is excluded fail-closed, regardless of what the ancestor-`acl:default`
 //!    fallback would grant; still-existing members keep the deliberate LIVE evaluation above
-//!    (fresh revocation applies immediately — the pin never freezes an ACL). See that method's
-//!    doc for the full invariant + the accepted delete-and-recreate residual.
+//!    (fresh revocation applies immediately — the pin never freezes an ACL). Existence is
+//!    re-confirmed LIVE **after** the ACL resolution completes (the T0/T2 TOCTOU closure: a
+//!    member deleted between the initial `read_plan` and the walk's live ACL re-confirm cannot
+//!    ride the ancestor-default fallback). See that method's doc for the full invariant, the
+//!    atomicity closure, + the accepted delete-and-recreate residual.
 //! 2. **Authenticated pins (defence-in-depth — [`super::pin`]).** The backend generation is a
 //!    small guessable integer, so raw `lws-gen=<u64>` would let ANY requester rewind ANY
 //!    container to an arbitrary retained state. Instead `lws-gen` carries a server-MINTED
