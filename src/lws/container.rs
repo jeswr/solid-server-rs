@@ -73,15 +73,19 @@
 //! that member's own ACL denied at the snapshot would be handed its IRI + content-type + size +
 //! modified out of the pin. Closed with two independent prongs:
 //!
-//! 1. **The current-existence guard (primary — `LdpState::authorize_listing_member`).** A member
-//!    is disclosed ONLY if it (a) EXISTS at the CURRENT store state and (b) live WAC grants Read.
-//!    A since-deleted member is excluded fail-closed, regardless of what the ancestor-`acl:default`
-//!    fallback would grant; still-existing members keep the deliberate LIVE evaluation above
-//!    (fresh revocation applies immediately — the pin never freezes an ACL). Existence is
-//!    re-confirmed LIVE **after** the ACL resolution completes (the T0/T2 TOCTOU closure: a
-//!    member deleted between the initial `read_plan` and the walk's live ACL re-confirm cannot
-//!    ride the ancestor-default fallback). See that method's doc for the full invariant, the
-//!    atomicity closure, + the accepted delete-and-recreate residual.
+//! 1. **The current-existence + incarnation re-bind guard (primary —
+//!    `LdpState::authorize_listing_member`).** A member is disclosed ONLY if it (a) EXISTS at the
+//!    CURRENT store state and (b) live WAC grants Read **on the incarnation that exists**: a
+//!    positive Allow is served only after a full confirm re-plan, read strictly AFTER the ACL
+//!    resolution completes, comes back IDENTICAL to the plan the decision consumed (the target's
+//!    `ResourceMeta` carries the per-write-unique `blob_key`, so any delete + same-IRI recreate
+//!    is a visible incarnation change that forces a re-walk against the recreated own-ACL). A
+//!    since-deleted member is excluded fail-closed, regardless of what the ancestor-`acl:default`
+//!    fallback would grant — including one deleted mid-decision (the T0/T2 TOCTOU) or deleted and
+//!    RECREATED under the same IRI inside the decision window (the round-4 recreate race, closed
+//!    by the re-bind); still-existing members keep the deliberate LIVE evaluation above (fresh
+//!    revocation applies immediately — the pin never freezes an ACL). See that method's doc for
+//!    the full invariant + the re-bind loop.
 //! 2. **Authenticated pins (defence-in-depth — [`super::pin`]).** The backend generation is a
 //!    small guessable integer, so raw `lws-gen=<u64>` would let ANY requester rewind ANY
 //!    container to an arbitrary retained state. Instead `lws-gen` carries a server-MINTED
@@ -297,8 +301,8 @@ fn page_plan(total: usize, page: usize, page_size: Option<std::num::NonZeroUsize
 /// Fail-closed per D12: each authoritative child is included only when it EXISTS at the CURRENT
 /// store state AND the agent holds `acl:Read` on it — both checked LIVE, never at the pinned
 /// snapshot, by [`LdpState::authorize_listing_member`] (the same planned WAC walk the read path
-/// uses, plus the current-existence guard that is prong 1 of the module doc's disclosure
-/// closure); a denial omits the child, a backend FAULT fails the request (never a
+/// uses, plus the current-existence + incarnation re-bind guard that is prong 1 of the module
+/// doc's disclosure closure); a denial omits the child, a backend FAULT fails the request (never a
 /// silently-shorter listing). A listed child whose metadata row is missing at the snapshot (a
 /// byte/index inconsistency window) is likewise omitted — `mediaType` is a MUST on data-resource
 /// members, so emitting a member we cannot describe would violate the shape. The filter runs over

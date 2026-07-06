@@ -57,6 +57,15 @@ use crate::notifications::{ActivityType, NotificationHub};
 use crate::store::{DeleteOutcome, Resource, ResourceMeta, Store};
 
 /// LDP/RDF vocabulary IRIs used to synthesise a container's `ldp:contains` representation.
+/// Decision-round bound for the LWS listing-member **incarnation re-bind loop**
+/// ([`LdpState::authorize_listing_member`]): each round is one plan → walk → confirm-plan
+/// authorization; a member whose plan keeps changing across this many consecutive rounds is
+/// OMITTED fail-closed (an unbindable Allow is never served, and a listing is never blocked by a
+/// single member under active churn). Steady state uses exactly one round; a single legitimate
+/// concurrent change (an ACL edit landing mid-walk) converges on the second. The value is a
+/// safety bound, not a tuning knob — it only decides how much churn we tolerate before omitting.
+const MEMBER_REBIND_ROUNDS: usize = 3;
+
 const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const LDP_RESOURCE_IRI: &str = "http://www.w3.org/ns/ldp#Resource";
 const LDP_CONTAINER_IRI: &str = "http://www.w3.org/ns/ldp#Container";
@@ -499,52 +508,68 @@ impl<S: Store> LdpState<S> {
     /// exactly the live planned walk — a fresh grant or revocation applies to the very next page
     /// request, pinned or not. The pin never freezes an ACL.
     ///
-    /// # The atomicity closure (the T0/T2 TOCTOU — invariant (1) enforced AT the decision)
-    /// (1) and (2) are TWO separate store observations, and their ORDER is load-bearing. The
-    /// first cut of this guard observed existence exactly ONCE, from the `read_plan`'s target row
-    /// (T0), BEFORE the walk — but the walk's own security core
-    /// (`read_acl_confirmed`) deliberately re-probes the found ACL LIVE at a LATER time (T2), so
-    /// ACL deletion is caught live. That ordering left a window (found by an independent
-    /// adversarial re-verify + codex): member + restrictive own-ACL both present at T0 (guard
-    /// passes), BOTH deleted at T1 ∈ (T0, T2), then the live own-ACL re-confirm at T2 finds it
-    /// gone and the walk falls back to the permissive ancestor `acl:default` — Allow — and the
-    /// deleted member's snapshot metadata leaks after all, reopening the very HIGH the guard
-    /// closed. The closure: existence is RE-CONFIRMED with a live probe (`Store::exists` — the
-    /// authoritative index check) strictly AFTER the ACL resolution completes (T3 > T2), and only
-    /// a positive Allow is gated on it. A member gone before the ACL confirm is still gone at the
-    /// re-confirm — absent recreation — so it can never ride the ancestor-default fallback; a
-    /// member deleted even later, inside (T2, T3), is likewise excluded (strictly safer).
-    /// Fail-closed: if existence cannot be re-confirmed at the point of the live ACL decision
-    /// (probe says absent), the member is OMITTED; a probe FAULT propagates and fails the whole
-    /// listing (D12), never a silently-shorter page. The plan-time (T0) target check is KEPT as a
-    /// cheap early-out — it saves the walk for members already known-gone and costs nothing (the
-    /// plan already carries the target row) — but it is no longer the security-carrying check.
+    /// # The incarnation re-bind (the T0/T2 TOCTOU **and** its delete+recreate variant — closed)
+    /// (1) and (2) are separate store observations, so their COMPOSITION is where every hole in
+    /// this guard has lived. The history (each found adversarially):
+    /// - **Plan-time-only existence:** existence was observed once, from the `read_plan` target
+    ///   row (T0), BEFORE the walk — but the walk's security core (`read_acl_confirmed`)
+    ///   re-probes the found ACL LIVE at a LATER T2, so a member + restrictive own-ACL both
+    ///   deleted inside (T0, T2) made the walk fall back to a permissive ancestor `acl:default`
+    ///   and the deleted member's snapshot metadata leaked (the independent re-verify + codex
+    ///   finding on the first cut).
+    /// - **Post-decision `exists` probe:** re-confirming bare existence at T3 > T2 closed the
+    ///   plain delete, but bound nothing about WHICH INCARNATION exists: a member deleted at T1
+    ///   and RECREATED under the SAME IRI at T2.5 ∈ (T2, T3) — with a restrictive own-ACL still
+    ///   denying the requester — answered the T3 probe `true` and rode the absent-incarnation
+    ///   fallback Allow anyway. That Allow held at NO instant at which the member existed: the
+    ///   old incarnation's ACL denied, the new one's denies, and the decision was computed over
+    ///   the absence interval in between (the round-4 residual this closes).
     ///
-    /// Accepted residual (documented, not closed): a member deleted AND RECREATED under the same
-    /// IRI passes (1) — including a recreation landing inside the (T2, T3) window — and (2)
-    /// evaluates the RECREATED resource's live ACL — so the pinned snapshot's metadata for the
-    /// OLD incarnation is disclosed to an agent the old own-ACL denied, if the new incarnation
-    /// grants them Read. Distinguishing incarnations needs a store-level resource identity the
-    /// index does not carry; the leak is bounded to the old version's size/modified/content-type
-    /// of an IRI whose CURRENT content the agent can read live anyway, and it requires the owner
-    /// to recreate the IRI with a weaker ACL inside the pin's short TTL + the backend's retention
-    /// window.
+    /// **The closure: a positive Allow is served only after the decision is RE-BOUND to a live
+    /// incarnation.** When the walk returns Allow, the member's FULL plan (target metadata +
+    /// every ACL-candidate row) is re-read strictly AFTER the decision, and the Allow is served
+    /// only if that confirm plan is IDENTICAL to the plan the decision consumed; on any
+    /// difference the loop re-runs the whole authorization against the FRESH plan (bounded by
+    /// [`MEMBER_REBIND_ROUNDS`], then fail-closed omit). Identity is exact
+    /// [`crate::store::ReadPlan`] equality, and the target's [`crate::store::ResourceMeta`]
+    /// includes the **per-write-unique `blob_key`** (minted from OS entropy on EVERY write — the
+    /// store's no-two-writes-share-a-key invariant), so ANY recreate — even byte-identical, even
+    /// landing inside the old (T2, T3) window — is a visible incarnation change: the confirm plan
+    /// differs, the walk re-runs, and the RECREATED incarnation's own ACL governs (restrictive ⇒
+    /// deny ⇒ omit). Plan equality also brackets the walk's live confirm probes: every row the
+    /// decision consumed was observed unchanged both before AND after the walk, so a served Allow
+    /// is a decision about an ACL state that held WHILE that exact incarnation existed — never
+    /// about an absence interval.
+    ///
+    /// What deliberately remains (and is NOT this finding): a pure ACL EDIT on a
+    /// continuously-existing member between the served decision and the response bytes is the
+    /// intrinsic authorize-then-serve window every live-ACL evaluation has (the
+    /// [`crate::lws::container`] module doc's "authorization stays LIVE" bound) — at the decision
+    /// instant the member existed and its then-current ACL genuinely granted. Likewise an ACL
+    /// delete+recreate with byte-identical content (ACL plan rows carry content-derived etags) is
+    /// decision-equivalent by construction: identical bytes ⇒ identical grants ⇒ no outcome can
+    /// differ. Fail-closed everywhere: a member absent at ANY plan (initial or confirm) is
+    /// omitted; a world that will not hold still across [`MEMBER_REBIND_ROUNDS`] decision rounds
+    /// is omitted (an unbindable decision is never served); a probe FAULT propagates and fails
+    /// the whole listing (D12), never a silently-shorter page.
     ///
     /// # Mechanics
     /// ONE combined `read_plan` round-trip with the MEMBER in the plan's TARGET slot (the read
     /// path's `authorize_read` shape, NOT the write path's candidate-0 slot): the same query
-    /// returns the member's plan-time existence and every ACL candidate row, so the early-out
-    /// costs no extra backend round-trip. The atomicity re-confirm adds ONE live `exists` probe —
-    /// only for members the walk actually ALLOWS (denied members are omitted without it), the
-    /// price of coupling the existence observation to the live ACL decision. The write path's
-    /// fault-oracle rationale for avoiding the raw target row does not apply here — a backend
-    /// fault on ANY row fails the whole LISTING request (D12's fail-closed-on-faults: never a
-    /// silently-shorter listing), which is the documented behaviour, not an oracle. The guard
-    /// runs for UNPINNED listings too: their snapshot is the current state modulo an
-    /// intra-request race, and excluding a member deleted inside that sliver is strictly safer —
-    /// one uniform invariant, no pinned/unpinned fork. A nonexistent member maps to
-    /// [`Decision::Forbidden`] purely as "not disclosable"; the caller omits it exactly like a
-    /// WAC denial (no distinguishable surface).
+    /// returns the member's plan-time existence and every ACL candidate row, so the absent
+    /// early-out costs no extra backend round-trip. The re-bind adds ONE further `read_plan`
+    /// round-trip — only for members the walk actually ALLOWS (a denial returns without it, so a
+    /// denied member's cost is unchanged) — replacing the bare `exists` probe with a probe that
+    /// carries existence AND incarnation identity AND the ACL-chain state in one observation.
+    /// Steady state (no churn) is exactly one iteration: plan → walk → confirm-plan (equal) →
+    /// serve. The write path's fault-oracle rationale for avoiding the raw target row does not
+    /// apply here — a backend fault on ANY row fails the whole LISTING request (D12's
+    /// fail-closed-on-faults: never a silently-shorter listing), which is the documented
+    /// behaviour, not an oracle. The guard runs for UNPINNED listings too: their snapshot is the
+    /// current state modulo an intra-request race, and excluding a member churned inside that
+    /// sliver is strictly safer — one uniform invariant, no pinned/unpinned fork. A nonexistent
+    /// member maps to [`Decision::Forbidden`] purely as "not disclosable"; the caller omits it
+    /// exactly like a WAC denial (no distinguishable surface).
     pub(crate) async fn authorize_listing_member(
         &self,
         member_iri: &str,
@@ -562,36 +587,57 @@ impl<S: Store> LdpState<S> {
         let wac = WacAuthorizer::with_cache(&self.store, &self.base_url, &self.acl_cache);
         let candidates = wac.read_plan_candidates(member_iri);
         let acl_iris: Vec<String> = candidates.iter().map(|c| c.acl.clone()).collect();
-        let plan = self.store.read_plan(member_iri, &acl_iris).await?;
-        // Plan-time (T0) existence early-out — invariant (1)'s cheap first half: a member already
-        // absent at plan time is not disclosable no matter what the ancestor-`acl:default`
-        // fallback would grant, and skipping the walk costs nothing (the plan carries the target
-        // row). NOT the security-carrying check — that is the post-decision re-confirm below
-        // (see "The atomicity closure" in the doc).
-        if plan.target.is_none() {
-            return Ok(Decision::Forbidden);
+        // The incarnation re-bind loop (see the doc): each round is plan → walk → confirm-plan.
+        // A denial returns immediately (fail-closed direction — omitting is always safe, and it
+        // preserves live revocation + the 401-vs-403 split untouched). A positive Allow is served
+        // ONLY when the confirm plan — read strictly AFTER the decision — is IDENTICAL to the
+        // plan the decision consumed, which re-binds the decision to a live incarnation: the
+        // target's `ResourceMeta` carries the per-write-unique `blob_key`, so ANY delete+recreate
+        // under the same IRI (the round-4 residual) shows as a plan change, and the next round
+        // re-walks against the RECREATED incarnation's own ACL rows. Every probe fault
+        // propagates (fails the whole listing per D12 — never a silently-shorter page).
+        let mut plan = self.store.read_plan(member_iri, &acl_iris).await?;
+        for _ in 0..MEMBER_REBIND_ROUNDS {
+            // Existence gate on the CURRENT plan: a member absent at plan time is not disclosable
+            // no matter what the ancestor-`acl:default` fallback would grant (fail-closed omit).
+            if plan.target.is_none() {
+                return Ok(Decision::Forbidden);
+            }
+            let decision = wac
+                .authorize_planned(
+                    required,
+                    token.web_id.as_deref(),
+                    origin,
+                    &candidates,
+                    &plan.acls,
+                )
+                .await?;
+            if !matches!(decision, Decision::Allow(_)) {
+                return Ok(decision);
+            }
+            // The re-bind confirm: re-read the member's FULL plan (existence + incarnation
+            // identity + the ACL-chain rows, one combined round-trip) strictly AFTER the ACL
+            // resolution (and its live `read_acl_confirmed` re-probes) completed.
+            let confirm = self.store.read_plan(member_iri, &acl_iris).await?;
+            if confirm.target.is_none() {
+                // Deleted since the decision (plain-delete race): the vanished member can never
+                // be authorized via the ancestor-default fallback — fail-closed omit.
+                return Ok(Decision::Forbidden);
+            }
+            if confirm == plan {
+                // The world the decision consumed was observed unchanged on BOTH sides of the
+                // walk: the Allow is bound to an ACL state that held while this exact
+                // incarnation existed. Serve it.
+                return Ok(decision);
+            }
+            // The member's world moved under the decision (a delete+recreate, an ACL-chain
+            // change): the Allow is NOT bound to any live incarnation. Re-run the whole
+            // authorization against the fresh observation.
+            plan = confirm;
         }
-        let decision = wac
-            .authorize_planned(
-                required,
-                token.web_id.as_deref(),
-                origin,
-                &candidates,
-                &plan.acls,
-            )
-            .await?;
-        // The atomicity closure (the T0/T2 TOCTOU — see the doc): re-confirm the member's
-        // existence with a LIVE probe strictly AFTER the ACL resolution (and its live
-        // `read_acl_confirmed` re-probe, T2) completed. A member deleted between the plan and the
-        // ACL confirm — whose vanished own-ACL made the walk fall back to a permissive ancestor
-        // `acl:default` — is gone at this re-confirm too, so it can NEVER be authorized via that
-        // fallback. Fail-closed: gate only a positive Allow (denials already omit), map an absent
-        // member to Forbidden (omit), and PROPAGATE a probe fault (fails the whole listing per
-        // D12 — never a silently-shorter page).
-        if matches!(decision, Decision::Allow(_)) && !self.store.exists(member_iri).await? {
-            return Ok(Decision::Forbidden);
-        }
-        Ok(decision)
+        // The member's world would not hold still across the bounded rounds: an unbindable
+        // decision is never served — fail-closed omit (not a fault: the listing itself proceeds).
+        Ok(Decision::Forbidden)
     }
 
     /// WAC container-modification authorization for a CREATE (the missing half of the WAC create rule).

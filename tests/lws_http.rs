@@ -2425,19 +2425,30 @@ async fn pinned_listing_never_discloses_a_member_deleted_since_the_snapshot() {
     );
 }
 
-/// The RACE-MODELLING store double for the T0/T2 TOCTOU regression (the atomicity closure in
-/// `LdpState::authorize_listing_member`): delegates everything to the shared composite store,
-/// except that the FIRST `read_plan` targeting `victim` returns the CURRENT (pre-delete) rows and
-/// then IMMEDIATELY deletes the victim + its own `.acl` from the inner store — so the member is
-/// PRESENT at plan time (T0) and GONE by the time the planned walk's LIVE ACL re-confirm
-/// (`read_acl_confirmed`, T2) and the post-decision existence re-confirm (T3) run. This is the
-/// deterministic model of "member deleted BETWEEN the initial `read_plan` and the live ACL
-/// confirmation" — the interleaving that reopened the deleted-member disclosure HIGH.
+/// The RACE-MODELLING store double for the listing-member TOCTOU regressions (the incarnation
+/// re-bind in `LdpState::authorize_listing_member`): delegates everything to the shared composite
+/// store, except that the FIRST `read_plan` targeting `victim` returns the CURRENT (pre-delete)
+/// rows and then IMMEDIATELY deletes the victim + its own `.acl` from the inner store — so the
+/// member is PRESENT at plan time (T0) and GONE by the time the planned walk's LIVE ACL
+/// re-confirm (`read_acl_confirmed`, T2) and every later probe run. This is the deterministic
+/// model of "member deleted BETWEEN the initial `read_plan` and the live ACL confirmation" — the
+/// interleaving that reopened the deleted-member disclosure HIGH.
+///
+/// The OPTIONAL second act (`recreate_acl: Some(_)`) models the delete + same-IRI RECREATE race
+/// (round 4 — the residual an independent re-verify + codex found in the exists-probe closure):
+/// the first live `meta` probe of the deleted victim's own `.acl` that observes it ABSENT is, by
+/// construction, the walk's `read_acl_confirmed` (T2) — the double then IMMEDIATELY recreates the
+/// victim under the SAME IRI with `recreate_acl` as its (still-restrictive) own ACL (T2.5), so a
+/// later bare existence probe (the OLD T3 guard) answers `true` for a DIFFERENT incarnation than
+/// the one the ACL decision was computed against.
 struct RaceDeletingStore {
     inner: Arc<TestStore>,
     victim: String,
     victim_parent: String,
     fired: std::sync::atomic::AtomicBool,
+    /// `Some(acl-body)` ⇒ the recreate arm is armed (see the struct doc's second act).
+    recreate_acl: Option<String>,
+    recreated: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -2452,7 +2463,33 @@ impl Store for RaceDeletingStore {
         &self,
         iri: &str,
     ) -> solid_server_rs::ServerResult<Option<solid_server_rs::store::ResourceMeta>> {
-        self.inner.meta(iri).await
+        let out = self.inner.meta(iri).await;
+        // T2.5 — the recreate arm: the walk's live own-ACL re-confirm (T2) has just observed the
+        // deleted victim's `.acl` as ABSENT; recreate the victim (a NEW incarnation, same IRI)
+        // with a restrictive own ACL BEFORE any later probe runs. One-shot.
+        if let Some(acl_body) = &self.recreate_acl {
+            if self.fired.load(std::sync::atomic::Ordering::SeqCst)
+                && iri == format!("{}.acl", self.victim)
+                && matches!(out, Ok(None))
+                && !self
+                    .recreated
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.inner
+                    .write(&self.victim, Bytes::from("recreated"), "text/plain")
+                    .await
+                    .expect("race recreate: member");
+                self.inner
+                    .write(
+                        &format!("{}.acl", self.victim),
+                        Bytes::from(acl_body.clone()),
+                        "text/turtle",
+                    )
+                    .await
+                    .expect("race recreate: own acl");
+            }
+        }
+        out
     }
     async fn exists(&self, iri: &str) -> solid_server_rs::ServerResult<bool> {
         self.inner.exists(iri).await
@@ -2501,8 +2538,9 @@ impl Store for RaceDeletingStore {
         let plan = self.inner.read_plan(target, acl_candidates).await?;
         if target == self.victim && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
             // …then T1 — the race: the member AND its own ACL vanish AFTER the plan observed
-            // them and BEFORE any LATER live probe (the walk's ACL re-confirm, the existence
-            // re-confirm) runs.
+            // them and BEFORE any LATER live probe (the walk's ACL re-confirm, the re-bind
+            // confirm plan) runs. Only the FIRST victim-targeted plan races: subsequent
+            // `read_plan`s (the re-bind confirm, later rounds) observe the true store.
             self.inner
                 .delete(&self.victim, Some(&self.victim_parent))
                 .await
@@ -2548,8 +2586,14 @@ impl Store for RaceDeletingStore {
 impl Harness {
     /// A RACE harness: LWS on, single-page, the store wrapped in [`RaceDeletingStore`] so
     /// `victim` (+ its own `.acl`) is deleted between the listing member's `read_plan` (T0) and
-    /// the walk's live ACL re-confirm (T2).
-    async fn lws_racing(victim: &str, victim_parent: &str) -> Self {
+    /// the walk's live ACL re-confirm (T2). `recreate_acl: Some(_)` arms the double's second
+    /// act — the victim is RECREATED under the same IRI (with that own-ACL body) immediately
+    /// after the T2 re-confirm observed its `.acl` absent (the delete+recreate race).
+    async fn lws_racing(
+        victim: &str,
+        victim_parent: &str,
+        recreate_acl: Option<String>,
+    ) -> Self {
         let issuer_key = KeyKit::generate();
         let client_key = KeyKit::generate();
         let config = VerifierConfig::new(vec![common::ISSUER.to_string()], BASE_URL);
@@ -2567,6 +2611,8 @@ impl Harness {
                 victim: victim.to_string(),
                 victim_parent: victim_parent.to_string(),
                 fired: std::sync::atomic::AtomicBool::new(false),
+                recreate_acl,
+                recreated: std::sync::atomic::AtomicBool::new(false),
             },
             BASE_URL,
         );
@@ -2592,16 +2638,18 @@ async fn member_deleted_between_read_plan_and_live_acl_confirm_is_not_disclosed(
     // plan's target row is Some, the guard passes; (T1) member + own-ACL both DELETED; (T2) the
     // live own-ACL re-confirm finds it gone → the walk falls back to the root's PERMISSIVE
     // `acl:default` → Allow → the deleted member's snapshot metadata is disclosed to Alice, whom
-    // the own-ACL denied. The fix re-confirms existence LIVE strictly AFTER the ACL resolution
-    // (T3 > T2), so the vanished member can never ride the ancestor-default fallback.
+    // the own-ACL denied. The fix re-binds the decision strictly AFTER the ACL resolution: the
+    // confirm re-plan finds the member's target row gone (existence is part of the confirm), so
+    // the vanished member can never ride the ancestor-default fallback.
     //
-    // MUTATION CHECK (verified by construction): with the post-decision existence re-confirm in
+    // MUTATION CHECK (verified by construction): with the post-decision re-bind confirm in
     // `LdpState::authorize_listing_member` removed, this test FAILS — the listing includes
     // secret.txt (totalItems 2) via the ancestor `acl:default` fallback, reproducing the
     // disclosure. The T0 guard alone CANNOT catch it: the race double serves the pre-delete plan.
     let h = Harness::lws_racing(
         "https://pod.example/notes/secret.txt",
         "https://pod.example/notes/",
+        None,
     )
     .await;
     for name in ["a.txt", "secret.txt"] {
@@ -2637,8 +2685,8 @@ async fn member_deleted_between_read_plan_and_live_acl_confirm_is_not_disclosed(
 
     // Alice lists /notes/. The snapshot captures BOTH members (secret still exists); secret's
     // per-member authorization then races: plan-present at T0, deleted (with its ACL) at T1,
-    // live ACL confirm at T2 falls back to the permissive root default. The atomic existence
-    // re-confirm must exclude it — never disclose the deleted member's IRI or metadata.
+    // live ACL confirm at T2 falls back to the permissive root default. The re-bind confirm plan
+    // must exclude it — never disclose the deleted member's IRI or metadata.
     let resp = h
         .request_with("GET", "/notes/", None, &[("accept", LWS_JSON)], Body::empty())
         .await;
@@ -2663,6 +2711,110 @@ async fn member_deleted_between_read_plan_and_live_acl_confirm_is_not_disclosed(
 
     // …and the race is one-shot: a fresh listing (member genuinely gone throughout) is identical —
     // no over-exclusion, no error.
+    let resp = h
+        .request_with("GET", "/notes/", None, &[("accept", LWS_JSON)], Body::empty())
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let doc = body_json(resp).await;
+    assert_eq!(doc["totalItems"], 1);
+}
+
+#[tokio::test]
+async fn member_deleted_and_recreated_in_the_decision_window_is_not_disclosed() {
+    // THE DELETE + SAME-IRI RECREATE race (round 4 — the residual an independent adversarial
+    // re-verify + codex found in the exists-probe closure): (T0) `/notes/secret.txt` + its
+    // restrictive Bob-only own-ACL both present — the plan observes them; (T1) member + own-ACL
+    // DELETED; (T2) the walk's live own-ACL re-confirm finds it gone → the walk falls back to the
+    // root's PERMISSIVE `acl:default` → Allow, a decision computed while the member was ABSENT;
+    // (T2.5) the member is RECREATED under the SAME IRI with a restrictive own-ACL that STILL
+    // denies Alice; (T3) a bare existence probe now answers `true` — for a DIFFERENT incarnation
+    // than the one the Allow was bound to. The OLD guard (`Allow && exists`) served the pinned
+    // snapshot's metadata to Alice, whom BOTH the old AND the recreated own-ACL deny — the
+    // invariant "disclosed only if it exists AND live WAC grants Read on it" held at NO instant.
+    //
+    // The fix RE-BINDS the decision to the live incarnation: a positive Allow is served only when
+    // a SECOND full `read_plan`, taken strictly AFTER the decision, is IDENTICAL to the one the
+    // decision consumed (`ResourceMeta` carries the per-write-unique `blob_key`, so ANY recreate
+    // is a visible incarnation change). Here the confirm plan differs → the walk re-runs on the
+    // RECREATED incarnation's rows → its restrictive own-ACL denies Alice → the member is
+    // EXCLUDED.
+    //
+    // MUTATION CHECK (run against the pre-fix guard — `matches!(decision, Allow) &&
+    // !store.exists(member)` with no re-bind): this test FAILS — the listing includes secret.txt
+    // (totalItems 2) via the ancestor `acl:default` fallback, reproducing the disclosure. The
+    // recreate makes the bare T3 existence probe TRUE, so only the incarnation re-bind catches it.
+    const SECRET: &str = "https://pod.example/notes/secret.txt";
+    const BOB: &str = "https://pod.example/bob/profile/card#me";
+    // The recreated incarnation's own ACL: Bob only — Alice (the requester) is STILL denied.
+    let recreated_acl = format!(
+        r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#bob> a acl:Authorization;
+       acl:agent <{BOB}>;
+       acl:accessTo <{SECRET}>;
+       acl:mode acl:Read, acl:Write."#
+    );
+    let h = Harness::lws_racing(
+        SECRET,
+        "https://pod.example/notes/",
+        Some(recreated_acl.clone()),
+    )
+    .await;
+    for name in ["a.txt", "secret.txt"] {
+        let put = h
+            .request(
+                "PUT",
+                &format!("/notes/{name}"),
+                Some("text/plain"),
+                Body::from("x"),
+            )
+            .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+    }
+    // The ORIGINAL incarnation's restrictive own ACL (same shape): Alice denied at T0 too.
+    h.store
+        .write(
+            &format!("{SECRET}.acl"),
+            Bytes::from(recreated_acl),
+            "text/turtle",
+        )
+        .await
+        .expect("seed the secret's own ACL");
+
+    // Alice lists /notes/. The snapshot captures BOTH members; secret's per-member authorization
+    // then races through delete (T1) → fallback-Allow (T2) → recreate (T2.5). The re-bound
+    // authorization must exclude it — never disclose the OLD incarnation's metadata.
+    let resp = h
+        .request_with("GET", "/notes/", None, &[("accept", LWS_JSON)], Body::empty())
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        doc["totalItems"], 1,
+        "the deleted-and-recreated member must not join the visible count"
+    );
+    assert_eq!(
+        item_ids(&doc),
+        vec!["https://pod.example/notes/a.txt".to_string()],
+        "only the untouched member is visible"
+    );
+    assert!(
+        !body.contains("secret"),
+        "REGRESSION (delete+recreate TOCTOU): a member recreated under the same IRI inside the \
+         decision window must be EXCLUDED — the absent-incarnation fallback Allow must never be \
+         served against the recreated incarnation's existence"
+    );
+    // The race genuinely fired: the recreated incarnation EXISTS at the current store state —
+    // i.e. the OLD bare existence probe would have answered `true` and served the leak.
+    assert!(
+        h.store.exists(SECRET).await.expect("exists probe"),
+        "test-model check: the recreate must have landed (else this exercises the plain-delete \
+         race, not the recreate residual)"
+    );
+
+    // No over-exclusion and no error afterwards: a fresh listing re-lists the untouched member
+    // (the recreated victim carries no containment edge — `write` restores the record, not the
+    // membership — so only a.txt is authoritative membership either way).
     let resp = h
         .request_with("GET", "/notes/", None, &[("accept", LWS_JSON)], Body::empty())
         .await;
