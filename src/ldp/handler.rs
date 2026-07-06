@@ -450,8 +450,6 @@ impl<S: Store> LdpState<S> {
     /// `VALUES` set is exactly the candidate ACLs (the slot IRI is already candidate 0 — no extra
     /// row on the wire), its target row is ignored, and an ACL-probe fault still fails the plan
     /// (fail-closed) exactly as the sequential walk's ACL probes did.
-    /// `pub(crate)` so the LWS container renderer ([`crate::lws::container`]) can run the SAME
-    /// per-member fail-closed read check (D12) the read path uses — never a parallel ACL walk.
     pub(crate) async fn authorize_planned_iri(
         &self,
         target_iri: &str,
@@ -464,6 +462,88 @@ impl<S: Store> LdpState<S> {
         let acl_iris: Vec<String> = candidates.iter().map(|c| c.acl.clone()).collect();
         // candidates[0] always exists (the chain starts at the protected resource's own ACL).
         let plan = self.store.read_plan(&acl_iris[0], &acl_iris).await?;
+        wac.authorize_planned(
+            required,
+            token.web_id.as_deref(),
+            origin,
+            &candidates,
+            &plan.acls,
+        )
+        .await
+    }
+
+    /// The LWS container-listing MEMBER disclosure check (D12 — [`crate::lws::container`]): may
+    /// this snapshot member be shown to the requester? The SAME planned WAC read walk the read
+    /// path uses (never a parallel ACL implementation), PLUS the **current-existence guard** —
+    /// prong 1 of the pinned-listing metadata-disclosure closure.
+    ///
+    /// # THE INVARIANT (metadata non-disclosure across snapshot pins)
+    /// A listing member is disclosed ONLY when BOTH hold at REQUEST time — live, never at the
+    /// pinned snapshot:
+    /// 1. the member EXISTS at the CURRENT store state, and
+    /// 2. live WAC grants the requester the read mode on it.
+    ///
+    /// (1) is load-bearing for pinned (`lws-gen`) walks. A pinned listing serves MEMBERSHIP +
+    /// METADATA from a PAST snapshot while authorization deliberately stays LIVE (revocation must
+    /// apply immediately). For a member DELETED since that snapshot — its own `.acl` gone with
+    /// it — the live ACL walk finds no own-ACL and falls back to an ancestor's `acl:default`
+    /// grant, which may be MORE permissive than the deleted member's own ACL was: without this
+    /// guard, an agent that member's own ACL DENIED at the snapshot would be handed its IRI +
+    /// content-type + size + modified out of the pin (the adversarial-verify HIGH this closes).
+    /// An `acl:default` grant states what a member WOULD inherit; it must never retroactively
+    /// authorize disclosure of a member that no longer exists to inherit it. So a member with no
+    /// current index record is EXCLUDED (fail-closed omit), regardless of what the fallback walk
+    /// would grant.
+    ///
+    /// (2) preserves the deliberate design for STILL-EXISTING members: their ACL evaluation is
+    /// exactly the live planned walk — a fresh grant or revocation applies to the very next page
+    /// request, pinned or not. The pin never freezes an ACL.
+    ///
+    /// Accepted residual (documented, not closed): a member deleted AND RECREATED under the same
+    /// IRI passes (1), and (2) evaluates the RECREATED resource's live ACL — so the pinned
+    /// snapshot's metadata for the OLD incarnation is disclosed to an agent the old own-ACL
+    /// denied, if the new incarnation grants them Read. Distinguishing incarnations needs a
+    /// store-level resource identity the index does not carry; the leak is bounded to the old
+    /// version's size/modified/content-type of an IRI whose CURRENT content the agent can read
+    /// live anyway, and it requires the owner to recreate the IRI with a weaker ACL inside the
+    /// pin's short TTL + the backend's retention window.
+    ///
+    /// # Mechanics
+    /// ONE combined `read_plan` round-trip with the MEMBER in the plan's TARGET slot (the read
+    /// path's `authorize_read` shape, NOT the write path's candidate-0 slot): the same query
+    /// returns the member's current existence and every ACL candidate row, so the guard costs no
+    /// extra backend round-trip. The write path's fault-oracle rationale for avoiding the raw
+    /// target row does not apply here — a backend fault on ANY row fails the whole LISTING
+    /// request (D12's fail-closed-on-faults: never a silently-shorter listing), which is the
+    /// documented behaviour, not an oracle. The guard runs for UNPINNED listings too: their
+    /// snapshot is the current state modulo an intra-request race, and excluding a member deleted
+    /// inside that sliver is strictly safer — one uniform invariant, no pinned/unpinned fork.
+    /// A nonexistent member maps to [`Decision::Forbidden`] purely as "not disclosable"; the
+    /// caller omits it exactly like a WAC denial (no distinguishable surface).
+    pub(crate) async fn authorize_listing_member(
+        &self,
+        member_iri: &str,
+        token: &VerifiedToken,
+        origin: Option<&str>,
+    ) -> Result<Decision, ServerError> {
+        // The read mode, with the `.acl`→Control override, exactly as `authorize_read` derives it
+        // (an `.acl` never appears as a contained member on the write path, but a store-level row
+        // must still not downgrade Control to Read — belt and braces).
+        let required = if crate::authz::is_acl_resource(member_iri) {
+            AccessMode::Control
+        } else {
+            AccessMode::Read
+        };
+        let wac = WacAuthorizer::with_cache(&self.store, &self.base_url, &self.acl_cache);
+        let candidates = wac.read_plan_candidates(member_iri);
+        let acl_iris: Vec<String> = candidates.iter().map(|c| c.acl.clone()).collect();
+        let plan = self.store.read_plan(member_iri, &acl_iris).await?;
+        // The current-existence guard — invariant (1) above. Checked BEFORE the ACL walk: a
+        // member that does not exist at the current state is not disclosable no matter what the
+        // ancestor-`acl:default` fallback would grant.
+        if plan.target.is_none() {
+            return Ok(Decision::Forbidden);
+        }
         wac.authorize_planned(
             required,
             token.web_id.as_deref(),
@@ -805,14 +885,14 @@ pub(crate) async fn serve_read<S: Store>(
             // design + its honest bounds are documented in `lws::container`). Its representation
             // ETag derives from the rendered PAGE bytes exactly like the LDP listing's, so the
             // 304/Vary machinery below applies unchanged (each page carries its own validator).
-            let (page, pin) = crate::lws::container::page_from_query(uri.query())?;
+            let (page, raw_pin) = crate::lws::container::page_from_query(uri.query())?;
             let listing = crate::lws::container::render(
                 state,
                 &target,
                 token,
                 origin,
                 page,
-                pin,
+                raw_pin.as_deref(),
                 state.lws().and_then(|l| l.page_size),
             )
             .await?;

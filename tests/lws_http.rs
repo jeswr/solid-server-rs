@@ -67,6 +67,9 @@ struct Harness {
     issuer_key: KeyKit,
     client_key: KeyKit,
     store: Arc<TestStore>,
+    /// The [`PinningStore`] snapshot state, when the harness was built generation-capable
+    /// (`lws_pinned`) — lets a test age a snapshot out of the "backend" retention window.
+    pins: Option<Arc<std::sync::Mutex<PinState>>>,
 }
 
 /// A `Store` view over the shared `Arc` so the harness can BOTH hand the store to `LdpState` and
@@ -177,6 +180,7 @@ impl Harness {
             issuer_key,
             client_key,
             store,
+            pins: None,
         }
     }
 
@@ -1893,9 +1897,15 @@ async fn lws_listing_paginates_deterministically_with_rfc8288_links() {
 async fn lws_gen_pin_is_honest_against_a_generation_less_backend() {
     // The snapshot-pin surface (sparq#1572 → sparq PR #1584) over a backend with NO generation
     // concept (this harness's in-memory store — same posture as the embedded engine or a
-    // pre-#1584 sparq): (a) no pinned links are ever MINTED, and (b) a hand-crafted pin is a 410
-    // `snapshot-gone` problem (the fail-closed honesty contract: the server never silently serves
-    // a DIFFERENT snapshot under a pinned URI), while (c) an unusable token is a 400.
+    // pre-#1584 sparq): (a) no pinned links are ever MINTED, and (b)+(c) ANY hand-crafted pin —
+    // a bare generation integer and garbage alike — is the opaque 400 `invalid-generation`
+    // problem, refused at the token-verification chokepoint BEFORE the backend is consulted
+    // (prong 2 of `lws::container`'s disclosure closure: only a pin this server minted is ever
+    // forwarded — the fail-closed honesty contract still holds: the server never silently serves
+    // a DIFFERENT snapshot under a pinned URI). The 410 `snapshot-gone` restart now requires a
+    // GENUINE minted token (expired TTL / backend-aged-out generation) and is pinned by
+    // `an_expired_pin_is_the_410_snapshot_gone_restart` +
+    // `a_verified_pin_the_backend_aged_out_is_410_snapshot_gone`.
     let h = Harness::lws_paged(2).await;
     for name in ["a.txt", "b.txt", "c.txt"] {
         let put = h
@@ -1928,43 +1938,31 @@ async fn lws_gen_pin_is_honest_against_a_generation_less_backend() {
         link_values(&p1)
     );
 
-    // (b) A pin this backend cannot honour: 410 snapshot-gone, with problem details.
-    let pinned = h
-        .request_with(
-            "GET",
-            "/alice/notes/?lws-page=2&lws-gen=7",
-            None,
-            &[("accept", LWS_JSON)],
-            Body::empty(),
-        )
-        .await;
-    assert_eq!(pinned.status(), StatusCode::GONE);
-    assert_eq!(
-        header_value(&pinned, "content-type").unwrap(),
-        "application/problem+json"
-    );
-    let problem = body_json(pinned).await;
-    assert_eq!(
-        problem["type"],
-        "https://w3id.org/jeswr/lws/problems/snapshot-gone"
-    );
-
-    // (c) An unusable generation token is a 400 problem (opaque — only server-minted links count).
-    let bad = h
-        .request_with(
-            "GET",
-            "/alice/notes/?lws-gen=abc",
-            None,
-            &[("accept", LWS_JSON)],
-            Body::empty(),
-        )
-        .await;
-    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
-    let problem = body_json(bad).await;
-    assert_eq!(
-        problem["type"],
-        "https://w3id.org/jeswr/lws/problems/invalid-generation"
-    );
+    // (b)+(c) A hand-crafted pin — bare-integer or garbage — is the SAME opaque 400
+    // `invalid-generation` problem (unminted; the backend is never consulted, so this backend
+    // that could not honour a pin is never asked to).
+    for forged in ["lws-page=2&lws-gen=7", "lws-gen=abc"] {
+        let bad = h
+            .request_with(
+                "GET",
+                &format!("/alice/notes/?{forged}"),
+                None,
+                &[("accept", LWS_JSON)],
+                Body::empty(),
+            )
+            .await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST, "{forged}");
+        assert_eq!(
+            header_value(&bad, "content-type").unwrap(),
+            "application/problem+json"
+        );
+        let problem = body_json(bad).await;
+        assert_eq!(
+            problem["type"],
+            "https://w3id.org/jeswr/lws/problems/invalid-generation",
+            "{forged}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2071,5 +2069,543 @@ async fn flag_off_ignores_linkset_and_page_queries_byte_identically() {
     assert!(
         link_values(&put).is_empty(),
         "flag-off 201 carries no Link headers"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pinned listings × live WAC — the deleted-member metadata-disclosure closure (two prongs; see
+// `src/lws/container.rs`'s module doc and `LdpState::authorize_listing_member`)
+// ---------------------------------------------------------------------------------------------
+
+/// The snapshot ledger behind [`PinningStore`]: (container, generation) → the members served at
+/// that generation. Exposed on [`Harness::pins`] so a test can age a snapshot out (the backend
+/// retention window).
+#[derive(Default)]
+struct PinState {
+    next_gen: u64,
+    snaps: std::collections::HashMap<
+        (String, u64),
+        Vec<(
+            solid_server_rs::store::ValidatedChildIri,
+            solid_server_rs::store::ResourceMeta,
+        )>,
+    >,
+}
+
+/// A GENERATION-CAPABLE store double modelling sparq PR #1584's snapshot surface at the `Store`
+/// seam (the in-memory backend has no generation concept): an UNPINNED listing captures the
+/// current members under a fresh monotonic generation and advertises it; a PINNED listing replays
+/// the captured snapshot EXACTLY, or fails with the 410 `snapshot-gone` problem for a generation
+/// it no longer holds — never a silent substitute. Every other method delegates to the shared
+/// composite store, so authorization/`read_plan` always see the CURRENT state (exactly the live
+/// posture the disclosure regression depends on).
+struct PinningStore {
+    inner: Arc<TestStore>,
+    state: Arc<std::sync::Mutex<PinState>>,
+}
+
+#[async_trait::async_trait]
+impl Store for PinningStore {
+    async fn read(
+        &self,
+        iri: &str,
+    ) -> solid_server_rs::ServerResult<solid_server_rs::store::Resource> {
+        self.inner.read(iri).await
+    }
+    async fn meta(
+        &self,
+        iri: &str,
+    ) -> solid_server_rs::ServerResult<Option<solid_server_rs::store::ResourceMeta>> {
+        self.inner.meta(iri).await
+    }
+    async fn exists(&self, iri: &str) -> solid_server_rs::ServerResult<bool> {
+        self.inner.exists(iri).await
+    }
+    async fn write(
+        &self,
+        iri: &str,
+        body: Bytes,
+        content_type: &str,
+    ) -> solid_server_rs::ServerResult<solid_server_rs::store::ResourceMeta> {
+        self.inner.write(iri, body, content_type).await
+    }
+    async fn create_in_container(
+        &self,
+        container: &str,
+        child: &str,
+        body: Bytes,
+        content_type: &str,
+    ) -> solid_server_rs::ServerResult<solid_server_rs::store::ResourceMeta> {
+        self.inner
+            .create_in_container(container, child, body, content_type)
+            .await
+    }
+    async fn delete(&self, iri: &str, parent: Option<&str>) -> solid_server_rs::ServerResult<()> {
+        self.inner.delete(iri, parent).await
+    }
+    async fn delete_container_if_empty(
+        &self,
+        iri: &str,
+        parent: Option<&str>,
+    ) -> solid_server_rs::ServerResult<solid_server_rs::store::DeleteOutcome> {
+        self.inner.delete_container_if_empty(iri, parent).await
+    }
+    async fn list_children(
+        &self,
+        container: &str,
+    ) -> solid_server_rs::ServerResult<Vec<solid_server_rs::store::ValidatedChildIri>> {
+        self.inner.list_children(container).await
+    }
+    async fn read_plan(
+        &self,
+        target: &str,
+        acl_candidates: &[String],
+    ) -> solid_server_rs::ServerResult<solid_server_rs::store::ReadPlan> {
+        // ALWAYS the current state — never the snapshot. This is the seam the current-existence
+        // guard + the live WAC walk read through.
+        self.inner.read_plan(target, acl_candidates).await
+    }
+    async fn read_at(
+        &self,
+        iri: &str,
+        meta: &solid_server_rs::store::ResourceMeta,
+    ) -> solid_server_rs::ServerResult<Bytes> {
+        self.inner.read_at(iri, meta).await
+    }
+    async fn get_linkset(
+        &self,
+        iri: &str,
+    ) -> solid_server_rs::ServerResult<Option<(String, String)>> {
+        self.inner.get_linkset(iri).await
+    }
+    async fn set_linkset(
+        &self,
+        iri: &str,
+        json: &str,
+        new_rev: &str,
+        expected: solid_server_rs::store::LinksetCas<'_>,
+    ) -> solid_server_rs::ServerResult<bool> {
+        self.inner.set_linkset(iri, json, new_rev, expected).await
+    }
+    async fn list_children_snapshot(
+        &self,
+        container: &str,
+        pin: Option<u64>,
+    ) -> solid_server_rs::ServerResult<solid_server_rs::store::ListingSnapshot> {
+        match pin {
+            None => {
+                let snap = self.inner.list_children_snapshot(container, None).await?;
+                let mut st = self.state.lock().expect("pin state lock");
+                let g = st.next_gen;
+                st.next_gen += 1;
+                st.snaps
+                    .insert((container.to_string(), g), snap.members.clone());
+                Ok(solid_server_rs::store::ListingSnapshot {
+                    members: snap.members,
+                    generation: Some(g),
+                })
+            }
+            Some(g) => {
+                let st = self.state.lock().expect("pin state lock");
+                match st.snaps.get(&(container.to_string(), g)) {
+                    Some(members) => Ok(solid_server_rs::store::ListingSnapshot {
+                        members: members.clone(),
+                        generation: Some(g),
+                    }),
+                    // Aged out / never minted here: the restartable 410, mirroring the live
+                    // client's SnapshotGone mapping.
+                    None => Err(solid_server_rs::ServerError::LwsProblem {
+                        status: 410,
+                        type_uri: solid_server_rs::lws::PROBLEM_SNAPSHOT_GONE,
+                        title: "the pagination snapshot is no longer available; restart from \
+                                the container URI (an unpinned first page)",
+                    }),
+                }
+            }
+        }
+    }
+}
+
+impl Harness {
+    /// A GENERATION-CAPABLE paged harness: LWS on, page size `page_size`, snapshots served by
+    /// [`PinningStore`] (so the server MINTS authenticated `lws-gen` tokens), pin-token TTL
+    /// `pin_ttl_secs` (0 ⇒ every minted token is already expired — the deterministic 410 hook).
+    async fn lws_pinned(page_size: usize, pin_ttl_secs: u64) -> Self {
+        let issuer_key = KeyKit::generate();
+        let client_key = KeyKit::generate();
+        let config = VerifierConfig::new(vec![common::ISSUER.to_string()], BASE_URL);
+        let replay = InMemoryReplayStore::with_window(config.replay_ttl());
+        let verifier = Verifier::new(config, jwks_provider(&issuer_key), replay).unwrap();
+        let ctx = AuthContext::new(verifier, BASE_URL);
+        let store = Arc::new(CompositeStore::new(
+            InMemorySparqClient::new(),
+            InMemoryBlobStore::new(),
+        ));
+        seed_root_owner_acl(&store, common::WEBID).await;
+        let pins = Arc::new(std::sync::Mutex::new(PinState::default()));
+        let mut ldp = LdpState::new(
+            PinningStore {
+                inner: store.clone(),
+                state: pins.clone(),
+            },
+            BASE_URL,
+        );
+        ldp.set_lws(Some(Arc::new(
+            LwsConfig::new(BASE_URL, true, false)
+                .with_page_size(std::num::NonZeroUsize::new(page_size))
+                .with_pin_ttl_secs(pin_ttl_secs),
+        )));
+        let app = build_router(AppState::new(ctx, ldp));
+        Self {
+            app,
+            issuer_key,
+            client_key,
+            store,
+            pins: Some(pins),
+        }
+    }
+}
+
+/// Extract the server-minted `lws-gen` token from a response's own pagination links (every pinned
+/// link carries the same token).
+fn pin_token(resp: &axum::http::Response<Body>) -> Option<String> {
+    link_values(resp).iter().find_map(|l| {
+        let (_, rest) = l.split_once("lws-gen=")?;
+        Some(rest.split('>').next().unwrap_or("").to_string())
+    })
+}
+
+/// The member `id`s of a listing document.
+fn item_ids(doc: &serde_json::Value) -> Vec<String> {
+    doc["items"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|i| i["id"].as_str().unwrap_or("").to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn pinned_listing_never_discloses_a_member_deleted_since_the_snapshot() {
+    // THE regression (adversarial-verify HIGH, independently flagged by codex — prong 1):
+    // `/notes/` carries the root's `acl:default` Read for Alice; `/notes/secret.txt` existed at
+    // generation G under a RESTRICTIVE own ACL (Bob-only), so Alice's gen-G listing correctly
+    // OMITS it. The member (and its `.acl`) is then DELETED. Alice re-requests the walk pinned to
+    // G with the token the server handed HER: the snapshot still contains the member + its
+    // metadata, and live WAC on the now-deleted IRI would fall back to the permissive ancestor
+    // `acl:default` — the current-existence guard must EXCLUDE it, disclosing nothing.
+    let h = Harness::lws_pinned(2, 300).await;
+    for name in ["a.txt", "b.txt", "c.txt", "secret.txt"] {
+        let put = h
+            .request(
+                "PUT",
+                &format!("/notes/{name}"),
+                Some("text/plain"),
+                Body::from("x"),
+            )
+            .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+    }
+    const SECRET: &str = "https://pod.example/notes/secret.txt";
+    const BOB: &str = "https://pod.example/bob/profile/card#me";
+    // The restrictive OWN ACL (nearest-first: it fully overrides the root default): Bob only.
+    let secret_acl = format!(
+        r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#bob> a acl:Authorization;
+       acl:agent <{BOB}>;
+       acl:accessTo <{SECRET}>;
+       acl:mode acl:Read, acl:Write."#
+    );
+    h.store
+        .write(&format!("{SECRET}.acl"), Bytes::from(secret_acl), "text/turtle")
+        .await
+        .expect("seed the secret's own ACL");
+
+    // Gen G: Alice's listing — secret.txt is invisible to her (live WAC), the walk is pinned.
+    let p1 = h
+        .request_with("GET", "/notes/", None, &[("accept", LWS_JSON)], Body::empty())
+        .await;
+    assert_eq!(p1.status(), StatusCode::OK);
+    let token = pin_token(&p1).expect("a generation-capable backend mints pinned links");
+    assert!(
+        token.matches('.').count() == 2 && token.len() > 64,
+        "the pin is the authenticated g.exp.mac token, never a bare integer: {token}"
+    );
+    let doc1 = body_json(p1).await;
+    assert_eq!(doc1["totalItems"], 3, "a, b, c visible; secret denied live");
+
+    // Bob deletes the member AND its ACL (directly through the store — the server-side state
+    // change; Alice could not).
+    h.store
+        .delete(SECRET, Some("https://pod.example/notes/"))
+        .await
+        .expect("delete the secret member");
+    h.store
+        .delete(&format!("{SECRET}.acl"), None)
+        .await
+        .expect("delete its own ACL");
+
+    // Alice walks the SAME pinned snapshot. The gen-G membership still contains secret.txt; the
+    // guard must exclude it — never authorize it via the root acl:default fallback.
+    let mut walked: Vec<String> = Vec::new();
+    let mut raw_bodies = String::new();
+    for page in 1..=2 {
+        let resp = h
+            .request_with(
+                "GET",
+                &format!("/notes/?lws-page={page}&lws-gen={token}"),
+                None,
+                &[("accept", LWS_JSON)],
+                Body::empty(),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK, "pinned page {page}");
+        let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        raw_bodies.push_str(&body);
+        let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            doc["totalItems"], 3,
+            "the deleted member must not join the visible count"
+        );
+        walked.extend(item_ids(&doc));
+    }
+    assert!(
+        !walked.iter().any(|id| id.contains("secret")),
+        "REGRESSION: the deleted, formerly-denied member must be excluded from the pinned \
+         listing, not authorized via the ancestor acl:default fallback — got {walked:?}"
+    );
+    assert!(
+        !raw_bodies.contains("secret"),
+        "no byte of the pinned pages may disclose the deleted member (IRI or metadata)"
+    );
+    // …and no over-exclusion: the legitimately-visible members all still tile the walk.
+    let mut expect: Vec<String> = ["a", "b", "c"]
+        .iter()
+        .map(|n| format!("https://pod.example/notes/{n}.txt"))
+        .collect();
+    expect.sort();
+    walked.sort();
+    assert_eq!(walked, expect, "a, b, c remain visible across the pinned walk");
+
+    // The PRESERVED design: WAC stays LIVE for still-existing members — a revocation lands on the
+    // very next pinned request (the pin never freezes an ACL). Clamp c.txt to Bob-only mid-walk.
+    const C: &str = "https://pod.example/notes/c.txt";
+    let c_acl = format!(
+        r#"@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+<#bob> a acl:Authorization;
+       acl:agent <{BOB}>;
+       acl:accessTo <{C}>;
+       acl:mode acl:Read."#
+    );
+    h.store
+        .write(&format!("{C}.acl"), Bytes::from(c_acl), "text/turtle")
+        .await
+        .expect("revoke Alice on c.txt mid-walk");
+    let resp = h
+        .request_with(
+            "GET",
+            &format!("/notes/?lws-page=1&lws-gen={token}"),
+            None,
+            &[("accept", LWS_JSON)],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let doc = body_json(resp).await;
+    assert_eq!(
+        doc["totalItems"], 2,
+        "live revocation applies inside the pinned walk (a, b only)"
+    );
+    assert!(
+        !item_ids(&doc).iter().any(|id| id.contains("c.txt")),
+        "the still-existing-but-revoked member is omitted by the LIVE walk"
+    );
+}
+
+#[tokio::test]
+async fn unminted_or_forged_pins_are_refused_before_the_backend() {
+    // Prong 2: `lws-gen` is a server-minted HMAC token bound to (container, requester) — a bare
+    // generation integer (the trivially-guessable pre-fix shape), a tampered token, or a token
+    // replayed against a different container is the opaque 400 `invalid-generation` problem.
+    let h = Harness::lws_pinned(2, 300).await;
+    for c in ["notes", "other"] {
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            let put = h
+                .request(
+                    "PUT",
+                    &format!("/{c}/{name}"),
+                    Some("text/plain"),
+                    Body::from("x"),
+                )
+                .await;
+            assert_eq!(put.status(), StatusCode::CREATED);
+        }
+    }
+    let p1 = h
+        .request_with("GET", "/notes/", None, &[("accept", LWS_JSON)], Body::empty())
+        .await;
+    assert_eq!(p1.status(), StatusCode::OK);
+    let token = pin_token(&p1).expect("pinned links minted");
+
+    let expect_400 = |resp: axum::http::Response<Body>, what: &'static str| async move {
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{what}");
+        let problem = body_json(resp).await;
+        assert_eq!(
+            problem["type"], "https://w3id.org/jeswr/lws/problems/invalid-generation",
+            "{what}"
+        );
+    };
+
+    // (a) Guessed bare generations — the exact pre-fix attack shape — and assorted garbage.
+    for forged in ["0", "1", "7", "18446744073709551615", "", "abc", "-1"] {
+        let resp = h
+            .request_with(
+                "GET",
+                &format!("/notes/?lws-gen={forged}"),
+                None,
+                &[("accept", LWS_JSON)],
+                Body::empty(),
+            )
+            .await;
+        expect_400(resp, "a guessed/unminted pin must be refused").await;
+    }
+
+    // (b) A TAMPERED minted token: a different generation under the real MAC, and a flipped MAC.
+    let mut parts = token.splitn(3, '.');
+    let (g, exp, mac) = (
+        parts.next().unwrap(),
+        parts.next().unwrap(),
+        parts.next().unwrap(),
+    );
+    let other_gen = format!("9{g}.{exp}.{mac}");
+    let flipped_mac = {
+        let mut m: Vec<u8> = mac.bytes().collect();
+        let last = m.len() - 1;
+        m[last] = if m[last] == b'0' { b'1' } else { b'0' };
+        format!("{g}.{exp}.{}", String::from_utf8(m).unwrap())
+    };
+    for forged in [other_gen.as_str(), flipped_mac.as_str()] {
+        let resp = h
+            .request_with(
+                "GET",
+                &format!("/notes/?lws-gen={forged}"),
+                None,
+                &[("accept", LWS_JSON)],
+                Body::empty(),
+            )
+            .await;
+        expect_400(resp, "a tampered pin must be refused").await;
+    }
+
+    // (c) CROSS-CONTAINER replay: /notes/' own genuine token does not pin /other/.
+    let resp = h
+        .request_with(
+            "GET",
+            &format!("/other/?lws-gen={token}"),
+            None,
+            &[("accept", LWS_JSON)],
+            Body::empty(),
+        )
+        .await;
+    expect_400(resp, "a pin is bound to its container").await;
+
+    // (d) The genuine token still walks its own container (no over-refusal).
+    let resp = h
+        .request_with(
+            "GET",
+            &format!("/notes/?lws-page=2&lws-gen={token}"),
+            None,
+            &[("accept", LWS_JSON)],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK, "the server's own pin works");
+}
+
+#[tokio::test]
+async fn an_expired_pin_is_the_410_snapshot_gone_restart() {
+    // A GENUINE token past its TTL is 410 `snapshot-gone` — the walker's restart-unpinned path
+    // (not the opaque 400: the token was really the server's). TTL 0 ⇒ immediately expired.
+    let h = Harness::lws_pinned(2, 0).await;
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        let put = h
+            .request(
+                "PUT",
+                &format!("/notes/{name}"),
+                Some("text/plain"),
+                Body::from("x"),
+            )
+            .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+    }
+    let p1 = h
+        .request_with("GET", "/notes/", None, &[("accept", LWS_JSON)], Body::empty())
+        .await;
+    assert_eq!(p1.status(), StatusCode::OK);
+    let token = pin_token(&p1).expect("pins are still minted under a zero TTL");
+    let resp = h
+        .request_with(
+            "GET",
+            &format!("/notes/?lws-page=2&lws-gen={token}"),
+            None,
+            &[("accept", LWS_JSON)],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::GONE);
+    let problem = body_json(resp).await;
+    assert_eq!(
+        problem["type"],
+        "https://w3id.org/jeswr/lws/problems/snapshot-gone"
+    );
+}
+
+#[tokio::test]
+async fn a_verified_pin_the_backend_aged_out_is_410_snapshot_gone() {
+    // Defence-in-depth ordering: the token VERIFIES (server-minted, unexpired) but the backend no
+    // longer holds the generation — the store's SnapshotGone maps to the same 410 restart. (The
+    // pre-prong-2 fail-closed-on-unacknowledged-pin guarantee, now reachable only via a genuine
+    // token.)
+    let h = Harness::lws_pinned(2, 300).await;
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        let put = h
+            .request(
+                "PUT",
+                &format!("/notes/{name}"),
+                Some("text/plain"),
+                Body::from("x"),
+            )
+            .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+    }
+    let p1 = h
+        .request_with("GET", "/notes/", None, &[("accept", LWS_JSON)], Body::empty())
+        .await;
+    let token = pin_token(&p1).expect("pinned links minted");
+    // The backend's retention window moves on.
+    h.pins
+        .as_ref()
+        .expect("pinned harness")
+        .lock()
+        .unwrap()
+        .snaps
+        .clear();
+    let resp = h
+        .request_with(
+            "GET",
+            &format!("/notes/?lws-page=2&lws-gen={token}"),
+            None,
+            &[("accept", LWS_JSON)],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::GONE);
+    let problem = body_json(resp).await;
+    assert_eq!(
+        problem["type"],
+        "https://w3id.org/jeswr/lws/problems/snapshot-gone"
     );
 }

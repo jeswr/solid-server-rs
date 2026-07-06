@@ -79,17 +79,45 @@ M4 (the last gated on `sparq#992`).
 3. **Multi-request snapshot consistency — filed as `sparq#1572`, landed as sparq PR #1584, now
    consumed:** each response derives from ONE combined membership+metadata query
    (`Store::list_children_snapshot`); when the backend advertises a generation token (sparq's
-   default-build `Sparq-Generation` header), the paged listing's own links carry it as
-   `lws-gen=<g>` and every follow-up page re-reads the SAME immutable snapshot (sparq's
-   `?generation=N` pin) — pages of one walk tile exactly one membership+metadata state. Honest
-   bounds (documented in `src/lws/container.rs`): the D12 WAC filter stays LIVE (revocation
-   applies immediately — an ACL change mid-walk may still shift visible offsets, deliberately);
-   an aged-out/unknown pin is a 410 `snapshot-gone` problem (restart from the container URI,
-   never a silent substitute — a pinned response is accepted ONLY when the backend echoes
-   exactly the pinned generation); a generation-less backend (in-memory, the embedded engine,
-   a pre-#1584 sparq) mints no pinned links and keeps the previous single-response-snapshot
-   contract. A past-the-end page is an empty 200 (opaque page URIs may outlive shrinkage), an
-   unparseable page/generation token a 400 problem.
+   default-build `Sparq-Generation` header), the paged listing's own links carry it as an
+   **authenticated `lws-gen` token** (see 3a — never the raw integer) and every follow-up page
+   re-reads the SAME immutable snapshot (sparq's `?generation=N` pin) — pages of one walk tile
+   exactly one membership+metadata state. Honest bounds (documented in `src/lws/container.rs`):
+   the D12 WAC filter stays LIVE (revocation applies immediately — an ACL change mid-walk may
+   still shift visible offsets, deliberately); an aged-out/unknown pin is a 410 `snapshot-gone`
+   problem (restart from the container URI, never a silent substitute — a pinned response is
+   accepted ONLY when the backend echoes exactly the pinned generation); a generation-less
+   backend (in-memory, the embedded engine, a pre-#1584 sparq) mints no pinned links and keeps
+   the previous single-response-snapshot contract. A past-the-end page is an empty 200 (opaque
+   page URIs may outlive shrinkage), an unusable page value or pin token a 400 problem.
+3a. **Pinned listings × live WAC — the deleted-member disclosure closure (an adversarial-verify
+   HIGH, independently flagged by codex; fixed 2026-07).** Snapshot membership composed with
+   LIVE per-member WAC had a hole: a member that existed at the pinned generation under a
+   restrictive own-ACL, then was DELETED (its `.acl` with it), stayed in the pinned snapshot
+   while the live walk on its IRI fell back to a (possibly permissive) ancestor `acl:default` —
+   disclosing the deleted member's IRI + content-type + size + modified to an agent its own ACL
+   denied at the snapshot. Closed with two prongs (both regression-tested end-to-end in
+   `tests/lws_http.rs`; removing the primary guard reproduces the disclosure — the mutation
+   check):
+   - **Current-existence guard (primary; `LdpState::authorize_listing_member`):** a listing
+     member is disclosed only if it EXISTS at the CURRENT store state AND live WAC grants the
+     read mode — one combined `read_plan` with the member in the target slot (no extra backend
+     round-trip). Still-existing members keep fully LIVE ACL evaluation (the pin never freezes
+     an ACL). Accepted residual (documented at the guard): a delete-and-recreate under the same
+     IRI within the pin's TTL can disclose the OLD incarnation's snapshot metadata when the NEW
+     incarnation grants Read — closing it needs a store-level resource identity the index does
+     not carry.
+   - **Authenticated pins (defence-in-depth; `src/lws/pin.rs`):** the backend generation is a
+     small guessable integer, so `lws-gen` carries a server-minted HMAC-SHA256 token
+     (`<g>.<exp>.<mac>`; aws-lc-rs primitive, per-process 32-byte key, constant-time compare)
+     bound to (container IRI, requester WebID/anonymous-class) with a short TTL
+     (`SOLID_SERVER_LWS_PIN_TTL_SECS`, default 300 s). Unminted / forged / tampered /
+     cross-container / cross-principal ⇒ the opaque 400 `invalid-generation` (MAC verified
+     before expiry, so a forgery never learns it named a once-valid pin); an expired genuine
+     token ⇒ the 410 restart. Only verified pins ever reach the backend. Per-process key ⇒ a
+     pin minted by one replica 400s on another and the walker restarts unpinned (the same
+     graceful degradation as retention ageing); a shared operator-provisioned key is a
+     documented follow-up seam, deliberately not built.
 4. **Existence-non-disclosure preserved:** the WAC filter runs over the WHOLE membership before
    any slicing, so counts/offsets are functions of the visible view only — pagination adds no
    oracle over hidden members. Cost: the same O(children) ACL walks per listing as M1 (the

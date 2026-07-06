@@ -134,6 +134,7 @@
 pub mod auth;
 pub mod container;
 pub mod linkset;
+pub mod pin;
 pub mod rar;
 pub mod transform;
 
@@ -235,6 +236,14 @@ pub const ENV_LWS_STRICT_PUT: &str = "SOLID_SERVER_LWS_STRICT_PUT";
 pub const ENV_LWS_PAGE_SIZE: &str = "SOLID_SERVER_LWS_PAGE_SIZE";
 /// The default pagination threshold/page size (members per page).
 pub const DEFAULT_LWS_PAGE_SIZE: usize = 1000;
+/// Env knob for the pagination snapshot-pin TTL in SECONDS (the server-minted `lws-gen` token's
+/// lifetime — see [`pin`]): how long a page walk may keep re-using one pinned snapshot. Default
+/// [`DEFAULT_LWS_PIN_TTL_SECS`]; unset/unparseable keeps the default. (The backend's own
+/// generation-retention window still applies underneath — an aged-out pin is a 410 either way.)
+pub const ENV_LWS_PIN_TTL: &str = "SOLID_SERVER_LWS_PIN_TTL_SECS";
+/// The default pagination snapshot-pin TTL (seconds). Generous for a human-speed page walk, small
+/// against the retention of anything the walker didn't just see.
+pub const DEFAULT_LWS_PIN_TTL_SECS: u64 = 300;
 /// Env knob for the step-8-B a2a-rdf discovery affordance (`lws-spec` `docs/alignment/a2a-rdf.md`):
 /// the **A2A Agent Card URL** of the agent that speaks for this storage's controller. Set (to a
 /// valid absolute http(s) URL) ⇒ the storage description advertises an
@@ -270,6 +279,17 @@ pub struct LwsConfig {
     /// `totalItems` = the whole visible membership). `None` ⇒ pagination off (every listing
     /// single-page). Default `Some(`[`DEFAULT_LWS_PAGE_SIZE`]`)`.
     pub page_size: Option<std::num::NonZeroUsize>,
+    /// The per-process MAC key authenticating `lws-gen` snapshot-pin tokens (see [`pin`]): only a
+    /// pin THIS server minted — bound to (container, requester) and expiring — is ever forwarded
+    /// to the backend. `None` (an OS-RNG failure at construction — effectively unreachable) FAILS
+    /// CLOSED: no pinned links are minted and every presented pin is refused with the 400
+    /// `invalid-generation` problem; page walks degrade to unpinned, exactly the generation-less
+    /// backend posture.
+    pin_key: Option<pin::PinKey>,
+    /// The snapshot-pin token TTL in seconds ([`ENV_LWS_PIN_TTL`], default
+    /// [`DEFAULT_LWS_PIN_TTL_SECS`]). Expiry is exclusive — a zero TTL means every minted pin is
+    /// already expired (used by tests to drive the 410 restart path deterministically).
+    pin_ttl_secs: u64,
     /// The server's public base URL (trailing slash trimmed) — kept so the builder-style setters
     /// can rebuild the precomputed description body.
     base: String,
@@ -298,6 +318,10 @@ impl LwsConfig {
             rdf_transform,
             strict_put,
             page_size: std::num::NonZeroUsize::new(DEFAULT_LWS_PAGE_SIZE),
+            // Fresh per-process entropy; `None` on RNG failure ⇒ pins disabled fail-closed (the
+            // field's doc). Never minted from a weak fallback.
+            pin_key: pin::PinKey::generate(),
+            pin_ttl_secs: DEFAULT_LWS_PIN_TTL_SECS,
             base,
             agent_card_url: None,
             description_body,
@@ -310,6 +334,51 @@ impl LwsConfig {
     pub fn with_page_size(mut self, page_size: Option<std::num::NonZeroUsize>) -> Self {
         self.page_size = page_size;
         self
+    }
+
+    /// Override the snapshot-pin token TTL (seconds; [`ENV_LWS_PIN_TTL`]). Builder-style; a zero
+    /// TTL makes every minted pin immediately expired (the deterministic 410-path test hook —
+    /// expiry is exclusive, see [`pin::verify`]).
+    pub fn with_pin_ttl_secs(mut self, secs: u64) -> Self {
+        self.pin_ttl_secs = secs;
+        self
+    }
+
+    /// Mint the authenticated `lws-gen` token this server's own pagination links carry for
+    /// (`container_iri`, `requester`, backend `generation`) — see [`pin`]. `None` when pins are
+    /// disabled (no key — the fail-closed RNG posture): the caller then emits UNPINNED links, the
+    /// graceful degradation shared with a generation-less backend.
+    pub(crate) fn mint_pin(
+        &self,
+        container_iri: &str,
+        requester: Option<&str>,
+        generation: u64,
+    ) -> Option<String> {
+        let key = self.pin_key.as_ref()?;
+        let exp = unix_now().saturating_add(self.pin_ttl_secs);
+        Some(pin::mint(key, container_iri, requester, generation, exp))
+    }
+
+    /// Verify a presented `lws-gen` token for (`container_iri`, `requester`) and return the
+    /// backend generation it pins. Fail-closed mapping (see [`pin`]'s module doc): anything not
+    /// verifiably minted by this server for exactly this (container, requester) — including the
+    /// no-key posture — is the opaque 400 [`PROBLEM_INVALID_GENERATION`]; a genuine token past its
+    /// expiry is the 410 [`PROBLEM_SNAPSHOT_GONE`] restart (the walker re-fetches the container's
+    /// own URI, an unpinned first page).
+    pub(crate) fn verify_pin(
+        &self,
+        container_iri: &str,
+        requester: Option<&str>,
+        token: &str,
+    ) -> Result<u64, crate::error::ServerError> {
+        let Some(key) = self.pin_key.as_ref() else {
+            return Err(invalid_generation_problem());
+        };
+        match pin::verify(key, container_iri, requester, token, unix_now()) {
+            Ok(g) => Ok(g),
+            Err(pin::PinVerifyError::Unminted) => Err(invalid_generation_problem()),
+            Err(pin::PinVerifyError::Expired) => Err(pin_expired_problem()),
+        }
     }
 
     /// Set the step-8-B a2a-rdf affordance (the controller-agent's **Agent Card URL**;
@@ -350,9 +419,14 @@ impl LwsConfig {
             None => std::num::NonZeroUsize::new(DEFAULT_LWS_PAGE_SIZE),
         };
         let agent_card = std::env::var(ENV_LWS_AGENT_CARD_URL).ok();
+        let pin_ttl_secs = std::env::var(ENV_LWS_PIN_TTL)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_LWS_PIN_TTL_SECS);
         Some(
             Self::new(base_url, rdf_transform, strict_put)
                 .with_page_size(page_size)
+                .with_pin_ttl_secs(pin_ttl_secs)
                 .with_agent_card_url(agent_card.as_deref()),
         )
     }
@@ -373,6 +447,41 @@ impl LwsConfig {
         if let Some(v) = &self.storage_description_link {
             headers.append(header::LINK, v.clone());
         }
+    }
+}
+
+/// Unix seconds now, for pin mint/verify. On a pre-epoch clock (unreachable in practice) this
+/// FAILS CLOSED via `u64::MAX`: every verify sees `now >= exp` (expired) and every mint saturates
+/// to an already-expired token — a broken clock can only ever REFUSE pins, never extend one.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(u64::MAX)
+}
+
+/// The opaque 400 for anything that is not a token THIS server verifiably minted for exactly this
+/// (container, requester) — forged, tampered, replayed cross-container/-principal, malformed, or
+/// presented while pins are disabled. One indistinguishable answer for the whole class (a probe
+/// learns nothing about WHY).
+pub(crate) fn invalid_generation_problem() -> crate::error::ServerError {
+    crate::error::ServerError::LwsProblem {
+        status: 400,
+        type_uri: PROBLEM_INVALID_GENERATION,
+        title: "lws-gen must be the opaque generation token from the server's own pagination \
+                links",
+    }
+}
+
+/// The 410 for a genuinely server-minted pin past its TTL: the same `snapshot-gone` restart
+/// contract as a backend-retention ageing — the walker re-fetches the container's own URI (an
+/// unpinned first page, a fresh snapshot), never a silently different snapshot.
+pub(crate) fn pin_expired_problem() -> crate::error::ServerError {
+    crate::error::ServerError::LwsProblem {
+        status: 410,
+        type_uri: PROBLEM_SNAPSHOT_GONE,
+        title: "the pagination snapshot is no longer available; restart from the container URI \
+                (an unpinned first page)",
     }
 }
 

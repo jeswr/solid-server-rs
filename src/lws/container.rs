@@ -46,8 +46,8 @@
 //! Each response is built from ONE combined membership+metadata query
 //! ([`Store::list_children_snapshot`]). When the backend advertises a **generation token** for
 //! that snapshot (sparq's default-build `Sparq-Generation` header), a paged listing's own
-//! `first`/`next`/`prev`/`last` links carry it as `lws-gen=<g>`, and every follow-up page request
-//! **re-reads the SAME immutable snapshot** (sparq's `?generation=N` pin) — so a member
+//! `first`/`next`/`prev`/`last` links carry it as `lws-gen=<token>`, and every follow-up page
+//! request **re-reads the SAME immutable snapshot** (sparq's `?generation=N` pin) — so a member
 //! created/deleted between page fetches can no longer shift the sorted offsets: the pages of one
 //! walk tile exactly one membership+metadata state (the sparq#1572 acceptance property).
 //!
@@ -65,6 +65,28 @@
 //!   `generation: None`: links carry no `lws-gen`, and behaviour is exactly the previous
 //!   single-response-snapshot contract (the spec's §pagination requires no more).
 //!
+//! ## Pinned listings × live WAC — the deleted-member disclosure closure (two prongs)
+//! Snapshot membership + LIVE authorization compose into a hole unless guarded: a member that
+//! existed at the pinned generation under a RESTRICTIVE own-ACL, then was DELETED (its `.acl`
+//! with it), is still in the pinned snapshot — but the LIVE walk on its IRI now finds no own-ACL
+//! and falls back to an ancestor's (possibly more permissive) `acl:default`. Unguarded, an agent
+//! that member's own ACL denied at the snapshot would be handed its IRI + content-type + size +
+//! modified out of the pin. Closed with two independent prongs:
+//!
+//! 1. **The current-existence guard (primary — `LdpState::authorize_listing_member`).** A member
+//!    is disclosed ONLY if it (a) EXISTS at the CURRENT store state and (b) live WAC grants Read.
+//!    A since-deleted member is excluded fail-closed, regardless of what the ancestor-`acl:default`
+//!    fallback would grant; still-existing members keep the deliberate LIVE evaluation above
+//!    (fresh revocation applies immediately — the pin never freezes an ACL). See that method's
+//!    doc for the full invariant + the accepted delete-and-recreate residual.
+//! 2. **Authenticated pins (defence-in-depth — [`super::pin`]).** The backend generation is a
+//!    small guessable integer, so raw `lws-gen=<u64>` would let ANY requester rewind ANY
+//!    container to an arbitrary retained state. Instead `lws-gen` carries a server-MINTED
+//!    HMAC token bound to (container, requester) with a short expiry, emitted only in the
+//!    server's own pagination links; anything else is the opaque 400 `invalid-generation`
+//!    problem (an expired genuine token is the 410 restart). Only verified pins ever reach the
+//!    backend.
+//!
 //! ## Fail-closed membership × pagination
 //! The D12 per-member WAC filter runs over the WHOLE membership BEFORE slicing (`totalItems` and
 //! the page boundaries are functions of the visible view only), so page arithmetic can never leak
@@ -74,7 +96,6 @@ use serde_json::{json, Map, Value};
 
 use crate::auth::VerifiedToken;
 use crate::authz::wac::Decision;
-use crate::authz::AccessMode;
 use crate::error::ServerError;
 use crate::ldp::handler::LdpState;
 use crate::ldp::target::LdpTarget;
@@ -184,16 +205,18 @@ pub(crate) struct Listing {
     pub page_links: Vec<axum::http::HeaderValue>,
 }
 
-/// Parse the requested page + snapshot pin from the query string: absent ⇒ page 1, unpinned;
-/// `lws-page=N` (N ≥ 1) ⇒ page N; `lws-gen=G` (a u64 generation token from the server's OWN
-/// pagination links) ⇒ the page walk is pinned to snapshot G. Anything unusable ⇒ a 400 problem
-/// (page URIs and generation tokens are opaque — only the server's own links count).
-pub(crate) fn page_from_query(query: Option<&str>) -> Result<(usize, Option<u64>), ServerError> {
+/// Parse the requested page + RAW snapshot-pin token from the query string: absent ⇒ page 1,
+/// unpinned; `lws-page=N` (N ≥ 1) ⇒ page N; `lws-gen=<token>` ⇒ the raw pin token, extracted
+/// UNINTERPRETED here — every judgement about it (shape, authenticity, binding, expiry) lives in
+/// the ONE verification chokepoint ([`super::LwsConfig::verify_pin`], called by [`render`]), so a
+/// forged/malformed/expired pin cannot be told apart by WHERE it was rejected. An unusable
+/// `lws-page` is a 400 problem (page URIs are opaque — only the server's own links count).
+pub(crate) fn page_from_query(query: Option<&str>) -> Result<(usize, Option<String>), ServerError> {
     let Some(query) = query else {
         return Ok((1, None));
     };
     let mut page: usize = 1;
-    let mut pin: Option<u64> = None;
+    let mut pin: Option<String> = None;
     for pair in query.split('&') {
         if let Some(v) = pair.strip_prefix("lws-page=") {
             page = match v.parse::<usize>() {
@@ -208,17 +231,8 @@ pub(crate) fn page_from_query(query: Option<&str>) -> Result<(usize, Option<u64>
                 }
             };
         } else if let Some(v) = pair.strip_prefix("lws-gen=") {
-            pin = match v.parse::<u64>() {
-                Ok(g) => Some(g),
-                _ => {
-                    return Err(ServerError::LwsProblem {
-                        status: 400,
-                        type_uri: super::PROBLEM_INVALID_GENERATION,
-                        title: "lws-gen must be the opaque generation token from the server's \
-                                own pagination links",
-                    })
-                }
-            };
+            // Opaque at this layer — verification (incl. the empty/garbage 400) is `verify_pin`'s.
+            pin = Some(v.to_string());
         }
     }
     Ok((page, pin))
@@ -270,12 +284,18 @@ fn page_plan(total: usize, page: usize, page_size: Option<std::num::NonZeroUsize
 
 /// Render the LWS container listing for `target` as the requesting agent sees it — `page` of a
 /// `page_size`-paged listing (see the module doc; `page_size: None` ⇒ single-page), optionally
-/// **pinned** to the snapshot generation a prior page of the same walk was served at (`pin` — the
-/// `lws-gen` token from the server's own links; the sparq#1572 consistency, module doc above).
+/// **pinned** to the snapshot generation a prior page of the same walk was served at (`raw_pin` —
+/// the `lws-gen` token from the server's own links; the sparq#1572 consistency, module doc above).
+/// The raw token is verified HERE, before any backend work, at the one chokepoint
+/// ([`super::LwsConfig::verify_pin`]): unminted/forged/mismatched ⇒ the 400 `invalid-generation`
+/// problem, expired ⇒ the 410 restart — only a verified pin ever reaches the backend (prong 2 of
+/// the module doc's disclosure closure).
 ///
-/// Fail-closed per D12: each authoritative child is included only when the agent holds `acl:Read`
-/// on it (via the same planned WAC walk the read path uses — always evaluated LIVE, never at the
-/// pinned snapshot); a denial omits the child, a backend FAULT fails the request (never a
+/// Fail-closed per D12: each authoritative child is included only when it EXISTS at the CURRENT
+/// store state AND the agent holds `acl:Read` on it — both checked LIVE, never at the pinned
+/// snapshot, by [`LdpState::authorize_listing_member`] (the same planned WAC walk the read path
+/// uses, plus the current-existence guard that is prong 1 of the module doc's disclosure
+/// closure); a denial omits the child, a backend FAULT fails the request (never a
 /// silently-shorter listing). A listed child whose metadata row is missing at the snapshot (a
 /// byte/index inconsistency window) is likewise omitted — `mediaType` is a MUST on data-resource
 /// members, so emitting a member we cannot describe would violate the shape. The filter runs over
@@ -287,12 +307,24 @@ pub(crate) async fn render<S: Store>(
     token: &VerifiedToken,
     origin: Option<&str>,
     page: usize,
-    pin: Option<u64>,
+    raw_pin: Option<&str>,
     page_size: Option<std::num::NonZeroUsize>,
 ) -> Result<Listing, ServerError> {
+    let requester = token.web_id.as_deref();
+    // Prong 2 (module doc): verify the presented pin token BEFORE any backend work — only a pin
+    // this server minted for exactly this (container, requester) is forwarded as a backend
+    // generation. The flag-off surface never reaches here; a missing config inside the LWS render
+    // is unreachable, but fails CLOSED as the same opaque 400 rather than trusting the raw value.
+    let pin: Option<u64> = match raw_pin {
+        None => None,
+        Some(raw) => match state.lws() {
+            Some(cfg) => Some(cfg.verify_pin(&target.iri, requester, raw)?),
+            None => return Err(super::invalid_generation_problem()),
+        },
+    };
     // ONE combined membership+metadata read from ONE backend state (pinned when the walker
-    // presented a server-minted `lws-gen` token). A no-longer-servable pin surfaces as the 410
-    // `snapshot-gone` problem from the store — the walker restarts unpinned.
+    // presented a verified server-minted `lws-gen` token). A no-longer-servable pin surfaces as
+    // the 410 `snapshot-gone` problem from the store — the walker restarts unpinned.
     let snapshot = state.store.list_children_snapshot(&target.iri, pin).await?;
     let generation = snapshot.generation;
     let mut children = snapshot.members;
@@ -301,16 +333,16 @@ pub(crate) async fn render<S: Store>(
     children.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
 
     // The VISIBLE view first (D12), across the whole membership. Membership + metadata come from
-    // the snapshot; the WAC decision is LIVE (deliberate — see the module doc's honest bounds).
+    // the snapshot; the disclosure decision is LIVE (deliberate — see the module doc's honest
+    // bounds): current existence AND live WAC Read, per member (prong 1 — the deleted-member
+    // guard lives inside `authorize_listing_member`).
     let mut visible: Vec<(String, crate::store::ResourceMeta)> = Vec::with_capacity(children.len());
     for (child, meta) in children {
         let iri = child.as_str();
-        // D12: only members the requesting agent can read are disclosed. A deny (401/403-class
-        // decision) omits the member; a backend error propagates (fail-closed on faults).
-        match state
-            .authorize_planned_iri(iri, AccessMode::Read, token, origin)
-            .await?
-        {
+        // D12: only members that currently exist AND that the requesting agent can read are
+        // disclosed. A deny (401/403-class decision) — including the nonexistent-at-current-state
+        // case — omits the member; a backend error propagates (fail-closed on faults).
+        match state.authorize_listing_member(iri, token, origin).await? {
             Decision::Allow(_) => {}
             Decision::Unauthenticated | Decision::Forbidden => continue,
         }
@@ -356,9 +388,14 @@ pub(crate) async fn render<S: Store>(
     });
     let body = serde_json::to_vec(&doc)
         .map_err(|e| ServerError::Storage(format!("lws container serialise: {e}")))?;
+    // Mint the authenticated pin token the links carry (prong 2): only when the backend
+    // advertised a generation AND pins are enabled (a key exists). `None` ⇒ unpinned links — the
+    // graceful degradation shared by generation-less backends and the disabled-pins posture.
+    let pin_token = generation
+        .and_then(|g| state.lws().and_then(|cfg| cfg.mint_pin(&target.iri, requester, g)));
     Ok(Listing {
         body,
-        page_links: page_links(&target.iri, page, &plan, generation),
+        page_links: page_links(&target.iri, page, &plan, pin_token.as_deref()),
     })
 }
 
@@ -366,21 +403,22 @@ pub(crate) async fn render<S: Store>(
 /// `next` on all but the last page (omitted on the last — a MUST both ways), `prev`/`last` when
 /// meaningful. Empty when the listing is single-page.
 ///
-/// When the backend advertised a snapshot `generation`, every link carries it as `lws-gen=<g>` so
-/// the walker's follow-up requests re-read the SAME snapshot (the sparq#1572 consistency — module
-/// doc). `None` ⇒ plain unpinned links (the graceful-degradation contract).
+/// When the caller minted a snapshot-pin token ([`super::pin`] — the backend advertised a
+/// generation and pins are enabled), every link carries it as `lws-gen=<token>` so the walker's
+/// follow-up requests re-read the SAME snapshot (the sparq#1572 consistency — module doc).
+/// `None` ⇒ plain unpinned links (the graceful-degradation contract).
 fn page_links(
     container_iri: &str,
     page: usize,
     plan: &PagePlan,
-    generation: Option<u64>,
+    pin_token: Option<&str>,
 ) -> Vec<axum::http::HeaderValue> {
     if !plan.paged {
         return Vec::new();
     }
     let link = |n: usize, rel: &str| {
-        let uri = match generation {
-            Some(g) => format!("{container_iri}?lws-page={n}&lws-gen={g}"),
+        let uri = match pin_token {
+            Some(t) => format!("{container_iri}?lws-page={n}&lws-gen={t}"),
             None => format!("{container_iri}?lws-page={n}"),
         };
         axum::http::HeaderValue::from_str(&format!("<{uri}>; rel=\"{rel}\"")).ok()
@@ -573,24 +611,26 @@ mod tests {
 
     #[test]
     fn page_links_carry_the_snapshot_pin_when_a_generation_is_known() {
-        // The sparq#1572 consistency wiring: a backend-advertised generation rides EVERY link as
-        // `lws-gen=<g>`, so a walker following the server's own links re-reads the SAME snapshot.
+        // The sparq#1572 consistency wiring: the caller-minted authenticated pin token (prong 2 —
+        // never the raw generation integer) rides EVERY link as `lws-gen=<token>`, so a walker
+        // following the server's own links re-reads the SAME snapshot.
         let c = "https://pod.example/alice/";
         let plan = page_plan(5, 2, std::num::NonZeroUsize::new(2));
-        let links: Vec<String> = page_links(c, 2, &plan, Some(42))
+        let t = "42.1000.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let links: Vec<String> = page_links(c, 2, &plan, Some(t))
             .iter()
             .map(|v| v.to_str().unwrap().to_string())
             .collect();
         assert_eq!(
             links,
             vec![
-                format!("<{c}?lws-page=1&lws-gen=42>; rel=\"first\""),
-                format!("<{c}?lws-page=1&lws-gen=42>; rel=\"prev\""),
-                format!("<{c}?lws-page=3&lws-gen=42>; rel=\"next\""),
-                format!("<{c}?lws-page=3&lws-gen=42>; rel=\"last\""),
+                format!("<{c}?lws-page=1&lws-gen={t}>; rel=\"first\""),
+                format!("<{c}?lws-page=1&lws-gen={t}>; rel=\"prev\""),
+                format!("<{c}?lws-page=3&lws-gen={t}>; rel=\"next\""),
+                format!("<{c}?lws-page=3&lws-gen={t}>; rel=\"last\""),
             ]
         );
-        // No generation ⇒ plain unpinned links (graceful degradation — asserted exactly in
+        // No pin token ⇒ plain unpinned links (graceful degradation — asserted exactly in
         // `page_links_follow_rfc8288` above).
         assert!(page_links(c, 2, &plan, None)
             .iter()
@@ -611,26 +651,34 @@ mod tests {
     }
 
     #[test]
-    fn generation_pin_parsing_fails_closed() {
-        // The server's own pinned-link shape round-trips.
+    fn generation_pin_is_extracted_raw_for_the_verify_chokepoint() {
+        // The pin token is OPAQUE here: `page_from_query` extracts the raw value uninterpreted —
+        // ALL judgement (shape, authenticity, binding, expiry) belongs to the ONE chokepoint
+        // (`LwsConfig::verify_pin`, exercised in `lws::pin`'s tests + the HTTP suite), so a
+        // rejected pin cannot be fingerprinted by WHERE it failed. Nothing here is a silent unpin:
+        // whatever was presented is carried to the verifier, which fails closed.
         assert_eq!(
-            page_from_query(Some("lws-page=2&lws-gen=42")).unwrap(),
-            (2, Some(42))
+            page_from_query(Some("lws-page=2&lws-gen=42.99.ff")).unwrap(),
+            (2, Some("42.99.ff".to_string()))
         );
         assert_eq!(
             page_from_query(Some("lws-gen=7")).unwrap(),
-            (1, Some(7)),
-            "a pin without an explicit page pins page 1"
+            (1, Some("7".to_string())),
+            "a pin without an explicit page applies to page 1 (and still must verify)"
         );
-        // Unusable tokens are a 400 problem (opaque — only server-minted links count), never a
-        // silent unpin (which would hand the walker a DIFFERENT snapshot than its links name).
-        for bad in [
-            "lws-gen=",
-            "lws-gen=abc",
-            "lws-gen=-1",
-            "lws-page=2&lws-gen=1.5",
+        // Garbage — including the legacy bare-int and empty forms — is still EXTRACTED (never
+        // dropped), so the verifier is the one to refuse it with the 400 problem.
+        for (q, raw) in [
+            ("lws-gen=", ""),
+            ("lws-gen=abc", "abc"),
+            ("lws-gen=-1", "-1"),
+            ("lws-page=2&lws-gen=1.5", "1.5"),
         ] {
-            assert!(page_from_query(Some(bad)).is_err(), "{bad} must be a 400");
+            assert_eq!(
+                page_from_query(Some(q)).unwrap().1,
+                Some(raw.to_string()),
+                "{q} must be carried raw to the verifier"
+            );
         }
     }
 
