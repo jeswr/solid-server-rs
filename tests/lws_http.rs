@@ -3575,19 +3575,33 @@ async fn lws_registry_problem_not_overwritten_by_generic_mapping() {
     );
 }
 
-/// HEAD carve-out ("except where HTTP semantics do not permit response content"): a HEAD error
-/// response is passed through untouched — no problem entity is minted for it. (The full RFC 9110
-/// §9.3.2 header-mirror — HEAD carrying the GET's problem `Content-Type` with no body — is the
-/// deferred GAPS.md vector.)
+/// HEAD header mirror (RFC 9110 §9.3.2): a HEAD error carries the SAME problem metadata the
+/// corresponding GET serves — `Content-Type: application/problem+json` — while the body bytes are
+/// suppressed by the stack (axum strips HEAD response bodies at the router layer; this test pins
+/// both halves: mirrored metadata, no content).
 #[tokio::test]
-async fn lws_head_error_is_not_given_a_problem_entity() {
+async fn lws_head_error_mirrors_get_problem_metadata() {
     let h = Harness::lws().await;
-    let resp = h
+    let head = h
         .request("HEAD", "/alice/notes/missing.txt", None, Body::empty())
         .await;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    let ct = header_value(&resp, "content-type").unwrap_or("");
-    assert_ne!(mediatype_of(ct), "application/problem+json");
+    assert_eq!(head.status(), StatusCode::NOT_FOUND);
+    let get = h
+        .request("GET", "/alice/notes/missing.txt", None, Body::empty())
+        .await;
+    assert_eq!(
+        mediatype_of(header_value(&head, "content-type").unwrap()),
+        "application/problem+json"
+    );
+    assert_eq!(
+        header_value(&head, "content-type").map(str::to_owned),
+        header_value(&get, "content-type").map(str::to_owned),
+        "HEAD must mirror the GET's problem Content-Type"
+    );
+    assert!(
+        body_bytes(head).await.is_empty(),
+        "a HEAD response transmits no content — the stack strips the minted entity"
+    );
 }
 
 /// Flag-off invariance: with the LWS surface OFF the generic error bytes are the pre-LWS

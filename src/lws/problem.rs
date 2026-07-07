@@ -12,9 +12,13 @@
 //!
 //! Behaviour:
 //! - Non-error responses (1xx–3xx) pass through untouched.
-//! - **HEAD carve-out** (the statement's "except where HTTP semantics do not permit response
-//!   content"): a HEAD response passes through untouched — its error metadata mirrors the GET's
-//!   headers (RFC 9110 §9.3.2) and it carries no content to replace.
+//! - **HEAD gets the full header mirror** (RFC 9110 §9.3.2): the problem entity is minted for a
+//!   HEAD error exactly as for a GET — same `Content-Type: application/problem+json` — and the
+//!   stack suppresses the body bytes for a HEAD response (axum strips HEAD response bodies at the
+//!   router layer; hyper's encoder would likewise never transmit them), so the metadata mirrors
+//!   what the corresponding GET serves while no content is actually transmitted (the statement's
+//!   "except where HTTP semantics do not permit response content" is satisfied by the transport,
+//!   not by skipping the mapping — pinned by `lws_head_error_mirrors_get_problem_metadata`).
 //! - A response that is **already `application/problem+json`** (the D17 fixed-registry problems)
 //!   passes through untouched — which also makes the mapping idempotent if it is ever layered
 //!   twice.
@@ -27,7 +31,7 @@
 
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::{header, HeaderValue, Method};
+use axum::http::{header, HeaderValue};
 use axum::middleware::Next;
 use axum::response::Response;
 
@@ -35,10 +39,9 @@ use axum::response::Response;
 /// `application/problem+json` body. Applied by the router builders ONLY when the LWS surface is
 /// enabled — see the module docs for the carve-outs and invariance argument.
 pub async fn problem_details_middleware(req: Request, next: Next) -> Response {
-    let is_head = req.method() == Method::HEAD;
     let resp = next.run(req).await;
     let status = resp.status();
-    if is_head || !(status.is_client_error() || status.is_server_error()) {
+    if !(status.is_client_error() || status.is_server_error()) {
         return resp;
     }
     let already_problem = resp
