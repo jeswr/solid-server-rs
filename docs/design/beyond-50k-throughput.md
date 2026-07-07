@@ -174,7 +174,7 @@ independently reversible.
 2. **P1.2 — land `perf-c-alloc-reduction`** (per-request read-response header allocations) —
    deterministic alloc-count delta via the bench-harness floor; the `bench/BASELINE.md` rank-4
    target.
-3. **P1.3 — TLS session resumption: size it for production — LANDED (cache-size half).** rustls `ServerConfig` defaults
+3. **P1.3 — TLS session resumption: size it for production — LANDED (both halves).** rustls `ServerConfig` defaults
    (verified against docs.rs/rustls): an in-memory **session cache of only 256 sessions**,
    **2 TLS 1.3 resumption tickets** per handshake, and **`max_early_data_size = 0`** (0-RTT
    off). Resumption therefore already *works*, but a 256-entry cache is a handful of
@@ -189,9 +189,21 @@ independently reversible.
    paths via `apply_transport_tuning`; 0-RTT stays off (asserted). The deterministic resumed-vs-full
    handshake count is the ignored integration test
    `tests/tls_handshake.rs::tls_session_cache_size_governs_resumed_handshake_count` (run with
-   `--ignored --nocapture`). The `Ticketer` (stateless-tickets) half is deferred — it changes the TLS 1.3
-   resumption mechanism (stateless vs the stateful cache) and interacts with the horizontal-scale /
-   shared-replay design, so it is a separate increment.
+   `--ignored --nocapture`). **LANDED (ticketer half):** `SOLID_SERVER_TLS_STATELESS_TICKETS` (affirmative
+   opt-in, **default OFF**) installs the aws-lc-rs RFC 5077 `rustls::crypto::aws_lc_rs::Ticketer`
+   (AES-256-CBC + HMAC-SHA256, random per-process keys rotated ~6h / ~12h ticket life, forward-secret by
+   key erasure), so TLS 1.3 resumption becomes STATELESS — an encrypted ticket, no server-side per-session
+   memory — independent of the session cache. Both halves flow through one `TransportTuning
+   { session_cache_size, stateless_tickets }` applied by `apply_transport_tuning` on both build paths; the
+   ticketer install is fail-safe (an RNG error falls back to the stateful cache). **0-RTT stays OFF even
+   with the ticketer** — `max_early_data_size` is force-set to `0` unconditionally, so a ticketer never
+   opens the 0-RTT replay window (the anti-replay DPoP invariant holds regardless; asserted in the unit +
+   integration tests). Default OFF on purpose: a per-process ticket key is NOT shared across a
+   horizontally-scaled fleet (cross-node resumption falls back to a full handshake — a perf, not
+   correctness, effect), and a shared ticket key belongs with the horizontal-scale / shared-replay design.
+   Deterministic metric: `tests/tls_handshake.rs::tls_stateless_ticketer_resumes_without_a_session_cache`
+   (cache=0 + tickets ON ⇒ all clients resume via TLS 1.3 tickets; the cache=0 + tickets OFF control ⇒ 0
+   resume) plus the in-gate `tls::tests::built_config_installs_ticketer_when_enabled_and_keeps_0rtt_off`.
 4. **P1.4 — vectored-write / response-coalescing audit — DONE (no change; premise did not hold).**
    The audit question was whether the response head+body leave as one `writev`-equivalent or two
    writes per response through axum-server → hyper. **Measured answer: already ONE.** The P0.1
@@ -396,7 +408,7 @@ transport crate-boundary and keeps the CTH + adversarial suites as the invariant
 | perf-p0-linuxprof | re-run the round-4 profile with `perf` on the Linux target; write the Linux NET-SYSCALL/MALLOC split into a `bench/LINUX-PROFILE.md` | 0 | measurement |
 | perf-p1-mimalloc | **LANDED** — `mimalloc::MiMalloc` installed as the `#[global_allocator]` in `src/main.rs`; remaining musl-build + Dockerized CTH 41/41 + peak-RSS flood acceptance run on the Linux/EC2 lane | 1 | deterministic (alloc source) + advisory RSS |
 | perf-p1-allocred | rebase + land `perf-c-alloc-reduction` on the bench-harness alloc floor | 1 | deterministic |
-| perf-p1-resumption | env-tunable rustls session-cache size / ticketer in `src/tls.rs`; scripted resumed-vs-full handshake count — **cache-size half LANDED** (`SOLID_SERVER_TLS_SESSION_CACHE_SIZE`, default 10 240; ticketer half deferred) | 1 | deterministic |
+| perf-p1-resumption | env-tunable rustls session-cache size / ticketer in `src/tls.rs`; scripted resumed-vs-full handshake count — **BOTH halves LANDED**: `SOLID_SERVER_TLS_SESSION_CACHE_SIZE` (default 10 240) + `SOLID_SERVER_TLS_STATELESS_TICKETS` (opt-in aws-lc-rs RFC 5077 ticketer, default OFF; 0-RTT stays off) | 1 | deterministic |
 | perf-p1-writev | **DONE (no code change)** — P0.1-driven write-coalescing audit: the response head+body already leave as ONE `writev` (`tests/response_write_coalescing.rs`); the P0.1 `write` 1.04/req is the tokio reactor waker (`eventfd`), a runtime lever not a serialization one. EC2 `strace -yy` confirmation-only follow-up. | 1 | deterministic |
 | perf-p1-nodelay | **LANDED (P1.5)** — `TCP_NODELAY` on accepted sockets on BOTH serve paths (`src/nodelay.rs`: TLS `NoDelayAcceptor` + plain `ListenerExt` tap); socket-option state pinned in `tests/tcp_nodelay.rs` | 1 | deterministic (socket-option state) |
 | perf-p1-backend | **counters LANDED** — backend-RTT counters at the SparqClient/BlobStore seams (`tests/{read,write}_path_counters.rs`) + the **embedded-sparq bench config** (`tests/embedded_read_counters.rs`, pins the embedded default `read_plan` `1+N` fan-out as the next reduction target); still open: pooled-connection verification for the HTTP client + `object_store` | 1 | deterministic |

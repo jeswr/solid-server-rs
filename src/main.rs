@@ -726,6 +726,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cert_path.display(),
             key_path.display()
         );
+        // P1.3 (beyond-50k): report the TLS session-resumption posture — the stateful cache bound and
+        // whether the opt-in stateless RFC 5077 ticketer is installed. 0-RTT is always OFF (anti-replay).
+        let session_cache_size = tls::session_cache_size_from_env();
+        if tls::stateless_tickets_from_env() {
+            eprintln!(
+                "  TLS resumption: STATELESS tickets ON (aws-lc-rs RFC 5077 ticketer, per-process keys \
+                 rotated ~6h) + stateful cache bound {session_cache_size}; 0-RTT OFF. NB tickets are NOT \
+                 shared across a scaled fleet — cross-node resumption falls back to a full handshake."
+            );
+        } else if session_cache_size == 0 {
+            eprintln!("  TLS resumption: DISABLED (session cache size 0, stateless tickets off); 0-RTT OFF.");
+        } else {
+            eprintln!(
+                "  TLS resumption: stateful session cache (bound {session_cache_size}); stateless tickets \
+                 off; 0-RTT OFF. Set SOLID_SERVER_TLS_STATELESS_TICKETS=1 for stateless tickets."
+            );
+        }
         if mtls_bound_tokens {
             eprintln!(
                 "  mTLS (PoP Tier-1b): RFC 8705 cert-bound tokens ENABLED — the handshake REQUESTS an \
