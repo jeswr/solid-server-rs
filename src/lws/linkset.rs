@@ -110,14 +110,24 @@ pub fn add_linkset_link(headers: &mut HeaderMap, resource_iri: &str) {
     }
 }
 
-/// Append the spec-required create-response links (§http-create: a 201 MUST carry `rel="up"` +
-/// `rel="linkset"`): called by the PUT/POST create paths when the LWS flag is on.
+/// Append the spec-required create-response links (§http-create-post JLWSC-POST-5: a 201 MUST carry
+/// `rel="up"`, `rel="linkset"`, and `rel="type"`): called by the PUT/POST create paths when the LWS
+/// flag is on. The `rel="type"` link names the created resource's JLWS type (`Container` for a
+/// trailing-slash IRI, `DataResource` otherwise).
 pub fn append_create_links(headers: &mut HeaderMap, created_iri: &str) {
     add_linkset_link(headers, created_iri);
     if let Some(parent) = parent_container_of(created_iri) {
         if let Ok(v) = HeaderValue::from_str(&format!("<{parent}>; rel=\"up\"")) {
             headers.append(header::LINK, v);
         }
+    }
+    let type_iri = if created_iri.ends_with('/') {
+        format!("{JLWS_NS}Container")
+    } else {
+        format!("{JLWS_NS}DataResource")
+    };
+    if let Ok(v) = HeaderValue::from_str(&format!("<{type_iri}>; rel=\"type\"")) {
+        headers.append(header::LINK, v);
     }
 }
 

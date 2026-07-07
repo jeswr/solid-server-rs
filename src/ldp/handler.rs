@@ -1589,14 +1589,32 @@ pub async fn post_handler<S: Store>(
         }
     }
 
-    // A POST write MUST carry a Content-Type (Solid Protocol — `content-type-reject`): ABSENT ⇒ 400.
-    let content_type = require_content_type(&headers)?;
-
-    // Container-intent: a `Link: <http://www.w3.org/ns/ldp#BasicContainer>; rel="type"` (or
-    // `ldp:Container`) on a POST asks the server to create a CONTAINER child (LDP §5.2.3.4) — the
-    // minted child IRI then ends in `/` and is created as a container. Without the type Link, a plain
-    // resource child is created.
+    // Container-intent: a `Link: <…#BasicContainer>`/`<…#Container>; rel="type"` on a POST asks the
+    // server to create a CONTAINER child — LDP §5.2.3.4 (`ldp:BasicContainer`/`ldp:Container`) AND
+    // JLWS §http-create-post (`jlws#Container` + its `w3.org/ns/lws#` alias — JLWSC-POST-3/NS-1).
+    // The minted child IRI then ends in `/` and is created as a container. Without the type Link, a
+    // plain resource child is created.
     let wants_container = wants_container_via_link(&headers);
+
+    // A POST write MUST carry a Content-Type (Solid Protocol — `content-type-reject`): ABSENT ⇒ 400
+    // — EXCEPT the JLWS container-creation POST (§http-create-post), whose canonical form carries NO
+    // body and NO Content-Type (a container's only representation is the server-managed listing, so
+    // there is nothing to type). A bodyless typed-Link container POST defaults to an empty
+    // `text/turtle` container; any OTHER absent-Content-Type POST is still a 400, and a container
+    // POST that DOES carry a body is validated under its declared type exactly as before. GATED on
+    // the LWS flag so the flag-off Solid surface is byte-identical (a bodyless POST is still a 400
+    // there — the additive invariant).
+    let bodyless_container = state.lws().is_some()
+        && wants_container
+        && body.is_empty()
+        && header_str(&headers, header::CONTENT_TYPE)
+            .map(|ct| ct.trim().is_empty())
+            .unwrap_or(true);
+    let content_type = if bodyless_container {
+        "text/turtle".to_string()
+    } else {
+        require_content_type(&headers)?
+    };
 
     // The sanitised Slug STEM (the caller's name hint; `None` if no usable Slug). The mint uses it ONLY
     // as a prefix of an opaque, collision-free name (V2 — see `mint_child_iri`), so the final segment
@@ -2490,15 +2508,21 @@ fn variant_suffix(format: RdfFormat) -> &'static str {
     }
 }
 
-/// Whether a POST asks for a CONTAINER child via `Link: <ldp#BasicContainer>; rel="type"` (or
-/// `ldp:Container`) — LDP §5.2.3.4 container creation. Matched across (possibly multiple) `Link`
-/// header lines, case-insensitively on the rel + the LDP container type IRI.
+/// Whether a POST asks for a CONTAINER child via a `Link: <type>; rel="type"` header — LDP
+/// §5.2.3.4 (`ldp#BasicContainer` / `ldp#Container`) OR JLWS §http-create-post
+/// (`https://w3id.org/jeswr/lws#Container` and its `https://www.w3.org/ns/lws#Container` alias —
+/// JLWSC-POST-3 / NS-1, both matched by the `lws#container` essence). Matched across (possibly
+/// multiple) `Link` header lines, case-insensitively on the rel + the container type IRI. The
+/// `lws#container` and `ldp#container` essences are distinct substrings, so neither matches the
+/// other.
 fn wants_container_via_link(headers: &HeaderMap) -> bool {
     headers.get_all(header::LINK).iter().any(|v| {
         let Ok(s) = v.to_str() else { return false };
         let lower = s.to_ascii_lowercase();
         lower.contains("rel=\"type\"")
-            && (lower.contains("ldp#basiccontainer") || lower.contains("ldp#container"))
+            && (lower.contains("ldp#basiccontainer")
+                || lower.contains("ldp#container")
+                || lower.contains("lws#container"))
     })
 }
 

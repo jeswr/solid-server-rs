@@ -581,6 +581,85 @@ async fn strict_listing_is_the_default_container_representation() {
     assert_eq!(bodies[0], bytes_default, "conneg variants match the no-Accept body");
 }
 
+/// #10 (JLWSC-POST-3/POST-5, NS-1): a POST with `Link: <jlws#Container>; rel="type"` — bodyless and
+/// Content-Type-less — creates a CONTAINER child (201 + trailing-slash Location + up/linkset/type
+/// links), the `w3.org/ns/lws#` alias is accepted, and the plain data-resource POST is unaffected.
+#[tokio::test]
+async fn post_typed_link_creates_a_container() {
+    let h = Harness::lws_strict_listing().await;
+    // Seed the parent container (a composed PUT auto-creates /alice/ and /alice/c/).
+    let seed = h
+        .request("PUT", "/alice/c/x.txt", Some("text/plain"), Body::from("x"))
+        .await;
+    assert_eq!(seed.status(), StatusCode::CREATED);
+
+    // (1) Bodyless typed-Link POST → 201 + a trailing-slash (container) Location.
+    let created = h
+        .request_with(
+            "POST",
+            "/alice/c/",
+            None,
+            &[
+                ("link", "<https://w3id.org/jeswr/lws#Container>; rel=\"type\""),
+                ("slug", "subdir"),
+            ],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let loc = header_value(&created, "location").unwrap().to_string();
+    assert!(loc.ends_with('/'), "container Location ends with '/': {loc}");
+    assert!(loc.starts_with("https://pod.example/alice/c/"), "{loc}");
+    // POST-5: the 201 carries rel="up", rel="linkset", and rel="type".
+    let links = link_values(&created).join("\n");
+    assert!(links.contains("rel=\"up\""), "up link: {links}");
+    assert!(links.contains("rel=\"linkset\""), "linkset link: {links}");
+    assert!(links.contains("lws#Container"), "type link: {links}");
+
+    // (2) GET the new container → the LWS listing, type Container, empty.
+    let path = loc.strip_prefix("https://pod.example").unwrap();
+    let got = h.request("GET", path, None, Body::empty()).await;
+    assert_eq!(got.status(), StatusCode::OK);
+    let doc = body_json(got).await;
+    assert_eq!(doc["type"], "Container");
+    assert_eq!(doc["totalItems"], 0);
+
+    // (3) JLWSC-NS-1: the w3.org/ns/lws# alias namespace is accepted in the typed link.
+    let aliased = h
+        .request_with(
+            "POST",
+            "/alice/c/",
+            None,
+            &[
+                ("link", "<https://www.w3.org/ns/lws#Container>; rel=\"type\""),
+                ("slug", "aliased"),
+            ],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(aliased.status(), StatusCode::CREATED);
+    assert!(header_value(&aliased, "location").unwrap().ends_with('/'));
+
+    // (4) The plain data-resource POST is unaffected: a body + Content-Type, no trailing slash.
+    let data = h
+        .request_with(
+            "POST",
+            "/alice/c/",
+            Some("text/plain"),
+            &[("slug", "note")],
+            Body::from("hello"),
+        )
+        .await;
+    assert_eq!(data.status(), StatusCode::CREATED);
+    assert!(!header_value(&data, "location").unwrap().ends_with('/'));
+
+    // (5) A bodyless POST WITHOUT the typed Link is still a 400 (Content-Type required).
+    let no_ct = h
+        .request("POST", "/alice/c/", None, Body::empty())
+        .await;
+    assert_eq!(no_ct.status(), StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn lws_container_listing_is_fail_closed_per_member() {
     let h = Harness::lws().await;
