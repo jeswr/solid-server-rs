@@ -1,0 +1,617 @@
+{
+  "kind": "solid-server-rs syscalls-per-request (Linux)",
+  "generated_by": "bench/syscalls.sh + bench/syscalls-report.py",
+  "generated_unix": 1783415619,
+  "generated_utc": "2026-07-07T09:13:39Z",
+  "git_sha": "b3ac0bf",
+  "host": {
+    "kernel": "6.18.35-68.129.amzn2023.x86_64",
+    "arch": "x86_64",
+    "cpu_model": "Intel(R) Xeon(R) Platinum 8488C",
+    "cores": 8,
+    "instance": "ip-172-31-2-27.eu-west-2.compute.internal",
+    "strace": "strace -- version 6.12",
+    "perf": "perf version 6.1.175-219.359.amzn2023.x86_64",
+    "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26)"
+  },
+  "params": {
+    "n": 5000,
+    "perf_n": 50000,
+    "warmup": 200,
+    "idle_secs": 5,
+    "listing_children": 100,
+    "transport": "plain HTTP/1.1, single keep-alive connection, loopback",
+    "store": "in-memory doubles (PSS_SPARQ_BACKEND=memory), bench-seeded",
+    "auth": "mock loopback OIDC issuer; DPoP-bound at+jwt; token cache ON (default)"
+  },
+  "metric_classes": {
+    "deterministic": [
+      "scenarios.*.reps[].by_syscall.*.calls / per_request",
+      "scenarios.*.reps[].total_syscalls / syscalls_per_request",
+      "scenarios.*.reps[].bytes_per_request"
+    ],
+    "advisory": [
+      "perf.* (sampled CPU shares, perf stat counters)"
+    ]
+  },
+  "caveats": [
+    "strace slows the traced server heavily; reactor-amortized syscalls (epoll_wait, timer maintenance) can BATCH differently under trace \u2014 per-request I/O syscalls (read/recvfrom/write/sendto/writev) are robust, amortized ones are approximate.",
+    "idle_baseline shows the background syscall rate the counts sit on; at the configured N its contribution per request is negligible but nonzero.",
+    "t3-class EC2 exposes no hardware PMU: perf uses software counters/cpu-clock sampling."
+  ],
+  "idle_baseline": {
+    "duration_secs": 5,
+    "total_syscalls": 819,
+    "syscalls_per_sec": 163.8,
+    "by_syscall": {
+      "accept4": 2,
+      "epoll_ctl": 1,
+      "epoll_wait": 206,
+      "futex": 7,
+      "recvfrom": 201,
+      "setsockopt": 1,
+      "write": 201,
+      "writev": 200
+    }
+  },
+  "scenarios": {
+    "anon-doc": {
+      "reps": [
+        {
+          "n": 5000,
+          "statuses": {
+            "200": 5000
+          },
+          "bytes_per_request": 116.0,
+          "reconnects": 0,
+          "total_syscalls": 20911,
+          "syscalls_per_request": 4.1822,
+          "by_syscall": {
+            "epoll_wait": {
+              "calls": 5240,
+              "errors": 0,
+              "per_request": 1.048
+            },
+            "recvfrom": {
+              "calls": 5202,
+              "errors": 0,
+              "per_request": 1.0404
+            },
+            "writev": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "write": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "madvise": {
+              "calls": 56,
+              "errors": 0,
+              "per_request": 0.0112
+            },
+            "futex": {
+              "calls": 6,
+              "errors": 0,
+              "per_request": 0.0012
+            },
+            "accept4": {
+              "calls": 2,
+              "errors": 1,
+              "per_request": 0.0004
+            },
+            "epoll_ctl": {
+              "calls": 2,
+              "errors": 0,
+              "per_request": 0.0004
+            },
+            "shutdown": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "close": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "setsockopt": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            }
+          }
+        },
+        {
+          "n": 5000,
+          "statuses": {
+            "200": 5000
+          },
+          "bytes_per_request": 116.0,
+          "reconnects": 0,
+          "total_syscalls": 22459,
+          "syscalls_per_request": 4.4918,
+          "by_syscall": {
+            "epoll_wait": {
+              "calls": 6845,
+              "errors": 0,
+              "per_request": 1.369
+            },
+            "recvfrom": {
+              "calls": 5202,
+              "errors": 0,
+              "per_request": 1.0404
+            },
+            "writev": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "write": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "futex": {
+              "calls": 4,
+              "errors": 0,
+              "per_request": 0.0008
+            },
+            "accept4": {
+              "calls": 2,
+              "errors": 1,
+              "per_request": 0.0004
+            },
+            "epoll_ctl": {
+              "calls": 2,
+              "errors": 0,
+              "per_request": 0.0004
+            },
+            "madvise": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "shutdown": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "close": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "setsockopt": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            }
+          }
+        }
+      ]
+    },
+    "listing": {
+      "reps": [
+        {
+          "n": 5000,
+          "statuses": {
+            "200": 5000
+          },
+          "bytes_per_request": 5199.0,
+          "reconnects": 0,
+          "total_syscalls": 21032,
+          "syscalls_per_request": 4.2064,
+          "by_syscall": {
+            "epoll_wait": {
+              "calls": 5417,
+              "errors": 0,
+              "per_request": 1.0834
+            },
+            "recvfrom": {
+              "calls": 5202,
+              "errors": 0,
+              "per_request": 1.0404
+            },
+            "writev": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "write": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "futex": {
+              "calls": 6,
+              "errors": 0,
+              "per_request": 0.0012
+            },
+            "accept4": {
+              "calls": 2,
+              "errors": 1,
+              "per_request": 0.0004
+            },
+            "epoll_ctl": {
+              "calls": 2,
+              "errors": 0,
+              "per_request": 0.0004
+            },
+            "shutdown": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "close": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "setsockopt": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            }
+          }
+        },
+        {
+          "n": 5000,
+          "statuses": {
+            "200": 5000
+          },
+          "bytes_per_request": 5199.0,
+          "reconnects": 0,
+          "total_syscalls": 23879,
+          "syscalls_per_request": 4.7758,
+          "by_syscall": {
+            "epoll_wait": {
+              "calls": 8261,
+              "errors": 0,
+              "per_request": 1.6522
+            },
+            "recvfrom": {
+              "calls": 5202,
+              "errors": 0,
+              "per_request": 1.0404
+            },
+            "write": {
+              "calls": 5201,
+              "errors": 0,
+              "per_request": 1.0402
+            },
+            "writev": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "futex": {
+              "calls": 4,
+              "errors": 0,
+              "per_request": 0.0008
+            },
+            "madvise": {
+              "calls": 4,
+              "errors": 0,
+              "per_request": 0.0008
+            },
+            "accept4": {
+              "calls": 2,
+              "errors": 1,
+              "per_request": 0.0004
+            },
+            "epoll_ctl": {
+              "calls": 2,
+              "errors": 0,
+              "per_request": 0.0004
+            },
+            "close": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "shutdown": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "setsockopt": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            }
+          }
+        }
+      ]
+    },
+    "authed-doc": {
+      "reps": [
+        {
+          "n": 5000,
+          "statuses": {
+            "200": 5000
+          },
+          "bytes_per_request": 118.0,
+          "reconnects": 0,
+          "total_syscalls": 26609,
+          "syscalls_per_request": 5.3218,
+          "by_syscall": {
+            "epoll_wait": {
+              "calls": 10347,
+              "errors": 0,
+              "per_request": 2.0694
+            },
+            "write": {
+              "calls": 5206,
+              "errors": 0,
+              "per_request": 1.0412
+            },
+            "recvfrom": {
+              "calls": 5202,
+              "errors": 0,
+              "per_request": 1.0404
+            },
+            "writev": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "futex": {
+              "calls": 442,
+              "errors": 0,
+              "per_request": 0.0884
+            },
+            "getrandom": {
+              "calls": 200,
+              "errors": 0,
+              "per_request": 0.04
+            },
+            "madvise": {
+              "calls": 5,
+              "errors": 0,
+              "per_request": 0.001
+            },
+            "epoll_ctl": {
+              "calls": 2,
+              "errors": 0,
+              "per_request": 0.0004
+            },
+            "accept4": {
+              "calls": 2,
+              "errors": 1,
+              "per_request": 0.0004
+            },
+            "close": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "shutdown": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "setsockopt": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            }
+          }
+        },
+        {
+          "n": 5000,
+          "statuses": {
+            "200": 5000
+          },
+          "bytes_per_request": 118.0,
+          "reconnects": 0,
+          "total_syscalls": 26838,
+          "syscalls_per_request": 5.3676,
+          "by_syscall": {
+            "epoll_wait": {
+              "calls": 10436,
+              "errors": 0,
+              "per_request": 2.0872
+            },
+            "write": {
+              "calls": 5204,
+              "errors": 0,
+              "per_request": 1.0408
+            },
+            "recvfrom": {
+              "calls": 5202,
+              "errors": 0,
+              "per_request": 1.0404
+            },
+            "writev": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "futex": {
+              "calls": 588,
+              "errors": 0,
+              "per_request": 0.1176
+            },
+            "getrandom": {
+              "calls": 200,
+              "errors": 0,
+              "per_request": 0.04
+            },
+            "epoll_ctl": {
+              "calls": 2,
+              "errors": 0,
+              "per_request": 0.0004
+            },
+            "accept4": {
+              "calls": 2,
+              "errors": 1,
+              "per_request": 0.0004
+            },
+            "madvise": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "close": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "shutdown": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "setsockopt": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            }
+          }
+        }
+      ]
+    },
+    "put": {
+      "reps": [
+        {
+          "n": 5000,
+          "statuses": {
+            "204": 5000
+          },
+          "bytes_per_request": 0.0,
+          "reconnects": 0,
+          "total_syscalls": 44840,
+          "syscalls_per_request": 8.968,
+          "by_syscall": {
+            "futex": {
+              "calls": 13666,
+              "errors": 67,
+              "per_request": 2.7332
+            },
+            "epoll_wait": {
+              "calls": 10355,
+              "errors": 0,
+              "per_request": 2.071
+            },
+            "write": {
+              "calls": 5391,
+              "errors": 0,
+              "per_request": 1.0782
+            },
+            "recvfrom": {
+              "calls": 5202,
+              "errors": 0,
+              "per_request": 1.0404
+            },
+            "writev": {
+              "calls": 5200,
+              "errors": 0,
+              "per_request": 1.04
+            },
+            "getrandom": {
+              "calls": 5000,
+              "errors": 0,
+              "per_request": 1.0
+            },
+            "madvise": {
+              "calls": 19,
+              "errors": 0,
+              "per_request": 0.0038
+            },
+            "epoll_ctl": {
+              "calls": 2,
+              "errors": 0,
+              "per_request": 0.0004
+            },
+            "accept4": {
+              "calls": 2,
+              "errors": 1,
+              "per_request": 0.0004
+            },
+            "shutdown": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "close": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "setsockopt": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            }
+          }
+        },
+        {
+          "n": 5000,
+          "statuses": {
+            "204": 5000
+          },
+          "bytes_per_request": 0.0,
+          "reconnects": 0,
+          "total_syscalls": 44082,
+          "syscalls_per_request": 8.8164,
+          "by_syscall": {
+            "futex": {
+              "calls": 13865,
+              "errors": 23,
+              "per_request": 2.773
+            },
+            "epoll_wait": {
+              "calls": 10115,
+              "errors": 0,
+              "per_request": 2.023
+            },
+            "write": {
+              "calls": 5096,
+              "errors": 0,
+              "per_request": 1.0192
+            },
+            "recvfrom": {
+              "calls": 5001,
+              "errors": 0,
+              "per_request": 1.0002
+            },
+            "writev": {
+              "calls": 5000,
+              "errors": 0,
+              "per_request": 1.0
+            },
+            "getrandom": {
+              "calls": 5000,
+              "errors": 0,
+              "per_request": 1.0
+            },
+            "madvise": {
+              "calls": 2,
+              "errors": 0,
+              "per_request": 0.0004
+            },
+            "shutdown": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "close": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            },
+            "epoll_ctl": {
+              "calls": 1,
+              "errors": 0,
+              "per_request": 0.0002
+            }
+          }
+        }
+      ]
+    }
+  },
+  "perf_advisory": {}
+}
