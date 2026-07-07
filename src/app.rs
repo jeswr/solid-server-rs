@@ -143,11 +143,21 @@ where
     // relying on axum's implicit default (which a dependency bump could silently change). The binary's
     // [`build_router_with_overload`] applies the CONFIGURABLE value instead. Health routes are merged
     // OUTSIDE the layer (they carry no body).
-    build_app_routes(state)
-        .layer(crate::body_limit::layer(
-            crate::body_limit::DEFAULT_MAX_BODY_BYTES,
-        ))
-        .merge(health_routes())
+    let lws_on = state.ldp.lws().is_some();
+    let mut app = build_app_routes(state).layer(crate::body_limit::layer(
+        crate::body_limit::DEFAULT_MAX_BODY_BYTES,
+    ));
+    // JLWSC-HG-5 (flag-gated, `crate::lws::problem`): with the LWS surface on, every content-
+    // bearing 4xx/5xx from the app routes carries an RFC 9457 `application/problem+json` body.
+    // OUTERMOST over the app routes so the auth 401s and the CORS'd errors are covered (it swaps
+    // only the entity — WWW-Authenticate / Allow / CORS headers pass through); health routes stay
+    // outside. Applied ONLY when LWS is on, so the flag-off error bytes are unchanged.
+    if lws_on {
+        app = app.layer(axum::middleware::from_fn(
+            crate::lws::problem::problem_details_middleware,
+        ));
+    }
+    app.merge(health_routes())
 }
 
 /// Build the router WITH overload protection (the binary's path): admission control (load shedding)
@@ -164,6 +174,7 @@ where
     R: ReplayStore + Send + Sync + 'static,
     S: Store + 'static,
 {
+    let lws_on = state.ldp.lws().is_some();
     let mut app = build_app_routes(state);
 
     // INNERMOST (app routes): the explicit, configurable request-body ceiling (a body over the limit ⇒
@@ -208,6 +219,18 @@ where
         app = app.layer(axum::middleware::from_fn_with_state(
             rate_limiter,
             rate_limit_middleware,
+        ));
+    }
+
+    // JLWSC-HG-5 (flag-gated, `crate::lws::problem`): with the LWS surface on, every content-
+    // bearing 4xx/5xx carries an RFC 9457 `application/problem+json` body. Applied OUTSIDE the
+    // overload/rate-limit layers so the shed 503, the timeout 504, and the rate-limit 429 carry
+    // problem details too (their Retry-After headers pass through — the middleware swaps only the
+    // entity). 🔒 It never changes a status or admits a request, so it cannot weaken the
+    // security-critical layer order above. Applied ONLY when LWS is on — flag-off bytes unchanged.
+    if lws_on {
+        app = app.layer(axum::middleware::from_fn(
+            crate::lws::problem::problem_details_middleware,
         ));
     }
 

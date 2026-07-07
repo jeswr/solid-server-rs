@@ -3503,3 +3503,103 @@ async fn a_verified_pin_the_backend_aged_out_is_410_snapshot_gone() {
         "https://w3id.org/jeswr/lws/problems/snapshot-gone"
     );
 }
+
+// ── JLWSC-HG-5 (D17): problem details on EVERY content-bearing 4xx, flag-gated ─────────────────
+//
+// The LWS code paths mint their fixed-registry problems directly (`ServerError::LwsProblem`);
+// these tests pin the `crate::lws::problem` middleware that closes the GENERIC `ServerError`
+// gap (404, 401, …) when — and only when — the LWS surface is on.
+
+/// A generic 404 (a path that simply does not exist) carries the RFC 9457 `about:blank` problem
+/// shape when LWS is on. This is the `errors/problem-details-on-4xx` /
+/// `resources/error-carries-problem-details` conformance-vector behaviour.
+#[tokio::test]
+async fn lws_generic_404_carries_problem_details() {
+    let h = Harness::lws().await;
+    let resp = h
+        .request("GET", "/alice/notes/missing.txt", None, Body::empty())
+        .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        mediatype_of(header_value(&resp, "content-type").unwrap()),
+        "application/problem+json"
+    );
+    let problem = body_json(resp).await;
+    assert_eq!(problem["type"], "about:blank");
+    assert_eq!(problem["title"], "Not Found");
+    assert_eq!(problem["status"], 404);
+}
+
+/// The anonymous-denial 401 keeps its `WWW-Authenticate` challenge (the middleware swaps only the
+/// entity) while gaining the problem body.
+#[tokio::test]
+async fn lws_anonymous_401_problem_details_preserves_challenge() {
+    let h = Harness::lws().await;
+    let resp = h.unauth_request("GET", "/alice/private.txt", None).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        header_value(&resp, "www-authenticate").is_some(),
+        "WWW-Authenticate challenge must survive the problem-details mapping"
+    );
+    assert_eq!(
+        mediatype_of(header_value(&resp, "content-type").unwrap()),
+        "application/problem+json"
+    );
+    let problem = body_json(resp).await;
+    assert_eq!(problem["status"], 401);
+}
+
+/// The LWS-minted fixed-registry problems (D17) pass through UNCHANGED — the middleware must not
+/// overwrite a specific problem type with the generic `about:blank` shape (idempotence).
+#[tokio::test]
+async fn lws_registry_problem_not_overwritten_by_generic_mapping() {
+    let h = Harness::lws_strict().await;
+    // Strict PUT (D2): an unconditional PUT is 428 + the `unconditional-put` registry problem.
+    let resp = h
+        .request(
+            "PUT",
+            "/alice/notes/a.txt",
+            Some("text/plain"),
+            Body::from("alpha"),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::PRECONDITION_REQUIRED);
+    assert_eq!(
+        mediatype_of(header_value(&resp, "content-type").unwrap()),
+        "application/problem+json"
+    );
+    let problem = body_json(resp).await;
+    assert_eq!(
+        problem["type"],
+        "https://w3id.org/jeswr/lws/problems/unconditional-put"
+    );
+}
+
+/// HEAD carve-out ("except where HTTP semantics do not permit response content"): a HEAD error
+/// response is passed through untouched — no problem entity is minted for it. (The full RFC 9110
+/// §9.3.2 header-mirror — HEAD carrying the GET's problem `Content-Type` with no body — is the
+/// deferred GAPS.md vector.)
+#[tokio::test]
+async fn lws_head_error_is_not_given_a_problem_entity() {
+    let h = Harness::lws().await;
+    let resp = h
+        .request("HEAD", "/alice/notes/missing.txt", None, Body::empty())
+        .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let ct = header_value(&resp, "content-type").unwrap_or("");
+    assert_ne!(mediatype_of(ct), "application/problem+json");
+}
+
+/// Flag-off invariance: with the LWS surface OFF the generic error bytes are the pre-LWS
+/// `text/plain` bodies, byte-identical — the middleware is not even installed.
+#[tokio::test]
+async fn flag_off_404_keeps_plain_text_error_body() {
+    let h = Harness::flag_off().await;
+    let resp = h
+        .request("GET", "/alice/notes/missing.txt", None, Body::empty())
+        .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let ct = header_value(&resp, "content-type").unwrap_or("");
+    assert_ne!(mediatype_of(ct), "application/problem+json");
+    assert_eq!(body_bytes(resp).await.as_ref(), b"not found");
+}

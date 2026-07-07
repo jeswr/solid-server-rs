@@ -135,6 +135,7 @@ pub mod auth;
 pub mod container;
 pub mod linkset;
 pub mod pin;
+pub mod problem;
 pub mod rar;
 pub mod transform;
 
