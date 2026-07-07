@@ -19,7 +19,7 @@ use axum::routing::get;
 use axum::Router;
 use rustls_pemfile::certs;
 use solid_server_rs::tls::{
-    build_rustls_config, build_rustls_config_with_session_cache_size, TlsMode,
+    build_rustls_config, build_rustls_config_with_tuning, TlsMode, TransportTuning,
     DEFAULT_TLS_SESSION_CACHE_SIZE,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -619,13 +619,28 @@ async fn exchange_and_handshake_kind(
 /// a deterministic count plus whether EVERY resumed handshake negotiated TLS 1.3 (so the test can prove
 /// the cache governs TLS 1.3 resumption specifically — see the roborev-finding note on the test below).
 async fn resumed_vs_full(cache_size: usize, n_clients: usize) -> (usize, usize, bool) {
+    // The stateful-cache-only path (stateless tickets OFF): the original cache-size lever.
+    resumed_vs_full_tuned(
+        TransportTuning {
+            session_cache_size: cache_size,
+            stateless_tickets: false,
+        },
+        n_clients,
+    )
+    .await
+}
+
+/// The [`TransportTuning`]-parametrized core of [`resumed_vs_full`], so a test can drive the SAME
+/// scripted reconnect harness against a stateless-ticketer config (P1.3 ticketer half) as well as the
+/// stateful-cache one. Identical mechanics; only the built rustls config differs.
+async fn resumed_vs_full_tuned(tuning: TransportTuning, n_clients: usize) -> (usize, usize, bool) {
     let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let mode = TlsMode::Tls {
         cert_path: CERT_PATH.into(),
         key_path: KEY_PATH.into(),
     };
-    let rustls_config = build_rustls_config_with_session_cache_size(&mode, false, cache_size)
+    let rustls_config = build_rustls_config_with_tuning(&mode, false, tuning)
         .await
         .expect("build rustls config")
         .expect("TLS mode yields a config");
@@ -765,5 +780,63 @@ async fn tls_session_cache_size_governs_resumed_handshake_count() {
          tiny(4)        N={n_small}: {resumed_tiny}/{n_small} resumed ({full_tiny} full)\n  \
          BEFORE cache=256   N={n_boundary}: {resumed_256}/{n_boundary} resumed ({full_256} full)\n  \
          AFTER  cache=10240 N={n_boundary}: {resumed_10240}/{n_boundary} resumed ({full_10240} full)"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the fixture test cert + real socket I/O; run with --ignored"]
+async fn tls_stateless_ticketer_resumes_without_a_session_cache() {
+    // The P1.3 ticketer half, proven deterministically by CONTRAST with the cache-size test's Scenario B.
+    //
+    // Scenario B there proves: with the DEFAULT (no ticketer) and session cache size 0, EVERY reconnect
+    // is a FULL handshake (stateful resumption is off, no ticket is issued). Here, with the SAME cache
+    // size 0 but stateless tickets ON, every client instead RESUMES via an encrypted RFC 5077 ticket —
+    // demonstrating (a) the ticketer genuinely enables TLS 1.3 resumption and (b) it is INDEPENDENT of the
+    // server-side session_storage (stateless: no per-session server memory). This is the deterministic
+    // resumed-vs-full COUNT metric for the ticketer, the analogue of the cache-size handshake-count test.
+    let n = 32usize;
+
+    // Ticketer ON + cache 0 ⇒ all resume (statelessly), and every resumed handshake is TLS 1.3.
+    let (resumed_tickets, full_tickets, tickets_all_tls13) = resumed_vs_full_tuned(
+        TransportTuning {
+            session_cache_size: 0,
+            stateless_tickets: true,
+        },
+        n,
+    )
+    .await;
+    assert_eq!(
+        resumed_tickets, n,
+        "stateless tickets must let all {n} clients resume WITHOUT a session cache (got {resumed_tickets} resumed, {full_tickets} full)"
+    );
+    assert!(
+        tickets_all_tls13,
+        "the ticket-based resumptions must be TLS 1.3 (rustls uses the ticketer for TLS 1.3 stateless resumption)"
+    );
+
+    // Control: SAME cache 0 but tickets OFF ⇒ zero resumptions (the stateful path is disabled and no
+    // ticket is issued) — the exact contrast that isolates the ticketer as the cause of resumption above.
+    let (resumed_off, full_off, _) = resumed_vs_full_tuned(
+        TransportTuning {
+            session_cache_size: 0,
+            stateless_tickets: false,
+        },
+        n,
+    )
+    .await;
+    assert_eq!(
+        resumed_off, 0,
+        "with tickets OFF and cache 0, resumption must be fully disabled (got {resumed_off} resumed)"
+    );
+    assert_eq!(full_off, n);
+    assert!(
+        resumed_tickets > resumed_off,
+        "the ticketer must strictly increase resumptions over the no-ticketer, no-cache baseline ({resumed_tickets} vs {resumed_off})"
+    );
+
+    eprintln!(
+        "P1.3 stateless-ticket resumption (cache=0):\n  \
+         tickets ON  N={n}: {resumed_tickets}/{n} resumed ({full_tickets} full, all TLS1.3={tickets_all_tls13})\n  \
+         tickets OFF N={n}: {resumed_off}/{n} resumed ({full_off} full)"
     );
 }
