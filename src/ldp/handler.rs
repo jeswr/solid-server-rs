@@ -260,6 +260,12 @@ impl<S: Store> LdpState<S> {
         self.lws.as_deref().is_some_and(|l| l.strict_put)
     }
 
+    /// Whether the LWS strict container-LISTING discipline is on (§container-media-type;
+    /// pure-LWS deployments) — the LWS JSON-LD listing is the default container representation.
+    fn lws_strict_listing(&self) -> bool {
+        self.lws.as_deref().is_some_and(|l| l.strict_listing)
+    }
+
     /// Set the `WWW-Authenticate` challenge emitted on a 401 (the verifier-derived one). Called by
     /// [`AppState::new`](crate::app::AppState::new) so the LDP layer's anonymous-401 names the same
     /// issuer(s)/algs as every other challenge.
@@ -1003,7 +1009,7 @@ pub(crate) async fn serve_read<S: Store>(
     // representation? `None` when the flag is off OR the Accept resolves to the existing surface
     // (the negotiation is surface-preserving — see `lws::container::negotiate_container`).
     let lws_container_variant = if target.is_container && state.lws().is_some() {
-        crate::lws::container::negotiate_container(accept)
+        crate::lws::container::negotiate_container(accept, state.lws_strict_listing())
     } else {
         None
     };

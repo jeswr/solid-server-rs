@@ -230,6 +230,16 @@ pub const ENV_LWS_RDF_TRANSFORM: &str = "SOLID_SERVER_LWS_RDF_TRANSFORM";
 /// Env flag for the STRICT D2/D3 PUT semantics (pure-LWS deployments only — changes Solid PUT
 /// behaviour, see the module doc). Default **off**.
 pub const ENV_LWS_STRICT_PUT: &str = "SOLID_SERVER_LWS_STRICT_PUT";
+/// Env flag for the STRICT container-LISTING discipline (pure-LWS deployments only —
+/// `index.html` §container-media-type, JLWSC-CMT-1/2). Default **off**. When ON, the LWS
+/// server-managed JSON-LD listing IS the container representation: a container GET with **no
+/// Accept**, or `application/ld+json` / `application/json` (in addition to the always-on
+/// `application/lws+json` / profiled ld+json), all serve the IDENTICAL listing bytes with only
+/// `Content-Type` varying (the same-bytes conneg rule). OFF (the composed default) keeps the
+/// existing Solid LDP `ldp:contains` rendering for every non-LWS Accept — so the additive
+/// invariant (an LWS-composed Solid deployment is byte-identical for the Solid surface) holds
+/// unless a deployment explicitly opts into the pure-LWS listing.
+pub const ENV_LWS_STRICT_LISTING: &str = "SOLID_SERVER_LWS_STRICT_LISTING";
 /// Env knob for the LWS container-listing PAGE SIZE (M3, spec §pagination — the "server-determined
 /// threshold"): a membership larger than this is paged. Default [`DEFAULT_LWS_PAGE_SIZE`]; `0`
 /// disables pagination (every listing single-page); unparseable values keep the default.
@@ -274,6 +284,12 @@ pub struct LwsConfig {
     /// The strict D2/D3 PUT semantics (every PUT conditional / no auto-intermediate containers /
     /// no container bodies). Off by default — see the module doc's composition note.
     pub strict_put: bool,
+    /// The strict container-LISTING discipline (§container-media-type / JLWSC-CMT-1/2): when on,
+    /// the LWS JSON-LD listing IS the container representation — a no-Accept / `application/ld+json`
+    /// / `application/json` container GET serves the identical listing bytes (only `Content-Type`
+    /// varies), rather than the composed Solid `ldp:contains` rendering. Off by default (composed
+    /// mode preserved — see [`ENV_LWS_STRICT_LISTING`] + the module doc's composition note).
+    pub strict_listing: bool,
     /// The container-listing page size (M3, spec §pagination): a listing whose VISIBLE membership
     /// exceeds this is paged (`Link` rel first/next/prev/last; `items` = the current page;
     /// `totalItems` = the whole visible membership). `None` ⇒ pagination off (every listing
@@ -317,6 +333,7 @@ impl LwsConfig {
         Self {
             rdf_transform,
             strict_put,
+            strict_listing: false,
             page_size: std::num::NonZeroUsize::new(DEFAULT_LWS_PAGE_SIZE),
             // Fresh per-process entropy; `None` on RNG failure ⇒ pins disabled fail-closed (the
             // field's doc). Never minted from a weak fallback.
@@ -333,6 +350,14 @@ impl LwsConfig {
     /// every existing `new` caller keeps the default.
     pub fn with_page_size(mut self, page_size: Option<std::num::NonZeroUsize>) -> Self {
         self.page_size = page_size;
+        self
+    }
+
+    /// Enable the strict container-LISTING discipline ([`ENV_LWS_STRICT_LISTING`]; JLWSC-CMT-1/2):
+    /// the LWS JSON-LD listing becomes the default container representation. Builder-style so every
+    /// existing `new` caller keeps the composed default (off).
+    pub fn with_strict_listing(mut self, strict_listing: bool) -> Self {
+        self.strict_listing = strict_listing;
         self
     }
 
@@ -411,6 +436,7 @@ impl LwsConfig {
             Some(v) => is_truthy(&v),
         };
         let strict_put = env_truthy(ENV_LWS_STRICT_PUT);
+        let strict_listing = env_truthy(ENV_LWS_STRICT_LISTING);
         let page_size = match std::env::var(ENV_LWS_PAGE_SIZE)
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
@@ -425,6 +451,7 @@ impl LwsConfig {
             .unwrap_or(DEFAULT_LWS_PIN_TTL_SECS);
         Some(
             Self::new(base_url, rdf_transform, strict_put)
+                .with_strict_listing(strict_listing)
                 .with_page_size(page_size)
                 .with_pin_ttl_secs(pin_ttl_secs)
                 .with_agent_card_url(agent_card.as_deref()),

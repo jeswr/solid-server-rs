@@ -154,9 +154,11 @@ impl ContainerVariant {
 }
 
 /// Decide whether a container GET's `Accept` selects the LWS representation, and under which
-/// `Content-Type`. `None` ⇒ the existing Solid LDP rendering (the flag-off behaviour).
+/// `Content-Type`. `None` ⇒ the existing Solid LDP rendering (the flag-off / composed behaviour).
 ///
-/// Selection rules (surface-preserving — see the module doc):
+/// Two modes, keyed by `strict` (the deployment's [`LwsConfig::strict_listing`](super::LwsConfig)):
+///
+/// **Composed mode (`strict = false`, the default)** — surface-preserving selection rules:
 /// 1. `application/lws+json` or PROFILED `application/ld+json` at a weight `>=` the best weight of
 ///    any type the existing surface can produce (Turtle / plain JSON-LD, incl. wildcard coverage)
 ///    ⇒ the LWS shape (these two forms are unambiguous LWS requests; ties resolve in their favour
@@ -165,7 +167,29 @@ impl ContainerVariant {
 ///    acceptable (the request would previously have been a 406) ⇒ the LWS shape as
 ///    `application/json`.
 /// 3. Else ⇒ `None` (existing behaviour, byte-identical).
-pub fn negotiate_container(accept: Option<&str>) -> Option<ContainerVariant> {
+///
+/// **Strict mode (`strict = true`, the pure-LWS deployment — §container-media-type / JLWSC-CMT-1/2)**
+/// — the LWS JSON-LD listing IS the container representation, so a request the composed rules would
+/// leave to the Solid rendering instead gets the listing under the best-matching JSON `Content-Type`
+/// (default: profiled `application/ld+json`). No-Accept / `application/ld+json` / `application/json`
+/// / a wildcard all resolve to the listing; the payload bytes are identical, only `Content-Type`
+/// varies. (An explicit non-JSON-only `Accept` such as `text/turtle` still gets the JSON listing
+/// labelled as the default profiled JSON-LD — a pure-LWS container has no other representation.)
+pub fn negotiate_container(accept: Option<&str>, strict: bool) -> Option<ContainerVariant> {
+    if let Some(v) = negotiate_container_composed(accept) {
+        return Some(v);
+    }
+    // Strict listing: the composed rules declined (the request would get the Solid rendering), but
+    // this pure-LWS deployment has no such rendering — serve the listing under the best JSON label.
+    if strict {
+        return Some(strict_default_variant(accept));
+    }
+    None
+}
+
+/// The composed-mode selection (the surface-preserving rules 1–3 above). Extracted so strict mode
+/// can reuse it verbatim before falling back to the pure-LWS default.
+fn negotiate_container_composed(accept: Option<&str>) -> Option<ContainerVariant> {
     let raw = accept?;
     if raw.trim().is_empty() {
         return None;
@@ -222,6 +246,37 @@ pub fn negotiate_container(accept: Option<&str>) -> Option<ContainerVariant> {
         return Some(ContainerVariant::PlainJson);
     }
     None
+}
+
+/// The pure-LWS (`strict_listing`) default `Content-Type` label for a container request the
+/// composed rules declined: among the three JSON forms the client named, pick the highest-weighted;
+/// with none named (no Accept, a wildcard, or a non-JSON type only) default to profiled
+/// `application/ld+json` (JLWSC-CMT-1's default advertised type). The payload BYTES are identical
+/// across every variant — this only chooses the `Content-Type` header (JLWSC-CMT-2).
+fn strict_default_variant(accept: Option<&str>) -> ContainerVariant {
+    let mut q_lws = 0.0f32;
+    let mut q_json = 0.0f32;
+    let mut q_ldjson = 0.0f32; // plain OR profiled ld+json — both label as ld+json
+    if let Some(raw) = accept {
+        for part in raw.split(',') {
+            let (media, q, _profiled) = super::parse_accept_part(part);
+            match media.as_str() {
+                MEDIA_LWS_JSON => q_lws = q_lws.max(q),
+                "application/json" => q_json = q_json.max(q),
+                "application/ld+json" => q_ldjson = q_ldjson.max(q),
+                _ => {}
+            }
+        }
+    }
+    // Prefer the more specific LWS type on a tie; plain JSON only when strictly best; else the
+    // default profiled JSON-LD (covers ld+json, no-Accept, wildcards, and non-JSON asks).
+    if q_lws > 0.0 && q_lws >= q_json && q_lws >= q_ldjson {
+        ContainerVariant::LwsJson
+    } else if q_json > 0.0 && q_json > q_ldjson {
+        ContainerVariant::PlainJson
+    } else {
+        ContainerVariant::ProfiledJsonLd
+    }
 }
 
 /// A rendered LWS listing: the (page's) JSON-LD bytes + the RFC 8288 pagination `Link` header
@@ -478,33 +533,38 @@ mod tests {
 
     #[test]
     fn lws_shape_selected_only_on_unambiguous_ask() {
-        // The unambiguous forms select it…
+        // The unambiguous forms select it (composed mode, strict = false)…
         assert_eq!(
-            negotiate_container(Some("application/lws+json")),
+            negotiate_container(Some("application/lws+json"), false),
             Some(ContainerVariant::LwsJson)
         );
         assert_eq!(
-            negotiate_container(Some(
-                "application/ld+json;profile=\"https://w3id.org/jeswr/lws/v1\""
-            )),
+            negotiate_container(
+                Some("application/ld+json;profile=\"https://w3id.org/jeswr/lws/v1\""),
+                false
+            ),
             Some(ContainerVariant::ProfiledJsonLd)
         );
         // …and win ties against equally-weighted existing types (the more specific ask).
         assert_eq!(
-            negotiate_container(Some("text/turtle, application/lws+json")),
+            negotiate_container(Some("text/turtle, application/lws+json"), false),
             Some(ContainerVariant::LwsJson)
         );
         // A STRICTLY higher existing weight keeps the Solid rendering.
         assert_eq!(
-            negotiate_container(Some("text/turtle;q=0.9, application/lws+json;q=0.5")),
+            negotiate_container(Some("text/turtle;q=0.9, application/lws+json;q=0.5"), false),
             None
         );
         // q=0 refuses the LWS form.
-        assert_eq!(negotiate_container(Some("application/lws+json;q=0")), None);
+        assert_eq!(
+            negotiate_container(Some("application/lws+json;q=0"), false),
+            None
+        );
     }
 
     #[test]
     fn existing_accepts_keep_the_solid_rendering() {
+        // Composed mode (strict = false): every non-LWS Accept keeps the Solid rendering.
         for accept in [
             None,
             Some(""),
@@ -516,7 +576,7 @@ mod tests {
             Some("text/turtle;q=0.5, application/ld+json;q=0.9"),
         ] {
             assert_eq!(
-                negotiate_container(accept),
+                negotiate_container(accept, false),
                 None,
                 "accept={accept:?} must keep the existing rendering"
             );
@@ -524,20 +584,51 @@ mod tests {
     }
 
     #[test]
-    fn plain_json_rescues_only_a_previous_406() {
-        // application/json alone: previously 406 ⇒ the LWS shape as plain JSON.
+    fn strict_listing_makes_the_lws_listing_the_default() {
+        // Strict mode (§container-media-type / JLWSC-CMT-1/2): the composed rules' `None` cases now
+        // resolve to the LWS listing under the best JSON `Content-Type` label. Bytes are identical
+        // across variants; only the label differs (JLWSC-CMT-2).
+        for (accept, want) in [
+            (None, ContainerVariant::ProfiledJsonLd),        // no Accept → CMT-1 default type
+            (Some(""), ContainerVariant::ProfiledJsonLd),
+            (Some("*/*"), ContainerVariant::ProfiledJsonLd),
+            (Some("text/turtle"), ContainerVariant::ProfiledJsonLd), // no other representation
+            (Some("application/ld+json"), ContainerVariant::ProfiledJsonLd),
+            (Some("application/json"), ContainerVariant::PlainJson),
+            (Some("application/lws+json"), ContainerVariant::LwsJson),
+            (
+                Some("text/turtle;q=0.5, application/json;q=0.9"),
+                ContainerVariant::PlainJson,
+            ),
+        ] {
+            assert_eq!(
+                negotiate_container(accept, true),
+                Some(want),
+                "strict accept={accept:?}"
+            );
+        }
+        // The unambiguous LWS asks resolve identically whether or not strict is on.
         assert_eq!(
-            negotiate_container(Some("application/json")),
+            negotiate_container(Some("application/lws+json"), true),
+            Some(ContainerVariant::LwsJson)
+        );
+    }
+
+    #[test]
+    fn plain_json_rescues_only_a_previous_406() {
+        // application/json alone: previously 406 ⇒ the LWS shape as plain JSON (composed mode).
+        assert_eq!(
+            negotiate_container(Some("application/json"), false),
             Some(ContainerVariant::PlainJson)
         );
         // With an acceptable existing type present, the Solid rendering wins (surface-preserving).
         assert_eq!(
-            negotiate_container(Some("application/json, text/turtle;q=0.5")),
+            negotiate_container(Some("application/json, text/turtle;q=0.5"), false),
             None
         );
         // A wildcard also keeps the existing rendering (it covers the Solid types).
         assert_eq!(
-            negotiate_container(Some("application/json;q=0.1, */*;q=0.1")),
+            negotiate_container(Some("application/json;q=0.1, */*;q=0.1"), false),
             None
         );
     }

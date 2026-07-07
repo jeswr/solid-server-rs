@@ -204,6 +204,17 @@ impl Harness {
         Self::with_lws(Some(LwsConfig::new(BASE_URL, true, true))).await
     }
 
+    /// LWS on, STRICT LISTING (the pure-LWS container representation — §container-media-type /
+    /// JLWSC-CMT-1/2). strict_listing is independent of strict_put, so this variant keeps the
+    /// composed (auto-intermediate) PUT to isolate the listing behaviour under test; the pure-LWS
+    /// conformance deployment sets BOTH (`from_env`).
+    async fn lws_strict_listing() -> Self {
+        Self::with_lws(Some(
+            LwsConfig::new(BASE_URL, true, false).with_strict_listing(true),
+        ))
+        .await
+    }
+
     fn auth_headers(&self, method: &str, path: &str) -> (String, String) {
         let access = mint_access_token(&self.issuer_key, &self.client_key.thumbprint);
         // The DPoP htu excludes the query (RFC 9449 §4.3), matching the server's parse_target —
@@ -276,6 +287,12 @@ async fn body_bytes(resp: axum::http::Response<Body>) -> Bytes {
 
 async fn body_json(resp: axum::http::Response<Body>) -> serde_json::Value {
     serde_json::from_slice(&body_bytes(resp).await).expect("response body is JSON")
+}
+
+/// The media-type essence of a `Content-Type` value (parameters trimmed) — mirrors the conformance
+/// harness's `mediaType` matcher (`value.split(';')[0].trim()`).
+fn mediatype_of(ct: &str) -> &str {
+    ct.split(';').next().unwrap_or("").trim()
 }
 
 fn header_value<'a>(resp: &'a axum::http::Response<Body>, name: &str) -> Option<&'a str> {
@@ -504,6 +521,64 @@ async fn lws_container_listing_shape_and_links() {
     let ttl = String::from_utf8(body_bytes(solid).await.to_vec()).unwrap();
     assert!(ttl.contains("ldp#contains"));
     assert!(ttl.contains("note1"));
+}
+
+/// #9 (JLWSC-CMT-1/2, CP-*, MA-1): the STRICT-LISTING pure-LWS deployment serves the LWS JSON-LD
+/// listing as the DEFAULT container representation — a no-Accept / `application/ld+json` /
+/// `application/json` GET all return the identical listing bytes, only `Content-Type` varying.
+#[tokio::test]
+async fn strict_listing_is_the_default_container_representation() {
+    let h = Harness::lws_strict_listing().await;
+
+    // Fixtures under /alice/notes/ (composed PUT auto-creates the intermediate container).
+    for (path, ct, body) in [
+        ("/alice/notes/a.txt", "text/plain", "alpha"),
+        ("/alice/notes/sub/", "text/turtle", ""),
+    ] {
+        let resp = h
+            .request("PUT", path, Some(ct), Body::from(body))
+            .await;
+        assert_eq!(resp.status(), StatusCode::CREATED, "fixture {path}");
+    }
+
+    // (a) No Accept ⇒ the LWS listing under application/ld+json (JLWSC-CMT-1 default type).
+    let no_accept = h
+        .request("GET", "/alice/notes/", None, Body::empty())
+        .await;
+    assert_eq!(no_accept.status(), StatusCode::OK);
+    assert_eq!(
+        mediatype_of(header_value(&no_accept, "content-type").unwrap()),
+        "application/ld+json"
+    );
+    assert!(no_accept.headers().contains_key(header::ETAG));
+    let bytes_default = body_bytes(no_accept).await;
+    let doc: serde_json::Value = serde_json::from_slice(&bytes_default).unwrap();
+    assert_eq!(doc["type"], "Container");
+    assert_eq!(doc["id"], "https://pod.example/alice/notes/");
+    assert_eq!(doc["totalItems"], 2);
+
+    // (b) application/lws+json, application/ld+json, application/json ⇒ IDENTICAL bytes, only the
+    // Content-Type label varies (JLWSC-CMT-2).
+    let mut bodies = Vec::new();
+    for (accept, want_ct) in [
+        ("application/lws+json", "application/lws+json"),
+        ("application/ld+json", "application/ld+json"),
+        ("application/json", "application/json"),
+    ] {
+        let resp = h
+            .request_with("GET", "/alice/notes/", None, &[("accept", accept)], Body::empty())
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK, "accept={accept}");
+        assert_eq!(
+            mediatype_of(header_value(&resp, "content-type").unwrap()),
+            want_ct,
+            "accept={accept}"
+        );
+        bodies.push(body_bytes(resp).await);
+    }
+    assert_eq!(bodies[0], bodies[1], "lws+json vs ld+json bytes identical");
+    assert_eq!(bodies[1], bodies[2], "ld+json vs json bytes identical");
+    assert_eq!(bodies[0], bytes_default, "conneg variants match the no-Accept body");
 }
 
 #[tokio::test]
