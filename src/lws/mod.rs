@@ -279,17 +279,24 @@ pub const A2A_AGENT_INTERACTION_SERVICE: &str =
 pub struct LwsConfig {
     /// The RDF content-transformation opt-in (`rdf-transform.html`). On ⇒ `ContentNegotiation`
     /// capability entries are advertised and derived representations (incl.
-    /// `application/n-triples`) are negotiable; off ⇒ byte-native only.
-    pub rdf_transform: bool,
+    /// `application/n-triples`) are negotiable; off ⇒ byte-native only. PRIVATE (read via
+    /// [`rdf_transform`](Self::rdf_transform)): it feeds the precomputed `description_body`, so
+    /// direct mutation would stale it — the value is fixed at construction.
+    rdf_transform: bool,
     /// The strict D2/D3 PUT semantics (every PUT conditional / no auto-intermediate containers /
-    /// no container bodies). Off by default — see the module doc's composition note.
-    pub strict_put: bool,
+    /// no container bodies). Off by default — see the module doc's composition note. PRIVATE (read
+    /// via [`strict_put`](Self::strict_put)): it gates the core `conformsTo` claim baked into
+    /// `description_body`, so it is set only at construction, never mutated in place.
+    strict_put: bool,
     /// The strict container-LISTING discipline (§container-media-type / JLWSC-CMT-1/2): when on,
     /// the LWS JSON-LD listing IS the container representation — a no-Accept / `application/ld+json`
     /// / `application/json` container GET serves the identical listing bytes (only `Content-Type`
     /// varies), rather than the composed Solid `ldp:contains` rendering. Off by default (composed
-    /// mode preserved — see [`ENV_LWS_STRICT_LISTING`] + the module doc's composition note).
-    pub strict_listing: bool,
+    /// mode preserved — see [`ENV_LWS_STRICT_LISTING`] + the module doc's composition note). PRIVATE
+    /// (read via [`strict_listing`](Self::strict_listing) / set via
+    /// [`with_strict_listing`](Self::with_strict_listing), which rebuilds the description): it also
+    /// gates the core `conformsTo` claim, so it must go through the rebuilding builder.
+    strict_listing: bool,
     /// The container-listing page size (M3, spec §pagination): a listing whose VISIBLE membership
     /// exceeds this is paged (`Link` rel first/next/prev/last; `items` = the current page;
     /// `totalItems` = the whole visible membership). `None` ⇒ pagination off (every listing
@@ -325,7 +332,10 @@ impl LwsConfig {
     /// Build a config for `base_url` (the server's public base URL, no trailing slash needed).
     pub fn new(base_url: &str, rdf_transform: bool, strict_put: bool) -> Self {
         let base = base_url.trim_end_matches('/').to_string();
-        let description_body = Bytes::from(build_storage_description(&base, rdf_transform, None));
+        // claims_core is false at construction (strict_listing defaults false, so
+        // strict_listing && strict_put is false); it is recomputed + the description rebuilt by
+        // every builder that changes an input to it (with_strict_listing / with_agent_card_url).
+        let description_body = Bytes::from(build_storage_description(&base, rdf_transform, false, None));
         let storage_description_link = HeaderValue::from_str(&format!(
             "<{base}{STORAGE_DESCRIPTION_PATH}>; rel=\"{JLWS_NS}storageDescription\""
         ))
@@ -355,10 +365,28 @@ impl LwsConfig {
 
     /// Enable the strict container-LISTING discipline ([`ENV_LWS_STRICT_LISTING`]; JLWSC-CMT-1/2):
     /// the LWS JSON-LD listing becomes the default container representation. Builder-style so every
-    /// existing `new` caller keeps the composed default (off).
+    /// existing `new` caller keeps the composed default (off). Rebuilds the storage description
+    /// because `strict_listing` gates the core/1.0 `conformsTo` claim (see
+    /// [`build_storage_description`]).
     pub fn with_strict_listing(mut self, strict_listing: bool) -> Self {
         self.strict_listing = strict_listing;
+        self.rebuild_description();
         self
+    }
+
+    /// Rebuild the precomputed storage-description bytes from the CURRENT config inputs
+    /// (`rdf_transform` + `strict_listing` + `agent_card_url`). Called by every builder that changes
+    /// one of those, so the description is always consistent regardless of builder-call order.
+    fn rebuild_description(&mut self) {
+        // Core/1.0 requires BOTH the strict listing AND the strict PUT posture (see
+        // [`build_storage_description`]).
+        let claims_core = self.strict_listing && self.strict_put;
+        self.description_body = Bytes::from(build_storage_description(
+            &self.base,
+            self.rdf_transform,
+            claims_core,
+            self.agent_card_url.as_deref(),
+        ));
     }
 
     /// Override the snapshot-pin token TTL (seconds; [`ENV_LWS_PIN_TTL`]). Builder-style; a zero
@@ -414,11 +442,7 @@ impl LwsConfig {
     /// keeps the default (no entry).
     pub fn with_agent_card_url(mut self, url: Option<&str>) -> Self {
         self.agent_card_url = url.and_then(validate_agent_card_url);
-        self.description_body = Bytes::from(build_storage_description(
-            &self.base,
-            self.rdf_transform,
-            self.agent_card_url.as_deref(),
-        ));
+        self.rebuild_description();
         self
     }
 
@@ -461,6 +485,23 @@ impl LwsConfig {
     /// The validated agent-card URL this config advertises (step-8 B), when configured.
     pub fn agent_card_url(&self) -> Option<&str> {
         self.agent_card_url.as_deref()
+    }
+
+    /// Whether the RDF content-transformation opt-in is on (read-only — set at construction; it
+    /// feeds the precomputed storage description).
+    pub fn rdf_transform(&self) -> bool {
+        self.rdf_transform
+    }
+
+    /// Whether the strict D2/D3 PUT semantics are on (read-only — set at construction).
+    pub fn strict_put(&self) -> bool {
+        self.strict_put
+    }
+
+    /// Whether the strict container-listing discipline is on (read-only — set via
+    /// [`with_strict_listing`](Self::with_strict_listing), which rebuilds the description).
+    pub fn strict_listing(&self) -> bool {
+        self.strict_listing
     }
 
     /// The precomputed storage-description bytes (identical for every conneg variant — the WD
@@ -562,13 +603,35 @@ fn validate_agent_card_url(v: &str) -> Option<String> {
 /// controller-agent's Agent Card URL, `conformsTo` = [`A2A_RDF_EXTENSION`]. It joins `service`
 /// ONLY (verdict (d): a reference affordance, not a capability — `conformsTo`/`capability` are
 /// untouched), and `None` leaves the document byte-identical to pre-step-8.
-fn build_storage_description(base: &str, rdf_transform: bool, agent_card: Option<&str>) -> Vec<u8> {
+///
+/// `claims_core` gates the **`conformsTo` core/1.0** advertisement (issue #9 — the "scope the
+/// conformsTo" alternative; roborev Mediums on 9e793e9 / 2060a38). Core/1.0 is only genuinely met
+/// by the FULL pure-LWS posture — `strict_listing` AND `strict_put` — because the core MUSTs span
+/// BOTH surfaces: the container-representation MUSTs (JLWSC-CMT-1/2, satisfied by `strict_listing`
+/// making the JSON-LD listing the representation) AND the container-vs-data / PUT MUSTs
+/// (JLWSC-CVD-1/2 "never serve client content as a container representation", PUT-2/3/6, UPD-1,
+/// satisfied by `strict_put`'s container-body/conditional/no-auto-parent discipline). A COMPOSED
+/// deployment missing EITHER serves the Solid `ldp:contains` graph or accepts a Solid content-PUT
+/// to a container, so it must not claim core conformance — it advertises only the capabilities it
+/// genuinely provides (e.g. the RDF-transform profile, which is orthogonal and stays gated on
+/// `rdf_transform`). The caller passes `strict_listing && strict_put`.
+fn build_storage_description(
+    base: &str,
+    rdf_transform: bool,
+    claims_core: bool,
+    agent_card: Option<&str>,
+) -> Vec<u8> {
     use serde_json::{json, Value};
 
     let storage_root = format!("{base}/");
     let description_url = format!("{base}{STORAGE_DESCRIPTION_PATH}");
 
-    let mut conforms_to = vec![Value::String(JLWS_CORE_CONFORMS.to_string())];
+    // Core/1.0 is claimed ONLY by the full pure-LWS posture (strict_listing AND strict_put — see the
+    // fn doc). Composed mode (missing either) advertises no core conformance — honest, per issue #9.
+    let mut conforms_to = Vec::new();
+    if claims_core {
+        conforms_to.push(Value::String(JLWS_CORE_CONFORMS.to_string()));
+    }
     let mut capability: Vec<Value> = Vec::new();
     if rdf_transform {
         conforms_to.push(Value::String(RDF_TRANSFORM_PROFILE.to_string()));
@@ -717,7 +780,8 @@ mod tests {
 
     #[test]
     fn description_advertises_core_and_transform_when_on() {
-        let cfg = LwsConfig::new("https://pod.example", true, false);
+        // Core/1.0 is claimed only by the full pure-LWS posture (strict_listing AND strict_put).
+        let cfg = LwsConfig::new("https://pod.example", true, true).with_strict_listing(true);
         let doc: serde_json::Value = serde_json::from_slice(&cfg.description_body()).unwrap();
         assert_eq!(doc["id"], "https://pod.example/");
         assert_eq!(doc["type"], "Storage");
@@ -754,7 +818,7 @@ mod tests {
 
     #[test]
     fn description_omits_transform_when_off() {
-        let cfg = LwsConfig::new("https://pod.example", false, false);
+        let cfg = LwsConfig::new("https://pod.example", false, true).with_strict_listing(true);
         let doc: serde_json::Value = serde_json::from_slice(&cfg.description_body()).unwrap();
         let conforms: Vec<&str> = doc["conformsTo"]
             .as_array()
@@ -764,6 +828,36 @@ mod tests {
             .collect();
         assert_eq!(conforms, vec![JLWS_CORE_CONFORMS]);
         assert_eq!(doc["capability"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn core_conformance_requires_both_strict_listing_and_strict_put() {
+        // Issue #9 / roborev Mediums: core/1.0 spans BOTH the container-representation MUSTs
+        // (strict_listing) AND the container-vs-data / PUT MUSTs (strict_put), so it is advertised
+        // ONLY when the deployment has both. A deployment missing EITHER advertises no core claim,
+        // only the capabilities it genuinely provides (the transform profile here).
+        let claims_core = |strict_put: bool, strict_listing: bool| -> bool {
+            let cfg = LwsConfig::new("https://pod.example", true, strict_put)
+                .with_strict_listing(strict_listing);
+            let doc: serde_json::Value =
+                serde_json::from_slice(&cfg.description_body()).unwrap();
+            let claims = doc["conformsTo"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c == JLWS_CORE_CONFORMS);
+            // The orthogonal transform profile is advertised regardless (rdf_transform on).
+            assert!(doc["conformsTo"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c == RDF_TRANSFORM_PROFILE));
+            claims
+        };
+        assert!(!claims_core(false, false), "composed (neither)");
+        assert!(!claims_core(true, false), "strict_put only — no strict listing");
+        assert!(!claims_core(false, true), "strict_listing only — no strict PUT");
+        assert!(claims_core(true, true), "full pure-LWS posture claims core");
     }
 
     #[test]

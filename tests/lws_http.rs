@@ -314,7 +314,12 @@ fn link_values(resp: &axum::http::Response<Body>) -> Vec<String> {
 
 #[tokio::test]
 async fn discovery_document_advertises_conformance_and_capabilities() {
-    let h = Harness::lws().await;
+    // A full pure-LWS deployment (strict_put AND strict_listing) advertises core/1.0 — core is
+    // claimed only when BOTH the listing and PUT/container-vs-data MUSTs are met (issue #9).
+    let h = Harness::with_lws(Some(
+        LwsConfig::new(BASE_URL, true, true).with_strict_listing(true),
+    ))
+    .await;
 
     // PUBLIC: an unauthenticated GET reaches the description (discovery precedes auth — the M2
     // RFC 9728 flow starts here).
@@ -380,7 +385,12 @@ async fn discovery_conneg_same_bytes_only_content_type_varies() {
 
 #[tokio::test]
 async fn discovery_reflects_transform_off() {
-    let h = Harness::lws_no_transform().await;
+    // Full pure-LWS posture (strict_put + strict_listing, so core/1.0 is claimed) + transform OFF
+    // (so no transform profile / capability) — isolates the transform-off effect on the description.
+    let h = Harness::with_lws(Some(
+        LwsConfig::new(BASE_URL, false, true).with_strict_listing(true),
+    ))
+    .await;
     let resp = h.unauth_request("GET", "/.well-known/lws", None).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let doc = body_json(resp).await;
@@ -658,6 +668,42 @@ async fn post_typed_link_creates_a_container() {
         .request("POST", "/alice/c/", None, Body::empty())
         .await;
     assert_eq!(no_ct.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Flag-off invariance (roborev Medium on 408b3e4): with the LWS surface OFF, a POST carrying the
+/// JLWS `lws#Container` type link + a Content-Type + body creates a DATA resource (the Solid
+/// surface never honours the LWS type), NOT a container.
+#[tokio::test]
+async fn flag_off_ignores_lws_container_type_link() {
+    let h = Harness::flag_off().await;
+    // Seed the parent (a Solid PUT auto-creates intermediates).
+    let seed = h
+        .request("PUT", "/alice/c/x.txt", Some("text/plain"), Body::from("x"))
+        .await;
+    assert_eq!(seed.status(), StatusCode::CREATED);
+
+    let posted = h
+        .request_with(
+            "POST",
+            "/alice/c/",
+            Some("text/plain"),
+            &[
+                ("link", "<https://w3id.org/jeswr/lws#Container>; rel=\"type\""),
+                ("slug", "child"),
+            ],
+            Body::from("hi"),
+        )
+        .await;
+    assert_eq!(posted.status(), StatusCode::CREATED);
+    // A DATA resource: no trailing slash, and no LWS create links (flag off).
+    assert!(
+        !header_value(&posted, "location").unwrap().ends_with('/'),
+        "flag-off lws#Container link must mint a data resource, not a container"
+    );
+    assert!(
+        !link_values(&posted).iter().any(|l| l.contains("rel=\"linkset\"")),
+        "flag-off create carries no LWS links"
+    );
 }
 
 #[tokio::test]

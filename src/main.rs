@@ -982,11 +982,12 @@ where
     match &lws {
         Some(cfg) => {
             eprintln!(
-                "  LWS: surface ENABLED (rdf_transform={}, strict_put={}) — storage description at \
-                 {}{}; container application/lws+json + rel=\"up\" active. Flag-gated: unset {} to \
-                 restore the pure Solid surface.",
-                cfg.rdf_transform,
-                cfg.strict_put,
+                "  LWS: surface ENABLED (rdf_transform={}, strict_put={}, strict_listing={}) — \
+                 storage description at {}{}; container application/lws+json + rel=\"up\" active. \
+                 Flag-gated: unset {} to restore the pure Solid surface.",
+                cfg.rdf_transform(),
+                cfg.strict_put(),
+                cfg.strict_listing(),
                 base_url.trim_end_matches('/'),
                 solid_server_rs::lws::STORAGE_DESCRIPTION_PATH,
                 solid_server_rs::lws::ENV_LWS,

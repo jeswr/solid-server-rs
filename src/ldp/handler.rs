@@ -252,18 +252,18 @@ impl<S: Store> LdpState<S> {
 
     /// Whether the LWS RDF content-transformation opt-in is on (`rdf-transform.html`).
     fn lws_transform_on(&self) -> bool {
-        self.lws.as_deref().is_some_and(|l| l.rdf_transform)
+        self.lws.as_deref().is_some_and(|l| l.rdf_transform())
     }
 
     /// Whether the LWS strict D2/D3 PUT semantics are on (pure-LWS deployments).
     fn lws_strict_put(&self) -> bool {
-        self.lws.as_deref().is_some_and(|l| l.strict_put)
+        self.lws.as_deref().is_some_and(|l| l.strict_put())
     }
 
     /// Whether the LWS strict container-LISTING discipline is on (§container-media-type;
     /// pure-LWS deployments) — the LWS JSON-LD listing is the default container representation.
     fn lws_strict_listing(&self) -> bool {
-        self.lws.as_deref().is_some_and(|l| l.strict_listing)
+        self.lws.as_deref().is_some_and(|l| l.strict_listing())
     }
 
     /// Set the `WWW-Authenticate` challenge emitted on a 401 (the verifier-derived one). Called by
@@ -1593,8 +1593,9 @@ pub async fn post_handler<S: Store>(
     // server to create a CONTAINER child — LDP §5.2.3.4 (`ldp:BasicContainer`/`ldp:Container`) AND
     // JLWS §http-create-post (`jlws#Container` + its `w3.org/ns/lws#` alias — JLWSC-POST-3/NS-1).
     // The minted child IRI then ends in `/` and is created as a container. Without the type Link, a
-    // plain resource child is created.
-    let wants_container = wants_container_via_link(&headers);
+    // plain resource child is created. The JLWS `lws#Container` type is honoured only when the LWS
+    // surface is on (flag-off invariance).
+    let wants_container = wants_container_via_link(&headers, state.lws().is_some());
 
     // A POST write MUST carry a Content-Type (Solid Protocol — `content-type-reject`): ABSENT ⇒ 400
     // — EXCEPT the JLWS container-creation POST (§http-create-post), whose canonical form carries NO
@@ -2509,20 +2510,22 @@ fn variant_suffix(format: RdfFormat) -> &'static str {
 }
 
 /// Whether a POST asks for a CONTAINER child via a `Link: <type>; rel="type"` header — LDP
-/// §5.2.3.4 (`ldp#BasicContainer` / `ldp#Container`) OR JLWS §http-create-post
-/// (`https://w3id.org/jeswr/lws#Container` and its `https://www.w3.org/ns/lws#Container` alias —
-/// JLWSC-POST-3 / NS-1, both matched by the `lws#container` essence). Matched across (possibly
-/// multiple) `Link` header lines, case-insensitively on the rel + the container type IRI. The
-/// `lws#container` and `ldp#container` essences are distinct substrings, so neither matches the
-/// other.
-fn wants_container_via_link(headers: &HeaderMap) -> bool {
+/// §5.2.3.4 (`ldp#BasicContainer` / `ldp#Container`, always honoured) OR, ONLY when the LWS surface
+/// is enabled (`lws_on`), JLWS §http-create-post (`https://w3id.org/jeswr/lws#Container` and its
+/// `https://www.w3.org/ns/lws#Container` alias — JLWSC-POST-3 / NS-1, both matched by the
+/// `lws#container` essence). Gating the LWS type on the flag keeps the flag-OFF Solid surface
+/// byte-identical (a flag-off POST carrying an `lws#Container` type link still mints a data
+/// resource, as before — the additive invariant). Matched across (possibly multiple) `Link` header
+/// lines, case-insensitively on the rel + the container type IRI. The `lws#container` and
+/// `ldp#container` essences are distinct substrings, so neither matches the other.
+fn wants_container_via_link(headers: &HeaderMap, lws_on: bool) -> bool {
     headers.get_all(header::LINK).iter().any(|v| {
         let Ok(s) = v.to_str() else { return false };
         let lower = s.to_ascii_lowercase();
         lower.contains("rel=\"type\"")
             && (lower.contains("ldp#basiccontainer")
                 || lower.contains("ldp#container")
-                || lower.contains("lws#container"))
+                || (lws_on && lower.contains("lws#container")))
     })
 }
 
@@ -3014,13 +3017,15 @@ mod tests {
 
     #[test]
     fn wants_container_link_is_detected() {
+        // The LDP types are honoured regardless of the LWS flag.
         let mut h = HeaderMap::new();
-        assert!(!wants_container_via_link(&h));
+        assert!(!wants_container_via_link(&h, false));
         h.append(
             header::LINK,
             HeaderValue::from_static("<http://www.w3.org/ns/ldp#BasicContainer>; rel=\"type\""),
         );
-        assert!(wants_container_via_link(&h));
+        assert!(wants_container_via_link(&h, false));
+        assert!(wants_container_via_link(&h, true));
 
         // ldp:Container also counts.
         let mut h2 = HeaderMap::new();
@@ -3028,7 +3033,7 @@ mod tests {
             header::LINK,
             HeaderValue::from_static("<http://www.w3.org/ns/ldp#Container>; rel=\"type\""),
         );
-        assert!(wants_container_via_link(&h2));
+        assert!(wants_container_via_link(&h2, false));
 
         // A non-type Link (e.g. an acl rel) does NOT request a container.
         let mut h3 = HeaderMap::new();
@@ -3036,7 +3041,25 @@ mod tests {
             header::LINK,
             HeaderValue::from_static("<https://pod.example/x.acl>; rel=\"acl\""),
         );
-        assert!(!wants_container_via_link(&h3));
+        assert!(!wants_container_via_link(&h3, true));
+
+        // The JLWS `lws#Container` type (and its w3.org alias) is honoured ONLY when the LWS flag
+        // is on — flag-off invariance (roborev Medium on 408b3e4).
+        for link in [
+            "<https://w3id.org/jeswr/lws#Container>; rel=\"type\"",
+            "<https://www.w3.org/ns/lws#Container>; rel=\"type\"",
+        ] {
+            let mut hl = HeaderMap::new();
+            hl.append(header::LINK, HeaderValue::from_str(link).unwrap());
+            assert!(
+                wants_container_via_link(&hl, true),
+                "lws#Container honoured with the flag ON: {link}"
+            );
+            assert!(
+                !wants_container_via_link(&hl, false),
+                "lws#Container ignored with the flag OFF: {link}"
+            );
+        }
     }
 
     #[test]

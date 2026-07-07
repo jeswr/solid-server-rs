@@ -169,22 +169,22 @@ impl ContainerVariant {
 /// 3. Else ⇒ `None` (existing behaviour, byte-identical).
 ///
 /// **Strict mode (`strict = true`, the pure-LWS deployment — §container-media-type / JLWSC-CMT-1/2)**
-/// — the LWS JSON-LD listing IS the container representation, so a request the composed rules would
-/// leave to the Solid rendering instead gets the listing under the best-matching JSON `Content-Type`
-/// (default: profiled `application/ld+json`). No-Accept / `application/ld+json` / `application/json`
-/// / a wildcard all resolve to the listing; the payload bytes are identical, only `Content-Type`
-/// varies. (An explicit non-JSON-only `Accept` such as `text/turtle` still gets the JSON listing
-/// labelled as the default profiled JSON-LD — a pure-LWS container has no other representation.)
+/// — the LWS JSON-LD listing IS the container representation, so the ONLY question is which JSON
+/// `Content-Type` label to serve the identical bytes under. That label is chosen directly from the
+/// client's JSON-form preferences ([`strict_default_variant`] — highest-weighted of
+/// `application/lws+json` / `application/ld+json` / `application/json`, default profiled
+/// `application/ld+json`), NOT via the composed rules: the composed selection has a
+/// best-existing-type tie-break that would let a lower-weighted `lws+json` win over a
+/// higher-weighted `application/json` (roborev Medium on 9e793e9), which only matters for the label
+/// in strict mode. No-Accept / a wildcard / a non-JSON `Accept` all serve the default profiled
+/// JSON-LD — a pure-LWS container has no other representation.
 pub fn negotiate_container(accept: Option<&str>, strict: bool) -> Option<ContainerVariant> {
-    if let Some(v) = negotiate_container_composed(accept) {
-        return Some(v);
-    }
-    // Strict listing: the composed rules declined (the request would get the Solid rendering), but
-    // this pure-LWS deployment has no such rendering — serve the listing under the best JSON label.
     if strict {
+        // The listing is the representation; the JSON label is a pure function of the client's
+        // JSON-form q-weights (bytes identical regardless).
         return Some(strict_default_variant(accept));
     }
-    None
+    negotiate_container_composed(accept)
 }
 
 /// The composed-mode selection (the surface-preserving rules 1–3 above). Extracted so strict mode
@@ -248,35 +248,70 @@ fn negotiate_container_composed(accept: Option<&str>) -> Option<ContainerVariant
     None
 }
 
-/// The pure-LWS (`strict_listing`) default `Content-Type` label for a container request the
-/// composed rules declined: among the three JSON forms the client named, pick the highest-weighted;
-/// with none named (no Accept, a wildcard, or a non-JSON type only) default to profiled
-/// `application/ld+json` (JLWSC-CMT-1's default advertised type). The payload BYTES are identical
-/// across every variant — this only chooses the `Content-Type` header (JLWSC-CMT-2).
+/// The pure-LWS (`strict_listing`) `Content-Type` label for a container request: among the three
+/// JSON forms the client named, pick the highest-weighted; with none named (no Accept, a wildcard,
+/// or a non-JSON type only) default to profiled `application/ld+json` (JLWSC-CMT-1's default
+/// advertised type). The payload BYTES are identical across every variant — this only chooses the
+/// `Content-Type` header (JLWSC-CMT-2).
+///
+/// Selection is a proper RFC 9110 §12.5.1 content negotiation over the three JSON labels, with
+/// **media-range specificity** (a specific `application/…json` entry — even `q=0` — wins over a
+/// wildcard) and **wildcards** (`application/*` / `*/*` supply the weight for an unlisted label). The
+/// best-weighted label with effective `q > 0` is served; ties break by the server's preference
+/// (profiled `application/ld+json` > `application/lws+json` > `application/json`, so a wildcard or
+/// no-Accept resolves to the default profiled JSON-LD). An explicitly refused label (`q=0`) is never
+/// served when another is acceptable — e.g. `application/ld+json;q=0, */*;q=1` serves `lws+json`.
+///
+/// When EVERY label is refused/unacceptable (all effective `q = 0` — an all-`q=0` `Accept`, or a
+/// non-JSON-only `Accept` with no covering wildcard), the sole representation is served under the
+/// default profiled JSON-LD rather than a 406. That fallback is deliberate and RFC 9110
+/// §12.5.1-permitted ("the origin server can either honor [with a 406] … or disregard the [Accept]
+/// header field by treating the response as if it is not subject to content negotiation"): a pure-LWS
+/// container has exactly one representation, so a 406 on the only representation it HAS helps no
+/// client.
 fn strict_default_variant(accept: Option<&str>) -> ContainerVariant {
-    let mut q_lws = 0.0f32;
-    let mut q_json = 0.0f32;
-    let mut q_ldjson = 0.0f32; // plain OR profiled ld+json — both label as ld+json
+    let mut spec_lws: Option<f32> = None; // application/lws+json (specific)
+    let mut spec_ld: Option<f32> = None; // application/ld+json (specific; profiled counts too)
+    let mut spec_json: Option<f32> = None; // application/json (specific)
+    let mut app_star: Option<f32> = None; // application/*
+    let mut any_star: Option<f32> = None; // */*
+    fn bump(slot: &mut Option<f32>, q: f32) {
+        *slot = Some(slot.map_or(q, |e| e.max(q)));
+    }
     if let Some(raw) = accept {
         for part in raw.split(',') {
             let (media, q, _profiled) = super::parse_accept_part(part);
             match media.as_str() {
-                MEDIA_LWS_JSON => q_lws = q_lws.max(q),
-                "application/json" => q_json = q_json.max(q),
-                "application/ld+json" => q_ldjson = q_ldjson.max(q),
+                MEDIA_LWS_JSON => bump(&mut spec_lws, q),
+                "application/ld+json" => bump(&mut spec_ld, q),
+                "application/json" => bump(&mut spec_json, q),
+                "application/*" => bump(&mut app_star, q),
+                "*/*" => bump(&mut any_star, q),
                 _ => {}
             }
         }
     }
-    // Prefer the more specific LWS type on a tie; plain JSON only when strictly best; else the
-    // default profiled JSON-LD (covers ld+json, no-Accept, wildcards, and non-JSON asks).
-    if q_lws > 0.0 && q_lws >= q_json && q_lws >= q_ldjson {
-        ContainerVariant::LwsJson
-    } else if q_json > 0.0 && q_json > q_ldjson {
-        ContainerVariant::PlainJson
-    } else {
-        ContainerVariant::ProfiledJsonLd
-    }
+    // Effective q per label via most-specific match: a specific entry (even q=0) wins; else the
+    // narrowest covering wildcard (application/* over */*); else 0 (not covered).
+    let effective = |spec: Option<f32>| spec.or(app_star).or(any_star).unwrap_or(0.0);
+    // (effective q, server preference) per producible variant. Preference: ld+json (default) 2 >
+    // lws+json 1 > json 0 — so a wildcard/no-Accept tie resolves to the default profiled JSON-LD.
+    let candidates = [
+        (effective(spec_ld), 2u8, ContainerVariant::ProfiledJsonLd),
+        (effective(spec_lws), 1u8, ContainerVariant::LwsJson),
+        (effective(spec_json), 0u8, ContainerVariant::PlainJson),
+    ];
+    candidates
+        .iter()
+        .filter(|(q, _, _)| *q > 0.0)
+        .max_by(|(qa, pa, _), (qb, pb, _)| {
+            qa.partial_cmp(qb)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(pa.cmp(pb))
+        })
+        .map(|(_, _, v)| *v)
+        // Everything refused/unacceptable ⇒ serve the sole representation (RFC 9110 §12.5.1 disregard).
+        .unwrap_or(ContainerVariant::ProfiledJsonLd)
 }
 
 /// A rendered LWS listing: the (page's) JSON-LD bytes + the RFC 8288 pagination `Link` header
@@ -599,6 +634,37 @@ mod tests {
             (
                 Some("text/turtle;q=0.5, application/json;q=0.9"),
                 ContainerVariant::PlainJson,
+            ),
+            // The label respects the client's JSON-form q-weights: a higher-weighted json beats a
+            // lower-weighted lws+json (roborev Medium — the composed tie-break must not leak in).
+            (
+                Some("application/json;q=1, application/lws+json;q=0.1"),
+                ContainerVariant::PlainJson,
+            ),
+            (
+                Some("application/lws+json;q=0.9, application/json;q=0.2"),
+                ContainerVariant::LwsJson,
+            ),
+            // All JSON forms explicitly refused (q=0): RFC 9110 §12.5.1 lets the server disregard
+            // Accept and serve the sole representation — the default profiled JSON-LD, not a 406
+            // (documented intentional choice; roborev note on strict conneg).
+            (
+                Some("application/json;q=0, application/ld+json;q=0, application/lws+json;q=0"),
+                ContainerVariant::ProfiledJsonLd,
+            ),
+            // ld+json EXPLICITLY refused but a wildcard accepts the rest ⇒ serve an acceptable
+            // label (never the refused ld+json). Specific q=0 wins over the wildcard; the wildcard
+            // supplies q for lws+json/json; server preference picks lws+json (roborev Medium).
+            (
+                Some("application/ld+json;q=0, */*;q=1"),
+                ContainerVariant::LwsJson,
+            ),
+            // application/* wildcard alone ⇒ all three covered at q=1; server preference default.
+            (Some("application/*"), ContainerVariant::ProfiledJsonLd),
+            // json refused, ld+json acceptable via application/* ⇒ ld+json (json excluded).
+            (
+                Some("application/json;q=0, application/*;q=1"),
+                ContainerVariant::ProfiledJsonLd,
             ),
         ] {
             assert_eq!(
