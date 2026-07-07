@@ -1582,10 +1582,10 @@ async fn linkset_merge_patch_full_flow() {
         .await;
     assert_eq!(replay.status(), StatusCode::PRECONDITION_FAILED);
 
-    // (6) Removal semantics. RFC 7386 nulls remove members only during OBJECT merging — but the
-    // `linkset` member is an ARRAY, replaced wholesale, so a null inside the echoed context object
-    // survives as a LITERAL null value ⇒ the strict validation rejects it (422). This pins the
-    // array-replacement footgun the module docs call out…
+    // (6) Removal semantics (issue #11). The merge is now applied at the context-object level, so
+    // RFC 7386 nulls work correctly: a bare `{"linkset":[{"<rel>":null}]}` REMOVES the user
+    // relations while PRESERVING the unmentioned system-managed members — a clean 204, no
+    // full-context echo required (the old array-replace made this a 422 footgun).
     let nulls = h
         .request_with(
             "PATCH",
@@ -1597,34 +1597,75 @@ async fn linkset_merge_patch_full_flow() {
             ),
         )
         .await;
-    assert_eq!(nulls.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    // …the correct removal echoes the full context object WITHOUT the user members.
-    let current = body_json(
-        h.request("GET", "/alice/doc.ttl?linkset", None, Body::empty())
-            .await,
-    )
-    .await;
-    let mut ctx = current["linkset"][0].clone();
-    ctx.as_object_mut().unwrap().remove("describedby");
-    ctx.as_object_mut()
-        .unwrap()
-        .remove("https://example.org/rel/source");
-    let ok = h
-        .request_with(
-            "PATCH",
-            "/alice/doc.ttl?linkset",
-            Some("application/merge-patch+json"),
-            &[("if-match", &etag1)],
-            Body::from(serde_json::json!({ "linkset": [ctx] }).to_string()),
-        )
-        .await;
-    assert_eq!(ok.status(), StatusCode::NO_CONTENT);
+    assert_eq!(nulls.status(), StatusCode::NO_CONTENT);
+    // The user relations are gone; the system links survive.
     let doc = body_json(
         h.request("GET", "/alice/doc.ttl?linkset", None, Body::empty())
             .await,
     )
     .await;
-    assert!(doc["linkset"][0].get("describedby").is_none());
+    let ctx = &doc["linkset"][0];
+    assert!(ctx.get("describedby").is_none(), "describedby removed");
+    assert!(
+        ctx.get("https://example.org/rel/source").is_none(),
+        "custom rel removed"
+    );
+    assert_eq!(
+        ctx["up"][0]["href"], "https://pod.example/alice/",
+        "system link preserved through the removal"
+    );
+    assert_eq!(ctx["acl"][0]["href"], "https://pod.example/alice/doc.ttl.acl");
+}
+
+/// #11 (JLWSC-MU-1/MU-3, UPD-2): a MINIMAL merge-patch naming only the anchor + a user relation
+/// (no system members echoed — the shape the conformance vector sends) merges cleanly, persists the
+/// relation, rotates the ETag, and leaves the system-managed members intact. Under the old literal
+/// array-replace this exact request 409'd.
+#[tokio::test]
+async fn linkset_merge_patch_minimal_user_relation_issue_11() {
+    let h = Harness::lws().await;
+    h.request(
+        "PUT",
+        "/alice/notes/a.txt",
+        Some("text/plain"),
+        Body::from("alpha"),
+    )
+    .await;
+    let ls = h
+        .request("GET", "/alice/notes/a.txt?linkset", None, Body::empty())
+        .await;
+    let etag = header_value(&ls, "etag").unwrap().to_string();
+
+    // The vector's patch shape: anchor + describedby ONLY.
+    let patch = r#"{"linkset":[{"anchor":"https://pod.example/alice/notes/a.txt","describedby":[{"href":"https://pod.example/alice/notes/a-meta.ttl"}]}]}"#;
+    let resp = h
+        .request_with(
+            "PATCH",
+            "/alice/notes/a.txt?linkset",
+            Some("application/merge-patch+json"),
+            &[("if-match", &etag)],
+            Body::from(patch),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "user-only patch merges cleanly");
+
+    let after = h
+        .request("GET", "/alice/notes/a.txt?linkset", None, Body::empty())
+        .await;
+    let after_etag = header_value(&after, "etag").unwrap().to_string();
+    assert_ne!(after_etag, etag, "the linkset ETag rotated (MU-3)");
+    let doc = body_json(after).await;
+    let ctx = &doc["linkset"][0];
+    assert_eq!(
+        ctx["describedby"][0]["href"],
+        "https://pod.example/alice/notes/a-meta.ttl"
+    );
+    // The system-managed members survive the merge.
+    assert_eq!(ctx["up"][0]["href"], "https://pod.example/alice/notes/");
+    assert_eq!(ctx["acl"][0]["href"], "https://pod.example/alice/notes/a.txt.acl");
+    assert!(ctx
+        .get("https://w3id.org/jeswr/lws#storageDescription")
+        .is_some());
 }
 
 #[tokio::test]

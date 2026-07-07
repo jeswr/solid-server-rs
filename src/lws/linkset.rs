@@ -317,9 +317,15 @@ pub async fn patch<S: Store>(
         title: "the merge-patch body is not valid JSON",
     })?;
 
-    // (7) RFC 7386: apply to the CURRENT full document, then re-validate everything.
+    // (7) Apply the merge at the CONTEXT-OBJECT level keyed by `anchor` (issue #11), then
+    // re-validate everything. RFC 7386 has no array-merge, so a LITERAL whole-document merge would
+    // REPLACE the `linkset` array wholesale — dropping every system-managed member the patch didn't
+    // echo and 409ing every user-only update. Merging the patch's context object INTO the current
+    // one (member-level RFC 7386) preserves unmentioned system members, so a patch that names only a
+    // user relation merges cleanly; a patch that TOUCHES a system member (sets it to a new value or
+    // to null) still 409s via `extract_user_relations`' value-equality guard.
     let current_doc = build_document(state.base_url(), target, user.as_ref());
-    let merged = merge_patch(&current_doc, &patch_doc);
+    let merged = merge_patch_linkset(&current_doc, &patch_doc)?;
     let new_user = extract_user_relations(&current_doc, &merged, target)?;
 
     // (8) Persist under CAS; serialisation is deterministic (serde_json's BTreeMap ordering).
@@ -572,6 +578,77 @@ fn if_match_matches(header_value: &str, current_etag: &str) -> bool {
     })
 }
 
+/// Apply an RFC 7386 merge patch at the linkset CONTEXT-OBJECT level, keyed by `anchor` (issue #11).
+///
+/// A linkset document is `{"linkset": [<one context object>]}`. RFC 7386 replaces an ARRAY member
+/// wholesale (there is no array-merge), so merging the raw patch into the whole document would
+/// discard every system-managed member the patch's `linkset` array didn't re-list. Instead this:
+/// - takes the current single context object (`build_document` always emits exactly one);
+/// - reads the patch's `linkset` array (which anchors the SAME resource) and — requiring exactly
+///   one context object in it — merges that object INTO the current context (member-level RFC 7386:
+///   an omitted member is PRESERVED, an explicit `null` REMOVES, any other value SETS);
+/// - re-assembles `{"linkset": [merged-context]}`, carrying through any NON-`linkset` top-level
+///   patch members verbatim so `extract_user_relations`' shape check (exactly the `linkset` member)
+///   still rejects them.
+///
+/// The result then flows through `extract_user_relations` unchanged: an anchor/up/type/acl/
+/// storage-description member the merge changed (or removed) is a 409; a valid user relation is
+/// kept. A patch with no `linkset` member is a no-op on the context (top-level extras still 422).
+fn merge_patch_linkset(current_doc: &Value, patch_doc: &Value) -> Result<Value, ServerError> {
+    let invalid = |title: &'static str| ServerError::LwsProblem {
+        status: 422,
+        type_uri: PROBLEM_INVALID_LINKSET_PATCH,
+        title,
+    };
+    // RFC 7386: the patch document itself must be a JSON object (a non-object patch would replace
+    // the whole document — never a valid linkset shape).
+    let Some(patch_obj) = patch_doc.as_object() else {
+        return Err(invalid(
+            "the merge-patch body must be a JSON object mirroring the linkset document",
+        ));
+    };
+    // The current single context object (guaranteed present + object by build_document).
+    let current_ctx = current_doc
+        .get("linkset")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+
+    let merged_ctx = match patch_obj.get("linkset") {
+        // No `linkset` member ⇒ the context is unchanged; keep it as-is.
+        None => current_ctx,
+        Some(Value::Array(arr)) => {
+            // Exactly one context object (this linkset anchors one resource). Anything else is an
+            // invalid patch shape (mirrors the document's own one-context invariant).
+            let [patch_ctx @ Value::Object(_)] = arr.as_slice() else {
+                return Err(invalid(
+                    "the patch's \"linkset\" must carry exactly one context object",
+                ));
+            };
+            // Member-level RFC 7386 merge of the patch context INTO the current one. An anchor
+            // mismatch (the patch naming a different anchor) shows up as a modified system member
+            // and is caught downstream (anchor is system-managed).
+            merge_patch(&current_ctx, patch_ctx)
+        }
+        Some(_) => {
+            return Err(invalid("the patch's \"linkset\" member must be an array"));
+        }
+    };
+
+    // Re-assemble, carrying through any NON-`linkset` top-level patch members so the downstream
+    // shape check (top.len() == 1) still rejects them; a `null` extra removes nothing new.
+    let mut top = Map::new();
+    top.insert("linkset".into(), Value::Array(vec![merged_ctx]));
+    for (k, v) in patch_obj {
+        if k == "linkset" || v.is_null() {
+            continue;
+        }
+        top.insert(k.clone(), v.clone());
+    }
+    Ok(Value::Object(top))
+}
+
 /// RFC 7386 JSON merge patch.
 fn merge_patch(target: &Value, patch: &Value) -> Value {
     match patch {
@@ -756,7 +833,8 @@ mod tests {
     fn patched(patch: Value) -> Result<Map<String, Value>, ServerError> {
         let t = target(DOC);
         let current = build_document(BASE, &t, None);
-        let merged = merge_patch(&current, &patch);
+        // The real patch flow (issue #11): merge at the context-object level, then validate.
+        let merged = merge_patch_linkset(&current, &patch)?;
         extract_user_relations(&current, &merged, &t)
     }
 
@@ -768,7 +846,23 @@ mod tests {
     }
 
     #[test]
-    fn adding_a_describedby_is_accepted() {
+    fn adding_a_describedby_merges_without_echoing_system_links() {
+        // #11: the patch names ONLY the anchor + user relations; the context-object merge PRESERVES
+        // the unmentioned system-managed members (up/type/acl/storage-description). The old literal
+        // array-replace 409'd this exact shape — the conformance vector's regression.
+        let user = patched(json!({
+            "linkset": [{
+                "anchor": DOC,
+                "describedby": [{ "href": "https://pod.example/alice/meta/a", "type": "text/turtle" }],
+                "https://example.org/rel/source": [{ "href": "https://upstream.example/x" }],
+            }]
+        }))
+        .expect("a user-only patch merges cleanly");
+        assert_eq!(user.len(), 2);
+        assert!(user.contains_key("describedby"));
+        assert!(user.contains_key("https://example.org/rel/source"));
+        // A FULL-context echo (every system link re-listed unchanged) is still accepted too — a
+        // no-op on the system members.
         let user = patched(json!({
             "linkset": [{
                 "anchor": DOC,
@@ -776,67 +870,66 @@ mod tests {
                 "type": [{ "href": format!("{JLWS_NS}DataResource") }],
                 "acl": [{ "href": format!("{DOC}.acl") }],
                 storage_description_rel(JLWS_NS): [{ "href": "https://pod.example/.well-known/lws" }],
-                "describedby": [{ "href": "https://pod.example/alice/meta/a", "type": "text/turtle" }],
-                "https://example.org/rel/source": [{ "href": "https://upstream.example/x" }],
+                "describedby": [{ "href": "https://pod.example/alice/meta/a" }],
             }]
         }))
-        .expect("valid patch");
-        assert_eq!(user.len(), 2);
+        .expect("full echo + describedby");
+        assert_eq!(user.len(), 1);
         assert!(user.contains_key("describedby"));
-        // Note the merged doc REPLACED the whole context object (RFC 7386 array semantics), so the
-        // client echoed the system links unchanged — accepted as a no-op on them.
     }
 
     #[test]
     fn modifying_or_removing_system_links_is_a_409() {
-        // Changing `up` (the §http-move mechanism is NOT offered — no MoveResource capability).
+        // Changing `up` to a new value (the §http-move mechanism is NOT offered).
         let e = patched(json!({
-            "linkset": [{
-                "anchor": DOC,
-                "up": [{ "href": "https://pod.example/elsewhere/" }],
-                "type": [{ "href": format!("{JLWS_NS}DataResource") }],
-                "acl": [{ "href": format!("{DOC}.acl") }],
-                storage_description_rel(JLWS_NS): [{ "href": "https://pod.example/.well-known/lws" }],
-            }]
+            "linkset": [{ "anchor": DOC, "up": [{ "href": "https://pod.example/elsewhere/" }] }]
         }))
         .unwrap_err();
         assert_eq!(status_of(&e), 409);
-        // Removing `acl` (absent from the replaced context object).
+        // Removing `acl` via an EXPLICIT null. (Omission now PRESERVES — issue #11 — so a removal
+        // attempt must be explicit, and it is still refused: system members cannot be removed.)
+        let e = patched(json!({ "linkset": [{ "anchor": DOC, "acl": null }] })).unwrap_err();
+        assert_eq!(status_of(&e), 409);
+        // Changing the anchor (the whole document's identity).
         let e = patched(json!({
-            "linkset": [{
-                "anchor": DOC,
-                "up": [{ "href": "https://pod.example/alice/notes/" }],
-                "type": [{ "href": format!("{JLWS_NS}DataResource") }],
-                storage_description_rel(JLWS_NS): [{ "href": "https://pod.example/.well-known/lws" }],
-            }]
+            "linkset": [{ "anchor": "https://pod.example/alice/notes/b.txt" }]
         }))
         .unwrap_err();
         assert_eq!(status_of(&e), 409);
-        // Changing the anchor.
-        let e = patched(json!({
-            "linkset": [{
-                "anchor": "https://pod.example/alice/notes/b.txt",
-                "up": [{ "href": "https://pod.example/alice/notes/" }],
-                "type": [{ "href": format!("{JLWS_NS}DataResource") }],
-                "acl": [{ "href": format!("{DOC}.acl") }],
-                storage_description_rel(JLWS_NS): [{ "href": "https://pod.example/.well-known/lws" }],
-            }]
-        }))
-        .unwrap_err();
-        assert_eq!(status_of(&e), 409);
-        // The WD-alias spelling of the storage-description rel is system-managed too (D14).
+        // Adding the WD-alias spelling of the storage-description rel — a system member not
+        // currently present, so introducing it is a modification (D14). 409.
         let e = patched(json!({
             "linkset": [{
                 "anchor": DOC,
-                "up": [{ "href": "https://pod.example/alice/notes/" }],
-                "type": [{ "href": format!("{JLWS_NS}DataResource") }],
-                "acl": [{ "href": format!("{DOC}.acl") }],
-                storage_description_rel(JLWS_NS): [{ "href": "https://pod.example/.well-known/lws" }],
                 storage_description_rel(LWS_WD_NS): [{ "href": "https://evil.example/desc" }],
             }]
         }))
         .unwrap_err();
         assert_eq!(status_of(&e), 409);
+    }
+
+    #[test]
+    fn merge_patch_linkset_shape_errors() {
+        let t = target(DOC);
+        let current = build_document(BASE, &t, None);
+        // A non-object patch body.
+        assert_eq!(
+            status_of(&merge_patch_linkset(&current, &json!([])).unwrap_err()),
+            422
+        );
+        // `linkset` not an array.
+        assert_eq!(
+            status_of(&merge_patch_linkset(&current, &json!({ "linkset": {} })).unwrap_err()),
+            422
+        );
+        // Two context objects.
+        assert_eq!(
+            status_of(&merge_patch_linkset(&current, &json!({ "linkset": [{}, {}] })).unwrap_err()),
+            422
+        );
+        // No `linkset` member ⇒ the context is unchanged (a no-op merge, not an error).
+        let merged = merge_patch_linkset(&current, &json!({})).unwrap();
+        assert_eq!(merged, current);
     }
 
     #[test]
