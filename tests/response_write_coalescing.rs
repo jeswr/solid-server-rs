@@ -41,6 +41,17 @@
 //! TLS-transport write shape) needs an EC2 re-run of `bench/syscalls.sh` with
 //! `strace -yy -e trace=write,writev` (the `-yy` shows the fd kind: `<eventfd:...>` vs the socket).
 //!
+//! ## nl48 reconciliation — same conclusion, now with a turnkey EC2 confirm
+//! Bead `suite-tracker-nl48` re-raised "coalesce the anon-doc head+body write" from the SAME P0.1
+//! `write`+`writev` pair. It is this exact, already-merged finding: the response is already one
+//! vectored socket write, so there is no serialization change to make (forcing hyper's Flatten
+//! strategy via `http1::Builder::writev(false)` would only swap the `writev` for a `write` **plus** a
+//! body-into-header memcpy — same write-class count, strictly worse). The residual aggregate `write`
+//! is the reactor-waker eventfd above. `bench/syscalls-fd-kind.sh` now makes the `strace -yy` fd-kind
+//! confirm turnkey on the EC2, and `bench/SYSCALLS.md` §"nl48" records the reconciliation + the
+//! secondary PUT `getrandom` (blob-key mint, security-adjacent — unchanged) / `futex` (in-memory
+//! test-double lock — a harness artifact) findings.
+//!
 //! ## What this guards
 //!
 //! A REGRESSION guard, not an optimization. Because it drives the REAL handler, it catches a change
