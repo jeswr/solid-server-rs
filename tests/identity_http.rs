@@ -216,6 +216,107 @@ async fn id_doc_if_none_match_answers_304() {
 }
 
 #[tokio::test]
+async fn id_doc_if_none_match_is_representation_specific_no_cross_repr_304() {
+    // Finding 1 (Medium): a client that cached the TURTLE representation and then requests JSON-LD
+    // carrying the Turtle ETag must get a fresh 200 — NEVER a 304 for a representation it never
+    // received. The variant tags are distinct, and Vary: Accept keeps caches from conflating them.
+    let h = Harness::new(true).await;
+
+    // The Turtle representation's strong tag.
+    let turtle = h.anon("GET", ID_HOST, "/alice", &[]).await;
+    assert_eq!(turtle.status(), StatusCode::OK);
+    let turtle_etag = turtle
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    // The JSON-LD representation's tag is DISTINCT from the Turtle one.
+    let jsonld = h
+        .anon(
+            "GET",
+            ID_HOST,
+            "/alice",
+            &[("accept", "application/ld+json")],
+        )
+        .await;
+    assert_eq!(jsonld.status(), StatusCode::OK);
+    let jsonld_etag = jsonld
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(
+        turtle_etag, jsonld_etag,
+        "the JSON-LD representation must carry a DISTINCT ETag from Turtle"
+    );
+
+    // The CROSS-representation conditional: JSON-LD requested with the TURTLE tag ⇒ fresh 200.
+    let resp = h
+        .anon(
+            "GET",
+            ID_HOST,
+            "/alice",
+            &[
+                ("accept", "application/ld+json"),
+                ("if-none-match", &turtle_etag),
+            ],
+        )
+        .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a Turtle ETag must NOT 304 a JSON-LD request (no cross-representation 304)"
+    );
+
+    // The SAME-representation conditional still 304s (JSON-LD tag + JSON-LD request).
+    let resp = h
+        .anon(
+            "GET",
+            ID_HOST,
+            "/alice",
+            &[
+                ("accept", "application/ld+json"),
+                ("if-none-match", &jsonld_etag),
+            ],
+        )
+        .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_MODIFIED,
+        "the matching JSON-LD ETag must still 304"
+    );
+    assert_eq!(
+        resp.headers().get("etag").unwrap().to_str().unwrap(),
+        jsonld_etag
+    );
+}
+
+#[tokio::test]
+async fn id_doc_demoted_card_is_an_honest_extension_of_the_id_host_webid() {
+    // Finding 2 (Low): the demoted in-pod card must extend the id-host WebID (owl:sameAs), not
+    // assert a separate legacy person — so the id-doc's rdfs:seeAlso link is honest.
+    let h = Harness::new(true).await;
+    let resp = h
+        .anon("GET", "pod.example", "/alice/profile/card", &[])
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(
+        body.contains("2002/07/owl#sameAs"),
+        "the demoted card must tie the legacy IRI to the id-host WebID via owl:sameAs: {body}"
+    );
+    assert!(
+        body.contains("https://id.pod.example/alice#me"),
+        "the demoted card must name the id-host WebID: {body}"
+    );
+}
+
+#[tokio::test]
 async fn id_host_write_methods_are_405_with_allow_get_head() {
     let h = Harness::new(true).await;
     for method in ["PUT", "POST", "DELETE", "PATCH", "OPTIONS"] {

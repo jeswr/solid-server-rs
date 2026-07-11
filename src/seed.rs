@@ -104,10 +104,11 @@ pub async fn seed_conformance_with_identity<S: Store>(
         ensure_container(store, &test, Some(&pod)).await?;
 
         // The in-pod profile document `/{u}/profile/card`, wired as a child of /{u}/profile/.
-        // Identity mode DEMOTES it: no issuer, no storage — just an extended profile that the
-        // locked id-doc `rdfs:seeAlso`-points at.
+        // Identity mode DEMOTES it: no issuer, no storage — an extended profile that the locked
+        // id-doc `rdfs:seeAlso`-points at, describing the SAME agent as the id-host WebID (never a
+        // competing legacy person). `webid` here IS the id-host WebID (identity mode).
         let body = match identity {
-            Some(_) => demoted_card_turtle(&card)?,
+            Some(_) => demoted_card_turtle(&card, &webid)?,
             None => webid_profile_turtle(&webid, &pod, issuer)?,
         };
         store
@@ -286,9 +287,17 @@ fn identity_doc_turtle(
 /// Build the DEMOTED in-pod profile card (identity mode): a user-editable extended profile carrying
 /// **no `solid:oidcIssuer` and no `pim:storage`** — nothing security-bearing may live in a
 /// WAC-governed, owner-writable document (the whole point of hosting the WebID outside the pod).
-fn demoted_card_turtle(card: &str) -> ServerResult<Vec<u8>> {
+///
+/// It is an HONEST EXTENSION of the id-host WebID, never a competing profile (roborev Finding 2):
+/// - the card's `foaf:primaryTopic` is the **id-host WebID** — the document is ABOUT that agent, so
+///   the id-doc's `rdfs:seeAlso → <card>` link resolves to a document extending the same person;
+/// - the legacy `<card>#me` IRI is tied to the id-host WebID via `owl:sameAs` (and typed
+///   `foaf:Person`), so a client that dereferences the legacy IRI learns it is the SAME agent — it
+///   asserts no separate person.
+fn demoted_card_turtle(card: &str, id_webid: &str) -> ServerResult<Vec<u8>> {
     const FOAF_PERSON: &str = "http://xmlns.com/foaf/0.1/Person";
     const FOAF_PRIMARY_TOPIC: &str = "http://xmlns.com/foaf/0.1/primaryTopic";
+    const OWL_SAME_AS: &str = "http://www.w3.org/2002/07/owl#sameAs";
 
     let card_me = format!("{card}#me");
     let nn = |s: &str| -> ServerResult<NamedNode> {
@@ -297,7 +306,11 @@ fn demoted_card_turtle(card: &str) -> ServerResult<Vec<u8>> {
         })
     };
     let triples = vec![
-        Triple::new(nn(card)?, nn(FOAF_PRIMARY_TOPIC)?, nn(&card_me)?),
+        // <card> foaf:primaryTopic <id-webid> .   (the document extends the id-host WebID)
+        Triple::new(nn(card)?, nn(FOAF_PRIMARY_TOPIC)?, nn(id_webid)?),
+        // <card#me> owl:sameAs <id-webid> .   (the legacy IRI IS the id-host WebID's agent)
+        Triple::new(nn(&card_me)?, nn(OWL_SAME_AS)?, nn(id_webid)?),
+        // <card#me> a foaf:Person .   (still a person — just not a competing, security-bearing one)
         Triple::new(nn(&card_me)?, nn(RDF_TYPE)?, nn(FOAF_PERSON)?),
     ];
     serialize_triples(RdfFormat::Turtle, &triples)
@@ -909,8 +922,19 @@ mod tests {
             !body.contains("pim/space#storage"),
             "the demoted card must not carry pim:storage: {body}"
         );
-        // It is still a profile document (primaryTopic + Person).
+        // HONEST EXTENSION, not a competing profile (roborev Finding 2): the card's primaryTopic is
+        // the ID-HOST WebID, and the legacy `card#me` is owl:sameAs that WebID — so a client that
+        // dereferences the legacy IRI learns it is the SAME agent, never a separate person.
+        let id_webid = "https://id.localhost:3000/alice#me";
         assert!(body.contains("primaryTopic"));
+        assert!(
+            body.contains("2002/07/owl#sameAs"),
+            "the demoted card must tie the legacy IRI to the id-host WebID via owl:sameAs: {body}"
+        );
+        assert!(
+            body.contains(id_webid),
+            "the demoted card's primaryTopic + owl:sameAs must name the id-host WebID: {body}"
+        );
     }
 
     #[tokio::test]

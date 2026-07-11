@@ -36,7 +36,10 @@ use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
-use crate::ldp::content::{classify, negotiate_accept, parse_to_triples, serialize_triples};
+use crate::ldp::conditional;
+use crate::ldp::content::{
+    classify, negotiate_accept, parse_to_triples, serialize_triples, RdfFormat,
+};
 use crate::ldp::handler::LdpState;
 use crate::store::Store;
 
@@ -358,8 +361,21 @@ async fn serve_identity_request<S: Store>(
         None => return (StatusCode::NOT_ACCEPTABLE, "not acceptable").into_response(),
     };
 
-    // Conditional GET: an If-None-Match hit answers 304 (with the same ETag + cache headers).
-    let etag = resource.meta.etag.clone();
+    // The response validator is REPRESENTATION-SPECIFIC (RFC 9110 §8.8.3 — an entity-tag identifies
+    // a representation, not a resource), mirroring the LDP read path's `negotiated_validator`: the
+    // STORED format (Turtle) keeps the stored strong ETag; a re-serialised representation (JSON-LD)
+    // gets a DISTINCT variant tag (`"<state>+jsonld"`, via `conditional::variant_etag`). Computed
+    // BEFORE the If-None-Match check so a 304 short-circuit uses the tag THIS request's
+    // representation would carry — a client holding the Turtle tag but asking for JSON-LD therefore
+    // gets a fresh 200, never a 304 for bytes it never received (the cross-representation-304 bug).
+    let etag = if format == stored {
+        resource.meta.etag.clone()
+    } else {
+        conditional::variant_etag(&resource.meta.etag, variant_suffix(format))
+    };
+
+    // Conditional GET: an If-None-Match hit (against the REPRESENTATION-SPECIFIC validator above)
+    // answers 304 with the same ETag + cache headers.
     if if_none_match_hits(if_none_match, &etag) {
         let mut resp = StatusCode::NOT_MODIFIED.into_response();
         add_identity_headers(&mut resp, &etag);
@@ -428,6 +444,16 @@ fn method_not_allowed() -> Response {
         HeaderValue::from_static("*"),
     );
     resp
+}
+
+/// The short, `+`-free `+<variant>` suffix token for a negotiated RDF format — mirrors the LDP read
+/// path's `variant_suffix` so a Turtle-vs-JSON-LD variant tag is derived identically on both
+/// surfaces (the STORED format never takes a suffix; only a re-serialised representation does).
+fn variant_suffix(format: RdfFormat) -> &'static str {
+    match format {
+        RdfFormat::Turtle => "ttl",
+        RdfFormat::JsonLd => "jsonld",
+    }
 }
 
 /// Whether an `If-None-Match` header value matches `etag` (`*`, or any listed entity-tag, weak
@@ -532,6 +558,26 @@ mod tests {
         ] {
             assert!(!is_valid_handle(bad), "{bad:?} must be rejected");
         }
+    }
+
+    #[test]
+    fn variant_validators_are_representation_specific() {
+        // Finding 1: the STORED format (Turtle) keeps the stored strong tag; a re-serialised
+        // representation (JSON-LD) gets a DISTINCT variant tag — so an If-None-Match carrying the
+        // Turtle tag can never match the JSON-LD representation (no cross-representation 304).
+        let stored = "\"42-abc\"";
+        let turtle = stored.to_string();
+        let jsonld = conditional::variant_etag(stored, variant_suffix(RdfFormat::JsonLd));
+        assert_eq!(turtle, "\"42-abc\"");
+        assert_eq!(jsonld, "\"42-abc+jsonld\"");
+        assert_ne!(
+            turtle, jsonld,
+            "the two representations must have distinct tags"
+        );
+        // The If-None-Match matcher agrees: the Turtle tag hits Turtle but NOT the JSON-LD tag.
+        assert!(if_none_match_hits(Some(&turtle), &turtle));
+        assert!(!if_none_match_hits(Some(&turtle), &jsonld));
+        assert!(if_none_match_hits(Some(&jsonld), &jsonld));
     }
 
     #[test]
