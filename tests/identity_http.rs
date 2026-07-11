@@ -16,12 +16,14 @@ mod common;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use common::{jwks_provider, mint_access_token, mint_dpop_proof, KeyKit, BASE_URL};
+use oxrdf::NamedNode;
 use solid_oidc_verifier::config::VerifierConfig;
 use solid_oidc_verifier::replay::InMemoryReplayStore;
 use solid_oidc_verifier::verifier::Verifier;
 use solid_server_rs::app::{build_router, AppState};
 use solid_server_rs::auth::AuthContext;
 use solid_server_rs::identity::IdentityConfig;
+use solid_server_rs::ldp::content::{parse_to_triples, RdfFormat};
 use solid_server_rs::ldp::handler::LdpState;
 use solid_server_rs::seed::{seed_conformance, seed_conformance_with_identity};
 use solid_server_rs::store::{CompositeStore, InMemoryBlobStore, InMemorySparqClient};
@@ -299,20 +301,45 @@ async fn id_doc_if_none_match_is_representation_specific_no_cross_repr_304() {
 #[tokio::test]
 async fn id_doc_demoted_card_is_an_honest_extension_of_the_id_host_webid() {
     // Finding 2 (Low): the demoted in-pod card must extend the id-host WebID (owl:sameAs), not
-    // assert a separate legacy person — so the id-doc's rdfs:seeAlso link is honest.
+    // assert a separate legacy person — so the id-doc's rdfs:seeAlso link is honest. Asserted as
+    // EXACT parsed triples (not substrings), so a regression that points `foaf:primaryTopic` back
+    // at the in-pod `<card#me>` — re-asserting a competing profile — fails this test.
     let h = Harness::new(true).await;
     let resp = h
         .anon("GET", "pod.example", "/alice/profile/card", &[])
         .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_string(resp).await;
+
+    const CARD: &str = "https://pod.example/alice/profile/card";
+    const CARD_ME: &str = "https://pod.example/alice/profile/card#me";
+    const ID_WEBID: &str = "https://id.pod.example/alice#me";
+    const FOAF_PRIMARY_TOPIC: &str = "http://xmlns.com/foaf/0.1/primaryTopic";
+    const OWL_SAME_AS: &str = "http://www.w3.org/2002/07/owl#sameAs";
+
+    let triples = parse_to_triples(RdfFormat::Turtle, body.as_bytes(), CARD)
+        .expect("the demoted card must parse as Turtle");
+    let nn = |s: &str| NamedNode::new(s).unwrap();
+    let has = |s: &str, p: &str, o: &str| {
+        triples
+            .iter()
+            .any(|t| t.subject == nn(s).into() && t.predicate == nn(p) && t.object == nn(o).into())
+    };
     assert!(
-        body.contains("2002/07/owl#sameAs"),
-        "the demoted card must tie the legacy IRI to the id-host WebID via owl:sameAs: {body}"
+        has(CARD, FOAF_PRIMARY_TOPIC, ID_WEBID),
+        "the demoted card's foaf:primaryTopic must be the id-host WebID: {body}"
     );
     assert!(
-        body.contains("https://id.pod.example/alice#me"),
-        "the demoted card must name the id-host WebID: {body}"
+        has(CARD_ME, OWL_SAME_AS, ID_WEBID),
+        "the demoted card must tie the legacy IRI to the id-host WebID via owl:sameAs: {body}"
+    );
+    // The regression guard: no foaf:primaryTopic triple may target the demoted in-pod `<card#me>`
+    // (from ANY subject) — that would restore the card as a competing profile document.
+    assert!(
+        !triples
+            .iter()
+            .any(|t| t.predicate == nn(FOAF_PRIMARY_TOPIC) && t.object == nn(CARD_ME).into()),
+        "foaf:primaryTopic must NOT target the demoted in-pod <card#me>: {body}"
     );
 }
 
