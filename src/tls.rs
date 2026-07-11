@@ -1302,7 +1302,10 @@ mod tests {
         for off in [
             "", " ", "0", "false", "no", "off", "enabled", "2", "garbage", "onn", "yeah",
         ] {
-            assert!(!is_affirmative(Some(off)), "{off:?} must NOT be affirmative");
+            assert!(
+                !is_affirmative(Some(off)),
+                "{off:?} must NOT be affirmative"
+            );
         }
         assert!(!is_affirmative(None), "absent ⇒ OFF (the default)");
     }
