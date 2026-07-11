@@ -34,11 +34,13 @@ use axum::body::Bytes;
 use oxrdf::{NamedNode, Triple};
 
 use crate::error::ServerResult;
+use crate::identity::{reserved_doc_iri, IdentityConfig};
 use crate::ldp::content::{serialize_triples, RdfFormat};
 use crate::store::Store;
 
 /// The conformance test users. Each maps to a Keycloak service-account client whose token carries
-/// the matching `webid` claim (`https://<base>/{u}/profile/card#me`).
+/// the matching `webid` claim (`https://<base>/{u}/profile/card#me` in the default posture, or
+/// `https://<identity-host>/{u}#me` in identity mode — see [`seed_conformance_with_identity`]).
 pub const SEED_USERS: [&str; 2] = ["alice", "bob"];
 
 /// Seed the store with the root container, the per-user container tree, and each user's WebID
@@ -50,6 +52,33 @@ pub async fn seed_conformance<S: Store>(
     store: &S,
     base_url: &str,
     issuer: &str,
+) -> ServerResult<()> {
+    seed_conformance_with_identity(store, base_url, issuer, None).await
+}
+
+/// [`seed_conformance`] with the OPTIONAL identity-host posture (`docs/design/webid-outside-pod.md`).
+///
+/// - `identity: None` — byte-identical to the pre-identity seed: the WebID is the in-pod
+///   `/{u}/profile/card#me` carrying `pim:storage` + `solid:oidcIssuer`.
+/// - `identity: Some(config)` — **provider WebIDs are hosted OUTSIDE the pod**:
+///   - each user's WebID becomes `https://<identity-host>/{u}#me`; its LOCKED id-doc (Person type,
+///     provider-locked `solid:oidcIssuer`, `pim:storage` → the pod root, the
+///     `<pod> solid:owner <webid>` back-link, `rdfs:seeAlso` → the in-pod card) is written at the
+///     RESERVED store key `<base>/.identity/{u}` — via [`Store::write`], with NO containment edge,
+///     so it appears in no `ldp:contains` listing and is addressable ONLY by the id-host route
+///     (the LDP surface refuses the namespace outright);
+///   - **no `.acl` is written for the id-doc** — none can exist (the namespace is refused), which
+///     is the security property, not an omission;
+///   - the pod-root ACL's owner `acl:agent` is the **id-host WebID** (the token's `webid` claim in
+///     identity mode);
+///   - the in-pod `/{u}/profile/card` is DEMOTED to a user-editable extended profile carrying
+///     **no `solid:oidcIssuer` and no `pim:storage`** (nothing security-bearing may live in a
+///     WAC-governed, owner-writable document).
+pub async fn seed_conformance_with_identity<S: Store>(
+    store: &S,
+    base_url: &str,
+    issuer: &str,
+    identity: Option<&IdentityConfig>,
 ) -> ServerResult<()> {
     let base = base_url.trim_end_matches('/');
 
@@ -63,15 +92,24 @@ pub async fn seed_conformance<S: Store>(
         let profile = format!("{base}/{user}/profile/");
         let test = format!("{base}/{user}/test/");
         let card = format!("{base}/{user}/profile/card");
-        let webid = format!("{card}#me");
+        // The OWNER WebID every ACL names: the id-host WebID in identity mode, else the in-pod card.
+        let webid = match identity {
+            Some(config) => config.webid(user),
+            None => format!("{card}#me"),
+        };
 
         // Container tree: /{u}/ ⊂ / ; /{u}/profile/ ⊂ /{u}/ ; /{u}/test/ ⊂ /{u}/.
         ensure_container(store, &pod, Some(&root)).await?;
         ensure_container(store, &profile, Some(&pod)).await?;
         ensure_container(store, &test, Some(&pod)).await?;
 
-        // The WebID profile document `/{u}/profile/card`, wired as a child of /{u}/profile/.
-        let body = webid_profile_turtle(&webid, &pod, issuer)?;
+        // The in-pod profile document `/{u}/profile/card`, wired as a child of /{u}/profile/.
+        // Identity mode DEMOTES it: no issuer, no storage — just an extended profile that the
+        // locked id-doc `rdfs:seeAlso`-points at.
+        let body = match identity {
+            Some(_) => demoted_card_turtle(&card)?,
+            None => webid_profile_turtle(&webid, &pod, issuer)?,
+        };
         store
             .create_in_container(
                 &profile,
@@ -80,6 +118,22 @@ pub async fn seed_conformance<S: Store>(
                 RdfFormat::Turtle.media_type(),
             )
             .await?;
+
+        // Identity mode: the LOCKED id-doc, at the RESERVED key, with NO containment edge and NO
+        // `.acl` (none can exist — the LDP surface refuses `/.identity/**` outright). Served
+        // read-only by the id-host route; written only here (dev seed) and by the future admin
+        // provisioning seam.
+        if let Some(config) = identity {
+            let id_doc_key = reserved_doc_iri(base, user);
+            let id_doc_body = identity_doc_turtle(config, user, &pod, issuer, &card)?;
+            store
+                .write(
+                    &id_doc_key,
+                    Bytes::from(id_doc_body),
+                    RdfFormat::Turtle.media_type(),
+                )
+                .await?;
+        }
 
         // The pod-root ACL `/{u}/.acl`: owner Read/Write/Control on the pod root AND on all
         // descendants (`acl:default`), so the whole pod is owner-controlled unless a descendant ACL
@@ -178,6 +232,74 @@ fn webid_profile_turtle(webid: &str, pod_root: &str, issuer: &str) -> ServerResu
         Triple::new(nn(webid)?, nn(SOLID_OIDC_ISSUER)?, nn(issuer)?),
     ];
 
+    serialize_triples(RdfFormat::Turtle, &triples)
+}
+
+/// Build the LOCKED identity document for `handle` — the provider-managed WebID doc served from the
+/// id host (identity mode; `docs/design/webid-outside-pod.md`). Subjects are on the IDENTITY origin
+/// (the served IRIs), never the reserved store key. Carries exactly the provider-locked statements:
+/// Person type, the locked `solid:oidcIssuer`, `pim:storage` → the pod root, the
+/// `<pod> solid:owner <webid>` back-link, and `rdfs:seeAlso` → the demoted in-pod card. Built via
+/// `oxrdf` triples (never hand-concatenated — the house rule).
+fn identity_doc_turtle(
+    config: &IdentityConfig,
+    handle: &str,
+    pod_root: &str,
+    issuer: &str,
+    card: &str,
+) -> ServerResult<Vec<u8>> {
+    const FOAF_PERSON: &str = "http://xmlns.com/foaf/0.1/Person";
+    const FOAF_PRIMARY_TOPIC: &str = "http://xmlns.com/foaf/0.1/primaryTopic";
+    const PIM_STORAGE: &str = "http://www.w3.org/ns/pim/space#storage";
+    const SOLID_OIDC_ISSUER: &str = "http://www.w3.org/ns/solid/terms#oidcIssuer";
+    const SOLID_OWNER: &str = "http://www.w3.org/ns/solid/terms#owner";
+    const RDFS_SEE_ALSO: &str = "http://www.w3.org/2000/01/rdf-schema#seeAlso";
+
+    let doc = config.doc_iri(handle);
+    let webid = config.webid(handle);
+    let nn = |s: &str| -> ServerResult<NamedNode> {
+        NamedNode::new(s).map_err(|e| {
+            crate::error::ServerError::Storage(format!("invalid identity seed IRI {s}: {e}"))
+        })
+    };
+
+    let triples = vec![
+        // <doc> foaf:primaryTopic <doc#me> .
+        Triple::new(nn(&doc)?, nn(FOAF_PRIMARY_TOPIC)?, nn(&webid)?),
+        // <doc#me> a foaf:Person .
+        Triple::new(nn(&webid)?, nn(RDF_TYPE)?, nn(FOAF_PERSON)?),
+        // <doc#me> pim:storage <pod_root> .   (locked — the demoted card carries none)
+        Triple::new(nn(&webid)?, nn(PIM_STORAGE)?, nn(pod_root)?),
+        // <doc#me> solid:oidcIssuer <issuer> .   (locked — the identity trust root)
+        Triple::new(nn(&webid)?, nn(SOLID_OIDC_ISSUER)?, nn(issuer)?),
+        // <pod_root> solid:owner <doc#me> .   (the per-user back-link, asserted in the PUBLIC
+        // per-user id-doc — never aggregated into one enumerable server-wide document, the
+        // ADR-0020 user-enumeration deviation)
+        Triple::new(nn(pod_root)?, nn(SOLID_OWNER)?, nn(&webid)?),
+        // <doc#me> rdfs:seeAlso <card> .   (the demoted, user-editable extended profile)
+        Triple::new(nn(&webid)?, nn(RDFS_SEE_ALSO)?, nn(card)?),
+    ];
+
+    serialize_triples(RdfFormat::Turtle, &triples)
+}
+
+/// Build the DEMOTED in-pod profile card (identity mode): a user-editable extended profile carrying
+/// **no `solid:oidcIssuer` and no `pim:storage`** — nothing security-bearing may live in a
+/// WAC-governed, owner-writable document (the whole point of hosting the WebID outside the pod).
+fn demoted_card_turtle(card: &str) -> ServerResult<Vec<u8>> {
+    const FOAF_PERSON: &str = "http://xmlns.com/foaf/0.1/Person";
+    const FOAF_PRIMARY_TOPIC: &str = "http://xmlns.com/foaf/0.1/primaryTopic";
+
+    let card_me = format!("{card}#me");
+    let nn = |s: &str| -> ServerResult<NamedNode> {
+        NamedNode::new(s).map_err(|e| {
+            crate::error::ServerError::Storage(format!("invalid demoted-card IRI {s}: {e}"))
+        })
+    };
+    let triples = vec![
+        Triple::new(nn(card)?, nn(FOAF_PRIMARY_TOPIC)?, nn(&card_me)?),
+        Triple::new(nn(&card_me)?, nn(RDF_TYPE)?, nn(FOAF_PERSON)?),
+    ];
     serialize_triples(RdfFormat::Turtle, &triples)
 }
 
@@ -720,5 +842,108 @@ mod tests {
             .exists("https://localhost:3000/alice/test/")
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn identity_seed_writes_locked_id_docs_outside_the_pod() {
+        let s = store();
+        let base = "https://localhost:3000";
+        let issuer = "http://localhost:8080/realms/solid";
+        let config = IdentityConfig::new(base, None).unwrap();
+        seed_conformance_with_identity(&s, base, issuer, Some(&config))
+            .await
+            .unwrap();
+
+        // The id-doc lives at the RESERVED key (outside the LDP-addressable surface).
+        let key = "https://localhost:3000/.identity/alice";
+        assert!(s.exists(key).await.unwrap());
+        let doc = s.read(key).await.unwrap();
+        let body = String::from_utf8(doc.body.to_vec()).unwrap();
+        // Subjects are on the IDENTITY origin, and the locked statements are all present.
+        assert!(body.contains("id.localhost:3000/alice#me"));
+        assert!(body.contains("pim/space#storage"));
+        assert!(body.contains("solid/terms#oidcIssuer"));
+        assert!(body.contains("solid/terms#owner"));
+        assert!(body.contains(issuer));
+        assert!(body.contains("https://localhost:3000/alice/")); // pim:storage + solid:owner subject
+        assert!(body.contains("rdf-schema#seeAlso"));
+
+        // NO `.acl` exists for the id-doc — none can (the namespace is refused on the LDP surface).
+        assert!(!s
+            .exists("https://localhost:3000/.identity/alice.acl")
+            .await
+            .unwrap());
+
+        // The id-doc has NO containment edge: the root listing exposes only the user pods, never
+        // the reserved namespace (outside the LDP-resource→storage mapping).
+        let root_children = s.list_children("https://localhost:3000/").await.unwrap();
+        assert!(
+            root_children
+                .iter()
+                .all(|c| !c.as_str().contains(".identity")),
+            "the reserved namespace must never appear in an ldp:contains listing: {root_children:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_seed_demotes_the_in_pod_card() {
+        let s = store();
+        let base = "https://localhost:3000";
+        let issuer = "http://localhost:8080/realms/solid";
+        let config = IdentityConfig::new(base, None).unwrap();
+        seed_conformance_with_identity(&s, base, issuer, Some(&config))
+            .await
+            .unwrap();
+
+        // The demoted card exists but carries NOTHING security-bearing: no issuer, no storage.
+        let card = s
+            .read("https://localhost:3000/alice/profile/card")
+            .await
+            .unwrap();
+        let body = String::from_utf8(card.body.to_vec()).unwrap();
+        assert!(
+            !body.contains("oidcIssuer"),
+            "the demoted card must not carry solid:oidcIssuer: {body}"
+        );
+        assert!(
+            !body.contains("pim/space#storage"),
+            "the demoted card must not carry pim:storage: {body}"
+        );
+        // It is still a profile document (primaryTopic + Person).
+        assert!(body.contains("primaryTopic"));
+    }
+
+    #[tokio::test]
+    async fn identity_seed_binds_the_pod_acl_to_the_id_host_webid() {
+        use crate::authz::wac::{Decision, WacAuthorizer};
+        use crate::authz::AccessMode;
+
+        let s = store();
+        let base = "https://localhost:3000";
+        let issuer = "http://localhost:8080/realms/solid";
+        let config = IdentityConfig::new(base, None).unwrap();
+        seed_conformance_with_identity(&s, base, issuer, Some(&config))
+            .await
+            .unwrap();
+
+        let wac = WacAuthorizer::new(&s, base);
+        let id_webid = config.webid("alice"); // https://id.localhost:3000/alice#me
+        let old_webid = "https://localhost:3000/alice/profile/card#me";
+        let target = "https://localhost:3000/alice/test/data";
+
+        // The ID-HOST WebID is the pod owner (Read/Write/Control via the pod-root acl:default)…
+        assert!(matches!(
+            wac.authorize(target, AccessMode::Write, Some(&id_webid), None)
+                .await
+                .unwrap(),
+            Decision::Allow(_)
+        ));
+        // …and the OLD in-pod WebID form is NOT granted (the ACL names only the id-host WebID).
+        assert_eq!(
+            wac.authorize(target, AccessMode::Write, Some(old_webid), None)
+                .await
+                .unwrap(),
+            Decision::Forbidden
+        );
     }
 }

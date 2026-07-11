@@ -58,6 +58,7 @@ use solid_server_rs::auth_cache::{
     ProofPolicy, SharedReplay, VerifiedTokenCache, DEFAULT_CACHE_CAPACITY,
 };
 use solid_server_rs::body_limit;
+use solid_server_rs::identity::IdentityConfig;
 use solid_server_rs::ldp::handler::LdpState;
 use solid_server_rs::overload::{self, AdmissionControl};
 use solid_server_rs::rate_limit::{self, RateConfig, RateLimiter};
@@ -127,6 +128,19 @@ const ENV_SEED_BENCH_OWNER: &str = "SOLID_SERVER_SEED_BENCH_OWNER";
 /// ONLY for an EPHEMERAL embedded test instance that the harness legitimately seeds (the
 /// conformance run.sh embedded leg sets it). NEVER set it against a real/persistent backend.
 const ENV_ALLOW_SEED_NONMEMORY: &str = "SOLID_SERVER_ALLOW_SEED_NONMEMORY";
+/// Provider WebIDs OUTSIDE the pod (`docs/design/webid-outside-pod.md` — the RSS adaptation of
+/// prod-solid-server `decisions/0020`): when `1`/`true`, the identity gate SERVES id-docs
+/// (GET/HEAD-only, Turtle/JSON-LD, NO WAC, no `.acl` Link) on the identity host, and the
+/// conformance seed mints id-host WebIDs (`https://<identity-host>/<handle>#me` with the LOCKED
+/// `solid:oidcIssuer` + `pim:storage`) instead of in-pod cards. Default OFF — byte-for-byte the
+/// prior behaviour EXCEPT the unconditional LDP refusal of the reserved `/.identity/**` namespace,
+/// which holds regardless of this flag (pre-seeded documents must never become LDP-addressable —
+/// and thus `.acl`-able — when the flag later turns on).
+const ENV_IDENTITY_ENABLE: &str = "SOLID_SERVER_IDENTITY_ENABLE";
+/// The identity-host authority (`host[:port]`) the gate exact-Host-matches (the analogue of
+/// `PSS_IDENTITY_HOST`). Unset ⇒ derived as `id.<base authority>` (deployment-agnostic). Only read
+/// when [`ENV_IDENTITY_ENABLE`] is on; must differ from the base authority (fail-closed at boot).
+const ENV_IDENTITY_HOST: &str = "SOLID_SERVER_IDENTITY_HOST";
 /// Round-3 verified-access-token cache capacity (distinct live access tokens). Unset =>
 /// [`DEFAULT_CACHE_CAPACITY`]. The cache removes the redundant per-request access-token *signature +
 /// claims* re-verify (the token is stable across a client's requests) while STILL fully verifying the
@@ -248,6 +262,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(300),
     );
     let bidirectional = parse_bidirectional(std::env::var(ENV_BIDIRECTIONAL).ok().as_deref());
+
+    // --- Identity host (provider WebIDs OUTSIDE the pod — docs/design/webid-outside-pod.md). ------
+    // Default OFF. When on, the identity gate serves id-docs on the id host (GET/HEAD-only, no WAC)
+    // and the conformance seed mints id-host WebIDs. The LDP surface's refusal of the reserved
+    // `/.identity/**` namespace is UNCONDITIONAL either way (flag-independent — the security
+    // property). A bad host config fails the boot (fail-closed), never a silent fallback.
+    let identity = if env_flag(ENV_IDENTITY_ENABLE) {
+        let host_override = std::env::var(ENV_IDENTITY_HOST).ok();
+        let config = IdentityConfig::new(&base_url, host_override.as_deref())
+            .map_err(|e| format!("identity-host configuration error: {e}"))?;
+        eprintln!(
+            "  IDENTITY: provider WebIDs served OUTSIDE the pod — {}/<handle>#me (GET/HEAD-only, \
+             Turtle/JSON-LD, NO WAC, no .acl Link; exact-Host match on {:?}). The reserved \
+             /.identity/** namespace is refused on the LDP surface (404, every method — also when \
+             this flag is off).",
+            config.origin(),
+            config.host()
+        );
+        Some(config)
+    } else {
+        None
+    };
 
     // --- TLS termination mode (config-gated; both-or-neither). ------------------------------------
     // Resolve EARLY so a misconfiguration (one TLS var without the other) fails fast at boot, before
@@ -624,6 +660,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 jwks_cache_ttl,
                 auth,
                 overload_config,
+                identity,
             )
             .await?
         }
@@ -646,6 +683,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 jwks_cache_ttl,
                 auth,
                 overload_config,
+                identity,
             )
             .await?
         }
@@ -682,6 +720,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 jwks_cache_ttl,
                 auth,
                 overload_config,
+                identity,
             )
             .await?
         }
@@ -917,6 +956,7 @@ async fn build_app_for_store<S, J, R>(
     jwks_cache_ttl: Duration,
     auth: AuthContext<J, R>,
     overload_config: OverloadConfig,
+    identity: Option<IdentityConfig>,
 ) -> Result<axum::Router, Box<dyn std::error::Error>>
 where
     S: Store + 'static,
@@ -925,15 +965,30 @@ where
 {
     // Dev/conformance seeding (gated): write the test users' WebID profiles + the container tree the
     // Solid CTH dereferences to bootstrap. Done BEFORE the store is moved into the LDP state; a seeding
-    // failure aborts boot (better than a half-seeded store).
+    // failure aborts boot (better than a half-seeded store). In identity mode the seed mints id-host
+    // WebIDs (`<identity-origin>/<handle>#me`, LOCKED issuer + storage, id-doc at the RESERVED
+    // `/.identity/<handle>` key) and DEMOTES the in-pod cards — see `seed_conformance_with_identity`.
     if env_flag(ENV_SEED_CONFORMANCE) {
-        solid_server_rs::seed::seed_conformance(&store, base_url, issuer)
-            .await
-            .map_err(|e| format!("conformance seeding failed: {e:?}"))?;
-        eprintln!(
-            "  SEEDED conformance users {:?} (WebID profiles + container tree) — DEV/CONFORMANCE ONLY.",
-            solid_server_rs::seed::SEED_USERS
-        );
+        solid_server_rs::seed::seed_conformance_with_identity(
+            &store,
+            base_url,
+            issuer,
+            identity.as_ref(),
+        )
+        .await
+        .map_err(|e| format!("conformance seeding failed: {e:?}"))?;
+        match &identity {
+            Some(config) => eprintln!(
+                "  SEEDED conformance users {:?} (id-host WebIDs {}/<handle>#me + demoted in-pod \
+                 cards) — DEV/CONFORMANCE ONLY.",
+                solid_server_rs::seed::SEED_USERS,
+                config.origin()
+            ),
+            None => eprintln!(
+                "  SEEDED conformance users {:?} (WebID profiles + container tree) — DEV/CONFORMANCE ONLY.",
+                solid_server_rs::seed::SEED_USERS
+            ),
+        }
     }
 
     // Dev/benchmark seeding (gated): purely additive fixtures for the HTTPS load benchmark. Like the
@@ -979,10 +1034,13 @@ where
     };
     ldp.set_acl_cache(acl_cache);
 
-    Ok(build_router_with_overload(
-        AppState::new(auth, ldp),
-        overload_config,
-    ))
+    // Identity-host serving (when configured) rides the same AppState — the gate is mounted by the
+    // router assembly; the namespace refusal is mounted regardless.
+    let mut app_state = AppState::new(auth, ldp);
+    if let Some(config) = identity {
+        app_state = app_state.with_identity(config);
+    }
+    Ok(build_router_with_overload(app_state, overload_config))
 }
 
 /// Format an optional seconds-duration for a startup log line: `Some(d)` ⇒ `"<n>s"`, `None` ⇒
