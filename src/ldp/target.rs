@@ -42,6 +42,16 @@ pub fn parse_target(base: &str, path: &str) -> Result<LdpTarget, ServerError> {
         return Err(ServerError::BadRequest("path must be absolute".into()));
     }
 
+    // The reserved provider-identity namespace (`/.identity/**` — see `crate::identity` and
+    // docs/design/webid-outside-pod.md) is refused OUTRIGHT on the LDP surface: 404 for every
+    // method, %-decoded too, REGARDLESS of the identity feature flag — so no `.acl` can ever exist
+    // for it and no WAC grant can ever apply to an id-doc. The identity gate middleware refuses it
+    // first (outermost); this check is the belt-and-braces chokepoint covering every handler and
+    // any internally-constructed target re-validated through `parse_target`.
+    if crate::identity::is_reserved_identity_path(path_only) {
+        return Err(ServerError::NotFound);
+    }
+
     // A trailing-slash path names a container — INCLUDING the storage root "/" itself (the root is a
     // `ldp:BasicContainer`, so a `GET /` must render its `ldp:contains` listing, not be treated as a
     // plain resource).

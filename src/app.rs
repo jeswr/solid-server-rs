@@ -34,6 +34,7 @@ use solid_oidc_verifier::replay::ReplayStore;
 use tower_http::timeout::TimeoutLayer;
 
 use crate::auth::{auth_middleware, AuthContext};
+use crate::identity::{identity_gate_middleware, IdentityConfig, IdentityGate};
 use crate::ldp::cors::cors_middleware;
 use crate::ldp::handler::{
     delete_handler, get_handler, head_handler, options_handler, patch_handler, post_handler,
@@ -89,10 +90,16 @@ impl OverloadConfig {
     }
 }
 
-/// The assembled application state — the auth context + the LDP state, each behind an [`Arc`].
+/// The assembled application state — the auth context + the LDP state, each behind an [`Arc`],
+/// plus the optional identity-host config (provider WebIDs outside the pod —
+/// `docs/design/webid-outside-pod.md`).
 pub struct AppState<J: JwksProvider, R: ReplayStore, S: Store> {
     pub auth: Arc<AuthContext<J, R>>,
     pub ldp: Arc<LdpState<S>>,
+    /// `Some` ⇒ the identity gate SERVES id-docs on the configured host. `None` (the default)
+    /// keeps serving off — but the gate's unconditional refusal of the reserved `/.identity/**`
+    /// namespace is mounted REGARDLESS (flag-independent, per the design's security property).
+    pub identity: Option<IdentityConfig>,
 }
 
 impl<J, R, S> AppState<J, R, S>
@@ -108,7 +115,14 @@ where
         Self {
             auth: Arc::new(auth),
             ldp: Arc::new(ldp),
+            identity: None,
         }
+    }
+
+    /// Enable id-host serving (provider WebIDs outside the pod). Router-assembly-time only.
+    pub fn with_identity(mut self, config: IdentityConfig) -> Self {
+        self.identity = Some(config);
+        self
     }
 }
 
@@ -224,7 +238,15 @@ where
     R: ReplayStore + Send + Sync + 'static,
     S: Store + 'static,
 {
-    let AppState { auth, ldp } = state;
+    let AppState {
+        auth,
+        ldp,
+        identity,
+    } = state;
+
+    // A handle for the identity gate (mounted last, below) — taken before `ldp` is moved into the
+    // protected routes' state.
+    let gate_ldp = ldp.clone();
 
     // The notification state shares the LDP state's hub + base URL, so a subscriber registered via
     // `…/receive` is the same registry the LDP emit path fans to.
@@ -352,7 +374,33 @@ where
         router = router.merge(metadata);
     }
 
-    router.merge(protected)
+    // The IDENTITY GATE — the OUTERMOST application layer (applied LAST, so it runs FIRST on every
+    // app-route request; only the overload/rate-limit layers in `build_router_with_overload` sit
+    // outside it, and those only ever reject earlier). Two halves (see `crate::identity`):
+    //
+    // 1. UNCONDITIONAL: any request whose path targets the reserved `/.identity/**` namespace is
+    //    404'd immediately — every method, every origin, every Host, BEFORE auth/WAC/storage,
+    //    REGARDLESS of the identity flag. This is what makes "no `.acl` can ever exist for an
+    //    id-doc ⇒ no WAC grant can ever apply to it" a construction-level property (the
+    //    `parse_target` refusal is the belt-and-braces second chokepoint).
+    // 2. CONFIG-GATED: when `identity` is `Some`, a request whose Host is EXACTLY the id host is
+    //    answered entirely by the gate (GET/HEAD id-doc with conneg + ETag + public cache +
+    //    `ACAO: *`; 405 for every other method; fail-closed 404 otherwise) and NEVER reaches the
+    //    auth/LDP stack — no WAC, no `.acl` Link, no `WWW-Authenticate`, by design.
+    //
+    // The health routes (`/livez`, `/readyz`) are merged OUTSIDE this gate (in the callers), so a
+    // probe is never intercepted; the probe names are in `identity::RESERVED_HANDLES` so the
+    // shadowing is explicit.
+    let gate = Arc::new(IdentityGate {
+        serving: identity,
+        ldp: gate_ldp,
+    });
+    router
+        .merge(protected)
+        .layer(axum::middleware::from_fn_with_state(
+            gate,
+            identity_gate_middleware::<S>,
+        ))
 }
 
 /// The health/readiness routes: `GET /livez` (process up) + `GET /readyz` (ready to serve). Both are

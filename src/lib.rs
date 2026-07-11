@@ -49,6 +49,11 @@ pub mod auth_cache;
 pub mod authz;
 pub mod body_limit;
 pub mod error;
+/// Provider-issued WebIDs hosted OUTSIDE the pod — the identity host (the RSS adaptation of
+/// prod-solid-server `decisions/0020`; design in `docs/design/webid-outside-pod.md`). The id-docs
+/// live in a reserved namespace the LDP surface refuses outright (no `.acl` can ever exist ⇒ no
+/// WAC grant can ever apply), served GET/HEAD-only by a Host-keyed route with no authorization.
+pub mod identity;
 pub mod ldp;
 pub mod nodelay;
 pub mod notifications;

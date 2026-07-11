@@ -65,6 +65,7 @@ impl Harness {
         let app = build_router(AppState {
             auth: Arc::new(ctx),
             ldp: Arc::new(ldp),
+            identity: None,
         });
         Self {
             app,
@@ -345,6 +346,7 @@ async fn bind_live_server() -> (String, KeyKit, KeyKit) {
     let app = build_router(AppState {
         auth: Arc::new(ctx),
         ldp: Arc::new(ldp),
+        identity: None,
     });
 
     tokio::spawn(async move {
